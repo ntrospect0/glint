@@ -12,7 +12,9 @@ use async_trait::async_trait;
 use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone, Timelike, Weekday,
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -30,6 +32,12 @@ use provider::{CalendarProvider, Event};
 
 use crate::auth::google::{store::GoogleToken, OAuthClientConfig};
 use crate::ui::{big_digits, decorate_title, focus_border_style};
+
+const VIEW_TABS: &[(CalendarView, &str)] = &[
+    (CalendarView::Day, "Day"),
+    (CalendarView::Week, "Week"),
+    (CalendarView::Month, "Month"),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -193,6 +201,81 @@ impl CalendarWidget {
         let st = self.state.lock().expect("calendar state poisoned");
         st.events.clone()
     }
+
+    fn nav_step(&self) -> ChronoDuration {
+        match self.view {
+            CalendarView::Day => ChronoDuration::days(1),
+            CalendarView::Week => ChronoDuration::days(7),
+            CalendarView::Month => ChronoDuration::days(30),
+        }
+    }
+
+    /// In week view the inner area is split into 7 equal-ratio columns, with
+    /// the bottom row reserved for the hint. Maps a click to the date in the
+    /// matching column.
+    fn week_day_at(&self, col: u16, row: u16, inner: Rect) -> Option<NaiveDate> {
+        let usable_height = inner.height.saturating_sub(1); // last row = hint
+        if row < inner.y || row >= inner.y + usable_height {
+            return None;
+        }
+        if col < inner.x || col >= inner.x + inner.width || inner.width == 0 {
+            return None;
+        }
+        let dow = ((col - inner.x) as u32 * 7) / inner.width.max(1) as u32;
+        let dow = dow.min(6) as i64;
+        Some(start_of_week(self.anchor) + ChronoDuration::days(dow))
+    }
+
+    /// Month view renders as: 1-row top padding, 1-row weekday header, 6 week
+    /// rows of 7 cells (5 chars each). Maps clicks in those week rows to a date.
+    fn month_day_at(&self, col: u16, row: u16, inner: Rect) -> Option<NaiveDate> {
+        let usable_height = inner.height.saturating_sub(1);
+        let rel_y = row.checked_sub(inner.y)?;
+        if rel_y < 2 || rel_y >= usable_height {
+            return None;
+        }
+        let week = (rel_y - 2) as i64;
+        if !(0..6).contains(&week) {
+            return None;
+        }
+        if col < inner.x {
+            return None;
+        }
+        let rel_x = (col - inner.x) as usize;
+        let cell = rel_x / 5; // each rendered cell is 5 chars wide
+        if cell >= 7 {
+            return None;
+        }
+        let grid_start = start_of_week(start_of_month(self.anchor));
+        Some(grid_start + ChronoDuration::days(week * 7 + cell as i64))
+    }
+}
+
+/// Distinct interactions exposed in the bottom hint row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BottomAction {
+    Today,
+    View(CalendarView),
+}
+
+/// Maps a click in the bottom hint row to a button. Layout must mirror the
+/// spans emitted in `render`: leading space, `[Today]`, space, then `[Label]`
+/// view tabs separated by single spaces.
+fn bottom_action_at(click_col: u16, hint_x: u16) -> Option<BottomAction> {
+    let mut x = hint_x + 1; // leading space
+    let today_w = "Today".len() as u16 + 2;
+    if click_col >= x && click_col < x + today_w {
+        return Some(BottomAction::Today);
+    }
+    x += today_w + 1;
+    for (v, label) in VIEW_TABS {
+        let w = label.chars().count() as u16 + 2;
+        if click_col >= x && click_col < x + w {
+            return Some(BottomAction::View(*v));
+        }
+        x += w + 1;
+    }
+    None
 }
 
 /// Returns (provider, effective_kind, auth_hint). When Google is requested but
@@ -591,7 +674,8 @@ impl Widget for CalendarWidget {
             CalendarView::Month => self.render_month(frame, inner, &events),
         }
 
-        // Footer hint at bottom of the cell.
+        // Footer row: [Today] action + [Day] [Week] [Month] view tabs on the
+        // left, dim keyboard hint on the right.
         if inner.height >= 2 {
             let hint_area = Rect {
                 x: inner.x,
@@ -599,12 +683,31 @@ impl Widget for CalendarWidget {
                 width: inner.width,
                 height: 1,
             };
-            let hint = Paragraph::new(Line::from(Span::styled(
-                "d/w/m view · ←/→ nav · t today",
+            let mut spans: Vec<Span<'_>> = vec![Span::raw(" ")];
+            spans.push(Span::styled(
+                "[Today]",
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+            for (v, label) in VIEW_TABS {
+                let active = *v == self.view;
+                let style = if active {
+                    Style::default()
+                        .fg(Color::LightYellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().add_modifier(Modifier::DIM)
+                };
+                spans.push(Span::styled(format!("[{label}]"), style));
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(
+                "  ←/→ nav",
                 Style::default().add_modifier(Modifier::DIM),
-            )))
-            .alignment(Alignment::Right);
-            frame.render_widget(hint, hint_area);
+            ));
+            frame.render_widget(Paragraph::new(Line::from(spans)), hint_area);
         }
     }
 
@@ -650,6 +753,76 @@ impl Widget for CalendarWidget {
             }
             _ => EventResult::Ignored,
         }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> EventResult {
+        // Scroll wheel: same effect as ←/→ navigation in the current view.
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                let step = self.nav_step();
+                self.anchor -= step;
+                self.mark_dirty();
+                return EventResult::Handled;
+            }
+            MouseEventKind::ScrollDown => {
+                let step = self.nav_step();
+                self.anchor += step;
+                self.mark_dirty();
+                return EventResult::Handled;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {}
+            _ => return EventResult::Ignored,
+        }
+
+        if area.width < 2 || area.height < 2 {
+            return EventResult::Ignored;
+        }
+        let inner = Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2);
+
+        // Bottom hint row hosts the [Today] button + [Day][Week][Month] tabs.
+        if inner.height >= 1 {
+            let hint_y = inner.y + inner.height - 1;
+            if mouse.row == hint_y {
+                match bottom_action_at(mouse.column, inner.x) {
+                    Some(BottomAction::Today) => {
+                        self.anchor = Local::now().date_naive();
+                        self.mark_dirty();
+                        return EventResult::Handled;
+                    }
+                    Some(BottomAction::View(v)) => {
+                        if self.view != v {
+                            self.view = v;
+                            self.mark_dirty();
+                        }
+                        return EventResult::Handled;
+                    }
+                    None => return EventResult::Ignored,
+                }
+            }
+        }
+
+        // Day-grid clicks: which date did the user pick? Always switches to
+        // Day view so the events for that date come up immediately.
+        match self.view {
+            CalendarView::Week => {
+                if let Some(date) = self.week_day_at(mouse.column, mouse.row, inner) {
+                    self.anchor = date;
+                    self.view = CalendarView::Day;
+                    self.mark_dirty();
+                    return EventResult::Handled;
+                }
+            }
+            CalendarView::Month => {
+                if let Some(date) = self.month_day_at(mouse.column, mouse.row, inner) {
+                    self.anchor = date;
+                    self.view = CalendarView::Day;
+                    self.mark_dirty();
+                    return EventResult::Handled;
+                }
+            }
+            CalendarView::Day => {}
+        }
+        EventResult::Ignored
     }
 
     fn handle_command(&mut self, _cmd: &str, _args: &[&str]) -> Result<bool> {
@@ -704,6 +877,65 @@ mod tests {
         let w = CalendarWidget::with_config(CalendarConfig::default());
         assert_eq!(w.view, CalendarView::Day);
         assert_eq!(w.anchor, Local::now().date_naive());
+    }
+
+    #[test]
+    fn bottom_action_at_maps_cols_to_actions() {
+        // Bottom row renders: " [Today] [Day] [Week] [Month]"
+        //                       1     7 9   13 15   20 22
+        assert_eq!(bottom_action_at(2, 0), Some(BottomAction::Today));
+        assert_eq!(bottom_action_at(7, 0), Some(BottomAction::Today)); // ']' position
+        assert_eq!(bottom_action_at(10, 0), Some(BottomAction::View(CalendarView::Day)));
+        assert_eq!(bottom_action_at(16, 0), Some(BottomAction::View(CalendarView::Week)));
+        assert_eq!(bottom_action_at(23, 0), Some(BottomAction::View(CalendarView::Month)));
+        assert_eq!(bottom_action_at(60, 0), None);
+    }
+
+    #[test]
+    fn week_day_at_maps_columns_to_dates() {
+        // Anchor on a Wednesday; weeks start Sunday.
+        let cfg = CalendarConfig {
+            default_view: CalendarView::Week,
+            ..CalendarConfig::default()
+        };
+        let mut w = CalendarWidget::with_config(cfg);
+        w.anchor = NaiveDate::from_ymd_opt(2026, 5, 20).unwrap();
+        let inner = Rect::new(0, 0, 70, 20);
+        // 70 wide → each of the 7 cols ≈ 10. Click in col 0 (x=2) → Sunday.
+        assert_eq!(
+            w.week_day_at(2, 1, inner),
+            Some(NaiveDate::from_ymd_opt(2026, 5, 17).unwrap())
+        );
+        // Click in column for Wednesday (col 3, x≈30+).
+        assert_eq!(
+            w.week_day_at(32, 5, inner),
+            Some(NaiveDate::from_ymd_opt(2026, 5, 20).unwrap())
+        );
+        // Click in the hint row → None.
+        assert_eq!(w.week_day_at(2, 19, inner), None);
+    }
+
+    #[test]
+    fn month_day_at_maps_grid_cells_to_dates() {
+        let cfg = CalendarConfig {
+            default_view: CalendarView::Month,
+            ..CalendarConfig::default()
+        };
+        let mut w = CalendarWidget::with_config(cfg);
+        w.anchor = NaiveDate::from_ymd_opt(2026, 5, 20).unwrap();
+        let inner = Rect::new(0, 0, 40, 20);
+        // Grid starts at relative y=2 (after padding+header). May 2026 starts
+        // on Friday — so first row of grid = Sun Apr 26 … Sat May 2.
+        // x=0..5 = Sun, 5..10 = Mon, etc.
+        let apr26 = NaiveDate::from_ymd_opt(2026, 4, 26).unwrap();
+        assert_eq!(w.month_day_at(2, 2, inner), Some(apr26));
+        let may2 = NaiveDate::from_ymd_opt(2026, 5, 2).unwrap();
+        assert_eq!(w.month_day_at(32, 2, inner), Some(may2));
+        // Clicks in padding/header rows → None.
+        assert_eq!(w.month_day_at(2, 0, inner), None);
+        assert_eq!(w.month_day_at(2, 1, inner), None);
+        // Clicks past the 7th cell → None.
+        assert_eq!(w.month_day_at(38, 2, inner), None);
     }
 
     #[test]

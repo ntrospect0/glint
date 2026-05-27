@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossterm::event::{Event as CtEvent, EventStream, KeyEvent};
+use crossterm::event::{Event as CtEvent, EventStream, KeyEvent, MouseEvent};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 #[derive(Debug, Clone)]
 pub enum Event {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Resize(#[allow(dead_code)] u16, #[allow(dead_code)] u16),
     Tick,
 }
@@ -48,6 +49,7 @@ async fn run_loop(tx: mpsc::Sender<Event>, tick_rate: Duration) {
                 let Ok(evt) = evt else { continue };
                 let mapped = match evt {
                     CtEvent::Key(k) => Some(Event::Key(k)),
+                    CtEvent::Mouse(m) => Some(Event::Mouse(m)),
                     CtEvent::Resize(w, h) => Some(Event::Resize(w, h)),
                     _ => None,
                 };

@@ -2,11 +2,14 @@ use std::{io, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 
 use chrono::Local;
 
@@ -17,6 +20,7 @@ use crate::{
     widgets::{
         calendar::{CalendarConfig, CalendarWidget},
         clock::{ClockConfig, ClockWidget},
+        news::{NewsConfig, NewsWidget},
         stocks::StocksWidget,
         weather::{WeatherConfig, WeatherWidget},
         AppContext, EventResult, WidgetManager,
@@ -42,12 +46,14 @@ impl App {
         let weather_cfg: WeatherConfig = config::load_widget_toml("weather").unwrap_or_default();
         let calendar_cfg: CalendarConfig =
             config::load_widget_toml("calendar").unwrap_or_default();
+        let news_cfg: NewsConfig = config::load_widget_toml("news").unwrap_or_default();
 
         let mut manager = WidgetManager::new();
         manager.register(StocksWidget::new());
         manager.register(ClockWidget::with_config(clock_cfg));
         manager.register(WeatherWidget::with_config(weather_cfg));
         manager.register(CalendarWidget::with_config(calendar_cfg));
+        manager.register(NewsWidget::with_config(news_cfg));
 
         let focus_order = focus_order_from_layout(&config, &manager);
         Self {
@@ -87,6 +93,28 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// Returns the (widget id, cell area) under screen coordinates `(col, row)`,
+/// if any. The bottom row is the status bar and is intentionally not focusable.
+fn widget_at(app: &App, full_area: Rect, col: u16, row: u16) -> Option<(String, Rect)> {
+    if full_area.width == 0 || full_area.height == 0 {
+        return None;
+    }
+    let main_height = full_area.height.saturating_sub(1);
+    if row >= main_height {
+        return None;
+    }
+    let main_area = Rect::new(full_area.x, full_area.y, full_area.width, main_height);
+    for resolved in app.config.layout.resolve(main_area) {
+        let r = resolved.area;
+        let in_x = col >= r.x && col < r.x + r.width;
+        let in_y = row >= r.y && row < r.y + r.height;
+        if in_x && in_y {
+            return Some((resolved.cell.widget.clone(), r));
+        }
+    }
+    None
 }
 
 /// Build the focus-cycling order from the layout cells, keeping only widgets
@@ -147,6 +175,35 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                     app.handle_global_key(key);
                 }
             }
+            Event::Mouse(mouse) => {
+                if let Ok(size) = terminal.size() {
+                    let full = Rect::new(0, 0, size.width, size.height);
+                    let target = widget_at(&app, full, mouse.column, mouse.row);
+                    match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if let Some((id, cell_area)) = target {
+                                if let Some(pos) = app.focus_order.iter().position(|w| w == &id) {
+                                    app.focus_idx = pos;
+                                }
+                                if let Some(widget) = app.manager.get_mut(&id) {
+                                    let _ = widget.handle_mouse(mouse, cell_area);
+                                }
+                            }
+                        }
+                        // Scroll wheel: forward to the widget under the cursor
+                        // without changing focus — most users expect "scroll
+                        // whatever I'm hovering over".
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                            if let Some((id, cell_area)) = target {
+                                if let Some(widget) = app.manager.get_mut(&id) {
+                                    let _ = widget.handle_mouse(mouse, cell_area);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             Event::Resize(_, _) => {
                 // Ratatui handles the re-layout on the next draw call below.
             }
@@ -185,7 +242,7 @@ type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 fn enter_tui() -> Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
@@ -196,13 +253,33 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn widget_at_maps_clicks_to_cells() {
+        let app = App::new(Config::default());
+        let area = Rect::new(0, 0, 100, 40);
+        assert_eq!(
+            widget_at(&app, area, 5, 2).map(|(id, _)| id),
+            Some("clock".to_string())
+        );
+        assert_eq!(
+            widget_at(&app, area, 80, 2).map(|(id, _)| id),
+            Some("calendar".to_string())
+        );
+        assert_eq!(
+            widget_at(&app, area, 50, 35).map(|(id, _)| id),
+            Some("stocks".to_string())
+        );
+        // Status bar row — last row of the area — should be unfocusable.
+        assert!(widget_at(&app, area, 50, 39).is_none());
+    }
 
     #[test]
     fn focus_cycles_in_layout_order() {
@@ -214,6 +291,7 @@ mod tests {
                 "clock".to_string(),
                 "calendar".to_string(),
                 "weather".to_string(),
+                "news".to_string(),
                 "stocks".to_string(),
             ]
         );
@@ -222,6 +300,8 @@ mod tests {
         assert_eq!(app.focused_widget(), Some("calendar"));
         app.cycle_focus(true);
         assert_eq!(app.focused_widget(), Some("weather"));
+        app.cycle_focus(true);
+        assert_eq!(app.focused_widget(), Some("news"));
         app.cycle_focus(true);
         assert_eq!(app.focused_widget(), Some("stocks"));
         app.cycle_focus(true);

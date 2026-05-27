@@ -137,6 +137,94 @@ poll_interval_secs = 600
 auto_locate = true                # only consulted when lat/lon are unset
 "#;
 
+pub const DEFAULT_NEWS_TOML: &str = r#"# Poll cadence in seconds (floor 60).
+poll_interval_secs = 900
+
+# RSS / Atom feeds to aggregate. `label` is shown in the article row.
+# Feeds are intentionally varied so each topic tab has something to show.
+# Phase 4 will add LLM-backed semantic ranking on top of these.
+
+[[feeds]]
+label = "Hacker News"
+url = "https://hnrss.org/frontpage"
+
+[[feeds]]
+label = "Ars Technica"
+url = "https://feeds.arstechnica.com/arstechnica/index"
+
+[[feeds]]
+label = "BBC News"
+url = "http://feeds.bbci.co.uk/news/rss.xml"
+
+[[feeds]]
+label = "BBC Business"
+url = "http://feeds.bbci.co.uk/news/business/rss.xml"
+
+[[feeds]]
+label = "BBC World"
+url = "http://feeds.bbci.co.uk/news/world/rss.xml"
+
+[[feeds]]
+label = "Yahoo Finance"
+url = "https://finance.yahoo.com/news/rssindex"
+
+[[feeds]]
+label = "CBC News"
+url = "https://www.cbc.ca/webfeed/rss/rss-topstories"
+
+[[feeds]]
+label = "Pitchfork"
+url = "https://pitchfork.com/rss/news/"
+
+[[feeds]]
+label = "Variety"
+url = "https://variety.com/feed/"
+
+# Topics tag articles whose title/summary contains any keyword (case-insensitive
+# substring match) and double as filter tabs across the top of the news cell
+# (←/→ to cycle). Add, rename, or remove tabs by editing this list.
+[[topics]]
+label = "Tech"
+keywords = [
+  "AI", "OpenAI", "Anthropic", "LLM", "GPU", "developer", "Linux", "Rust",
+  "Apple", "Google", "Microsoft", "Meta", "chip", "software", "startup",
+  "open source", "GitHub",
+]
+
+[[topics]]
+label = "Business"
+keywords = [
+  "CEO", "merger", "acquisition", "IPO", "revenue", "earnings", "quarterly",
+  "Wall Street", "market", "Fed", "inflation", "interest rate", "Bitcoin",
+  "crypto", "yield", "treasury", "stocks", "bonds", "dividend", "trader",
+]
+
+[[topics]]
+label = "World"
+keywords = [
+  "Ukraine", "Russia", "China", "EU", "UN", "climate", "war", "election",
+  "summit", "treaty", "Israel", "Gaza", "Iran", "NATO", "global", "Brussels",
+  "international",
+]
+
+[[topics]]
+label = "Canada"
+keywords = [
+  "Canada", "Canadian", "Ottawa", "Toronto", "Vancouver", "Montreal",
+  "Quebec", "Alberta", "B.C.", "Trudeau", "Carney", "CBC", "Bank of Canada",
+  "Loonie",
+]
+
+[[topics]]
+label = "Entertainment"
+keywords = [
+  "movie", "film", "actor", "actress", "Hollywood", "Netflix", "HBO", "Disney",
+  "Oscar", "Grammy", "Emmy", "show", "series", "trailer",
+  "album", "song", "single", "artist", "band", "concert", "tour", "music",
+  "EP", "soundtrack",
+]
+"#;
+
 pub const DEFAULT_CALENDAR_TOML: &str = r#"# Default view: "day", "week", or "month".
 default_view = "day"
 poll_interval_secs = 60
@@ -184,6 +272,7 @@ pub fn init_default_config() -> Result<PathBuf> {
     seed(&dir.join("clock.toml"), DEFAULT_CLOCK_TOML)?;
     seed(&dir.join("weather.toml"), DEFAULT_WEATHER_TOML)?;
     seed(&dir.join("calendar.toml"), DEFAULT_CALENDAR_TOML)?;
+    seed(&dir.join("news.toml"), DEFAULT_NEWS_TOML)?;
     Ok(main)
 }
 
@@ -226,6 +315,9 @@ mod tests {
         let cal: crate::widgets::calendar::CalendarConfig =
             toml::from_str(DEFAULT_CALENDAR_TOML).expect("calendar seed should parse");
         assert!(!cal.events.is_empty(), "calendar seed should ship example events");
+        let news: crate::widgets::news::NewsConfig =
+            toml::from_str(DEFAULT_NEWS_TOML).expect("news seed should parse");
+        assert!(!news.feeds.is_empty(), "news seed should ship example feeds");
     }
 
     #[test]

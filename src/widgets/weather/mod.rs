@@ -377,14 +377,15 @@ fn build_lines<'a>(s: &'a Snapshot, units: Units) -> Vec<Line<'a>> {
     }
 
     lines.push(Line::from(""));
-    let age = chrono::Local::now()
+    let age_secs = chrono::Local::now()
         .signed_duration_since(data.fetched_at)
         .num_seconds()
         .max(0);
+    let age = format_age(age_secs);
     let footer = if let Some(e) = &s.last_error {
-        format!("⚠ stale ({e}) — updated {age}s ago")
+        format!("⚠ stale ({e}) — updated {age} ago")
     } else {
-        format!("Updated {age}s ago")
+        format!("Updated {age} ago")
     };
     lines.push(Line::from(Span::styled(
         footer,
@@ -431,6 +432,19 @@ fn loading_lines(s: &Snapshot) -> Vec<Line<'_>> {
         lines.push(Line::from("Fetching first reading…"));
     }
     lines
+}
+
+/// Format a duration in seconds as a compact `45s`, `7m`, `3h`, or `2d` label.
+fn format_age(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
 }
 
 fn weekday_short(w: chrono::Weekday) -> &'static str {
@@ -485,6 +499,19 @@ mod tests {
         };
         let w = WeatherWidget::with_config(cfg);
         assert_eq!(w.poll_interval, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn format_age_uses_appropriate_units() {
+        assert_eq!(format_age(0), "0s");
+        assert_eq!(format_age(45), "45s");
+        assert_eq!(format_age(59), "59s");
+        assert_eq!(format_age(60), "1m");
+        assert_eq!(format_age(3599), "59m");
+        assert_eq!(format_age(3600), "1h");
+        assert_eq!(format_age(86_399), "23h");
+        assert_eq!(format_age(86_400), "1d");
+        assert_eq!(format_age(86_400 * 5), "5d");
     }
 
     #[test]

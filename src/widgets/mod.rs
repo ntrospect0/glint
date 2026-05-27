@@ -1,5 +1,6 @@
 pub mod calendar;
 pub mod clock;
+pub mod news;
 pub mod stocks;
 pub mod weather;
 
@@ -7,7 +8,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::{layout::Rect, Frame};
 
 /// Shared app-wide context handed to widgets on each tick.
@@ -35,6 +36,13 @@ pub trait Widget: Send + Sync {
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool);
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult;
+
+    /// Per-widget mouse interaction. `area` is the same outer Rect the widget
+    /// received in `render`, so the widget can reconstruct its internal layout.
+    /// Default implementation ignores all clicks.
+    fn handle_mouse(&mut self, _mouse: MouseEvent, _area: Rect) -> EventResult {
+        EventResult::Ignored
+    }
 
     #[allow(dead_code)] // routed from command bar in Phase 2+.
     fn handle_command(&mut self, cmd: &str, args: &[&str]) -> Result<bool>;
