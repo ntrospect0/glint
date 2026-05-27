@@ -211,22 +211,22 @@ mod tests {
         assert_eq!(
             app.focus_order,
             vec![
-                "stocks".to_string(),
                 "clock".to_string(),
-                "weather".to_string(),
                 "calendar".to_string(),
+                "weather".to_string(),
+                "stocks".to_string(),
             ]
         );
-        assert_eq!(app.focused_widget(), Some("stocks"));
-        app.cycle_focus(true);
         assert_eq!(app.focused_widget(), Some("clock"));
+        app.cycle_focus(true);
+        assert_eq!(app.focused_widget(), Some("calendar"));
         app.cycle_focus(true);
         assert_eq!(app.focused_widget(), Some("weather"));
         app.cycle_focus(true);
-        assert_eq!(app.focused_widget(), Some("calendar"));
-        app.cycle_focus(true);
         assert_eq!(app.focused_widget(), Some("stocks"));
+        app.cycle_focus(true);
+        assert_eq!(app.focused_widget(), Some("clock"));
         app.cycle_focus(false);
-        assert_eq!(app.focused_widget(), Some("calendar"));
+        assert_eq!(app.focused_widget(), Some("stocks"));
     }
 }

@@ -1,3 +1,4 @@
+pub mod big_digits;
 pub mod status_bar;
 
 use chrono::{DateTime, Local};

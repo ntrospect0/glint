@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use chrono::Datelike;
 use crossterm::event::KeyEvent;
 use ratatui::{
     layout::{Alignment, Rect},
@@ -17,62 +18,72 @@ use ratatui::{
 };
 use serde::Deserialize;
 
+use crate::geolocation::{self, GeoLocation};
 use crate::providers::DataProvider;
 use crate::ui::{decorate_title, focus_border_style};
 
 use super::{AppContext, EventResult, Widget};
 
-use provider::{describe_code, OpenMeteoProvider, Units, WeatherData};
+use provider::{ascii_art, describe_code, OpenMeteoProvider, Units, WeatherData};
 
 /// User-configurable weather options (loaded from `~/.config/glint/weather.toml`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct WeatherConfig {
-    #[serde(default = "default_label")]
-    pub label: String,
+    /// Display label for the location. If omitted, the IP-geolocation result is used.
+    #[serde(default)]
+    pub label: Option<String>,
 
-    #[serde(default = "default_latitude")]
-    pub latitude: f64,
+    /// Explicit latitude. If omitted and `auto_locate` is true, ipapi.co is used.
+    #[serde(default)]
+    pub latitude: Option<f64>,
 
-    #[serde(default = "default_longitude")]
-    pub longitude: f64,
+    /// Explicit longitude. If omitted and `auto_locate` is true, ipapi.co is used.
+    #[serde(default)]
+    pub longitude: Option<f64>,
 
     #[serde(default = "default_units")]
     pub units: Units,
 
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
+
+    /// When true and lat/lon are missing, glint geolocates by IP on first
+    /// refresh and caches the result for the session.
+    #[serde(default = "default_auto_locate")]
+    pub auto_locate: bool,
 }
 
-fn default_label() -> String {
-    "New York".into()
-}
-fn default_latitude() -> f64 {
-    40.7128
-}
-fn default_longitude() -> f64 {
-    -74.006
-}
 fn default_units() -> Units {
-    Units::Imperial
+    Units::Metric
 }
 fn default_poll_interval() -> u64 {
     600
 }
+fn default_auto_locate() -> bool {
+    true
+}
 
 impl Default for WeatherConfig {
     fn default() -> Self {
+        // Without a weather.toml on disk we default to Richmond, BC. To opt
+        // into IP geolocation, write a weather.toml that leaves latitude and
+        // longitude unset (auto_locate defaults to true).
         Self {
-            label: default_label(),
-            latitude: default_latitude(),
-            longitude: default_longitude(),
+            label: Some("Richmond, BC".into()),
+            latitude: Some(49.166),
+            longitude: Some(-123.133),
             units: default_units(),
             poll_interval_secs: default_poll_interval(),
+            auto_locate: default_auto_locate(),
         }
     }
 }
 
 #[derive(Default)]
 struct WeatherState {
+    location: Option<GeoLocation>,
+    locating: bool,
+    geolocation_error: Option<String>,
     data: Option<WeatherData>,
     last_error: Option<String>,
     last_attempt: Option<Instant>,
@@ -82,7 +93,6 @@ struct WeatherState {
 pub struct WeatherWidget {
     id: String,
     config: WeatherConfig,
-    provider: Arc<OpenMeteoProvider>,
     state: Arc<Mutex<WeatherState>>,
     poll_interval: Duration,
 }
@@ -95,41 +105,100 @@ impl Default for WeatherWidget {
 
 impl WeatherWidget {
     pub fn with_config(config: WeatherConfig) -> Self {
-        let provider = Arc::new(OpenMeteoProvider::new(
-            config.latitude,
-            config.longitude,
-            config.units,
-        ));
+        // If the user specified explicit lat/lon, seed the location immediately
+        // so we skip the geolocation hop.
+        let initial_location = match (config.latitude, config.longitude) {
+            (Some(lat), Some(lon)) => Some(GeoLocation {
+                latitude: lat,
+                longitude: lon,
+                label: config
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| format!("{lat:.3}, {lon:.3}")),
+                timezone: None,
+            }),
+            _ => None,
+        };
+        let state = Arc::new(Mutex::new(WeatherState {
+            location: initial_location,
+            ..WeatherState::default()
+        }));
         Self {
             id: "weather".into(),
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(30)),
             config,
-            provider,
-            state: Arc::new(Mutex::new(WeatherState::default())),
+            state,
         }
     }
 
-    /// Returns true if a new fetch should be kicked off.
-    fn is_due(&self) -> bool {
+    /// What the widget should do on the next tick. Computed inside a single
+    /// short lock window.
+    fn next_action(&self) -> NextAction {
         let st = self.state.lock().expect("weather state poisoned");
-        if st.inflight {
-            return false;
+        if st.location.is_none() {
+            if st.locating {
+                return NextAction::Wait;
+            }
+            return if self.config.auto_locate {
+                NextAction::Locate
+            } else {
+                NextAction::Wait
+            };
         }
-        match st.last_attempt {
+        if st.inflight {
+            return NextAction::Wait;
+        }
+        let due = match st.last_attempt {
             None => true,
             Some(t) => t.elapsed() >= self.poll_interval,
+        };
+        if due {
+            NextAction::Fetch
+        } else {
+            NextAction::Wait
         }
+    }
+
+    fn spawn_geolocate(&self) {
+        {
+            let mut st = self.state.lock().expect("weather state poisoned");
+            st.locating = true;
+        }
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let result = geolocation::by_ip().await;
+            let mut st = state.lock().expect("weather state poisoned");
+            st.locating = false;
+            match result {
+                Ok(loc) => {
+                    st.location = Some(loc);
+                    st.geolocation_error = None;
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "ip geolocation failed");
+                    st.geolocation_error = Some(err.to_string());
+                }
+            }
+        });
     }
 
     fn spawn_refresh(&self) {
+        let (lat, lon) = {
+            let st = self.state.lock().expect("weather state poisoned");
+            let Some(loc) = st.location.as_ref() else {
+                return;
+            };
+            (loc.latitude, loc.longitude)
+        };
         {
             let mut st = self.state.lock().expect("weather state poisoned");
             st.inflight = true;
             st.last_attempt = Some(Instant::now());
         }
-        let provider = self.provider.clone();
+        let units = self.config.units;
         let state = self.state.clone();
         tokio::spawn(async move {
+            let provider = OpenMeteoProvider::new(lat, lon, units);
             let result = provider.fetch().await;
             let mut st = state.lock().expect("weather state poisoned");
             st.inflight = false;
@@ -147,6 +216,13 @@ impl WeatherWidget {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum NextAction {
+    Locate,
+    Fetch,
+    Wait,
+}
+
 #[async_trait]
 impl Widget for WeatherWidget {
     fn id(&self) -> &str {
@@ -158,105 +234,45 @@ impl Widget for WeatherWidget {
     }
 
     async fn update(&mut self, _ctx: &AppContext) -> Result<()> {
-        if self.is_due() {
-            self.spawn_refresh();
+        match self.next_action() {
+            NextAction::Locate => self.spawn_geolocate(),
+            NextAction::Fetch => self.spawn_refresh(),
+            NextAction::Wait => {}
         }
         Ok(())
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
-        let title_base = format!("Weather — {}", self.config.label);
+        let snapshot = {
+            let st = self.state.lock().expect("weather state poisoned");
+            Snapshot {
+                location_label: st.location.as_ref().map(|l| l.label.clone()),
+                locating: st.locating,
+                geolocation_error: st.geolocation_error.clone(),
+                data: st.data.clone(),
+                last_error: st.last_error.clone(),
+                inflight: st.inflight,
+                attempted: st.last_attempt.is_some(),
+            }
+        };
+        let title_label = snapshot
+            .location_label
+            .clone()
+            .unwrap_or_else(|| "Locating…".into());
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(focus_border_style(focused))
             .title(Span::styled(
-                decorate_title(focused, &title_base),
+                decorate_title(focused, &format!("Weather — {title_label}")),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
-
-        let snapshot = {
-            let st = self.state.lock().expect("weather state poisoned");
-            (
-                st.data.clone(),
-                st.last_error.clone(),
-                st.inflight,
-                st.last_attempt.is_some(),
-            )
-        };
-        let (data, err, inflight, attempted) = snapshot;
-
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let mut lines: Vec<Line<'_>> = Vec::new();
-        match data {
-            Some(d) => {
-                let (label, icon) = describe_code(d.weather_code);
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    format!("{icon}  {label}"),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    format!("{:.0}{}", d.temperature, d.units.temp_symbol()),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                lines.push(Line::from(format!(
-                    "Feels like {:.0}{}",
-                    d.apparent_temperature,
-                    d.units.temp_symbol()
-                )));
-                lines.push(Line::from(""));
-                lines.push(Line::from(format!(
-                    "Humidity: {:.0}%   Wind: {:.0} {}",
-                    d.humidity,
-                    d.wind_speed,
-                    d.units.wind_label()
-                )));
-                lines.push(Line::from(""));
-                let age = chrono::Local::now()
-                    .signed_duration_since(d.fetched_at)
-                    .num_seconds()
-                    .max(0);
-                let footer = if let Some(e) = err {
-                    format!("⚠ stale ({e}) — updated {age}s ago")
-                } else {
-                    format!("Updated {age}s ago")
-                };
-                lines.push(Line::from(Span::styled(
-                    footer,
-                    Style::default().add_modifier(Modifier::DIM),
-                )));
-            }
-            None => {
-                lines.push(Line::from(""));
-                let msg = if inflight {
-                    "Loading…"
-                } else if let Some(ref e) = err {
-                    lines.push(Line::from(Span::styled(
-                        "Weather unavailable",
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )));
-                    lines.push(Line::from(""));
-                    e.as_str()
-                } else if attempted {
-                    "Loading…"
-                } else {
-                    "Fetching first reading…"
-                };
-                lines.push(Line::from(msg.to_string()));
-            }
-        }
-
-        let used = lines.len() as u16;
-        let pad = inner.height.saturating_sub(used) / 2;
-        let mut padded: Vec<Line<'_>> = Vec::with_capacity(lines.len() + pad as usize);
-        for _ in 0..pad {
-            padded.push(Line::from(""));
-        }
+        let lines = build_lines(&snapshot, self.config.units);
+        // Reserve one blank line at the top so content doesn't hug the border.
+        let mut padded: Vec<Line<'_>> = Vec::with_capacity(lines.len() + 1);
+        padded.push(Line::from(""));
         padded.extend(lines);
 
         let body = Paragraph::new(padded).alignment(Alignment::Center);
@@ -277,6 +293,7 @@ impl Widget for WeatherWidget {
             "latitude": self.config.latitude,
             "longitude": self.config.longitude,
             "poll_interval_secs": self.config.poll_interval_secs,
+            "auto_locate": self.config.auto_locate,
         })
     }
 
@@ -288,17 +305,176 @@ impl Widget for WeatherWidget {
     }
 }
 
+struct Snapshot {
+    location_label: Option<String>,
+    locating: bool,
+    geolocation_error: Option<String>,
+    data: Option<WeatherData>,
+    last_error: Option<String>,
+    inflight: bool,
+    attempted: bool,
+}
+
+fn build_lines<'a>(s: &'a Snapshot, units: Units) -> Vec<Line<'a>> {
+    let mut lines: Vec<Line<'a>> = Vec::new();
+    if s.location_label.is_none() {
+        return loading_lines(s);
+    }
+    let Some(data) = &s.data else {
+        return loading_lines(s);
+    };
+
+    let (label, icon) = describe_code(data.weather_code);
+    lines.push(Line::from(Span::styled(
+        format!("{icon}  {label}"),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    for row in ascii_art(data.weather_code) {
+        lines.push(Line::from(row));
+    }
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(
+        format!("{:.0}{}", data.temperature, data.units.temp_symbol()),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(format!(
+        "Feels like {:.0}{}",
+        data.apparent_temperature,
+        data.units.temp_symbol()
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!(
+        "Humidity: {:.0}%   Wind: {:.0} {}",
+        data.humidity,
+        data.wind_speed,
+        data.units.wind_label()
+    )));
+
+    // 3-day forecast (skip today, which is data.daily[0]).
+    if data.daily.len() >= 2 {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "── Next 3 days ──",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+        for d in data.daily.iter().skip(1).take(3) {
+            let (_, icon) = describe_code(d.weather_code);
+            lines.push(Line::from(format!(
+                "{}  {}  {:.0}{} / {:.0}{}",
+                weekday_short(d.date.weekday()),
+                icon,
+                d.temperature_high,
+                units.temp_symbol(),
+                d.temperature_low,
+                units.temp_symbol(),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    let age = chrono::Local::now()
+        .signed_duration_since(data.fetched_at)
+        .num_seconds()
+        .max(0);
+    let footer = if let Some(e) = &s.last_error {
+        format!("⚠ stale ({e}) — updated {age}s ago")
+    } else {
+        format!("Updated {age}s ago")
+    };
+    lines.push(Line::from(Span::styled(
+        footer,
+        Style::default().add_modifier(Modifier::DIM),
+    )));
+    lines
+}
+
+fn loading_lines(s: &Snapshot) -> Vec<Line<'_>> {
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    lines.push(Line::from(""));
+    if s.location_label.is_none() {
+        if let Some(err) = &s.geolocation_error {
+            lines.push(Line::from(Span::styled(
+                "Could not auto-locate",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(err.clone()));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Set latitude/longitude in ~/.config/glint/weather.toml",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        } else if s.locating {
+            lines.push(Line::from("Locating you via IP…"));
+        } else {
+            lines.push(Line::from("Configure latitude/longitude in weather.toml"));
+        }
+        return lines;
+    }
+    if s.inflight {
+        lines.push(Line::from("Loading weather…"));
+    } else if let Some(err) = &s.last_error {
+        lines.push(Line::from(Span::styled(
+            "Weather unavailable",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(err.clone()));
+    } else if s.attempted {
+        lines.push(Line::from("Loading weather…"));
+    } else {
+        lines.push(Line::from("Fetching first reading…"));
+    }
+    lines
+}
+
+fn weekday_short(w: chrono::Weekday) -> &'static str {
+    use chrono::Weekday::*;
+    match w {
+        Mon => "Mon",
+        Tue => "Tue",
+        Wed => "Wed",
+        Thu => "Thu",
+        Fri => "Fri",
+        Sat => "Sat",
+        Sun => "Sun",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn default_widget_is_not_inflight_and_has_no_data() {
+    fn default_widget_seeds_richmond_location() {
         let w = WeatherWidget::default();
         let st = w.state.lock().unwrap();
         assert!(st.data.is_none());
+        let loc = st.location.as_ref().expect("default should bake in Richmond");
+        assert_eq!(loc.latitude, 49.166);
+        assert_eq!(loc.longitude, -123.133);
         assert!(!st.inflight);
-        assert!(st.last_attempt.is_none());
+        assert!(!st.locating);
+    }
+
+    #[test]
+    fn explicit_lat_lon_seeds_location_immediately() {
+        let cfg = WeatherConfig {
+            label: Some("Richmond, BC".into()),
+            latitude: Some(49.166),
+            longitude: Some(-123.133),
+            ..WeatherConfig::default()
+        };
+        let w = WeatherWidget::with_config(cfg);
+        let st = w.state.lock().unwrap();
+        let loc = st.location.as_ref().expect("location should be seeded");
+        assert_eq!(loc.latitude, 49.166);
+        assert_eq!(loc.label, "Richmond, BC");
     }
 
     #[test]
@@ -312,8 +488,38 @@ mod tests {
     }
 
     #[test]
-    fn is_due_when_never_attempted() {
-        let w = WeatherWidget::default();
-        assert!(w.is_due());
+    fn next_action_is_locate_when_no_location_and_auto_locate() {
+        // To test the auto-locate path, explicitly clear lat/lon.
+        let cfg = WeatherConfig {
+            latitude: None,
+            longitude: None,
+            ..WeatherConfig::default()
+        };
+        let w = WeatherWidget::with_config(cfg);
+        assert!(matches!(w.next_action(), NextAction::Locate));
+    }
+
+    #[test]
+    fn next_action_is_fetch_when_location_known_and_no_recent_attempt() {
+        let cfg = WeatherConfig {
+            latitude: Some(49.166),
+            longitude: Some(-123.133),
+            label: Some("Richmond, BC".into()),
+            ..WeatherConfig::default()
+        };
+        let w = WeatherWidget::with_config(cfg);
+        assert!(matches!(w.next_action(), NextAction::Fetch));
+    }
+
+    #[test]
+    fn next_action_is_wait_when_no_location_and_not_auto_locating() {
+        let cfg = WeatherConfig {
+            latitude: None,
+            longitude: None,
+            auto_locate: false,
+            ..WeatherConfig::default()
+        };
+        let w = WeatherWidget::with_config(cfg);
+        assert!(matches!(w.next_action(), NextAction::Wait));
     }
 }

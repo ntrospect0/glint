@@ -29,7 +29,7 @@ use local::{LocalCalendarFile, LocalCalendarProvider};
 use provider::{CalendarProvider, Event};
 
 use crate::auth::google::{store::GoogleToken, OAuthClientConfig};
-use crate::ui::{decorate_title, focus_border_style};
+use crate::ui::{big_digits, decorate_title, focus_border_style};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -348,6 +348,50 @@ impl CalendarWidget {
     fn render_day(&self, frame: &mut Frame, area: Rect, events: &[Event]) {
         let today_events: Vec<&Event> =
             events.iter().filter(|e| e.on_date(self.anchor)).collect();
+
+        // Split the inner area: tear-off-sheet header on top (centered), the
+        // hint banner + event list below (left-aligned). 8 rows fits the
+        // padding + weekday/month line + 5 block-digit rows + bottom padding;
+        // shrink gracefully when the cell is shorter than that.
+        let header_height = 8u16.min(area.height);
+        let header_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: header_height,
+        };
+        let body_area = Rect {
+            x: area.x,
+            y: area.y + header_height,
+            width: area.width,
+            height: area.height.saturating_sub(header_height),
+        };
+
+        let header_text = format!(
+            "{} · {}",
+            weekday_short(self.anchor.weekday()),
+            month_long(self.anchor.month()),
+        );
+        let mut header_lines: Vec<Line<'_>> = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                header_text,
+                Style::default().add_modifier(Modifier::DIM),
+            )),
+        ];
+        for row in big_digits::render(&self.anchor.day().to_string()) {
+            header_lines.push(Line::from(Span::styled(
+                row,
+                Style::default()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+        frame.render_widget(
+            Paragraph::new(header_lines).alignment(Alignment::Center),
+            header_area,
+        );
+
         let mut lines: Vec<Line<'_>> = Vec::new();
         if let Some(hint) = &self.auth_hint {
             lines.push(Line::from(Span::styled(
@@ -357,7 +401,6 @@ impl CalendarWidget {
             lines.push(Line::from(""));
         }
         if today_events.is_empty() {
-            lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "No events.",
                 Style::default().add_modifier(Modifier::DIM),
@@ -392,7 +435,7 @@ impl CalendarWidget {
             }
         }
         let body = Paragraph::new(lines);
-        frame.render_widget(body, area);
+        frame.render_widget(body, body_area);
     }
 
     fn render_week(&self, frame: &mut Frame, area: Rect, events: &[Event]) {
@@ -405,17 +448,28 @@ impl CalendarWidget {
         for (i, col_area) in cols.iter().enumerate() {
             let day = s + ChronoDuration::days(i as i64);
             let is_today = day == today;
-            let header = if is_today {
-                format!("[{} {}]", weekday_short(day.weekday()), day.day())
+            // Stack weekday on top, date underneath — keeps both visible even
+            // in narrow columns where `Mon 18` would otherwise truncate.
+            let weekday_label = weekday_short(day.weekday());
+            let date_label = if is_today {
+                format!("[{}]", day.day())
             } else {
-                format!(" {} {} ", weekday_short(day.weekday()), day.day())
+                format!("{}", day.day())
             };
-            let mut lines: Vec<Line<'_>> = Vec::new();
-            lines.push(Line::from(Span::styled(
-                header,
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from(""));
+            let header_style = if is_today {
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            };
+            // Top padding so headers don't kiss the border.
+            let mut lines: Vec<Line<'_>> = vec![
+                Line::from(""),
+                Line::from(Span::styled(weekday_label, header_style)),
+                Line::from(Span::styled(date_label, header_style)),
+                Line::from(""),
+            ];
             let day_events: Vec<&Event> = events.iter().filter(|e| e.on_date(day)).collect();
             if day_events.is_empty() {
                 lines.push(Line::from(Span::styled(
@@ -436,7 +490,10 @@ impl CalendarWidget {
                     )));
                 }
             }
-            frame.render_widget(Paragraph::new(lines), *col_area);
+            frame.render_widget(
+                Paragraph::new(lines).alignment(Alignment::Center),
+                *col_area,
+            );
         }
     }
 
@@ -454,7 +511,9 @@ impl CalendarWidget {
                 .collect::<Vec<_>>(),
         );
 
-        let mut lines: Vec<Line<'_>> = Vec::with_capacity(8);
+        let mut lines: Vec<Line<'_>> = Vec::with_capacity(9);
+        // Top padding so the weekday header doesn't kiss the border.
+        lines.push(Line::from(""));
         lines.push(header_line);
 
         // 6 weeks always fit any month.

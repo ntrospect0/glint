@@ -12,19 +12,24 @@ use ratatui::{
 };
 use serde::Deserialize;
 
-use crate::ui::{decorate_title, focus_border_style};
+use crate::ui::{big_digits, decorate_title, focus_border_style};
 
 use super::{AppContext, EventResult, Widget};
 
 /// User-configurable clock options (loaded from `~/.config/glint/clock.toml`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClockConfig {
-    /// IANA timezone name (e.g. "America/Los_Angeles"). Defaults to system local time.
+    /// IANA timezone name for the primary clock. Defaults to system local time.
     #[serde(default)]
     pub timezone: Option<String>,
 
-    #[serde(default = "default_show_seconds")]
+    /// Show seconds inside the big block-digit display (e.g. `HH:MM:SS`).
+    #[serde(default)]
     pub show_seconds: bool,
+
+    /// Show a small ticking `HH:MM:SS` text line below the big digits.
+    #[serde(default = "default_show_seconds_ticker")]
+    pub show_seconds_ticker: bool,
 
     #[serde(default = "default_show_date")]
     pub show_date: bool,
@@ -32,10 +37,21 @@ pub struct ClockConfig {
     /// 12 or 24. Anything else falls back to 24.
     #[serde(default = "default_hour_format")]
     pub hour_format: u8,
+
+    /// Additional world clocks rendered below the primary display when the
+    /// cell is tall enough.
+    #[serde(default)]
+    pub secondary_timezones: Vec<SecondaryTimezone>,
 }
 
-fn default_show_seconds() -> bool {
-    false
+#[derive(Debug, Clone, Deserialize)]
+pub struct SecondaryTimezone {
+    pub label: String,
+    pub tz: String,
+}
+
+fn default_show_seconds_ticker() -> bool {
+    true
 }
 fn default_show_date() -> bool {
     true
@@ -48,9 +64,11 @@ impl Default for ClockConfig {
     fn default() -> Self {
         Self {
             timezone: None,
-            show_seconds: default_show_seconds(),
+            show_seconds: false,
+            show_seconds_ticker: default_show_seconds_ticker(),
             show_date: default_show_date(),
             hour_format: default_hour_format(),
+            secondary_timezones: Vec::new(),
         }
     }
 }
@@ -59,6 +77,9 @@ pub struct ClockWidget {
     id: String,
     config: ClockConfig,
     tz: Option<Tz>,
+    /// Parsed secondary timezones — entries with invalid IANA names get dropped
+    /// at construction time and a warning logged.
+    secondaries: Vec<(String, Tz)>,
 }
 
 impl Default for ClockWidget {
@@ -73,26 +94,29 @@ impl ClockWidget {
             .timezone
             .as_deref()
             .and_then(|name| name.parse::<Tz>().ok());
+        let mut secondaries = Vec::with_capacity(config.secondary_timezones.len());
+        for st in &config.secondary_timezones {
+            match st.tz.parse::<Tz>() {
+                Ok(t) => secondaries.push((st.label.clone(), t)),
+                Err(_) => {
+                    tracing::warn!(label = %st.label, tz = %st.tz, "invalid IANA timezone, skipping");
+                }
+            }
+        }
         Self {
             id: "clock".into(),
             config,
             tz,
+            secondaries,
         }
     }
 
-    /// Returns the time string (e.g. "14:32" or "02:32 PM") and the date line.
+    /// Returns (HH:MM[:SS], AM/PM, date) for the primary timezone.
     fn render_strings(&self, now_utc: DateTime<chrono::Utc>) -> (String, String, String) {
-        let (time, ampm, date) = match self.tz {
-            Some(tz) => {
-                let local = now_utc.with_timezone(&tz);
-                self.format_parts(local)
-            }
-            None => {
-                let local = now_utc.with_timezone(&Local);
-                self.format_parts(local)
-            }
-        };
-        (time, ampm, date)
+        match self.tz {
+            Some(tz) => self.format_parts(now_utc.with_timezone(&tz)),
+            None => self.format_parts(now_utc.with_timezone(&Local)),
+        }
     }
 
     fn format_parts<T: TimeZone>(&self, dt: DateTime<T>) -> (String, String, String)
@@ -132,6 +156,60 @@ impl ClockWidget {
 
         (time, ampm, date)
     }
+
+    fn ticker_string(&self, now_utc: DateTime<chrono::Utc>) -> String {
+        match self.tz {
+            Some(tz) => format_ticker(now_utc.with_timezone(&tz), self.config.hour_format),
+            None => format_ticker(now_utc.with_timezone(&Local), self.config.hour_format),
+        }
+    }
+
+    /// Returns (label, "HH:MM") pairs for the World Clocks block. Primary
+    /// timezone leads, then any configured secondaries.
+    fn world_clock_entries(&self) -> Vec<(String, String)> {
+        let now = chrono::Utc::now();
+        let mut out: Vec<(String, String)> = Vec::with_capacity(self.secondaries.len() + 1);
+        let (primary_label, primary_hm) = match self.tz {
+            Some(tz) => {
+                let t = now.with_timezone(&tz);
+                (city_from_tz_name(tz.name()), format!("{:02}:{:02}", t.hour(), t.minute()))
+            }
+            None => {
+                let t = now.with_timezone(&Local);
+                ("Local".to_string(), format!("{:02}:{:02}", t.hour(), t.minute()))
+            }
+        };
+        out.push((primary_label, primary_hm));
+        for (label, tz) in &self.secondaries {
+            let t = now.with_timezone(tz);
+            out.push((label.clone(), format!("{:02}:{:02}", t.hour(), t.minute())));
+        }
+        out
+    }
+}
+
+/// Convert an IANA timezone name like "America/Vancouver" into a friendly
+/// label ("Vancouver"). Underscores become spaces.
+fn city_from_tz_name(name: &str) -> String {
+    name.rsplit('/').next().unwrap_or(name).replace('_', " ")
+}
+
+fn format_ticker<T: TimeZone>(t: DateTime<T>, hour_format: u8) -> String
+where
+    T::Offset: std::fmt::Display,
+{
+    let hour = t.hour();
+    if hour_format == 12 {
+        let (h12, suffix) = match hour {
+            0 => (12, "AM"),
+            1..=11 => (hour, "AM"),
+            12 => (12, "PM"),
+            _ => (hour - 12, "PM"),
+        };
+        format!("{:02}:{:02}:{:02} {}", h12, t.minute(), t.second(), suffix)
+    } else {
+        format!("{:02}:{:02}:{:02}", hour, t.minute(), t.second())
+    }
 }
 
 fn weekday_name(w: chrono::Weekday) -> &'static str {
@@ -165,41 +243,6 @@ fn month_name(m: u32) -> &'static str {
     }
 }
 
-/// 3-wide × 5-tall block-character font for digits 0-9 and `:`.
-const GLYPH_HEIGHT: usize = 5;
-
-fn glyph(c: char) -> Option<[&'static str; GLYPH_HEIGHT]> {
-    Some(match c {
-        '0' => ["███", "█ █", "█ █", "█ █", "███"],
-        '1' => ["  █", "  █", "  █", "  █", "  █"],
-        '2' => ["███", "  █", "███", "█  ", "███"],
-        '3' => ["███", "  █", "███", "  █", "███"],
-        '4' => ["█ █", "█ █", "███", "  █", "  █"],
-        '5' => ["███", "█  ", "███", "  █", "███"],
-        '6' => ["███", "█  ", "███", "█ █", "███"],
-        '7' => ["███", "  █", "  █", "  █", "  █"],
-        '8' => ["███", "█ █", "███", "█ █", "███"],
-        '9' => ["███", "█ █", "███", "  █", "███"],
-        ':' => ["   ", " █ ", "   ", " █ ", "   "],
-        _ => return None,
-    })
-}
-
-/// Render `time` (e.g. "14:32") as five rows of block-character glyphs.
-fn render_big_digits(time: &str) -> Vec<String> {
-    let mut rows: Vec<String> = vec![String::new(); GLYPH_HEIGHT];
-    for (i, ch) in time.chars().enumerate() {
-        let Some(g) = glyph(ch) else { continue };
-        for (row_idx, row) in rows.iter_mut().enumerate() {
-            if i > 0 {
-                row.push(' ');
-            }
-            row.push_str(g[row_idx]);
-        }
-    }
-    rows
-}
-
 #[async_trait]
 impl Widget for ClockWidget {
     fn id(&self) -> &str {
@@ -229,13 +272,14 @@ impl Widget for ClockWidget {
 
         let now = chrono::Utc::now();
         let (time, ampm, date) = self.render_strings(now);
-        let big = render_big_digits(&time);
+        let big = big_digits::render(&time);
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Vertically center: 5 digit rows + optional ampm/date lines.
-        let mut lines: Vec<Line<'_>> = Vec::with_capacity(GLYPH_HEIGHT + 3);
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        // Top padding so the big digits don't kiss the border.
+        lines.push(Line::from(""));
         for row in big {
             lines.push(Line::from(Span::styled(
                 row,
@@ -244,6 +288,14 @@ impl Widget for ClockWidget {
                     .add_modifier(Modifier::BOLD),
             )));
         }
+
+        if self.config.show_seconds_ticker {
+            lines.push(Line::from(Span::styled(
+                self.ticker_string(now),
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        }
+
         if !ampm.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -256,16 +308,32 @@ impl Widget for ClockWidget {
             lines.push(Line::from(date));
         }
 
-        // Pad with leading blank lines so content is roughly centered vertically.
-        let used = lines.len() as u16;
-        let pad = inner.height.saturating_sub(used) / 2;
-        let mut padded: Vec<Line<'_>> = Vec::with_capacity(lines.len() + pad as usize);
-        for _ in 0..pad {
-            padded.push(Line::from(""));
+        // World clocks block — only shown if there's room for at least the
+        // separator line + one entry. Primary timezone is listed first so the
+        // user can see the local time alongside the rest of the world.
+        let clocks = self.world_clock_entries();
+        if !clocks.is_empty() {
+            let extra_needed = 2 + clocks.len();
+            if (lines.len() + extra_needed) as u16 <= inner.height {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "── World Clocks ──",
+                    Style::default().add_modifier(Modifier::DIM),
+                )));
+                let max_label = clocks.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0);
+                for (label, time_str) in &clocks {
+                    let line = format!(
+                        "{:<width$}  {}",
+                        label,
+                        time_str,
+                        width = max_label
+                    );
+                    lines.push(Line::from(line));
+                }
+            }
         }
-        padded.extend(lines);
 
-        let body = Paragraph::new(padded).alignment(Alignment::Center);
+        let body = Paragraph::new(lines).alignment(Alignment::Center);
         frame.render_widget(body, inner);
     }
 
@@ -281,8 +349,12 @@ impl Widget for ClockWidget {
         serde_json::json!({
             "timezone": self.config.timezone,
             "show_seconds": self.config.show_seconds,
+            "show_seconds_ticker": self.config.show_seconds_ticker,
             "show_date": self.config.show_date,
             "hour_format": self.config.hour_format,
+            "secondary_timezones": self.config.secondary_timezones.iter().map(|s| {
+                serde_json::json!({"label": s.label, "tz": s.tz})
+            }).collect::<Vec<_>>(),
         })
     }
 
@@ -300,30 +372,14 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
-    fn glyph_renders_all_chars_in_a_time_string() {
-        for ch in "0123456789:".chars() {
-            assert!(glyph(ch).is_some(), "missing glyph for {ch}");
-        }
-    }
-
-    #[test]
-    fn big_digits_have_five_rows_and_correct_width() {
-        let rows = render_big_digits("12:34");
-        assert_eq!(rows.len(), GLYPH_HEIGHT);
-        // 5 glyphs × 3 wide, plus 4 single-space separators = 19.
-        let widths: Vec<usize> = rows.iter().map(|r| r.chars().count()).collect();
-        for w in &widths {
-            assert_eq!(*w, 5 * 3 + 4);
-        }
-    }
-
-    #[test]
     fn twelve_hour_format_renders_midnight_as_12_am() {
         let cfg = ClockConfig {
             timezone: Some("UTC".into()),
             show_seconds: false,
+            show_seconds_ticker: false,
             show_date: false,
             hour_format: 12,
+            secondary_timezones: Vec::new(),
         };
         let widget = ClockWidget::with_config(cfg);
         let midnight_utc = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
@@ -338,13 +394,75 @@ mod tests {
         let cfg = ClockConfig {
             timezone: Some("UTC".into()),
             show_seconds: true,
+            show_seconds_ticker: false,
             show_date: false,
             hour_format: 24,
+            secondary_timezones: Vec::new(),
         };
         let widget = ClockWidget::with_config(cfg);
         let t = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 9, 5, 7).unwrap();
         let (time, ampm, _) = widget.render_strings(t);
         assert_eq!(time, "09:05:07");
         assert_eq!(ampm, "");
+    }
+
+    #[test]
+    fn ticker_includes_seconds_in_primary_timezone() {
+        let cfg = ClockConfig {
+            timezone: Some("UTC".into()),
+            show_seconds: false,
+            show_seconds_ticker: true,
+            show_date: false,
+            hour_format: 24,
+            secondary_timezones: Vec::new(),
+        };
+        let w = ClockWidget::with_config(cfg);
+        let t = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 9, 5, 42).unwrap();
+        assert_eq!(w.ticker_string(t), "09:05:42");
+    }
+
+    #[test]
+    fn city_from_tz_name_strips_region_and_underscores() {
+        assert_eq!(city_from_tz_name("America/New_York"), "New York");
+        assert_eq!(city_from_tz_name("Europe/London"), "London");
+        assert_eq!(city_from_tz_name("Asia/Tokyo"), "Tokyo");
+        assert_eq!(city_from_tz_name("UTC"), "UTC");
+    }
+
+    #[test]
+    fn world_clock_entries_lead_with_primary() {
+        let cfg = ClockConfig {
+            timezone: Some("America/Vancouver".into()),
+            secondary_timezones: vec![SecondaryTimezone {
+                label: "Tokyo".into(),
+                tz: "Asia/Tokyo".into(),
+            }],
+            ..ClockConfig::default()
+        };
+        let w = ClockWidget::with_config(cfg);
+        let entries = w.world_clock_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "Vancouver");
+        assert_eq!(entries[1].0, "Tokyo");
+    }
+
+    #[test]
+    fn invalid_secondary_timezones_are_dropped() {
+        let cfg = ClockConfig {
+            secondary_timezones: vec![
+                SecondaryTimezone {
+                    label: "New York".into(),
+                    tz: "America/New_York".into(),
+                },
+                SecondaryTimezone {
+                    label: "Bogus".into(),
+                    tz: "Not/A_Real_TZ".into(),
+                },
+            ],
+            ..ClockConfig::default()
+        };
+        let w = ClockWidget::with_config(cfg);
+        assert_eq!(w.secondaries.len(), 1);
+        assert_eq!(w.secondaries[0].0, "New York");
     }
 }

@@ -25,10 +25,18 @@ where
     Ok(value)
 }
 
-/// Returns `~/.config/glint/` on Linux/macOS (or the platform equivalent).
+/// Returns `~/.config/glint/` on every platform (overridable with
+/// `$XDG_CONFIG_HOME`). The XDG Base Directory layout is what the spec
+/// promises, so we use it consistently rather than falling back to
+/// `~/Library/Application Support/` on macOS or `%APPDATA%` on Windows.
 pub fn config_dir() -> Result<PathBuf> {
-    let base = dirs::config_dir().context("could not locate user config directory")?;
-    Ok(base.join("glint"))
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return Ok(PathBuf::from(xdg).join("glint"));
+        }
+    }
+    let home = dirs::home_dir().context("could not locate user home directory")?;
+    Ok(home.join(".config").join("glint"))
 }
 
 /// Returns the path to the main config file (`config.toml`).
@@ -67,50 +75,66 @@ refresh_all_on_focus = true
 log_level = "info"
 
 [layout]
-columns = [45, 30, 25]
-rows = [45, 55]
-
-[[layout.cells]]
-widget = "stocks"
-col = 0
-row = 0
-col_span = 1
-row_span = 2
+columns = [40, 60]
+rows = [35, 35, 30]
 
 [[layout.cells]]
 widget = "clock"
+col = 0
+row = 0
+
+[[layout.cells]]
+widget = "calendar"
 col = 1
 row = 0
 
 [[layout.cells]]
 widget = "weather"
+col = 0
+row = 1
+
+[[layout.cells]]
+widget = "news"
 col = 1
 row = 1
 
 [[layout.cells]]
-widget = "calendar"
-col = 2
-row = 0
-
-[[layout.cells]]
-widget = "news"
-col = 2
-row = 1
+widget = "stocks"
+col = 0
+row = 2
+col_span = 2
 "#;
 
-pub const DEFAULT_CLOCK_TOML: &str = r#"# Optional IANA timezone name; defaults to system local time.
-# timezone = "America/Los_Angeles"
-show_seconds = false
+pub const DEFAULT_CLOCK_TOML: &str = r#"# Optional IANA timezone name for the primary clock; defaults to system local time.
+# timezone = "America/Vancouver"
+show_seconds = false              # show :SS in the big block-digit display
+show_seconds_ticker = true        # show a small ticking HH:MM:SS below the big digits
 show_date = true
-hour_format = 24
+hour_format = 24                  # 12 or 24
+
+# Additional world clocks rendered when there's vertical room.
+[[secondary_timezones]]
+label = "New York"
+tz = "America/New_York"
+
+[[secondary_timezones]]
+label = "London"
+tz = "Europe/London"
+
+[[secondary_timezones]]
+label = "Tokyo"
+tz = "Asia/Tokyo"
 "#;
 
 pub const DEFAULT_WEATHER_TOML: &str = r#"# Open-Meteo is free and key-less. Set lat/lon to your city.
-label = "New York"
-latitude = 40.7128
-longitude = -74.006
-units = "imperial"          # or "metric"
+# Comment out latitude + longitude (and leave auto_locate = true) to fall back
+# to IP-based geolocation via ipapi.co.
+label = "Richmond, BC"
+latitude = 49.166
+longitude = -123.133
+units = "metric"                  # "metric" (°C, km/h) or "imperial" (°F, mph)
 poll_interval_secs = 600
+auto_locate = true                # only consulted when lat/lon are unset
 "#;
 
 pub const DEFAULT_CALENDAR_TOML: &str = r#"# Default view: "day", "week", or "month".

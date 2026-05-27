@@ -7,6 +7,7 @@ mod app;
 mod auth;
 mod config;
 mod event;
+mod geolocation;
 mod providers;
 mod ui;
 mod widgets;
