@@ -157,6 +157,13 @@ struct CalendarState {
     last_error: Option<String>,
     last_attempt: Option<Instant>,
     inflight: bool,
+    /// `(start, end)` of the data span the most recent successful
+    /// fetch covered — the *fetch* range, which is wider than the
+    /// displayed range thanks to the buffer added in `fetch_range`.
+    /// Navigation that lands inside this span doesn't trigger a
+    /// refetch (`mark_dirty_if_uncovered`), so scrolling through
+    /// recently-visited days is instant.
+    last_fetched_range: Option<(DateTime<Local>, DateTime<Local>)>,
     /// Active big-digit gradient. Seeded from config; user cycles with `g`.
     gradient: big_digits::Gradient,
     /// Row offset for the day's agenda list (Day view body + Month
@@ -289,6 +296,68 @@ impl CalendarWidget {
         }
     }
 
+    /// Has the events vec settled to the current view's range? `false`
+    /// while a refresh is in flight or pending (`mark_dirty` clears
+    /// `last_attempt`); render uses this to decide between showing
+    /// "No events." and leaving the agenda blank during the brief
+    /// window where the events vec is from the previously-fetched
+    /// range and might be spuriously empty for the new anchor.
+    fn agenda_data_loaded(&self) -> bool {
+        let st = self.state.lock().expect("calendar state poisoned");
+        !st.inflight && st.last_attempt.is_some()
+    }
+
+    /// Range we ask the provider for — `current_range` widened by a
+    /// per-view buffer so adjacent days / weeks / months land in the
+    /// same fetch and navigation within that buffer is instant.
+    /// Without the buffer, every `h` / `l` press in Day view forced
+    /// a refetch (Day's `current_range` is only the anchor + preview
+    /// = 2 days), so even days the user *just* visited weren't in
+    /// `state.events` anymore.
+    fn fetch_range(&self) -> (DateTime<Local>, DateTime<Local>) {
+        let (start, end) = self.current_range();
+        let buffer = match self.view {
+            // ±2 weeks lets the user step through a month of days
+            // without re-hitting the provider.
+            CalendarView::Day => ChronoDuration::days(14),
+            // Same buffer; a full extra month each side fits in one fetch.
+            CalendarView::Week => ChronoDuration::days(14),
+            // ±1 month so Month-view's ←/→ across adjacent months is
+            // also covered.
+            CalendarView::Month => ChronoDuration::days(31),
+        };
+        (start - buffer, end + buffer)
+    }
+
+    /// True when the most recent successful fetch covers the current
+    /// display range. Used by `mark_dirty_if_uncovered` to skip the
+    /// forced refresh that fires on every anchor / view change — most
+    /// navigations within the fetch buffer are already covered.
+    fn current_range_covered(&self) -> bool {
+        let (display_start, display_end) = self.current_range();
+        let st = self.state.lock().expect("calendar state poisoned");
+        match st.last_fetched_range {
+            Some((s, e)) => display_start >= s && display_end <= e,
+            None => false,
+        }
+    }
+
+    /// Like `mark_dirty`, but only fires when the new display range
+    /// isn't already covered by the last successful fetch. Anchor and
+    /// view changes route through this so navigation within the fetch
+    /// buffer doesn't trigger spurious refetches. Background polling
+    /// still catches stale data on its own cadence.
+    fn mark_dirty_if_uncovered(&self) {
+        if self.current_range_covered() {
+            return;
+        }
+        // Inline the `mark_dirty` body so a sweep replacing
+        // `self.mark_dirty()` → `self.mark_dirty_if_uncovered()` at
+        // navigation sites doesn't accidentally recurse here.
+        let mut st = self.state.lock().expect("calendar state poisoned");
+        st.last_attempt = None;
+    }
+
     fn current_range(&self) -> (DateTime<Local>, DateTime<Local>) {
         let (start, end) = match self.view {
             // Fetch two days when in Day view: the wide layout previews the
@@ -312,7 +381,7 @@ impl CalendarWidget {
     }
 
     fn spawn_refresh(&self) {
-        let (start, end) = self.current_range();
+        let (start, end) = self.fetch_range();
         {
             let mut st = self.state.lock().expect("calendar state poisoned");
             st.inflight = true;
@@ -331,6 +400,7 @@ impl CalendarWidget {
                         tracing::warn!(error = %err, "calendar cache store failed");
                     }
                     st.events = events;
+                    st.last_fetched_range = Some((start, end));
                     st.last_error = None;
                 }
                 Err(err) => {
@@ -341,11 +411,6 @@ impl CalendarWidget {
         });
     }
 
-    /// Force a refresh on the next tick by clearing the last_attempt clock.
-    fn mark_dirty(&self) {
-        let mut st = self.state.lock().expect("calendar state poisoned");
-        st.last_attempt = None;
-    }
 
     /// Reset the agenda scroll offset to the top and re-arm the
     /// auto-scroll-to-now pass. Called whenever the anchor day or
@@ -1231,10 +1296,24 @@ impl CalendarWidget {
             .max(1);
 
         if day_events.is_empty() {
-            return vec![Line::from(Span::styled(
-                "No events.",
-                self.theme.text_dim,
-            ))];
+            // Distinguish "no events for this day" from "events not yet
+            // fetched for this day's range." The latter happens for
+            // ~one tick after the user navigates to a new anchor (`h`
+            // / `l` in Day view, day-click in Month view): `mark_dirty`
+            // clears `last_attempt`, but `state.events` is still the
+            // *previous* range's data — its filter for the new date
+            // can be spuriously empty until the next refresh lands.
+            // Show the "No events." line only once we have authoritative
+            // data; before that, return an empty Vec so the agenda body
+            // is blank rather than flashing the misleading message.
+            return if self.agenda_data_loaded() {
+                vec![Line::from(Span::styled(
+                    "No events.",
+                    self.theme.text_dim,
+                ))]
+            } else {
+                Vec::new()
+            };
         }
 
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -1707,37 +1786,37 @@ impl Widget for CalendarWidget {
             KeyCode::Char('d') => {
                 self.view = CalendarView::Day;
                 self.reset_agenda_scroll();
-                self.mark_dirty();
+                self.mark_dirty_if_uncovered();
                 EventResult::Handled
             }
             KeyCode::Char('w') => {
                 self.view = CalendarView::Week;
                 self.reset_agenda_scroll();
-                self.mark_dirty();
+                self.mark_dirty_if_uncovered();
                 EventResult::Handled
             }
             KeyCode::Char('m') => {
                 self.view = CalendarView::Month;
                 self.reset_agenda_scroll();
-                self.mark_dirty();
+                self.mark_dirty_if_uncovered();
                 EventResult::Handled
             }
             KeyCode::Char('t') => {
                 self.anchor = Local::now().date_naive();
                 self.reset_agenda_scroll();
-                self.mark_dirty();
+                self.mark_dirty_if_uncovered();
                 EventResult::Handled
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.anchor -= step;
                 self.reset_agenda_scroll();
-                self.mark_dirty();
+                self.mark_dirty_if_uncovered();
                 EventResult::Handled
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 self.anchor += step;
                 self.reset_agenda_scroll();
-                self.mark_dirty();
+                self.mark_dirty_if_uncovered();
                 EventResult::Handled
             }
             // ↑ / ↓ (and j/k) scroll the day's agenda when it has more
@@ -1796,13 +1875,13 @@ impl Widget for CalendarWidget {
                 match bottom_action_at(mouse.column, inner.x) {
                     Some(BottomAction::Today) => {
                         self.anchor = Local::now().date_naive();
-                        self.mark_dirty();
+                        self.mark_dirty_if_uncovered();
                         return EventResult::Handled;
                     }
                     Some(BottomAction::View(v)) => {
                         if self.view != v {
                             self.view = v;
-                            self.mark_dirty();
+                            self.mark_dirty_if_uncovered();
                         }
                         return EventResult::Handled;
                     }
@@ -1824,7 +1903,7 @@ impl Widget for CalendarWidget {
                     self.anchor = date;
                     self.view = CalendarView::Day;
                     self.reset_agenda_scroll();
-                    self.mark_dirty();
+                    self.mark_dirty_if_uncovered();
                     return EventResult::Handled;
                 }
             }
@@ -1832,7 +1911,7 @@ impl Widget for CalendarWidget {
                 if let Some(date) = self.month_day_at(mouse.column, mouse.row, content) {
                     self.anchor = date;
                     self.reset_agenda_scroll();
-                    self.mark_dirty();
+                    self.mark_dirty_if_uncovered();
                     return EventResult::Handled;
                 }
             }
@@ -1842,7 +1921,7 @@ impl Widget for CalendarWidget {
                 if content.width >= 50 && mouse.column >= content.x + content.width / 2 {
                     self.anchor += ChronoDuration::days(1);
                     self.reset_agenda_scroll();
-                    self.mark_dirty();
+                    self.mark_dirty_if_uncovered();
                     return EventResult::Handled;
                 }
             }

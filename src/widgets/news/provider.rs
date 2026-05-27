@@ -24,6 +24,17 @@ pub trait NewsProvider: Send + Sync {
 pub struct FeedConfig {
     pub label: String,
     pub url: String,
+    /// Per-feed override of `[news] fetch_body_for_summary` in
+    /// `news.toml`. When `Some(true)`, pressing `s` on an article from
+    /// this feed HTTP-fetches the article page and extracts the
+    /// readable body before handing it to the LLM. When `Some(false)`,
+    /// the LLM only ever sees the RSS excerpt for this feed (useful
+    /// for feeds whose `<description>` is already the full article,
+    /// like Phoronix or HN, or for paywalled sources where the body
+    /// fetch would just return the paywall page). `None` falls back
+    /// to the widget-wide default.
+    #[serde(default)]
+    pub fetch_body: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -79,9 +90,30 @@ impl RssProvider {
     }
 
     async fn fetch_feed(&self, feed: &FeedConfig) -> Result<Vec<Article>> {
+        // Per-request overrides for the RSS path. Many feeds sit behind
+        // bot-detection layers (Cloudflare, Akamai) that 403 / 451 the
+        // plain `glint-tui/x.y.z` UA — Barron's (Dow Jones) and CTV are
+        // the canonical examples. Sending a browser-shaped UA + the
+        // `Accept` headers an actual feed reader sends gets us past
+        // the same gates without lying about who we are (we still keep
+        // glint-tui in the comment portion of the UA).
         let bytes = self
             .http
             .get(&feed.url)
+            .header(
+                reqwest::header::USER_AGENT,
+                concat!(
+                    "Mozilla/5.0 (compatible; glint-tui/",
+                    env!("CARGO_PKG_VERSION"),
+                    "; +https://github.com/ntrospect0/glint) Gecko/20100101 Firefox/120.0",
+                ),
+            )
+            .header(
+                reqwest::header::ACCEPT,
+                "application/rss+xml, application/atom+xml, application/xml;q=0.9, \
+                 text/xml;q=0.8, application/json;q=0.7, */*;q=0.5",
+            )
+            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
             .send()
             .await
             .with_context(|| format!("GET {} failed", feed.url))?

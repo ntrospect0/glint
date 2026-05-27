@@ -90,6 +90,13 @@ notify = "6"
 # math against text that can contain CJK / emoji / wide glyphs (where
 # `chars().count()` no longer matches what the terminal renders).
 unicode-width = "0.1"
+# Mozilla's Readability port for Rust — used by the news widget to extract
+# the readable article body from an HTML page before handing it to the
+# LLM for summarization. Lazy / on-demand; only fires when the user
+# explicitly opts into the LLM summary via `s`.
+readability = "0.3"
+# `readability::extract` takes a `&Url` for resolving relative links.
+url = "2"
 dirs = "5"
 clap = { version = "4", features = ["derive"] }
 

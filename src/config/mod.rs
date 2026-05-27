@@ -182,12 +182,23 @@ horizontal_scroll_filters = false
 # meta row. Many users prefer the quieter look — flip this off to hide.
 show_topic_labels = true
 
-# When true and an LLM provider is configured in llm.toml, expanded
-# articles request an on-demand summary from the LLM. Set to false to
-# stay fully offline even when the provider is wired up.
+# When true and an LLM provider is configured in llm.toml, pressing `s`
+# on an expanded article requests an on-demand summary from the LLM.
+# Set to false to stay fully offline even when the provider is wired up.
 summarize_with_llm = true
 
+# Default behaviour when `s` requests a summary: HTTP-fetch the article
+# page and feed its extracted body to the LLM (true) or send just the
+# RSS excerpt (false). Per-feed `fetch_body = true/false` below overrides
+# this for specific sources — useful for feeds whose RSS already carries
+# the full article (Phoronix, HN) or whose article page would just
+# return a paywall (WSJ, NYT, FT). Default = true since fetched bodies
+# produce far richer summaries than RSS teasers.
+fetch_body_for_summary = true
+
 # RSS / Atom feeds to aggregate. `label` is shown in the article row.
+# Each feed may override `fetch_body = true/false`; absent means inherit
+# the widget-wide `fetch_body_for_summary` above.
 # All sources here are free / non-paywall to read (some have paywalls on
 # the article pages themselves — your browser session handles auth when
 # you hit Enter to open). Add or remove freely.

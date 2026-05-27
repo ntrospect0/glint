@@ -37,6 +37,21 @@ enum SummaryState {
     Failed,
 }
 
+/// Per-article state for the "fetch the full article body before
+/// summarizing" path. Pressing `s` on an article whose feed has
+/// `fetch_body` enabled walks: `Requested` → `Ready(plain_text)` (or
+/// `Failed`); the LLM summary task is chained off the body's success
+/// so it sees the extracted body instead of just the RSS excerpt.
+#[derive(Debug, Clone)]
+enum BodyState {
+    Requested,
+    Ready(String),
+    /// HTTP fetch or readability extraction failed. The LLM path
+    /// falls back to summarizing the RSS excerpt so the user still
+    /// sees *something* rather than a hard error.
+    Failed,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewsConfig {
     #[serde(default = "default_poll_interval")]
@@ -69,9 +84,24 @@ pub struct NewsConfig {
     /// Flip false to stay fully offline.
     #[serde(default = "default_summarize_with_llm")]
     pub summarize_with_llm: bool,
+
+    /// Widget-wide default for "fetch the article HTML and extract the
+    /// body before summarizing." Per-feed `fetch_body` in
+    /// `[[feeds]]` blocks overrides this. `true` by default —
+    /// summarizing the full article reads better than summarizing
+    /// the (often near-empty) RSS excerpt. Flip false widget-wide
+    /// for fully-offline use, or per-feed for sources whose feed
+    /// excerpt is already the whole article (Phoronix, HN) or that
+    /// paywall the article page (WSJ, NYT, FT).
+    #[serde(default = "default_fetch_body_for_summary")]
+    pub fetch_body_for_summary: bool,
 }
 
 fn default_summarize_with_llm() -> bool {
+    true
+}
+
+fn default_fetch_body_for_summary() -> bool {
     true
 }
 
@@ -94,6 +124,7 @@ impl Default for NewsConfig {
             colors: ColorScheme::default(),
             shortcuts: Vec::new(),
             summarize_with_llm: default_summarize_with_llm(),
+            fetch_body_for_summary: default_fetch_body_for_summary(),
         }
     }
 }
@@ -162,9 +193,19 @@ struct NewsState {
     articles: Vec<Article>,
     selected: usize,
     scroll: usize,
-    /// When true, the selected article renders its full summary (up to
-    /// `MAX_SUMMARY_LINES` wrapped lines) instead of the one-line excerpt.
+    /// When true, the selected article renders its full body (raw RSS
+    /// excerpt or LLM summary, depending on `summary_view`) below its
+    /// header. Toggled by `e` (expand/collapse) and `s` (which also
+    /// expands if collapsed, like the email widget's `s`).
     expanded: bool,
+    /// Per-article "show LLM summary instead of raw excerpt" flag,
+    /// keyed by URL. Mirrors the email widget's pattern: `s` flips
+    /// this and (when entering summary view) lazily fires the LLM
+    /// request if one isn't already in flight or cached. Absent or
+    /// `false` means "show the raw excerpt"; `true` means "prefer the
+    /// LLM summary." Per-article so toggling on one article doesn't
+    /// affect the others.
+    summary_view: HashMap<String, bool>,
     /// Index into the *visible* tab list (static topic tabs + the dynamic
     /// search tab when one exists). 0 is always `All`.
     active_filter_idx: usize,
@@ -173,6 +214,12 @@ struct NewsState {
     inflight: bool,
     /// Per-article LLM summarization state, keyed by article URL.
     summaries: HashMap<String, SummaryState>,
+    /// Per-article HTTP body fetch state, keyed by URL. Populated by
+    /// `ensure_body_fetched` when the user opts into the LLM summary
+    /// via `s` on a feed whose `fetch_body` is enabled. The LLM task
+    /// is chained off `BodyState::Ready` so a successful body becomes
+    /// the LLM prompt's input; failures fall back to the RSS excerpt.
+    bodies: HashMap<String, BodyState>,
     /// Active `:news <terms>` filter, if any. When present, an extra tab
     /// is appended to the tab bar and articles matching at least one term
     /// are surfaced (sorted by hit count). Cleared by `x` or `:news` with
@@ -184,10 +231,11 @@ const MAX_SUMMARY_LINES: usize = 6;
 const ALL_TAB_LABEL: &str = "All";
 
 const SUMMARY_SYSTEM_PROMPT: &str = "You are a concise news summarizer. \
-Given a headline and a short excerpt, return a neutral 3-5 sentence summary \
-capturing the key facts and any direct quotes. Do not editorialize, do not \
-add preamble, do not use markdown. If the input is too sparse to summarize \
-faithfully, respond with the single sentence: \"Insufficient content to summarize.\"";
+Given a headline and an article body (or short excerpt when the body is \
+unavailable), return a neutral 3-5 sentence summary capturing the key \
+facts and any direct quotes. Do not editorialize, do not add preamble, \
+do not use markdown. If the input is too sparse to summarize faithfully, \
+respond with the single sentence: \"Insufficient content to summarize.\"";
 
 const CACHE_KEY_ARTICLES: &str = "articles";
 
@@ -199,11 +247,37 @@ const CACHE_KEY_ARTICLES: &str = "articles";
 /// when the user clears the cache.
 const SUMMARY_CACHE_PREFIX: &str = "summary-";
 
+/// Cache-key namespace for extracted article bodies (the readable
+/// plain-text we pass to the LLM instead of the RSS excerpt). Same
+/// hashing approach as summaries — keys stay filesystem-safe across
+/// URLs with query strings and unusual characters.
+const BODY_CACHE_PREFIX: &str = "body-";
+
+/// Cap on extracted body length sent to the LLM. Most news articles
+/// are 2-6 KB of readable text; truncating long-form pieces at 30 KB
+/// keeps the prompt under the cheap-tier model's context windows
+/// while still giving the LLM far more substance than the RSS excerpt.
+const MAX_BODY_BYTES: usize = 30_000;
+
+/// HTTP timeout for fetching an article page. RSS feeds get 30s via the
+/// shared client; article pages live behind more layers (Cloudflare,
+/// rendering pipelines) so we give them headroom. Still tight enough
+/// that a wedged origin doesn't pile up tasks.
+const ARTICLE_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+
 fn summary_cache_key(url: &str) -> String {
+    cache_key_with_prefix(SUMMARY_CACHE_PREFIX, url)
+}
+
+fn body_cache_key(url: &str) -> String {
+    cache_key_with_prefix(BODY_CACHE_PREFIX, url)
+}
+
+fn cache_key_with_prefix(prefix: &str, url: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(url.as_bytes());
-    let mut key = String::with_capacity(SUMMARY_CACHE_PREFIX.len() + 16);
-    key.push_str(SUMMARY_CACHE_PREFIX);
+    let mut key = String::with_capacity(prefix.len() + 16);
+    key.push_str(prefix);
     for b in &digest[..8] {
         use std::fmt::Write;
         let _ = write!(key, "{b:02x}");
@@ -232,6 +306,14 @@ pub struct NewsWidget {
     llm: Option<Arc<dyn LlmProvider>>,
     /// True when the user has opted into LLM news summaries via llm.toml.
     llm_summarize_enabled: bool,
+    /// Widget-wide default for "fetch the article body before sending
+    /// to the LLM." Per-feed `fetch_body` in `feed_configs` overrides.
+    fetch_body_for_summary_default: bool,
+    /// Copy of the configured feeds so per-feed lookups (currently:
+    /// `fetch_body`) work after the original `Vec<FeedConfig>` has
+    /// been moved into the provider. Cloned at construction; small
+    /// (typically <30 entries).
+    feed_configs: Vec<FeedConfig>,
     /// Mirrors NewsConfig.horizontal_scroll_filters — gates the ScrollLeft /
     /// ScrollRight handler so accidental trackpad gestures don't switch tabs
     /// for users who haven't asked for that.
@@ -277,6 +359,8 @@ impl NewsWidget {
         let horizontal_scroll_filters = config.horizontal_scroll_filters;
         let show_topic_labels = config.show_topic_labels;
         let llm_summarize_enabled = config.summarize_with_llm;
+        let fetch_body_for_summary_default = config.fetch_body_for_summary;
+        let feed_configs = config.feeds.clone();
         let mut filter_tabs = vec![ALL_TAB_LABEL.to_string()];
         filter_tabs.extend(config.topics.iter().map(|t| t.label.clone()));
         let colors_override = config.colors.clone();
@@ -329,6 +413,8 @@ impl NewsWidget {
             filter_tabs,
             llm,
             llm_summarize_enabled,
+            fetch_body_for_summary_default,
+            feed_configs,
             horizontal_scroll_filters,
             show_topic_labels,
             app_theme,
@@ -339,87 +425,234 @@ impl NewsWidget {
         }
     }
 
-    /// Resolve a summary for `article`, in priority order:
-    ///   1. Already-known in-memory state (incl. earlier successful or failed
-    ///      requests this session) — no-op.
-    ///   2. Persisted LLM summary in the cache — hydrate state synchronously.
-    ///   3. Otherwise spawn an LLM request; cache the result on success.
-    ///
-    /// Skips the round-trip entirely when the raw RSS excerpt is already
-    /// substantive — the LLM's contribution there is marginal and "Insufficient
-    /// content to summarize." is a net loss compared to the original paragraph.
-    /// Failures are *not* persisted: a retry after restart is cheap and a
-    /// flaky network call shouldn't poison the cache.
-    fn ensure_summary_requested(&self, article: &Article) {
-        if !self.llm_summarize_enabled || self.llm.is_none() {
+    /// Resolve the effective `fetch_body` policy for `article`. Looks
+    /// up the article's source (the feed label) in `feed_configs`,
+    /// returning the per-feed override if set, else the widget-wide
+    /// default. Articles whose source doesn't match any configured
+    /// feed (shouldn't happen in practice — that'd mean an article
+    /// got into state from a deleted feed) fall back to the default.
+    fn fetch_body_enabled_for(&self, article: &Article) -> bool {
+        let feed = self
+            .feed_configs
+            .iter()
+            .find(|f| f.label == article.source);
+        feed.and_then(|f| f.fetch_body)
+            .unwrap_or(self.fetch_body_for_summary_default)
+    }
+
+    /// Kick off an LLM summary for `article`, using `body_override` as
+    /// the input when present (e.g. when the body-fetch path extracted
+    /// the full article), otherwise the RSS excerpt. Idempotent: hits
+    /// in-memory state and on-disk cache before firing a new request.
+    /// Failures aren't persisted — a retry after restart is cheap.
+    fn ensure_summary_requested(&self, article: &Article, body_override: Option<String>) {
+        if !self.llm_summarize_enabled {
+            tracing::info!(
+                url = %article.url,
+                "news summary skipped: summarize_with_llm = false in news.toml"
+            );
             return;
         }
-        if !needs_llm_summary(article.summary.as_deref()) {
+        let Some(llm) = self.llm.clone() else {
+            tracing::info!(
+                url = %article.url,
+                "news summary skipped: no LLM provider configured (check llm.toml)"
+            );
             return;
-        }
-        {
-            let st = self.state.lock().expect("news state poisoned");
-            if st.summaries.contains_key(&article.url) {
-                return;
-            }
-        }
-        let cache_key = summary_cache_key(&article.url);
-        if let Some(entry) = self.cache.load::<String>(&cache_key) {
-            let mut st = self.state.lock().expect("news state poisoned");
-            st.summaries
-                .insert(article.url.clone(), SummaryState::Ready(entry.value));
+        };
+        spawn_summary_llm_task(
+            llm,
+            self.state.clone(),
+            self.cache.clone(),
+            article.title.clone(),
+            article.url.clone(),
+            body_override
+                .filter(|b| !b.trim().is_empty())
+                .unwrap_or_else(|| article.summary.clone().unwrap_or_default()),
+        );
+    }
+
+    /// Two-step LLM summary path: HTTP-fetch the article page, extract
+    /// the readable body with Mozilla's Readability port, then chain
+    /// into the LLM call with that body as input. On any failure
+    /// (fetch error, extraction blank, paywall page detected) falls
+    /// back to summarizing the RSS excerpt — the user still gets
+    /// *something*. Idempotent at the body layer (in-memory state +
+    /// `body-<hash>` cache) just like the summary layer.
+    fn ensure_body_then_summary(&self, article: &Article) {
+        if !self.llm_summarize_enabled {
             return;
         }
         let Some(llm) = self.llm.clone() else {
             return;
         };
-        let state = self.state.clone();
-        let cache = self.cache.clone();
-        let url = article.url.clone();
-        let title = article.title.clone();
-        let raw = article.summary.clone().unwrap_or_default();
+        // Check in-memory body state first.
+        let body_state = {
+            let st = self.state.lock().expect("news state poisoned");
+            st.bodies.get(&article.url).cloned()
+        };
+        match body_state {
+            Some(BodyState::Ready(text)) => {
+                tracing::info!(url = %article.url, "news body: already in memory; chaining to summary");
+                self.ensure_summary_requested(article, Some(text));
+                return;
+            }
+            Some(BodyState::Requested) => {
+                tracing::info!(url = %article.url, "news body: fetch already in flight; summary will chain on completion");
+                return;
+            }
+            Some(BodyState::Failed) => {
+                tracing::info!(url = %article.url, "news body: previously failed; summarizing RSS excerpt");
+                self.ensure_summary_requested(article, None);
+                return;
+            }
+            None => {}
+        }
+        // Try the persisted body cache.
+        if let Some(entry) = self.cache.load::<String>(&body_cache_key(&article.url)) {
+            tracing::info!(url = %article.url, "news body: hydrated from on-disk cache; chaining to summary");
+            let body = entry.value;
+            {
+                let mut st = self.state.lock().expect("news state poisoned");
+                st.bodies
+                    .insert(article.url.clone(), BodyState::Ready(body.clone()));
+            }
+            self.ensure_summary_requested(article, Some(body));
+            return;
+        }
+        // Fresh fetch + extract + chain.
+        tracing::info!(
+            url = %article.url,
+            title = %article.title,
+            "news body: spawning HTTP fetch + readability extract"
+        );
         {
             let mut st = self.state.lock().expect("news state poisoned");
-            st.summaries.insert(url.clone(), SummaryState::Requested);
+            st.bodies
+                .insert(article.url.clone(), BodyState::Requested);
         }
+        let url = article.url.clone();
+        let title = article.title.clone();
+        let rss_excerpt = article.summary.clone().unwrap_or_default();
+        let state = self.state.clone();
+        let cache = self.cache.clone();
         tokio::spawn(async move {
-            let request = LlmRequest {
-                model: None,
-                system: Some(SUMMARY_SYSTEM_PROMPT.into()),
-                messages: vec![LlmMessage {
-                    role: Role::User,
-                    content: format!(
-                        "Title: {title}\nURL: {url}\nRaw excerpt: {}\n",
-                        if raw.is_empty() { "(none)" } else { raw.as_str() }
-                    ),
-                }],
-                max_tokens: 350,
-                cache_system: true,
-            };
-            let outcome = match llm.complete(request).await {
-                Ok(resp) => {
-                    let text = resp.text.trim();
-                    if is_insufficient_reply(text) {
-                        // Model said it couldn't summarize — prefer the raw
-                        // excerpt over the model's apology.
-                        SummaryState::Failed
-                    } else {
-                        SummaryState::Ready(text.to_string())
+            let extracted = fetch_and_extract_body(&url).await;
+            let (body_state_value, body_for_summary) = match extracted {
+                Ok(text) => {
+                    tracing::info!(
+                        url = %url,
+                        chars = text.chars().count(),
+                        "news body: extracted; caching"
+                    );
+                    if let Err(err) = cache.store(&body_cache_key(&url), &text) {
+                        tracing::warn!(error = %err, url = %url, "news body cache store failed");
                     }
+                    (BodyState::Ready(text.clone()), Some(text))
                 }
                 Err(err) => {
-                    tracing::warn!(error = %err, url = %url, "LLM summarization failed");
-                    SummaryState::Failed
+                    tracing::warn!(
+                        error = %err,
+                        url = %url,
+                        "news body: fetch/extract failed; falling back to RSS excerpt for the summary"
+                    );
+                    (BodyState::Failed, None)
                 }
             };
-            if let SummaryState::Ready(text) = &outcome {
-                if let Err(err) = cache.store(&cache_key, text) {
-                    tracing::warn!(error = %err, url = %url, "news summary cache store failed");
+            {
+                let mut st = state.lock().expect("news state poisoned");
+                st.bodies.insert(url.clone(), body_state_value);
+            }
+            // Always chain to the summary task — body success uses the
+            // extracted text, body failure falls back to the RSS excerpt.
+            let summary_input = body_for_summary
+                .filter(|b| !b.trim().is_empty())
+                .unwrap_or(rss_excerpt);
+            spawn_summary_llm_task(llm, state, cache, title, url, summary_input);
+        });
+    }
+
+    /// Press-`s` entry point. Mirrors the email widget's Body ⇄ Summary
+    /// toggle:
+    /// - **Collapsed**: expand, switch to summary view, fire the LLM
+    ///   request (or hydrate from cache).
+    /// - **Expanded + Body**: switch to summary view; fire LLM if not
+    ///   already cached or in flight.
+    /// - **Expanded + Summary**: switch back to Body — no LLM hit,
+    ///   the cached summary stays put for the next `s`.
+    /// No-op when there are no articles or no LLM is configured.
+    fn toggle_summary_view(&mut self) {
+        if !self.llm_summarize_enabled {
+            tracing::info!(
+                "news `s` ignored: summarize_with_llm = false in news.toml"
+            );
+            return;
+        }
+        if self.llm.is_none() {
+            tracing::info!(
+                "news `s` ignored: no LLM provider configured (check llm.toml)"
+            );
+            return;
+        }
+        let (article_url, will_show_summary) = {
+            let mut st = self.state.lock().expect("news state poisoned");
+            if st.articles.is_empty() {
+                tracing::info!("news `s` ignored: no articles loaded yet");
+                return;
+            }
+            let url = match st.articles.get(st.selected) {
+                Some(a) => a.url.clone(),
+                None => {
+                    tracing::info!(
+                        selected = st.selected,
+                        len = st.articles.len(),
+                        "news `s` ignored: selected index out of range"
+                    );
+                    return;
+                }
+            };
+            let was_collapsed = !st.expanded;
+            let result = if was_collapsed {
+                st.expanded = true;
+                st.summary_view.insert(url.clone(), true);
+                (url, true)
+            } else {
+                let new = !*st.summary_view.get(&url).unwrap_or(&false);
+                st.summary_view.insert(url.clone(), new);
+                (url, new)
+            };
+            tracing::info!(
+                url = %result.0,
+                was_collapsed,
+                prefer_summary = result.1,
+                "news `s` toggled"
+            );
+            result
+        };
+        // Fire the LLM request only when entering summary view —
+        // staying on Body should never cost network or tokens. The
+        // dispatch fork: if this article's feed has `fetch_body`
+        // enabled, route through the body-fetch + chain path so the
+        // LLM gets the full article; otherwise call the LLM directly
+        // with the RSS excerpt.
+        if will_show_summary {
+            let article = {
+                let st = self.state.lock().expect("news state poisoned");
+                st.articles.iter().find(|a| a.url == article_url).cloned()
+            };
+            if let Some(article) = article {
+                if self.fetch_body_enabled_for(&article) {
+                    self.ensure_body_then_summary(&article);
+                } else {
+                    tracing::info!(
+                        url = %article.url,
+                        feed = %article.source,
+                        "news: fetch_body disabled for this feed; LLM gets the RSS excerpt only"
+                    );
+                    self.ensure_summary_requested(&article, None);
                 }
             }
-            let mut st = state.lock().expect("news state poisoned");
-            st.summaries.insert(url, outcome);
-        });
+        }
     }
 
     /// Compose the *visible* tab list = static tabs from config + an
@@ -911,9 +1144,12 @@ impl Widget for NewsWidget {
         // expansion at the visible bottom would push title+meta past
         // list_height and the loop would break before emitting anything —
         // the user would lose the article entirely.
+        // No LLM request fired here — `s` is now the explicit opt-in,
+        // and `ensure_summary_requested` runs from `toggle_summary_view`
+        // when the user actually asks for the summary. That matches the
+        // email widget and avoids billing the user for every `e` press.
         let selected_summary_lines: Vec<String> = if expanded && selected < articles.len() {
             let article = &articles[selected];
-            self.ensure_summary_requested(article);
             expanded_summary_lines(
                 article,
                 &self.state,
@@ -923,21 +1159,32 @@ impl Widget for NewsWidget {
         } else {
             Vec::new()
         };
-        let selected_height = ROWS_PER_ITEM as u16 + selected_summary_lines.len() as u16;
-
+        // Scroll math — mirrors the email widget's pattern row-for-
+        // row so navigation feels identical between the two. ROWS_
+        // PER_ITEM = 2 (title + meta) means "items_visible" here is
+        // measured in *articles*, not rows; the expansion height is
+        // the only term carried in raw row units. Three clamps in
+        // order:
+        //   1. Keep selected from scrolling above the viewport.
+        //   2. Keep selected from scrolling below the viewport.
+        //   3. When expanded, scroll up just enough that the title +
+        //      meta + summary fits without clipping at the bottom —
+        //      and never past `selected` (so the selected row stays
+        //      visible even when the expansion is taller than the pane).
+        let summary_rows = selected_summary_lines.len() as u16;
+        let items_visible = (list_height / ROWS_PER_ITEM as u16).max(1) as usize;
         if selected < scroll {
             scroll = selected;
         }
-        // Scroll just enough that the selected article (including its
-        // expanded summary, if any) fits. When the expansion alone is
-        // taller than the pane, `available_above` saturates to 0 and
-        // `min_scroll` snaps selected to the top so the title stays
-        // visible and the summary tail clips at the bottom.
-        let available_above = list_height.saturating_sub(selected_height);
-        let max_compact_items_above = (available_above / ROWS_PER_ITEM as u16) as usize;
-        let min_scroll = selected.saturating_sub(max_compact_items_above);
-        if scroll < min_scroll {
-            scroll = min_scroll;
+        if selected >= scroll + items_visible {
+            scroll = selected + 1 - items_visible;
+        }
+        if expanded {
+            let max_items_with_expansion = (list_height.saturating_sub(summary_rows)
+                / ROWS_PER_ITEM as u16)
+                .max(1) as usize;
+            let want = (selected + 1).saturating_sub(max_items_with_expansion);
+            scroll = scroll.max(want).min(selected);
         }
 
         let mut lines: Vec<Line<'_>> = Vec::with_capacity(list_height as usize);
@@ -1086,6 +1333,10 @@ impl Widget for NewsWidget {
                 }
                 EventResult::Handled
             }
+            KeyCode::Char('s') => {
+                self.toggle_summary_view();
+                EventResult::Handled
+            }
             KeyCode::Char('[') | KeyCode::Left | KeyCode::Char('h') => {
                 self.cycle_filter(false);
                 EventResult::Handled
@@ -1202,7 +1453,8 @@ impl Widget for NewsWidget {
             ("g / Home", "jump to top"),
             ("End", "jump to bottom"),
             ("Enter", "open article URL in browser"),
-            ("e", "expand selected article"),
+            ("e", "expand selected article (raw RSS excerpt)"),
+            ("s", "toggle LLM summary for the expanded article"),
             ("x", "clear :news <terms> search filter"),
             (":news <terms>", "filter articles by keyword (ranked by hits)"),
             ("r", "force refresh"),
@@ -1270,20 +1522,6 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Threshold (in whitespace-separated words) below which an RSS excerpt is
-/// considered too thin to display on its own; only then is the LLM consulted.
-const RAW_SUMMARY_GOOD_ENOUGH_WORDS: usize = 15;
-
-/// Heuristic: does this article's raw summary look thin enough that an LLM
-/// summarization round-trip is worth it? Empty or stubby ("Read more…")
-/// excerpts → yes; a substantive paragraph → no, just show the raw text.
-fn needs_llm_summary(raw: Option<&str>) -> bool {
-    match raw {
-        None => true,
-        Some(s) => s.split_whitespace().count() < RAW_SUMMARY_GOOD_ENOUGH_WORDS,
-    }
-}
-
 /// Detects the canonical "I can't summarize this" sentence we asked the model
 /// to emit when the input was too sparse. Match is case-insensitive and
 /// tolerant of trailing punctuation / whitespace.
@@ -1293,36 +1531,242 @@ fn is_insufficient_reply(text: &str) -> bool {
         || lower.starts_with("insufficient information to summarize")
 }
 
-/// Returns the wrapped lines to render under an expanded article. Prefers an
-/// LLM summary when one has come back; otherwise falls back to the wrapped
-/// raw RSS excerpt. While the LLM call is in flight we show a "Summarizing…"
-/// placeholder so the user has visual feedback.
+/// Spawn the LLM summary task. Standalone (vs a method on `NewsWidget`)
+/// so the body-fetch task can call it directly without juggling
+/// `&self` lifetimes. Handles all the idempotency checks (in-memory
+/// state, on-disk cache) and falls through to a tokio spawn for the
+/// actual network call. `content` is whatever the caller decided to
+/// feed the model — the extracted article body when available, the
+/// RSS excerpt otherwise.
+fn spawn_summary_llm_task(
+    llm: Arc<dyn LlmProvider>,
+    state: Arc<Mutex<NewsState>>,
+    cache: ScopedCache,
+    title: String,
+    url: String,
+    content: String,
+) {
+    // Idempotency: if we've already produced (or are producing, or
+    // recently failed) a summary for this URL, don't fire again.
+    {
+        let st = state.lock().expect("news state poisoned");
+        if let Some(existing) = st.summaries.get(&url) {
+            tracing::info!(
+                url = %url,
+                state = %match existing {
+                    SummaryState::Ready(_) => "ready",
+                    SummaryState::Requested => "in-flight",
+                    SummaryState::Failed => "failed",
+                },
+                "news summary already known — no new LLM call"
+            );
+            return;
+        }
+    }
+    let cache_key = summary_cache_key(&url);
+    if let Some(entry) = cache.load::<String>(&cache_key) {
+        tracing::info!(url = %url, "news summary hydrated from on-disk cache");
+        let mut st = state.lock().expect("news state poisoned");
+        st.summaries
+            .insert(url.clone(), SummaryState::Ready(entry.value));
+        return;
+    }
+    tracing::info!(
+        url = %url,
+        title = %title,
+        input_chars = content.chars().count(),
+        "news summary firing LLM request"
+    );
+    {
+        let mut st = state.lock().expect("news state poisoned");
+        st.summaries.insert(url.clone(), SummaryState::Requested);
+    }
+    tokio::spawn(async move {
+        let user_block = if content.trim().is_empty() {
+            format!("Title: {title}\nURL: {url}\n\nContent:\n(no body or excerpt available)\n")
+        } else {
+            format!("Title: {title}\nURL: {url}\n\nContent:\n{content}\n")
+        };
+        let request = LlmRequest {
+            model: None,
+            system: Some(SUMMARY_SYSTEM_PROMPT.into()),
+            messages: vec![LlmMessage {
+                role: Role::User,
+                content: user_block,
+            }],
+            max_tokens: 350,
+            cache_system: true,
+        };
+        let outcome = match llm.complete(request).await {
+            Ok(resp) => {
+                let text = resp.text.trim();
+                if is_insufficient_reply(text) {
+                    tracing::info!(
+                        url = %url,
+                        reply = %text,
+                        "news summary: LLM returned insufficient-content reply"
+                    );
+                    SummaryState::Failed
+                } else {
+                    tracing::info!(
+                        url = %url,
+                        chars = text.chars().count(),
+                        "news summary: LLM returned summary, caching"
+                    );
+                    SummaryState::Ready(text.to_string())
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, url = %url, "news summary: LLM call failed");
+                SummaryState::Failed
+            }
+        };
+        if let SummaryState::Ready(text) = &outcome {
+            if let Err(err) = cache.store(&cache_key, text) {
+                tracing::warn!(error = %err, url = %url, "news summary cache store failed");
+            }
+        }
+        let mut st = state.lock().expect("news state poisoned");
+        st.summaries.insert(url, outcome);
+    });
+}
+
+/// HTTP-fetch the article at `url` and extract its readable body via
+/// the `readability` crate (Rust port of Mozilla's Readability.js).
+/// Returns the extracted plain text on success, truncated to
+/// `MAX_BODY_BYTES` so a single huge article can't swell the prompt
+/// (and the LLM bill) without bound. Errors propagate normally —
+/// callers fall back to the RSS excerpt at the layer above.
+async fn fetch_and_extract_body(url: &str) -> Result<String> {
+    let parsed = url::Url::parse(url).with_context(|| format!("invalid article URL: {url}"))?;
+    let resp = crate::http::shared()
+        .get(url)
+        // Same browser-shaped headers we send for RSS — article pages
+        // are at least as bot-gated as feed endpoints. Per-request so
+        // these don't bleed into other widgets' HTTP traffic.
+        .header(
+            reqwest::header::USER_AGENT,
+            concat!(
+                "Mozilla/5.0 (compatible; glint-tui/",
+                env!("CARGO_PKG_VERSION"),
+                "; +https://github.com/ntrospect0/glint) Gecko/20100101 Firefox/120.0",
+            ),
+        )
+        .header(
+            reqwest::header::ACCEPT,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+        .timeout(ARTICLE_FETCH_TIMEOUT)
+        .send()
+        .await
+        .with_context(|| format!("GET {url} failed"))?
+        .error_for_status()
+        .with_context(|| format!("{url} returned non-2xx"))?
+        .bytes()
+        .await
+        .with_context(|| format!("reading body of {url} failed"))?;
+    // Readability extraction is CPU-bound (html5ever DOM walk +
+    // scoring heuristics); offload to a blocking-friendly task so we
+    // don't block the tokio reactor on long documents.
+    let html_bytes = resp.to_vec();
+    let parsed_clone = parsed.clone();
+    let extracted = tokio::task::spawn_blocking(move || {
+        let mut cursor = std::io::Cursor::new(html_bytes);
+        readability::extractor::extract(&mut cursor, &parsed_clone)
+            .map_err(|err| anyhow::anyhow!("readability extraction failed: {err}"))
+    })
+    .await
+    .context("readability task panicked")??;
+    let mut text = extracted.text;
+    // Collapse whitespace runs that Readability sometimes leaves
+    // behind (multiple blank lines from sectioning elements) so the
+    // LLM doesn't waste tokens on filler.
+    text = text
+        .lines()
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
+    while text.contains("\n\n\n") {
+        text = text.replace("\n\n\n", "\n\n");
+    }
+    if text.trim().is_empty() {
+        anyhow::bail!("readability returned an empty body — likely a paywall or JS-rendered page");
+    }
+    if text.len() > MAX_BODY_BYTES {
+        let _ = parsed; // keep Url ownership tidy
+        text.truncate(MAX_BODY_BYTES);
+        // Don't sever a multi-byte UTF-8 sequence at the truncation
+        // boundary.
+        while !text.is_char_boundary(text.len()) {
+            text.pop();
+        }
+    }
+    Ok(text)
+}
+
+/// Returns the wrapped lines to render under an expanded article.
+/// Mirrors the email widget's two-mode model: `e` shows the raw RSS
+/// excerpt by default, `s` toggles into LLM-summary view (lazily firing
+/// the request the first time). `prefer_summary` lookups land here from
+/// `state.summary_view[url]` so the per-article preference is the
+/// single source of truth — render reads it, the `s` toggle writes it.
+///
+/// While an in-flight summary is loading we show "Summarizing…" plus
+/// the raw excerpt as a placeholder so the user has visual feedback.
+/// Failed summaries silently fall back to the raw excerpt — the model
+/// already declined, so spamming an error is worse than just showing
+/// the original paragraph.
 fn expanded_summary_lines(
     article: &Article,
     state: &Arc<Mutex<NewsState>>,
     max_width: usize,
     llm_enabled: bool,
 ) -> Vec<String> {
-    let summary_state = {
+    let (summary_state, body_state, prefer_summary) = {
         let st = state.lock().expect("news state poisoned");
-        st.summaries.get(&article.url).cloned()
+        (
+            st.summaries.get(&article.url).cloned(),
+            st.bodies.get(&article.url).cloned(),
+            *st.summary_view.get(&article.url).unwrap_or(&false),
+        )
     };
     let raw = article.summary.as_deref().unwrap_or("");
     let raw_lines = || wrap_text(raw, max_width, MAX_SUMMARY_LINES);
 
-    if !llm_enabled {
+    // Default view (`e` only, or `s` after toggling back to body): raw
+    // excerpt. The user has to opt in to the LLM summary.
+    if !llm_enabled || !prefer_summary {
         return raw_lines();
     }
+    // Summary results take priority over body-fetch progress — once
+    // the LLM has returned (Ready or Failed), the body's status is
+    // immaterial to the displayed lines.
     match summary_state {
-        Some(SummaryState::Ready(text)) => wrap_text(&text, max_width, MAX_SUMMARY_LINES),
+        Some(SummaryState::Ready(text)) => return wrap_text(&text, max_width, MAX_SUMMARY_LINES),
         Some(SummaryState::Requested) => {
             let mut out = vec!["Summarizing…".to_string()];
             if !raw.is_empty() {
                 out.extend(wrap_text(raw, max_width, MAX_SUMMARY_LINES.saturating_sub(1)));
             }
+            return out;
+        }
+        Some(SummaryState::Failed) => return raw_lines(),
+        None => {}
+    }
+    // No summary state yet — either the body fetch is still in flight
+    // (show "Fetching article…") or summarization simply hasn't kicked
+    // off (fall back to raw). The body-fetch task chains into the LLM
+    // on completion, so this placeholder is short-lived.
+    match body_state {
+        Some(BodyState::Requested) => {
+            let mut out = vec!["Fetching article…".to_string()];
+            if !raw.is_empty() {
+                out.extend(wrap_text(raw, max_width, MAX_SUMMARY_LINES.saturating_sub(1)));
+            }
             out
         }
-        Some(SummaryState::Failed) | None => raw_lines(),
+        _ => raw_lines(),
     }
 }
 
@@ -1998,23 +2442,6 @@ mod tests {
     fn empty_feeds_is_visible_in_state() {
         let w = NewsWidget::with_config(NewsConfig::default());
         assert!(!w.feeds_configured);
-    }
-
-    #[test]
-    fn needs_llm_summary_skips_substantial_excerpts() {
-        // A real paragraph — no need for the LLM.
-        let paragraph = "Apple today announced the iPhone 16 with a new A18 chip, \
-            improved camera system, and a redesigned aluminium chassis available in \
-            five colors. Pre-orders start Friday.";
-        assert!(!needs_llm_summary(Some(paragraph)));
-    }
-
-    #[test]
-    fn needs_llm_summary_kicks_in_for_thin_excerpts() {
-        assert!(needs_llm_summary(None));
-        assert!(needs_llm_summary(Some("")));
-        assert!(needs_llm_summary(Some("Read more")));
-        assert!(needs_llm_summary(Some("Apple announces new iPhone today.")));
     }
 
     #[test]
