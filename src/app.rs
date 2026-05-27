@@ -16,6 +16,7 @@ use chrono::Local;
 use crate::{
     config::{self, Config},
     event::{Event, EventReader},
+    llm::{self, LlmConfig},
     ui,
     widgets::{
         calendar::{CalendarConfig, CalendarWidget},
@@ -48,12 +49,26 @@ impl App {
             config::load_widget_toml("calendar").unwrap_or_default();
         let news_cfg: NewsConfig = config::load_widget_toml("news").unwrap_or_default();
 
+        // LLM is optional: if llm.toml is missing or no Anthropic key is on
+        // disk, `build_provider` returns None and widgets fall back to their
+        // non-LLM paths.
+        let llm_cfg: LlmConfig = config::load_widget_toml("llm").unwrap_or_default();
+        let llm_provider = llm::build_provider(&llm_cfg).unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "failed to build LLM provider");
+            None
+        });
+        let news_summarize = llm_cfg.features.news_summarize;
+
         let mut manager = WidgetManager::new();
         manager.register(StocksWidget::new());
         manager.register(ClockWidget::with_config(clock_cfg));
         manager.register(WeatherWidget::with_config(weather_cfg));
         manager.register(CalendarWidget::with_config(calendar_cfg));
-        manager.register(NewsWidget::with_config(news_cfg));
+        manager.register(NewsWidget::with_config_and_llm(
+            news_cfg,
+            llm_provider,
+            news_summarize,
+        ));
 
         let focus_order = focus_order_from_layout(&config, &manager);
         Self {

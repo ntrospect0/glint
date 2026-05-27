@@ -8,6 +8,7 @@ mod auth;
 mod config;
 mod event;
 mod geolocation;
+mod llm;
 mod providers;
 mod ui;
 mod widgets;

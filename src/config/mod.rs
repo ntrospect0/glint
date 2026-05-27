@@ -225,6 +225,33 @@ keywords = [
 ]
 "#;
 
+pub const DEFAULT_LLM_TOML: &str = r#"# Master switch. If false, every LLM-backed feature falls back to its
+# structured-only counterpart (keyword filtering, raw RSS summaries, …).
+enabled = true
+
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-6"
+api_base = "https://api.anthropic.com"
+max_tokens = 512
+
+[limits]
+max_requests_per_minute = 20
+cache_capacity = 1024
+
+# Per-feature toggles. Each defaults to a sensible value; flip off if you
+# want to avoid LLM calls for a specific feature.
+[features]
+news_summarize = true
+news_classify = false
+stock_disambiguate = false
+"#;
+
+pub const DEFAULT_ANTHROPIC_KEY_TEMPLATE: &str = r#"# Anthropic API key. Get one at https://console.anthropic.com/.
+# Leave api_key blank or unset to keep LLM features disabled.
+api_key = "REPLACE_WITH_YOUR_KEY"
+"#;
+
 pub const DEFAULT_CALENDAR_TOML: &str = r#"# Default view: "day", "week", or "month".
 default_view = "day"
 poll_interval_secs = 60
@@ -273,6 +300,26 @@ pub fn init_default_config() -> Result<PathBuf> {
     seed(&dir.join("weather.toml"), DEFAULT_WEATHER_TOML)?;
     seed(&dir.join("calendar.toml"), DEFAULT_CALENDAR_TOML)?;
     seed(&dir.join("news.toml"), DEFAULT_NEWS_TOML)?;
+    seed(&dir.join("llm.toml"), DEFAULT_LLM_TOML)?;
+
+    // Credentials live in their own subdirectory (created with 0700) so they
+    // can be locked down with one chmod.
+    let credentials = crate::auth::credentials_dir()?;
+    let key_file = credentials.join("anthropic_key.toml");
+    if !key_file.exists() {
+        std::fs::write(&key_file, DEFAULT_ANTHROPIC_KEY_TEMPLATE).with_context(|| {
+            format!("failed to write Anthropic key template at {}", key_file.display())
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &key_file,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+        tracing::info!(path = %key_file.display(), "wrote Anthropic key template");
+    }
     Ok(main)
 }
 
@@ -318,6 +365,10 @@ mod tests {
         let news: crate::widgets::news::NewsConfig =
             toml::from_str(DEFAULT_NEWS_TOML).expect("news seed should parse");
         assert!(!news.feeds.is_empty(), "news seed should ship example feeds");
+        let llm: crate::llm::LlmConfig =
+            toml::from_str(DEFAULT_LLM_TOML).expect("llm seed should parse");
+        assert!(llm.enabled);
+        assert_eq!(llm.provider.name, "anthropic");
     }
 
     #[test]

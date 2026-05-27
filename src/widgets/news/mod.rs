@@ -1,6 +1,7 @@
 pub mod provider;
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -18,11 +19,22 @@ use ratatui::{
 };
 use serde::Deserialize;
 
+use crate::llm::{LlmMessage, LlmProvider, LlmRequest, Role};
 use crate::ui::{decorate_title, focus_border_style};
 
 use super::{AppContext, EventResult, Widget};
 
 use provider::{Article, FeedConfig, NewsProvider, RssProvider, Topic};
+
+#[derive(Debug, Clone)]
+enum SummaryState {
+    Requested,
+    Ready(String),
+    /// LLM call failed; we already logged the reason via tracing, so just
+    /// remember the failure so the render path can fall back to the raw RSS
+    /// excerpt rather than re-requesting.
+    Failed,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewsConfig {
@@ -63,10 +75,18 @@ struct NewsState {
     last_error: Option<String>,
     last_attempt: Option<Instant>,
     inflight: bool,
+    /// Per-article LLM summarization state, keyed by article URL.
+    summaries: HashMap<String, SummaryState>,
 }
 
 const MAX_SUMMARY_LINES: usize = 6;
 const ALL_TAB_LABEL: &str = "All";
+
+const SUMMARY_SYSTEM_PROMPT: &str = "You are a concise news summarizer. \
+Given a headline and a short excerpt, return a neutral 3-5 sentence summary \
+capturing the key facts and any direct quotes. Do not editorialize, do not \
+add preamble, do not use markdown. If the input is too sparse to summarize \
+faithfully, respond with the single sentence: \"Insufficient content to summarize.\"";
 
 pub struct NewsWidget {
     id: String,
@@ -77,10 +97,22 @@ pub struct NewsWidget {
     /// Tabs across the top of the cell. Index 0 is always `All`; the rest
     /// mirror the topic labels in news.toml.
     filter_tabs: Vec<String>,
+    /// Optional LLM provider for on-demand article summarization.
+    llm: Option<Arc<dyn LlmProvider>>,
+    /// True when the user has opted into LLM news summaries via llm.toml.
+    llm_summarize_enabled: bool,
 }
 
 impl NewsWidget {
     pub fn with_config(config: NewsConfig) -> Self {
+        Self::with_config_and_llm(config, None, false)
+    }
+
+    pub fn with_config_and_llm(
+        config: NewsConfig,
+        llm: Option<Arc<dyn LlmProvider>>,
+        llm_summarize_enabled: bool,
+    ) -> Self {
         let feeds_configured = !config.feeds.is_empty();
         let mut filter_tabs = vec![ALL_TAB_LABEL.to_string()];
         filter_tabs.extend(config.topics.iter().map(|t| t.label.clone()));
@@ -98,7 +130,74 @@ impl NewsWidget {
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(60)),
             feeds_configured,
             filter_tabs,
+            llm,
+            llm_summarize_enabled,
         }
+    }
+
+    /// Kick off an LLM summarization task for the given article if we have a
+    /// provider, summaries are enabled, and we haven't already requested one.
+    /// Skips the round-trip when the raw RSS excerpt already has enough
+    /// substance — the LLM's contribution there is marginal at best, and
+    /// replacing a useful paragraph with "Insufficient content to summarize."
+    /// is a net loss.
+    fn ensure_summary_requested(&self, article: &Article) {
+        if !self.llm_summarize_enabled || self.llm.is_none() {
+            return;
+        }
+        if !needs_llm_summary(article.summary.as_deref()) {
+            return;
+        }
+        {
+            let st = self.state.lock().expect("news state poisoned");
+            if st.summaries.contains_key(&article.url) {
+                return;
+            }
+        }
+        let Some(llm) = self.llm.clone() else {
+            return;
+        };
+        let state = self.state.clone();
+        let url = article.url.clone();
+        let title = article.title.clone();
+        let raw = article.summary.clone().unwrap_or_default();
+        {
+            let mut st = self.state.lock().expect("news state poisoned");
+            st.summaries.insert(url.clone(), SummaryState::Requested);
+        }
+        tokio::spawn(async move {
+            let request = LlmRequest {
+                model: None,
+                system: Some(SUMMARY_SYSTEM_PROMPT.into()),
+                messages: vec![LlmMessage {
+                    role: Role::User,
+                    content: format!(
+                        "Title: {title}\nURL: {url}\nRaw excerpt: {}\n",
+                        if raw.is_empty() { "(none)" } else { raw.as_str() }
+                    ),
+                }],
+                max_tokens: 350,
+                cache_system: true,
+            };
+            let outcome = match llm.complete(request).await {
+                Ok(resp) => {
+                    let text = resp.text.trim();
+                    if is_insufficient_reply(text) {
+                        // Model said it couldn't summarize — prefer the raw
+                        // excerpt over the model's apology.
+                        SummaryState::Failed
+                    } else {
+                        SummaryState::Ready(text.to_string())
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, url = %url, "LLM summarization failed");
+                    SummaryState::Failed
+                }
+            };
+            let mut st = state.lock().expect("news state poisoned");
+            st.summaries.insert(url, outcome);
+        });
     }
 
     fn cycle_filter(&mut self, forward: bool) {
@@ -462,13 +561,19 @@ impl Widget for NewsWidget {
             let is_selected = i == selected;
             let expand_this = is_selected && expanded;
 
+            // Trigger LLM summarization the first time an article is expanded.
+            if expand_this {
+                self.ensure_summary_requested(article);
+            }
+
             // How many rows would this item consume?
             let summary_lines: Vec<String> = if expand_this {
-                article
-                    .summary
-                    .as_deref()
-                    .map(|s| wrap_text(s, inner_width.saturating_sub(3), MAX_SUMMARY_LINES))
-                    .unwrap_or_default()
+                expanded_summary_lines(
+                    article,
+                    &self.state,
+                    inner_width.saturating_sub(3),
+                    self.llm_summarize_enabled && self.llm.is_some(),
+                )
             } else {
                 Vec::new()
             };
@@ -680,6 +785,62 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Threshold (in whitespace-separated words) below which an RSS excerpt is
+/// considered too thin to display on its own; only then is the LLM consulted.
+const RAW_SUMMARY_GOOD_ENOUGH_WORDS: usize = 15;
+
+/// Heuristic: does this article's raw summary look thin enough that an LLM
+/// summarization round-trip is worth it? Empty or stubby ("Read more…")
+/// excerpts → yes; a substantive paragraph → no, just show the raw text.
+fn needs_llm_summary(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(s) => s.split_whitespace().count() < RAW_SUMMARY_GOOD_ENOUGH_WORDS,
+    }
+}
+
+/// Detects the canonical "I can't summarize this" sentence we asked the model
+/// to emit when the input was too sparse. Match is case-insensitive and
+/// tolerant of trailing punctuation / whitespace.
+fn is_insufficient_reply(text: &str) -> bool {
+    let lower = text.trim().to_lowercase();
+    lower.starts_with("insufficient content to summarize")
+        || lower.starts_with("insufficient information to summarize")
+}
+
+/// Returns the wrapped lines to render under an expanded article. Prefers an
+/// LLM summary when one has come back; otherwise falls back to the wrapped
+/// raw RSS excerpt. While the LLM call is in flight we show a "Summarizing…"
+/// placeholder so the user has visual feedback.
+fn expanded_summary_lines(
+    article: &Article,
+    state: &Arc<Mutex<NewsState>>,
+    max_width: usize,
+    llm_enabled: bool,
+) -> Vec<String> {
+    let summary_state = {
+        let st = state.lock().expect("news state poisoned");
+        st.summaries.get(&article.url).cloned()
+    };
+    let raw = article.summary.as_deref().unwrap_or("");
+    let raw_lines = || wrap_text(raw, max_width, MAX_SUMMARY_LINES);
+
+    if !llm_enabled {
+        return raw_lines();
+    }
+    match summary_state {
+        Some(SummaryState::Ready(text)) => wrap_text(&text, max_width, MAX_SUMMARY_LINES),
+        Some(SummaryState::Requested) => {
+            let mut out = vec!["Summarizing…".to_string()];
+            if !raw.is_empty() {
+                out.extend(wrap_text(raw, max_width, MAX_SUMMARY_LINES.saturating_sub(1)));
+            }
+            out
+        }
+        Some(SummaryState::Failed) | None => raw_lines(),
+    }
+}
+
 /// Naive word-wrap: greedy line-fill at `max_width` columns, capped at
 /// `max_lines`. Words longer than `max_width` are character-truncated. If the
 /// text doesn't fully fit, the last emitted line ends in `…`.
@@ -823,6 +984,34 @@ mod tests {
     fn empty_feeds_is_visible_in_state() {
         let w = NewsWidget::with_config(NewsConfig::default());
         assert!(!w.feeds_configured);
+    }
+
+    #[test]
+    fn needs_llm_summary_skips_substantial_excerpts() {
+        // A real paragraph — no need for the LLM.
+        let paragraph = "Apple today announced the iPhone 16 with a new A18 chip, \
+            improved camera system, and a redesigned aluminium chassis available in \
+            five colors. Pre-orders start Friday.";
+        assert!(!needs_llm_summary(Some(paragraph)));
+    }
+
+    #[test]
+    fn needs_llm_summary_kicks_in_for_thin_excerpts() {
+        assert!(needs_llm_summary(None));
+        assert!(needs_llm_summary(Some("")));
+        assert!(needs_llm_summary(Some("Read more")));
+        assert!(needs_llm_summary(Some("Apple announces new iPhone today.")));
+    }
+
+    #[test]
+    fn is_insufficient_reply_recognizes_canonical_phrasings() {
+        assert!(is_insufficient_reply("Insufficient content to summarize."));
+        assert!(is_insufficient_reply("insufficient content to summarize"));
+        assert!(is_insufficient_reply("  INSUFFICIENT CONTENT TO SUMMARIZE.  "));
+        assert!(is_insufficient_reply(
+            "Insufficient information to summarize this article."
+        ));
+        assert!(!is_insufficient_reply("Apple announced…"));
     }
 
     #[test]

@@ -710,6 +710,7 @@ dependencies = [
  "dirs",
  "feed-rs",
  "futures",
+ "lru",
  "notify",
  "open",
  "ratatui",

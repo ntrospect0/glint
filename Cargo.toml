@@ -33,6 +33,7 @@ futures = "0.3"
 open = "5"
 urlencoding = "2"
 feed-rs = "2"
+lru = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 strsim = "0.11"
