@@ -1,3 +1,4 @@
+pub mod calendar;
 pub mod clock;
 pub mod stocks;
 pub mod weather;

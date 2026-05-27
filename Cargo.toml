@@ -30,6 +30,8 @@ chrono-tz = "0.9"
 anyhow = "1"
 async-trait = "0.1"
 futures = "0.3"
+open = "5"
+urlencoding = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 strsim = "0.11"

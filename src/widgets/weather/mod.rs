@@ -18,6 +18,7 @@ use ratatui::{
 use serde::Deserialize;
 
 use crate::providers::DataProvider;
+use crate::ui::{decorate_title, focus_border_style};
 
 use super::{AppContext, EventResult, Widget};
 
@@ -164,17 +165,12 @@ impl Widget for WeatherWidget {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
-        let border_style = if focused {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        let title = format!(" Weather — {} ", self.config.label);
+        let title_base = format!("Weather — {}", self.config.label);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(border_style)
+            .border_style(focus_border_style(focused))
             .title(Span::styled(
-                title,
+                decorate_title(focused, &title_base),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
 

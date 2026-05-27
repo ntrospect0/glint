@@ -9,6 +9,8 @@ use ratatui::{
     Frame,
 };
 
+use crate::ui::{decorate_title, focus_border_style};
+
 use super::{AppContext, EventResult, Widget};
 
 /// Phase 1 placeholder. The real implementation will fetch quotes via
@@ -46,16 +48,11 @@ impl Widget for StocksWidget {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
-        let border_style = if focused {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(border_style)
+            .border_style(focus_border_style(focused))
             .title(Span::styled(
-                " Stocks ",
+                decorate_title(focused, "Stocks"),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
         let body = Paragraph::new(vec![

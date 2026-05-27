@@ -12,6 +12,8 @@ use ratatui::{
 };
 use serde::Deserialize;
 
+use crate::ui::{decorate_title, focus_border_style};
+
 use super::{AppContext, EventResult, Widget};
 
 /// User-configurable clock options (loaded from `~/.config/glint/clock.toml`).
@@ -213,20 +215,15 @@ impl Widget for ClockWidget {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
-        let border_style = if focused {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        let title = match &self.tz {
-            Some(tz) => format!(" Clock — {tz} "),
-            None => " Clock ".into(),
+        let title_base = match &self.tz {
+            Some(tz) => format!("Clock — {tz}"),
+            None => "Clock".into(),
         };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(border_style)
+            .border_style(focus_border_style(focused))
             .title(Span::styled(
-                title,
+                decorate_title(focused, &title_base),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
 

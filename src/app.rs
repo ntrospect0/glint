@@ -8,11 +8,14 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
+use chrono::Local;
+
 use crate::{
     config::{self, Config},
     event::{Event, EventReader},
     ui,
     widgets::{
+        calendar::{CalendarConfig, CalendarWidget},
         clock::{ClockConfig, ClockWidget},
         stocks::StocksWidget,
         weather::{WeatherConfig, WeatherWidget},
@@ -20,8 +23,8 @@ use crate::{
     },
 };
 
-/// Top-level app state. Phase 1 keeps this intentionally tiny — it'll grow as
-/// the command bar, status bar, and help overlay land.
+/// Top-level app state. Grows as the command bar, status bar, and help
+/// overlay land in subsequent phases.
 pub struct App {
     config: Config,
     manager: WidgetManager,
@@ -29,17 +32,22 @@ pub struct App {
     /// Widget ids in the order they appear in the grid (Tab cycling order).
     focus_order: Vec<String>,
     should_quit: bool,
+    /// Set on every successful tick to drive the status-bar "Last fetch" field.
+    last_fetch: Option<chrono::DateTime<Local>>,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
         let clock_cfg: ClockConfig = config::load_widget_toml("clock").unwrap_or_default();
         let weather_cfg: WeatherConfig = config::load_widget_toml("weather").unwrap_or_default();
+        let calendar_cfg: CalendarConfig =
+            config::load_widget_toml("calendar").unwrap_or_default();
 
         let mut manager = WidgetManager::new();
         manager.register(StocksWidget::new());
         manager.register(ClockWidget::with_config(clock_cfg));
         manager.register(WeatherWidget::with_config(weather_cfg));
+        manager.register(CalendarWidget::with_config(calendar_cfg));
 
         let focus_order = focus_order_from_layout(&config, &manager);
         Self {
@@ -48,6 +56,7 @@ impl App {
             focus_idx: 0,
             focus_order,
             should_quit: false,
+            last_fetch: None,
         }
     }
 
@@ -108,7 +117,13 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
 
     // Initial draw before the first event arrives.
     terminal.draw(|frame| {
-        ui::render(frame, &app.config.layout, &app.manager, app.focused_widget());
+        ui::render(
+            frame,
+            &app.config.layout,
+            &app.manager,
+            app.focused_widget(),
+            app.last_fetch,
+        );
     })?;
 
     let ctx = AppContext;
@@ -136,8 +151,6 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                 // Ratatui handles the re-layout on the next draw call below.
             }
             Event::Tick => {
-                // Phase 1 has no async-fetching widgets, but we walk the list
-                // anyway so future widgets pick this up automatically.
                 for id in app.manager.ids().to_vec() {
                     if let Some(w) = app.manager.get_mut(&id) {
                         if let Err(err) = w.update(&ctx).await {
@@ -145,6 +158,7 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                         }
                     }
                 }
+                app.last_fetch = Some(Local::now());
             }
         }
 
@@ -153,7 +167,13 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
         }
 
         terminal.draw(|frame| {
-            ui::render(frame, &app.config.layout, &app.manager, app.focused_widget());
+            ui::render(
+                frame,
+                &app.config.layout,
+                &app.manager,
+                app.focused_widget(),
+                app.last_fetch,
+            );
         })?;
     }
 
@@ -194,6 +214,7 @@ mod tests {
                 "stocks".to_string(),
                 "clock".to_string(),
                 "weather".to_string(),
+                "calendar".to_string(),
             ]
         );
         assert_eq!(app.focused_widget(), Some("stocks"));
@@ -202,8 +223,10 @@ mod tests {
         app.cycle_focus(true);
         assert_eq!(app.focused_widget(), Some("weather"));
         app.cycle_focus(true);
+        assert_eq!(app.focused_widget(), Some("calendar"));
+        app.cycle_focus(true);
         assert_eq!(app.focused_widget(), Some("stocks"));
         app.cycle_focus(false);
-        assert_eq!(app.focused_widget(), Some("weather"));
+        assert_eq!(app.focused_widget(), Some("calendar"));
     }
 }

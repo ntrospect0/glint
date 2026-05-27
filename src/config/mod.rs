@@ -113,6 +113,41 @@ units = "imperial"          # or "metric"
 poll_interval_secs = 600
 "#;
 
+pub const DEFAULT_CALENDAR_TOML: &str = r#"# Default view: "day", "week", or "month".
+default_view = "day"
+poll_interval_secs = 60
+
+# Example events. Replace these with your own — timed events use RFC3339
+# timestamps with a timezone offset; all-day events use bare YYYY-MM-DD.
+# Google Calendar wiring lands in a later release.
+
+[[events]]
+title = "Team standup"
+start = "2026-05-20T09:30:00-07:00"
+end = "2026-05-20T10:00:00-07:00"
+calendar = "work"
+location = "Zoom"
+
+[[events]]
+title = "Coffee with Sara"
+start = "2026-05-20T15:00:00-07:00"
+end = "2026-05-20T16:00:00-07:00"
+calendar = "personal"
+
+[[events]]
+title = "Project review"
+start = "2026-05-21T13:00:00-07:00"
+end = "2026-05-21T14:30:00-07:00"
+calendar = "work"
+
+[[events]]
+title = "Conference"
+start = "2026-05-23"
+end = "2026-05-24"
+all_day = true
+calendar = "personal"
+"#;
+
 /// Create `~/.config/glint/` and seed the default config files if they do not
 /// already exist. Returns the path of the main `config.toml`.
 pub fn init_default_config() -> Result<PathBuf> {
@@ -124,6 +159,7 @@ pub fn init_default_config() -> Result<PathBuf> {
     seed(&main, DEFAULT_CONFIG_TOML)?;
     seed(&dir.join("clock.toml"), DEFAULT_CLOCK_TOML)?;
     seed(&dir.join("weather.toml"), DEFAULT_WEATHER_TOML)?;
+    seed(&dir.join("calendar.toml"), DEFAULT_CALENDAR_TOML)?;
     Ok(main)
 }
 
@@ -158,11 +194,14 @@ mod tests {
     }
 
     #[test]
-    fn default_clock_and_weather_seed_files_parse() {
+    fn default_widget_seed_files_parse() {
         let _: crate::widgets::clock::ClockConfig =
             toml::from_str(DEFAULT_CLOCK_TOML).expect("clock seed should parse");
         let _: crate::widgets::weather::WeatherConfig =
             toml::from_str(DEFAULT_WEATHER_TOML).expect("weather seed should parse");
+        let cal: crate::widgets::calendar::CalendarConfig =
+            toml::from_str(DEFAULT_CALENDAR_TOML).expect("calendar seed should parse");
+        assert!(!cal.events.is_empty(), "calendar seed should ship example events");
     }
 
     #[test]
