@@ -115,10 +115,6 @@ impl CalendarProvider for LocalCalendarProvider {
         filtered.sort_by_key(|e| e.start);
         Ok(filtered)
     }
-
-    fn name(&self) -> &str {
-        "local"
-    }
 }
 
 #[cfg(test)]

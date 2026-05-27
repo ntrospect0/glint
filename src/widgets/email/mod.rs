@@ -29,6 +29,7 @@ use ratatui::{
 };
 use serde::Deserialize;
 
+use crate::cache::ScopedCache;
 use crate::llm::{LlmMessage, LlmProvider, LlmRequest, Role};
 use crate::theme::{ColorScheme, Theme};
 use crate::ui::decorated_title_line;
@@ -56,41 +57,36 @@ enum SummaryState {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EmailConfig {
-    /// "outlook" or "gmail". Anything else falls back to a placeholder so
-    /// the widget still renders.
+    /// `"outlook"` or `"gmail"`. Anything else renders a placeholder.
     #[serde(default = "default_provider")]
     pub provider: String,
 
-    /// Pull every message with `receivedDateTime >= now - latest_days`.
+    /// Pull messages received within the last N days.
     #[serde(default = "default_latest_days")]
     pub latest_days: u32,
 
-    /// Background poll cadence.
     #[serde(default = "default_refresh_minutes")]
     pub refresh_minutes: u64,
 
-    /// Folder names to monitor. Gmail's are label ids (INBOX, SENT, …),
-    /// Outlook accepts well-known names (inbox, sentitems, …).
+    /// Gmail label ids (`INBOX`, `SENT`, …) or Outlook well-known names
+    /// (`inbox`, `sentitems`, …).
     #[serde(default = "default_folders")]
     pub folders: Vec<String>,
 
-    /// When true and an LlmProvider is wired in, pressing `s` on an
-    /// expanded message fetches a Claude-generated summary.
+    /// On-demand message summarisation when an LLM provider is configured.
+    /// Press `s` on an expanded message.
     #[serde(default)]
     pub summarize_with_llm: bool,
 
-    /// Optional override for the address displayed in the title line.
-    /// When set, the title shows it immediately at startup instead of
-    /// "(loading…)". The provider's authoritative `/me` lookup still
-    /// runs and replaces it once the first fetch completes.
+    /// Pre-populates the title's address before the provider's `/me` lookup
+    /// resolves. The lookup still runs and overwrites this once it returns.
     #[serde(default)]
     pub account_address: Option<String>,
 
     #[serde(default)]
     pub colors: ColorScheme,
 
-    /// Prioritized `Shift+<letter>` focus shortcut list. Default is the
-    /// letters in "email".
+    /// `Shift+<letter>` focus shortcuts; falls back to the letters in "email".
     #[serde(default)]
     pub shortcuts: Vec<char>,
 }
@@ -149,6 +145,27 @@ struct EmailState {
     last_list_area: Option<Rect>,
 }
 
+const CACHE_KEY_MESSAGES: &str = "messages";
+
+/// Cache-key namespace for LLM-generated message summaries. Each summary is
+/// keyed by `summary-<sha256(id)>`. Provider IDs are filesystem-safe today
+/// (Gmail hex, Outlook alphanumeric) but hashing keeps the namespace bounded
+/// and future-provider-proof. Email bodies don't change post-delivery so a
+/// cached summary is valid until the user explicitly clears the cache.
+const SUMMARY_CACHE_PREFIX: &str = "summary-";
+
+fn summary_cache_key(id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(id.as_bytes());
+    let mut key = String::with_capacity(SUMMARY_CACHE_PREFIX.len() + 16);
+    key.push_str(SUMMARY_CACHE_PREFIX);
+    for b in &digest[..8] {
+        use std::fmt::Write;
+        let _ = write!(key, "{b:02x}");
+    }
+    key
+}
+
 pub struct EmailWidget {
     id: String,
     instance: String,
@@ -177,6 +194,8 @@ pub struct EmailWidget {
     theme: Theme,
     shortcut: Option<char>,
     shortcut_prefs: Vec<char>,
+    /// Persistent cache of the merged message list across configured folders.
+    cache: ScopedCache,
 }
 
 /// Thin wrapper so the widget can fetch a fresh `cached_account()` snapshot
@@ -217,6 +236,7 @@ impl EmailWidget {
             config,
             None,
             Arc::new(Theme::builtin_defaults()),
+            ScopedCache::ephemeral(),
         )
     }
 
@@ -225,6 +245,7 @@ impl EmailWidget {
         config: EmailConfig,
         llm: Option<Arc<dyn LlmProvider>>,
         app_theme: Arc<Theme>,
+        cache: ScopedCache,
     ) -> Self {
         let folders = if config.folders.is_empty() {
             default_folders()
@@ -268,18 +289,28 @@ impl EmailWidget {
             SeenStore::load(&provider_label, "_unknown_").expect("seen-store fallback failed")
         });
 
+        let poll_interval = Duration::from_secs(config.refresh_minutes.max(1) * 60);
+        // Seed messages from cache so the first render shows the prior
+        // session's inbox while the refresh runs in the background.
+        let mut initial_state = EmailState {
+            account: config.account_address.clone(),
+            ..EmailState::default()
+        };
+        if let Some(entry) = cache.load::<Vec<EmailMessage>>(CACHE_KEY_MESSAGES) {
+            let age = entry.age().min(poll_interval);
+            initial_state.messages = entry.value;
+            initial_state.last_attempt = Some(Instant::now() - age);
+        }
+
         Self {
             id,
             instance,
             display_name_cache,
             provider: Arc::new(provider),
-            state: Arc::new(Mutex::new(EmailState {
-                account: config.account_address.clone(),
-                ..EmailState::default()
-            })),
+            state: Arc::new(Mutex::new(initial_state)),
             seen: Arc::new(Mutex::new(seen)),
             folders,
-            poll_interval: Duration::from_secs(config.refresh_minutes.max(1) * 60),
+            poll_interval,
             latest_days: config.latest_days.max(1),
             summarize_with_llm: config.summarize_with_llm,
             llm,
@@ -291,6 +322,7 @@ impl EmailWidget {
             theme,
             shortcut: None,
             shortcut_prefs,
+            cache,
         }
     }
 
@@ -337,6 +369,7 @@ impl EmailWidget {
         let state = self.state.clone();
         let folders = self.folders.clone();
         let latest_days = self.latest_days;
+        let cache = self.cache.clone();
         tokio::spawn(async move {
             let Some(prov) = provider.as_provider() else {
                 let mut st = state.lock().expect("email state poisoned");
@@ -357,6 +390,13 @@ impl EmailWidget {
             }
             // Sort newest-first across all folders.
             messages.sort_by_key(|m| std::cmp::Reverse(m.received));
+            // Persist before swapping state so a concurrent reload sees the
+            // same payload either way. Errors are warned and ignored.
+            if last_error.is_none() {
+                if let Err(err) = cache.store(CACHE_KEY_MESSAGES, &messages) {
+                    tracing::warn!(error = %err, "email cache store failed");
+                }
+            }
             // Capture the just-refreshed account address (the providers populate
             // their cache during fetch_recent).
             let account = provider.cached_account();
@@ -460,10 +500,18 @@ impl EmailWidget {
                 return;
             }
         }
+        let cache_key = summary_cache_key(&msg.id);
+        if let Some(entry) = self.cache.load::<String>(&cache_key) {
+            let mut st = self.state.lock().expect("email state poisoned");
+            st.summaries
+                .insert(msg.id.clone(), SummaryState::Ready(entry.value));
+            return;
+        }
         let Some(llm) = self.llm.clone() else {
             return;
         };
         let state = self.state.clone();
+        let cache = self.cache.clone();
         {
             let mut st = self.state.lock().expect("email state poisoned");
             st.summaries.insert(msg.id.clone(), SummaryState::Requested);
@@ -500,6 +548,11 @@ impl EmailWidget {
                     SummaryState::Failed
                 }
             };
+            if let SummaryState::Ready(text) = &outcome {
+                if let Err(err) = cache.store(&cache_key, text) {
+                    tracing::warn!(error = %err, id = %id, "email summary cache store failed");
+                }
+            }
             let mut st = state.lock().expect("email state poisoned");
             st.summaries.insert(id, outcome);
         });
@@ -580,7 +633,7 @@ fn build_outlook() -> Result<outlook::OutlookEmailProvider, String> {
     let token = MicrosoftToken::load()
         .map_err(|err| format!("Outlook token unreadable: {err}"))?
         .ok_or_else(|| {
-            "Run `glint --auth outlook` to connect Microsoft Outlook (the Email widget needs Mail.Read — re-run after upgrading)".to_string()
+            "Run `glint --auth microsoft` to connect Microsoft Outlook (the Email widget needs Mail.Read — re-run after upgrading)".to_string()
         })?;
     outlook::OutlookEmailProvider::new(client, token)
         .map_err(|err| format!("Outlook email init failed: {err}"))
@@ -1031,8 +1084,9 @@ impl Widget for EmailWidget {
             serde_json::from_value(config).context("invalid email config payload")?;
         let llm = self.llm.clone();
         let app_theme = self.app_theme.clone();
+        let cache = self.cache.clone();
         let instance = self.instance.clone();
-        *self = Self::with_config_and_llm(instance, new_config, llm, app_theme);
+        *self = Self::with_config_and_llm(instance, new_config, llm, app_theme, cache);
         Ok(())
     }
 
@@ -1177,6 +1231,20 @@ fn wrap_text(text: &str, max_width: usize, max_lines: usize) -> Vec<String> {
         }
     }
     lines
+}
+
+pub const KIND: &str = "email";
+
+pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
+    let cfg: EmailConfig =
+        crate::config::load_widget_toml_for_instance(KIND, &ctx.instance).unwrap_or_default();
+    Box::new(EmailWidget::with_config_and_llm(
+        ctx.instance.clone(),
+        cfg,
+        ctx.llm.clone(),
+        ctx.theme.clone(),
+        ctx.cache.clone(),
+    ))
 }
 
 #[cfg(test)]

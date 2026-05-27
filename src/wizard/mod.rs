@@ -24,10 +24,13 @@ use crate::config::layout::{GridCell, LayoutConfig};
 use crate::config::{self, config_dir, config_path};
 use crate::widgets::calendar::{CalendarConfig, ProviderEntry, ProviderKind};
 use crate::widgets::clock::{ClockConfig, SecondaryTimezone};
+#[cfg(feature = "widget-email")]
 use crate::widgets::email::EmailConfig;
+#[cfg(feature = "widget-gallery")]
 use crate::widgets::gallery::GalleryConfig;
 use crate::widgets::news::NewsConfig;
 use crate::widgets::parse_widget_ref;
+#[cfg(feature = "widget-resources")]
 use crate::widgets::resources::ResourcesConfig;
 use crate::widgets::stocks::StocksConfig;
 use crate::widgets::weather::provider::Units;
@@ -170,12 +173,15 @@ pub fn run() -> Result<()> {
     for instance in instances_for(&instances, "calendar") {
         step_calendar(&mut report, &instance)?;
     }
+    #[cfg(feature = "widget-resources")]
     for instance in instances_for(&instances, "resources") {
         step_resources(&mut report, &instance)?;
     }
+    #[cfg(feature = "widget-gallery")]
     for instance in instances_for(&instances, "gallery") {
         step_gallery(&mut report, &instance)?;
     }
+    #[cfg(feature = "widget-email")]
     for instance in instances_for(&instances, "email") {
         step_email(&mut report, &instance)?;
     }
@@ -1492,11 +1498,7 @@ fn step_calendar(report: &mut WizardReport, instance: &str) -> Result<()> {
     let path = config_dir()?.join(format!("{stem}.toml"));
 
     if existing.providers.is_empty() {
-        let kind = provider_kind_str(existing.provider);
-        println!("Current provider: {kind} (single-provider mode)");
-        if !existing.calendar_ids.is_empty() {
-            println!("Calendar IDs: {}", existing.calendar_ids.join(", "));
-        }
+        println!("Current providers: (none — local-only mode)");
     } else {
         println!("Current providers ({}):", existing.providers.len());
         for (i, p) in existing.providers.iter().enumerate() {
@@ -1565,7 +1567,7 @@ fn step_calendar(report: &mut WizardReport, instance: &str) -> Result<()> {
                 println!();
                 println!("Outlook / Microsoft 365: after this wizard, ensure");
                 println!("~/.config/glint/credentials/microsoft_oauth_client.toml has your");
-                println!("Azure app client_id, then run `glint --auth outlook`.");
+                println!("Azure app client_id, then run `glint --auth microsoft`.");
                 let ids = read_comma_list(
                     "Calendar IDs (comma-separated, empty for primary): ",
                 )?;
@@ -1694,6 +1696,7 @@ fn write_caldav_credentials(server: &str, username: &str, report: &mut WizardRep
 
 // ── Step 4: LLM API key ─────────────────────────────────────────────────────
 
+#[cfg(feature = "widget-resources")]
 fn step_resources(report: &mut WizardReport, instance: &str) -> Result<()> {
     println!();
     let header = instance_header("Resources", instance);
@@ -1751,6 +1754,7 @@ fn step_resources(report: &mut WizardReport, instance: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "widget-resources")]
 fn render_resources_toml(interval_secs: u64, top_n: usize, sort_by_memory: bool) -> String {
     let mut out = String::new();
     out.push_str("# Resources widget — CPU / memory / top-process snapshot.\n");
@@ -1761,6 +1765,7 @@ fn render_resources_toml(interval_secs: u64, top_n: usize, sort_by_memory: bool)
     out
 }
 
+#[cfg(feature = "widget-gallery")]
 fn step_gallery(report: &mut WizardReport, instance: &str) -> Result<()> {
     println!();
     let header = instance_header("Gallery", instance);
@@ -1863,10 +1868,19 @@ fn step_gallery(report: &mut WizardReport, instance: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "widget-gallery")]
 fn render_gallery_toml(images: &[String], rotation_secs: u64) -> String {
     let mut out = String::new();
     out.push_str("# Photo slideshow for the Gallery widget.\n");
-    out.push_str("# `rotation_secs`: any positive integer (seconds) or 0 to start paused.\n");
+    out.push_str("#\n");
+    out.push_str("# `images` accepts literal file paths and simple globs:\n");
+    out.push_str("#   \"~/Pictures/cover.png\"   — one file\n");
+    out.push_str("#   \"~/Pictures/*\"           — every image file in the directory\n");
+    out.push_str("#   \"~/Downloads/*.jpg\"      — every .jpg in the directory\n");
+    out.push_str("#\n");
+    out.push_str("# `rotation_secs`        : seconds between slides (0 = start paused).\n");
+    out.push_str("# `rescan_interval_secs` : how often glob entries are re-scanned for\n");
+    out.push_str("#                          newly added images (0 = disable, min 30s).\n");
     out.push_str("# Press `p` to pause/resume, `n`/`N` to step, ↑/↓ to tune the timer.\n\n");
     out.push_str("images = [\n");
     for img in images {
@@ -1874,11 +1888,13 @@ fn render_gallery_toml(images: &[String], rotation_secs: u64) -> String {
     }
     out.push_str("]\n");
     out.push_str(&format!("rotation_secs = {rotation_secs}\n"));
+    out.push_str("rescan_interval_secs = 300\n");
     out
 }
 
 /// `~/` → `$HOME`, otherwise pass through. Local to this module so we
 /// don't have to leak the gallery widget's helper out.
+#[cfg(feature = "widget-gallery")]
 fn resolve_tilde(raw: &str) -> std::path::PathBuf {
     if let Some(rest) = raw.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -1891,6 +1907,7 @@ fn resolve_tilde(raw: &str) -> std::path::PathBuf {
 /// Read `dir`, return paths whose extension matches a known image
 /// suffix (case-insensitive). One level deep — we don't recurse since
 /// that surprises users who only meant to grab the top-level folder.
+#[cfg(feature = "widget-gallery")]
 fn scan_image_directory(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
     const EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp"];
     let mut paths: Vec<String> = Vec::new();
@@ -1916,6 +1933,7 @@ fn scan_image_directory(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
     Ok(paths)
 }
 
+#[cfg(feature = "widget-email")]
 fn step_email(report: &mut WizardReport, instance: &str) -> Result<()> {
     println!();
     let header = instance_header("Email", instance);
@@ -2021,6 +2039,7 @@ fn step_email(report: &mut WizardReport, instance: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "widget-email")]
 fn render_email_toml(
     provider: &str,
     latest_days: u32,

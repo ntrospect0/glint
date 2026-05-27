@@ -189,10 +189,6 @@ impl CalendarProvider for CalDavProvider {
         events.sort_by_key(|e| e.start);
         Ok(events)
     }
-
-    fn name(&self) -> &str {
-        "caldav"
-    }
 }
 
 /// PROPFIND chain to discover the user's calendars from a bare CalDAV

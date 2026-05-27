@@ -89,6 +89,14 @@ command_key = ":"
 refresh_all_on_focus = true
 log_level = "info"
 
+# Vertical mouse-wheel direction.
+#   "natural"  — wheel-up scrolls a list selection / pane content up (default).
+#   "inverted" — wheel-up scrolls down. Pick this if your trackpad / mouse
+#                feels backwards in news, email, stocks, and other scrollable
+#                widgets. Applied once at the platform boundary so every
+#                widget honors the choice without per-widget config.
+mouse_scroll = "natural"
+
 [layout]
 columns = [40, 60]
 rows = [35, 35, 30]
@@ -166,6 +174,11 @@ horizontal_scroll_filters = false
 # Show the topic categorization (e.g. `[Business,World]`) on each article's
 # meta row. Many users prefer the quieter look — flip this off to hide.
 show_topic_labels = true
+
+# When true and an LLM provider is configured in llm.toml, expanded
+# articles request an on-demand summary from the LLM. Set to false to
+# stay fully offline even when the provider is wired up.
+summarize_with_llm = true
 
 # RSS / Atom feeds to aggregate. `label` is shown in the article row.
 # All sources here are free / non-paywall to read (some have paywalls on
@@ -470,12 +483,9 @@ max_requests_per_minute = 20
 cache_capacity = 1024
 
 # ── Per-feature toggles ──────────────────────────────────────────────────────
-# Each defaults to a sensible value; flip off if you want to avoid LLM calls
-# for a specific feature.
-[features]
-news_summarize = true
-news_classify = false
-stock_disambiguate = false
+# Per-widget LLM toggles live in each widget's own TOML — e.g. news.toml has
+# `summarize_with_llm = true`, email.toml has its own. Nothing widget-specific
+# belongs in this file.
 "#;
 
 pub const DEFAULT_ANTHROPIC_KEY_TEMPLATE: &str = r#"# Anthropic API key. Get one at https://console.anthropic.com/.
@@ -496,7 +506,7 @@ pub const DEFAULT_MICROSOFT_CLIENT_TEMPLATE: &str = r#"# Microsoft OAuth client 
 #      applications" → check the "http://localhost" loopback option. Save.
 #   5. Sidebar → API permissions → "Add a permission" → Microsoft Graph →
 #      Delegated permissions → check `Calendars.Read` → Add.
-#   6. Back here, save this file, then run:  glint --auth outlook
+#   6. Back here, save this file, then run:  glint --auth microsoft
 #
 # `tenant` defaults to "common" which accepts both personal and work/school
 # accounts. Set it to a specific tenant UUID if your org requires it.
@@ -560,38 +570,30 @@ pub const DEFAULT_CALENDAR_TOML: &str = r#"# Default view: "day", "week", or "mo
 default_view = "day"
 poll_interval_secs = 60
 
-# Provider: "local" (use the [[events]] block below), "google" (run
-# `glint --auth google` first; calendars listed in `calendar_ids`),
-# "outlook" (Microsoft 365 / outlook.com — run `glint --auth outlook`
-# after filling in microsoft_oauth_client.toml), or "caldav" (Apple
-# iCloud / Fastmail / Nextcloud / Synology — fills in caldav.toml).
-provider = "local"
-
-# Multi-provider mode: merge events from two or more backends into one
-# timeline. When [[providers]] entries exist, they take priority over the
-# singular `provider` field above. Cell title shows "google+outlook" etc.
+# Calendar sources. Each [[providers]] entry pulls events from one backend;
+# add multiple entries to merge timelines (e.g. work Google + personal
+# Outlook). The default config is "local" — events listed below — which works
+# offline. Comment in any of these and `glint --auth <name>` to connect a
+# real backend.
 #
 # [[providers]]
-# kind = "google"
-# calendar_ids = ["primary"]
+# kind = "google"            # run `glint --auth google` first
+# calendar_ids = ["primary"] # or e.g. ["team@group.calendar.google.com"]
 #
 # [[providers]]
-# kind = "outlook"
+# kind = "outlook"           # run `glint --auth microsoft` first
 # calendar_ids = []          # empty = the account's default calendar
 #
 # [[providers]]
-# kind = "caldav"
-# calendar_ids = []          # empty = auto-discover every iCloud calendar
+# kind = "caldav"            # fill in credentials/caldav.toml
+# calendar_ids = []          # empty = auto-discover every calendar
 
-# Google-only: which calendars to fetch. Use "primary" for your main one.
-# calendar_ids = ["primary", "team@group.calendar.google.com"]
-
-# CalDAV-only: optional explicit calendar URLs. Leave empty to auto-discover
-# every calendar your account has access to.
+# CalDAV-only: optional explicit calendar URLs used when a `caldav` provider
+# entry doesn't supply its own `calendar_ids`. Auto-discovers when empty.
 # [caldav]
 # calendars = []
 
-# Example events. Replace these with your own — timed events use RFC3339
+# Example events for the built-in "local" provider — timed events use RFC3339
 # timestamps with a timezone offset; all-day events use bare YYYY-MM-DD.
 
 [[events]]

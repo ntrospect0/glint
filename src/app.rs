@@ -12,72 +12,60 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 
 use crate::{
+    cache::Cache,
     config::{self, Config},
     event::{Event, EventReader},
     llm::{self, LlmConfig, LlmProvider},
     theme::{self, Theme},
     ui,
-    widgets::{
-        calendar::{CalendarConfig, CalendarWidget},
-        clock::{ClockConfig, ClockWidget},
-        news::{NewsConfig, NewsWidget},
-        parse_widget_ref,
-        stocks::{StocksConfig, StocksWidget},
-        weather::{WeatherConfig, WeatherWidget},
-        AppContext, EventResult, WidgetManager,
-    },
+    widgets::{parse_widget_ref, registry, AppContext, EventResult, WidgetCtx, WidgetManager},
 };
 
-/// Top-level app state. Grows as the command bar, status bar, and help
-/// overlay land in subsequent phases.
 pub struct App {
     config: Config,
     theme: Arc<Theme>,
     manager: WidgetManager,
     focus_idx: usize,
-    /// Widget ids in the order they appear in the grid (Tab cycling order).
+    /// Widget ids in layout order (Tab cycles through this).
     focus_order: Vec<String>,
-    /// Letter → widget id map for `Shift+<letter>` focus jumps. Built once
-    /// at construction by walking each widget's `shortcut_preferences`
-    /// list; first registered widget wins on conflicts.
+    /// `Shift+<letter>` → widget id. First registered widget wins on conflicts.
     shortcuts: HashMap<char, String>,
     should_quit: bool,
-    /// True when the `?` help overlay is showing.
     show_help: bool,
-    /// Row offset for the help overlay's vertical scroll. Cleared to 0
-    /// when the overlay opens.
     help_scroll: u16,
-    /// Last-known maximum scroll value for the help overlay. Updated by
-    /// `ui::help::render` on every frame so the scroll handler can clamp
-    /// without re-computing the layout.
+    /// Max scroll updated by `ui::help::render` so the scroll handler can
+    /// clamp without re-computing the layout.
     help_scroll_max: Cell<u16>,
-    /// `Some` while the user is composing a command after pressing `:`.
-    /// `None` when the command bar is closed.
+    /// `Some` while the user is composing after pressing `:`.
     command_buffer: Option<String>,
-    /// Transient status line shown next to the command bar — used for error
-    /// feedback after a failed command. Cleared on the next keystroke.
+    /// Transient feedback shown next to the command bar; cleared on next key.
     command_feedback: Option<String>,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
-        // Resolve the app-level color palette. Falls back to built-in
-        // defaults if `colorschemes.toml` is missing or the named scheme
-        // can't be found — the app should always start.
+        // Theme + LLM are both best-effort: missing files / unknown schemes /
+        // missing API keys all log a warning and continue with sensible
+        // defaults (built-in palette, no LLM).
         let theme = theme::load(&config.global.theme).unwrap_or_else(|err| {
             tracing::warn!(error = %err, "failed to load colorschemes.toml, using built-in defaults");
             Arc::new(Theme::builtin_defaults())
         });
 
-        // LLM is optional: if llm.toml is missing or no Anthropic key is on
-        // disk, `build_provider` returns None and widgets fall back to their
-        // non-LLM paths.
         let llm_cfg: LlmConfig = config::load_widget_toml("llm").unwrap_or_default();
         let llm_provider = llm::build_provider(&llm_cfg).unwrap_or_else(|err| {
             tracing::warn!(error = %err, "failed to build LLM provider");
             None
         });
-        let news_summarize = llm_cfg.features.news_summarize;
+
+        // Cache root opened once and scoped per-widget at registration time.
+        // If the home dir can't be resolved (exotic environment), fall back
+        // to the system temp dir — widgets keep working, they just don't
+        // persist between runs.
+        let cache = Cache::open_default().unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "failed to resolve cache dir; using temp dir");
+            Cache::at(std::env::temp_dir().join("glint-cache"))
+        });
 
         let mut manager = WidgetManager::new();
         register_widgets_from_layout(
@@ -85,7 +73,7 @@ impl App {
             &config,
             theme.clone(),
             llm_provider.clone(),
-            news_summarize,
+            &cache,
         );
 
         // If the layout produced no recognizable widgets (empty layout, or
@@ -93,7 +81,7 @@ impl App {
         // five-widget seed so first-run with an empty config still shows
         // something useful.
         if manager.ids().is_empty() {
-            register_default_widgets(&mut manager, theme.clone(), llm_provider, news_summarize);
+            register_default_widgets(&mut manager, theme.clone(), llm_provider, &cache);
         }
 
         let focus_order = focus_order_from_layout(&config, &manager);
@@ -141,9 +129,9 @@ impl App {
     }
 
     fn handle_global_key(&mut self, key: crossterm::event::KeyEvent) {
-        // Help overlay intercepts every key. Esc / ? / q close it,
-        // ↑/↓/k/j/PgUp/PgDn/Home/End scroll the contents, anything else is
-        // swallowed so q doesn't accidentally quit through the overlay.
+        // Help overlay swallows every key — Esc / ? / q close it; arrows / k /
+        // j / PgUp / PgDn / Home / End scroll. Everything else is dropped so
+        // `q` doesn't accidentally quit through the overlay.
         if self.show_help {
             match key.code {
                 KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
@@ -178,11 +166,9 @@ impl App {
                 self.command_buffer = Some(String::new());
                 self.command_feedback = None;
             }
-            // Shift+<letter> jumps focus to the widget that claimed that
-            // letter via `shortcut_preferences`. Most terminals report
-            // Shift+C as `Char('C')` with the SHIFT modifier set, but
-            // some don't include the modifier — so we match on uppercase
-            // ASCII letters and treat the case alone as the signal.
+            // `Shift+<letter>` jumps to the widget that claimed that letter.
+            // Some terminals drop the SHIFT modifier on shifted alphabetic
+            // keys, so we match on case rather than `KeyModifiers::SHIFT`.
             (_, KeyCode::Char(c)) if c.is_ascii_uppercase() => {
                 let lower = c.to_ascii_lowercase();
                 if let Some(id) = self.shortcuts.get(&lower).cloned() {
@@ -224,12 +210,9 @@ impl App {
         }
     }
 
-    /// `:scheme <name>` — re-read `colorschemes.toml`, pick the named scheme,
-    /// and propagate the new app theme to every widget without restarting.
-    /// `:scheme` with no name (or an unknown name) drops a friendly message
-    /// in the command-bar feedback slot listing the schemes that are
-    /// actually available, so the user can correct the typo without leaving
-    /// the TUI.
+    /// `:scheme <name>` — re-read `colorschemes.toml` and propagate the new
+    /// palette to every widget. Missing/unknown names surface a feedback
+    /// line listing the available schemes.
     fn execute_scheme_command(&mut self, args: &[&str]) {
         let file = match theme::load_schemes_file() {
             Ok(f) => f,
@@ -275,9 +258,8 @@ impl App {
                 widget.set_app_theme(new_theme.clone());
             }
         }
-        // Write the choice back to config.toml so it survives a restart.
-        // Failure is non-fatal — we still applied the scheme in-memory; the
-        // user will see a warning instead of the success line.
+        // Persist so the choice survives restart. In-memory swap already
+        // happened; a write failure only downgrades the success line.
         match theme::persist_active_scheme(name) {
             Ok(()) => {
                 self.command_feedback = Some(format!("scheme → {name}"));
@@ -311,8 +293,7 @@ impl App {
                 return;
             }
             "refresh" | "r" => {
-                // Forwarded to the focused widget so each one can implement
-                // its own refresh semantics via handle_command.
+                // Delegated so each widget defines its own refresh semantics.
                 if let Some(id) = self.focused_widget().map(str::to_string) {
                     if let Some(widget) = self.manager.get_mut(&id) {
                         let _ = widget.handle_command("refresh", &args);
@@ -364,25 +345,23 @@ impl App {
     }
 }
 
-/// Re-read a TOML file and pipe the new value into the matching widget via
-/// Widget::apply_config. Best-effort: parse errors are logged (the file may
-/// be mid-write) and the next event will retry.
+/// Re-read a widget TOML file and pipe the value through `Widget::apply_config`.
+/// Parse failures log and skip — the next save event will retry.
 fn apply_config_change(app: &mut App, path: &std::path::Path) {
-    // We only care about *.toml files inside the config dir.
     let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
         return;
     };
-    // Filename stem may be either `<kind>` (main instance) or `<kind>@<instance>`.
+    // Stem is `<kind>` or `<kind>@<instance>`. Non-widget files (llm.toml,
+    // colorschemes.toml, credentials/…) won't resolve to a manager entry.
     let (kind, instance) = parse_widget_ref(stem);
-    match kind.as_str() {
-        "clock" | "weather" | "calendar" | "news" | "stocks" | "email" => {}
-        _ => return, // ignore credentials/, llm.toml (no live reload), etc.
-    }
     let widget_id: String = if instance == "main" {
         kind.clone()
     } else {
         format!("{kind}@{instance}")
     };
+    if app.manager.get(&widget_id).is_none() {
+        return;
+    }
     let Ok(contents) = std::fs::read_to_string(path) else {
         return;
     };
@@ -410,6 +389,20 @@ fn apply_config_change(app: &mut App, path: &std::path::Path) {
     }
 }
 
+/// Swap scroll-wheel directions in place. Vertical and horizontal axes are
+/// both flipped so a trackpad with two-finger panning behaves consistently.
+/// Non-scroll kinds pass through unchanged. Centralising this here keeps
+/// every widget free of `if invert { ... } else { ... }` plumbing.
+fn invert_scroll(kind: MouseEventKind) -> MouseEventKind {
+    match kind {
+        MouseEventKind::ScrollUp => MouseEventKind::ScrollDown,
+        MouseEventKind::ScrollDown => MouseEventKind::ScrollUp,
+        MouseEventKind::ScrollLeft => MouseEventKind::ScrollRight,
+        MouseEventKind::ScrollRight => MouseEventKind::ScrollLeft,
+        other => other,
+    }
+}
+
 /// Returns the (widget id, cell area) under screen coordinates `(col, row)`,
 /// if any. The bottom row is the status bar and is intentionally not focusable.
 fn widget_at(app: &App, full_area: Rect, col: u16, row: u16) -> Option<(String, Rect)> {
@@ -432,11 +425,9 @@ fn widget_at(app: &App, full_area: Rect, col: u16, row: u16) -> Option<(String, 
     None
 }
 
-/// Walk widgets in registration order; assign each the first letter from
-/// its `shortcut_preferences` list that isn't already claimed. Returns the
-/// letter→id map and calls `set_shortcut(Some(letter))` on each widget
-/// that got one (or `set_shortcut(None)` if every preference was taken,
-/// so the widget can clear stale state on later reassignments).
+/// First-fit assignment of `Shift+<letter>` shortcuts in registration order.
+/// Returns the letter → id map; each widget is notified via `set_shortcut`
+/// (including `None` for widgets whose preferences were all taken).
 fn assign_shortcuts(manager: &mut WidgetManager) -> HashMap<char, String> {
     let mut shortcuts: HashMap<char, String> = HashMap::new();
     let mut assignments: HashMap<String, char> = HashMap::new();
@@ -466,10 +457,7 @@ fn assign_shortcuts(manager: &mut WidgetManager) -> HashMap<char, String> {
     shortcuts
 }
 
-/// Build the focus-cycling order from the layout cells, keeping only widgets
-/// that the manager actually knows about. Each cell's `widget` ref is parsed
-/// into `(kind, instance)` and recomposed into the canonical id so the
-/// lookup matches what `register_widgets_from_layout` registered.
+/// Focus-cycling order matches layout-cell order, skipping unknown widgets.
 fn focus_order_from_layout(config: &Config, manager: &WidgetManager) -> Vec<String> {
     let mut order: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -490,16 +478,14 @@ fn focus_order_from_layout(config: &Config, manager: &WidgetManager) -> Vec<Stri
     order
 }
 
-/// Walk the layout, deduplicate `(kind, instance)` pairs in order, load each
-/// pair's TOML config from the matching `<kind>[@<instance>].toml` file, and
-/// register the resulting widget with the manager. Unknown kinds are
-/// skipped with a warning.
+/// Register each unique `(kind, instance)` pair found in the layout via
+/// the widget registry. Unknown kinds log a warning and skip.
 fn register_widgets_from_layout(
     manager: &mut WidgetManager,
     config: &Config,
     theme: Arc<Theme>,
     llm_provider: Option<Arc<dyn LlmProvider>>,
-    news_summarize: bool,
+    cache: &Cache,
 ) {
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     for cell in &config.layout.cells {
@@ -513,110 +499,55 @@ fn register_widgets_from_layout(
             &instance,
             theme.clone(),
             llm_provider.clone(),
-            news_summarize,
+            cache,
         );
     }
 }
 
-/// Construct + register a single widget for a `(kind, instance)` pair. No-op
-/// (with a warning) when `kind` doesn't match a known widget.
 fn register_widget(
     manager: &mut WidgetManager,
     kind: &str,
     instance: &str,
     theme: Arc<Theme>,
     llm_provider: Option<Arc<dyn LlmProvider>>,
-    news_summarize: bool,
+    cache: &Cache,
 ) {
-    match kind {
-        "clock" => {
-            let cfg: ClockConfig =
-                config::load_widget_toml_for_instance("clock", instance).unwrap_or_default();
-            manager.register(ClockWidget::with_config(instance.to_string(), cfg, theme));
-        }
-        "weather" => {
-            let cfg: WeatherConfig =
-                config::load_widget_toml_for_instance("weather", instance).unwrap_or_default();
-            manager.register(WeatherWidget::with_config(instance.to_string(), cfg, theme));
-        }
-        "calendar" => {
-            let cfg: CalendarConfig =
-                config::load_widget_toml_for_instance("calendar", instance).unwrap_or_default();
-            manager.register(CalendarWidget::with_config(instance.to_string(), cfg, theme));
-        }
-        "news" => {
-            let cfg: NewsConfig =
-                config::load_widget_toml_for_instance("news", instance).unwrap_or_default();
-            manager.register(NewsWidget::with_config_and_llm(
-                instance.to_string(),
-                cfg,
-                llm_provider,
-                news_summarize,
-                theme,
-            ));
-        }
-        "email" => {
-            let cfg: crate::widgets::email::EmailConfig =
-                config::load_widget_toml_for_instance("email", instance).unwrap_or_default();
-            manager.register(crate::widgets::email::EmailWidget::with_config_and_llm(
-                instance.to_string(),
-                cfg,
-                llm_provider,
-                theme,
-            ));
-        }
-        "stocks" => {
-            let cfg: StocksConfig =
-                config::load_widget_toml_for_instance("stocks", instance).unwrap_or_default();
-            manager.register(StocksWidget::with_config(instance.to_string(), cfg, theme));
-        }
-        "resources" => {
-            let cfg: crate::widgets::resources::ResourcesConfig =
-                config::load_widget_toml_for_instance("resources", instance).unwrap_or_default();
-            manager.register(crate::widgets::resources::ResourcesWidget::with_config(
-                instance.to_string(),
-                cfg,
-                theme,
-            ));
-        }
-        "gallery" => {
-            let cfg: crate::widgets::gallery::GalleryConfig =
-                config::load_widget_toml_for_instance("gallery", instance).unwrap_or_default();
-            manager.register(crate::widgets::gallery::GalleryWidget::with_config(
-                instance.to_string(),
-                cfg,
-                theme,
-            ));
-        }
-        other => {
-            tracing::warn!(kind = %other, instance = %instance, "unknown widget kind in layout, skipping");
+    let scoped = cache.scoped(kind, instance);
+    let widget = registry::build_for(kind, instance, |instance| WidgetCtx {
+        instance,
+        theme,
+        llm: llm_provider,
+        cache: scoped,
+    });
+    match widget {
+        Some(w) => manager.register_boxed(w),
+        None => {
+            tracing::warn!(kind = %kind, instance = %instance, "unknown widget kind in layout, skipping");
         }
     }
 }
 
-/// Fallback registration when the layout is empty or yields no recognized
-/// widgets — keep the original five-widget hardcoded set so first-run with
-/// no config still gives the user something to look at.
+/// Fallback when the layout produces no recognised widgets — seed every
+/// descriptor with `default_in_first_run = true`.
 fn register_default_widgets(
     manager: &mut WidgetManager,
     theme: Arc<Theme>,
     llm_provider: Option<Arc<dyn LlmProvider>>,
-    news_summarize: bool,
+    cache: &Cache,
 ) {
-    for kind in ["stocks", "clock", "weather", "calendar", "news"] {
+    for kind in registry::default_kinds() {
         register_widget(
             manager,
             kind,
             "main",
             theme.clone(),
             llm_provider.clone(),
-            news_summarize,
+            cache,
         );
     }
 }
 
-/// Set up the terminal, run the main loop, then tear the terminal back down
-/// regardless of how we exited (panic-safe via the `TerminalGuard`).
+/// Run the main loop. `TerminalGuard` restores the terminal on any exit path.
 pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
     let config = config::load(config_path_override.as_deref())?;
 
@@ -625,9 +556,8 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
 
     let mut app = App::new(config);
 
-    // Set up the config file watcher so edits to ~/.config/glint/*.toml hot-
-    // reload via Widget::apply_config. If the dir doesn't exist or notify
-    // can't start (e.g. permission), we just run without live reload.
+    // Live-reload via the `notify` crate. Failure is non-fatal — we just
+    // run without hot-reload.
     let config_rx = match config::config_dir() {
         Ok(dir) if dir.exists() => match config::watcher::spawn(dir) {
             Ok(rx) => Some(rx),
@@ -689,7 +619,14 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                     }
                 }
             }
-            Event::Mouse(mouse) => {
+            Event::Mouse(mut mouse) => {
+                // Apply the global `mouse_scroll` preference once at the
+                // dispatch boundary so every downstream consumer (help
+                // overlay + widgets) sees a consistent direction without
+                // each having to know about the preference.
+                if app.config.global.mouse_scroll == config::types::MouseScroll::Inverted {
+                    mouse.kind = invert_scroll(mouse.kind);
+                }
                 // Help overlay sits on top of the entire dashboard — when
                 // it's open, mouse input belongs to it, not to the widgets
                 // visually behind it. Without this guard the scroll wheel
@@ -755,7 +692,7 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                     }
                 }
             }
-            Event::Resize(_, _) => {
+            Event::Resize => {
                 // Ratatui handles the re-layout on the next draw call below.
             }
             Event::ConfigChanged(path) => {
@@ -942,5 +879,17 @@ mod tests {
             "calendar should fall through to 'd' since clock claimed 'c'"
         );
         assert_eq!(app.shortcuts.get(&'n').map(String::as_str), Some("news"));
+    }
+
+    #[test]
+    fn invert_scroll_flips_both_axes_and_passes_other_kinds_through() {
+        assert_eq!(invert_scroll(MouseEventKind::ScrollUp), MouseEventKind::ScrollDown);
+        assert_eq!(invert_scroll(MouseEventKind::ScrollDown), MouseEventKind::ScrollUp);
+        assert_eq!(invert_scroll(MouseEventKind::ScrollLeft), MouseEventKind::ScrollRight);
+        assert_eq!(invert_scroll(MouseEventKind::ScrollRight), MouseEventKind::ScrollLeft);
+        // Non-scroll events are untouched.
+        let click = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(invert_scroll(click), click);
+        assert_eq!(invert_scroll(MouseEventKind::Moved), MouseEventKind::Moved);
     }
 }

@@ -1,10 +1,11 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Local, NaiveDate};
+use serde::{Deserialize, Serialize};
 
 /// A single calendar event normalized to local time. All-day events have
 /// `all_day = true` and `start`/`end` set to midnight at the event date.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub title: String,
     pub start: DateTime<Local>,
@@ -48,9 +49,6 @@ pub trait CalendarProvider: Send + Sync {
         start: DateTime<Local>,
         end: DateTime<Local>,
     ) -> Result<Vec<Event>>;
-
-    #[allow(dead_code)] // surfaced in status bar in a later phase.
-    fn name(&self) -> &str;
 }
 
 #[cfg(test)]

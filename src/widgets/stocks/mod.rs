@@ -21,6 +21,7 @@ use ratatui::{
 };
 use serde::Deserialize;
 
+use crate::cache::ScopedCache;
 use crate::theme::{ColorScheme, Theme};
 use crate::ui::decorated_title_line;
 
@@ -28,66 +29,51 @@ use super::{AppContext, EventResult, Widget};
 
 use provider::{Period, StockQuote, YahooFinanceProvider};
 
-/// User-configurable stocks options (loaded from `~/.config/glint/stocks.toml`).
+/// Loaded from `~/.config/glint/stocks.toml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StocksConfig {
-    /// Index symbols listed at the top of the ticker list. Yahoo conventions:
-    /// `^DJI` (Dow), `^GSPC` (S&P 500), `^IXIC` (Nasdaq Composite).
+    /// Index symbols pinned to the top (Yahoo: `^DJI`, `^GSPC`, `^IXIC`).
     #[serde(default = "default_indices")]
     pub indices: Vec<String>,
 
-    /// User-defined watchlist tickers shown alongside the indices.
     #[serde(default = "default_watchlist")]
     pub watchlist: Vec<String>,
 
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
 
-    /// Initial display mode. One of "percent" / "dollar" / "change".
-    /// Initial display mode for the change column. Accepts the legacy name
-    /// `display_mode` for backward compatibility.
-    #[serde(default, alias = "display_mode")]
+    /// `"percent"` / `"dollar"` / `"change"`.
+    #[serde(default)]
     pub default_display_mode: DisplayMode,
 
-    /// Initial graph period. One of "1d" / "1w" / "1m" / "6m" / "ytd" / "1y".
+    /// `"1d"` / `"1w"` / `"1m"` / `"6m"` / `"ytd"` / `"1y"`.
     #[serde(default)]
     pub default_period: Period,
 
-    /// Optional URL template opened when the user presses Enter on a ticker.
-    /// The literal token `{ticker}` is replaced with the URL-encoded ticker
-    /// symbol — e.g. `"https://www.marketwatch.com/investing/stock/{ticker}"`.
-    /// Leave unset to make Enter a no-op.
+    /// URL opened on Enter. `{ticker}` is replaced with the URL-encoded symbol.
     #[serde(default)]
     pub jump_url_template: Option<String>,
 
-    /// When true, horizontal mouse scroll cycles the period toggles. Default
-    /// is false because trackpad horizontal-scroll gestures often fire
-    /// accidentally while scrolling vertically.
+    /// Cycle period tabs on horizontal scroll. Off by default — trackpad
+    /// sideways gestures often fire accidentally while scrolling vertically.
     #[serde(default)]
     pub horizontal_scroll_period: bool,
 
-    /// When true, draw very faint dashed lines at the visible range's high
-    /// and low on non-Day periods. Independent of the always-on reference
-    /// line (previous close on 1D, start-of-range on other periods).
+    /// Faint dashed range-high/low lines on non-Day periods.
     #[serde(default = "default_graph_high_low_lines")]
     pub graph_high_low_lines: bool,
 
-    /// When true on the 1D period, render the intraday trace against the
-    /// full trading-day x-axis instead of stretching the partial day across
-    /// the whole plot width. The remainder of the day appears as empty
-    /// space, giving a visual sense of how far along the session is.
+    /// On 1D, render the intraday trace against the full session x-axis so
+    /// the remainder of the day stays as empty space — gives a visual sense
+    /// of how far along the session is.
     #[serde(default = "default_pad_intraday_to_full_day")]
     pub pad_intraday_to_full_day: bool,
 
-    /// Per-widget style overrides layered on top of the active app
-    /// color scheme. Any role omitted here inherits from the app theme.
+    /// Per-widget overrides layered on the app theme.
     #[serde(default)]
     pub colors: ColorScheme,
 
-    /// Prioritized `Shift+<letter>` focus shortcut preferences. The first
-    /// letter not already claimed by an earlier-loaded widget is assigned.
-    /// Leave empty (default) to use the built-in preference list — for
-    /// stocks that's `['s', 't', 'o', 'c', 'k']`.
+    /// `Shift+<letter>` focus shortcuts; falls back to `['s', 't', 'o', 'c', 'k']`.
     #[serde(default)]
     pub shortcuts: Vec<char>,
 }
@@ -174,6 +160,14 @@ struct StocksState {
     any_inflight: bool,
 }
 
+/// Cache key prefix; the active period is appended so each period has its
+/// own cached payload (chart data shape varies by period).
+const CACHE_KEY_QUOTES_PREFIX: &str = "quotes-";
+
+fn quotes_cache_key(period: Period) -> String {
+    format!("{CACHE_KEY_QUOTES_PREFIX}{}", period.label().to_ascii_lowercase())
+}
+
 pub struct StocksWidget {
     id: String,
     instance: String,
@@ -202,10 +196,18 @@ pub struct StocksWidget {
     /// override or the built-in default. Returned by
     /// `shortcut_preferences` so the trait's borrow lifetime matches.
     shortcut_prefs: Vec<char>,
+    /// Persistent cache of fetched quotes keyed by period. Each successful
+    /// refresh writes the full `symbol → StockQuote` snapshot.
+    cache: ScopedCache,
 }
 
 impl StocksWidget {
-    pub fn with_config(instance: String, config: StocksConfig, app_theme: Arc<Theme>) -> Self {
+    pub fn with_config(
+        instance: String,
+        config: StocksConfig,
+        app_theme: Arc<Theme>,
+        cache: ScopedCache,
+    ) -> Self {
         let provider = match YahooFinanceProvider::new() {
             Ok(p) => Arc::new(p),
             Err(err) => {
@@ -231,20 +233,35 @@ impl StocksWidget {
         } else {
             format!("Stocks ({instance})")
         };
+        let poll_interval = Duration::from_secs(config.poll_interval_secs.max(15));
+        // Seed quotes for the default period so the dashboard paints prior
+        // prices instantly. Period switches after startup miss the cache (we
+        // only persist one period's payload here) and refetch on demand.
+        let mut initial_state = StocksState::default();
+        if let Some(entry) = cache.load::<HashMap<String, StockQuote>>(&quotes_cache_key(period)) {
+            let age = entry.age().min(poll_interval);
+            initial_state.quotes = entry
+                .value
+                .into_iter()
+                .map(|(sym, q)| (sym, QuoteState::Ready(Box::new(q))))
+                .collect();
+            initial_state.last_attempt = Some(Instant::now() - age);
+        }
         Self {
             id,
             instance,
             display_name_cache,
-            poll_interval: Duration::from_secs(config.poll_interval_secs.max(15)),
+            poll_interval,
             config,
             provider,
-            state: Arc::new(Mutex::new(StocksState::default())),
+            state: Arc::new(Mutex::new(initial_state)),
             display_mode,
             period,
             app_theme,
             theme,
             shortcut: None,
             shortcut_prefs,
+            cache,
         }
     }
 
@@ -324,6 +341,7 @@ impl StocksWidget {
         }
         let provider = self.provider.clone();
         let state = self.state.clone();
+        let cache = self.cache.clone();
         let period = self.period;
         tokio::spawn(async move {
             // Fetch each symbol in parallel. Yahoo's v8/chart endpoint is
@@ -338,9 +356,11 @@ impl StocksWidget {
             });
             let results = futures::future::join_all(futs).await;
             let mut st = state.lock().expect("stocks state poisoned");
+            let mut snapshot: HashMap<String, StockQuote> = HashMap::new();
             for (sym, result) in results {
                 match result {
                     Ok(q) => {
+                        snapshot.insert(sym.clone(), q.clone());
                         st.quotes.insert(sym, QuoteState::Ready(Box::new(q)));
                     }
                     Err(err) => {
@@ -350,6 +370,12 @@ impl StocksWidget {
                 }
             }
             st.any_inflight = false;
+            drop(st);
+            if !snapshot.is_empty() {
+                if let Err(err) = cache.store(&quotes_cache_key(period), &snapshot) {
+                    tracing::warn!(error = %err, "stocks cache store failed");
+                }
+            }
         });
     }
 
@@ -1008,8 +1034,9 @@ impl Widget for StocksWidget {
         let new_config: StocksConfig =
             serde_json::from_value(config).context("invalid stocks config payload")?;
         let app_theme = self.app_theme.clone();
+        let cache = self.cache.clone();
         let instance = self.instance.clone();
-        *self = Self::with_config(instance, new_config, app_theme);
+        *self = Self::with_config(instance, new_config, app_theme, cache);
         Ok(())
     }
 
@@ -1989,6 +2016,19 @@ fn provider_dummy() -> YahooFinanceProvider {
     YahooFinanceProvider::new().expect("dummy yahoo provider should build")
 }
 
+pub const KIND: &str = "stocks";
+
+pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
+    let cfg: StocksConfig =
+        crate::config::load_widget_toml_for_instance(KIND, &ctx.instance).unwrap_or_default();
+    Box::new(StocksWidget::with_config(
+        ctx.instance.clone(),
+        cfg,
+        ctx.theme.clone(),
+        ctx.cache.clone(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1998,6 +2038,7 @@ mod tests {
             "main".to_string(),
             cfg,
             Arc::new(Theme::builtin_defaults()),
+            ScopedCache::ephemeral(),
         )
     }
 

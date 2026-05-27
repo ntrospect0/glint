@@ -1,15 +1,12 @@
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::icons::{self, WeatherIcon};
-use crate::providers::DataProvider;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Units {
     Metric,
@@ -44,7 +41,7 @@ impl Units {
 }
 
 /// Snapshot of current conditions as we parse them out of the Open-Meteo response.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WeatherData {
     pub temperature: f64,
     pub apparent_temperature: f64,
@@ -74,7 +71,7 @@ impl WeatherData {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyForecast {
     pub date: chrono::NaiveDate,
     pub temperature_high: f64,
@@ -159,11 +156,8 @@ struct OpenMeteoDaily {
     sunset: Vec<Option<String>>,
 }
 
-#[async_trait]
-impl DataProvider for OpenMeteoProvider {
-    type Data = WeatherData;
-
-    async fn fetch(&self) -> Result<WeatherData> {
+impl OpenMeteoProvider {
+    pub async fn fetch(&self) -> Result<WeatherData> {
         let url = self.build_url();
         let resp = self
             .client
@@ -189,9 +183,6 @@ impl DataProvider for OpenMeteoProvider {
         })
     }
 
-    fn name(&self) -> &str {
-        "open-meteo"
-    }
 }
 
 fn parse_daily(daily: OpenMeteoDaily) -> Vec<DailyForecast> {

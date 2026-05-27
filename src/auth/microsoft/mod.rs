@@ -10,7 +10,7 @@ pub use store::OAuthClientConfig;
 ///
 /// Tokens issued against the old (Calendars-only) scope will keep working for
 /// the calendar widget; the Email widget needs the user to re-run
-/// `glint --auth outlook` so the additional Mail.Read scope is granted.
+/// `glint --auth microsoft` so the additional Mail.Read scope is granted.
 pub const SCOPE: &str = "Calendars.Read Mail.Read offline_access";
 
 /// `common` accepts both personal Microsoft accounts (outlook.com /

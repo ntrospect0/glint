@@ -147,10 +147,6 @@ impl CalendarProvider for OutlookCalendarProvider {
         events.sort_by_key(|e| e.start);
         Ok(events)
     }
-
-    fn name(&self) -> &str {
-        "outlook"
-    }
 }
 
 #[derive(Debug, Deserialize)]

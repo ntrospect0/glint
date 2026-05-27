@@ -17,5 +17,8 @@ Thumbs.db
 # Config credentials (never commit API keys)
 credentials/
 
-# AI-agent session state (gitignored defensively; any agent).
+# AI-agent session state. Project-level conventions for any agent
+# belong in AGENTS.md, which is tracked.
 .claude/
+.cursor/
+.codex/

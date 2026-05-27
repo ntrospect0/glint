@@ -1,14 +1,11 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::providers::DataProvider;
-
 /// Time window selectable by the user from the stocks graph toggle bar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Period {
     #[default]
@@ -85,7 +82,7 @@ impl Period {
 /// Some fields the spec calls out (P/E, EPS, market cap, yield) require a
 /// separate quoteSummary call and are filled in only when available — keep
 /// them `Option` so the renderer can show `—` cleanly.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StockQuote {
     pub symbol: String,
     pub short_name: String,
@@ -475,21 +472,6 @@ struct SearchQuote {
     symbol: Option<String>,
     #[serde(rename = "quoteType", default)]
     quote_type: Option<String>,
-}
-
-/// Thin wrapper so the generic `DataProvider` trait stays useful for stocks —
-/// `fetch_quote` is the more natural per-symbol entry point used by the widget.
-#[async_trait]
-impl DataProvider for YahooFinanceProvider {
-    type Data = ();
-
-    async fn fetch(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn name(&self) -> &str {
-        "yahoo-finance"
-    }
 }
 
 #[derive(Debug, Deserialize)]

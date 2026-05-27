@@ -14,20 +14,18 @@ pub use anthropic::AnthropicProvider;
 /// chooses how to map `LlmRequest` onto its native API; widgets stay generic.
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
-    #[allow(dead_code)] // surfaced in status bar / settings in a later phase.
-    fn name(&self) -> &str;
-
     async fn complete(&self, request: LlmRequest) -> Result<LlmResponse>;
-
-    #[allow(dead_code)] // wired into status bar in a later phase.
-    async fn health_check(&self) -> Result<bool>;
 }
 
 /// Role on a single chat message — matches the Anthropic Messages convention.
+/// Both variants stay in the type even when only `User` is constructed today:
+/// it's a faithful model of the upstream protocol, and the cache-key /
+/// serialisation match arms need to remain exhaustive against future
+/// multi-turn flows.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     User,
-    #[allow(dead_code)] // used by multi-turn flows in later phases.
     Assistant,
 }
 
@@ -52,13 +50,13 @@ pub struct LlmRequest {
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
     pub text: String,
-    #[allow(dead_code)] // surfaced in status bar in a later phase.
-    pub input_tokens: u32,
-    #[allow(dead_code)] // surfaced in status bar in a later phase.
-    pub output_tokens: u32,
 }
 
 /// User-configurable LLM options (loaded from `~/.config/glint/llm.toml`).
+///
+/// Per-feature on/off toggles live in each LLM-aware widget's own TOML
+/// (e.g. `summarize_with_llm = true` in news.toml), keeping this layer
+/// widget-agnostic.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlmConfig {
     #[serde(default = "default_enabled")]
@@ -69,9 +67,6 @@ pub struct LlmConfig {
 
     #[serde(default)]
     pub limits: LimitsConfig,
-
-    #[serde(default)]
-    pub features: FeaturesConfig,
 }
 
 fn default_enabled() -> bool {
@@ -84,7 +79,6 @@ impl Default for LlmConfig {
             enabled: default_enabled(),
             provider: ProviderConfig::default(),
             limits: LimitsConfig::default(),
-            features: FeaturesConfig::default(),
         }
     }
 }
@@ -149,32 +143,6 @@ impl Default for LimitsConfig {
         Self {
             max_requests_per_minute: default_rpm(),
             cache_capacity: default_cache_capacity(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct FeaturesConfig {
-    #[serde(default = "default_true")]
-    pub news_summarize: bool,
-    #[allow(dead_code)] // wired in when LLM topic classification lands.
-    #[serde(default)]
-    pub news_classify: bool,
-    #[allow(dead_code)] // wired in when stocks widget gets real data.
-    #[serde(default)]
-    pub stock_disambiguate: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl Default for FeaturesConfig {
-    fn default() -> Self {
-        Self {
-            news_summarize: true,
-            news_classify: false,
-            stock_disambiguate: false,
         }
     }
 }

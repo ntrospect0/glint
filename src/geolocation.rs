@@ -8,7 +8,10 @@ pub struct GeoLocation {
     pub latitude: f64,
     pub longitude: f64,
     pub label: String,
-    #[allow(dead_code)] // surfaced when the clock widget gains auto-locate (later phase).
+    /// IANA timezone string when the lookup returned one. Consumed by the
+    /// clock widget's `:clock <city>` flow to set a transient secondary
+    /// zone. `None` is normal for the IP-geolocation path which we don't
+    /// always request the timezone from.
     pub timezone: Option<String>,
 }
 

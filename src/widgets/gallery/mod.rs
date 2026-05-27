@@ -1,21 +1,15 @@
 //! Gallery widget — rotating inline image slideshow.
 //!
-//! Renders one image at a time, auto-scaled to fit the pane, and rotates
-//! through a configured list every `rotation_secs` seconds. `p` pauses /
-//! resumes; `n` and `N` step manually. When `rotation_secs = 0` the
-//! slideshow starts paused — useful when the user wants to flip through
-//! manually instead of cycling on a timer.
-//!
-//! Powered by `ratatui-image`, which auto-detects the host terminal's
-//! image protocol (iTerm2 inline, Kitty graphics, Sixel, or unicode
-//! halfblocks as a last-resort fallback). Images larger than the pane
-//! get downscaled to fit; smaller ones aren't upscaled past their native
-//! size. Decode failures are logged to `glint.log` via `tracing::warn`
-//! and the offending entry is skipped silently.
+//! Uses `ratatui-image` to pick the host terminal's image protocol
+//! (iTerm2 / Kitty / Sixel, falling back to unicode halfblocks). Images
+//! are downscaled to fit the pane but never upscaled past native size.
 
 use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -32,6 +26,7 @@ use ratatui::{
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol, Resize, StatefulImage};
 use serde::Deserialize;
 
+use crate::cache::ScopedCache;
 use crate::theme::{ColorScheme, Theme};
 use crate::ui::decorated_title_line;
 
@@ -39,26 +34,34 @@ use super::{AppContext, EventResult, Widget};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GalleryConfig {
-    /// Image file paths. `~` at the start expands to `$HOME`. Anything
-    /// else is taken verbatim. Relative paths resolve against the
-    /// process's CWD at startup. Failed loads are skipped with a warning
-    /// in `glint.log`.
+    /// Image sources. Each entry is either a literal path or a simple glob:
+    ///
+    /// - `/abs/path/to/img.png` — single file.
+    /// - `~/Pictures/*` — every image-format file in `~/Pictures/`.
+    /// - `/path/*.jpg` — every `.jpg` in `/path/`.
+    ///
+    /// `~/` expands to `$HOME`. Globs are non-recursive (no `**`); for
+    /// richer patterns add another entry. Failed loads skip with a warning.
     #[serde(default)]
     pub images: Vec<String>,
 
-    /// Seconds between automatic rotations. `0` = paused from the start;
-    /// the user can hit `p` to start rotating or `n`/`N` to step
-    /// manually. Floor of 1 second when non-zero to keep the dashboard
-    /// from re-rendering every tick.
+    /// Seconds between rotations. `0` starts paused (`p` toggles, `n`/`N` step).
+    /// Floored to 1s when non-zero.
     #[serde(default = "default_rotation_secs")]
     pub rotation_secs: u64,
 
-    /// Per-widget style overrides layered on the active app scheme.
+    /// Seconds between directory rescans for glob entries in `images`.
+    /// `0` disables periodic rescans (initial scan still runs); literal
+    /// paths in `images` are unaffected by this either way. Floored to
+    /// 30s when non-zero so misconfigured intervals don't hammer the disk.
+    #[serde(default = "default_rescan_interval_secs")]
+    pub rescan_interval_secs: u64,
+
+    /// Per-widget overrides layered on the app theme.
     #[serde(default)]
     pub colors: ColorScheme,
 
-    /// Prioritized `Shift+<letter>` shortcut preferences. Leave empty
-    /// for the built-in default `['g', 'a', 'l', 'r', 'y']`.
+    /// `Shift+<letter>` focus shortcuts; falls back to `['g', 'a', 'l', 'r', 'y']`.
     #[serde(default)]
     pub shortcuts: Vec<char>,
 }
@@ -67,31 +70,33 @@ fn default_rotation_secs() -> u64 {
     10
 }
 
+fn default_rescan_interval_secs() -> u64 {
+    300
+}
+
 impl Default for GalleryConfig {
     fn default() -> Self {
         Self {
             images: Vec::new(),
             rotation_secs: default_rotation_secs(),
+            rescan_interval_secs: default_rescan_interval_secs(),
             colors: ColorScheme::default(),
             shortcuts: Vec::new(),
         }
     }
 }
 
-/// One slot in the slideshow — protocol-cached image data or `None` if
-/// the underlying file couldn't be decoded. The label is the original
-/// path (or filename) used for status/error display.
+/// One slideshow slot. `protocol` is `None` for files that failed to decode;
+/// `label` is the user-facing path for status display.
 struct Slide {
+    /// Resolved on-disk path. Used as the identity key during rescan
+    /// diffs so a re-discovered image isn't re-decoded.
+    source_path: PathBuf,
     label: String,
-    /// Boxed trait object — `ratatui-image` v2 returns `Box<dyn
-    /// StatefulProtocol>` so the concrete encoding (sixel / kitty /
-    /// iterm2 / halfblocks) is hidden behind the trait. Wrapped in
-    /// `Mutex` because `StatefulImage` needs `&mut` to the state, but
-    /// the widget's `render` method only has `&self`.
+    /// `Mutex` because `StatefulImage::render` needs `&mut state` but the
+    /// widget's `render` only has `&self`.
     protocol: Option<Mutex<Box<dyn StatefulProtocol>>>,
-    /// Original image dimensions in pixels (width, height). Captured at
-    /// decode time and used to compute a horizontally-centered render
-    /// rect that matches the image's actual aspect ratio.
+    /// Native pixel size, used to center the render rect with the right aspect.
     pixel_size: (u32, u32),
 }
 
@@ -104,10 +109,10 @@ pub struct GalleryWidget {
     /// the main thread so app startup isn't blocked on disk I/O for
     /// large slideshows.
     slides: Arc<Mutex<Vec<Slide>>>,
-    /// Total number of image entries the user configured. Surface in
-    /// the status line as `Loading m/n images…` while the loader catches
-    /// up so the user knows progress is in flight.
-    target_count: usize,
+    /// Total number of images currently resolved from the config. Updated
+    /// by the rescan loop so the "Loading m/n images…" status line reflects
+    /// the latest glob expansion, not just the startup snapshot.
+    target_count: Arc<std::sync::atomic::AtomicUsize>,
     current: Arc<Mutex<GalleryState>>,
     rotation_interval: Duration,
     /// Cell size in pixels (width, height) as reported by the image
@@ -121,6 +126,19 @@ pub struct GalleryWidget {
     theme: Theme,
     shortcut: Option<char>,
     shortcut_prefs: Vec<char>,
+    /// Persistent thumb cache. The loader writes downscaled JPEGs here
+    /// keyed by source-path hash; subsequent startups skip the source
+    /// decode + resize and load the small thumb instead.
+    cache: ScopedCache,
+    /// Set on Drop / `apply_config` so the background loader exits its
+    /// rescan loop instead of leaking after a config reload.
+    loader_stop: Arc<AtomicBool>,
+}
+
+impl Drop for GalleryWidget {
+    fn drop(&mut self) {
+        self.loader_stop.store(true, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +155,7 @@ impl GalleryWidget {
         instance: String,
         config: GalleryConfig,
         app_theme: Arc<Theme>,
+        cache: ScopedCache,
     ) -> Self {
         let id = if instance == "main" {
             "gallery".to_string()
@@ -176,66 +195,82 @@ impl GalleryWidget {
             Duration::from_secs(config.rotation_secs.max(1))
         };
         let paused = rotation_interval.is_zero();
-        let state = GalleryState {
+        let current = Arc::new(Mutex::new(GalleryState {
             idx: 0,
             paused,
             last_rotation: Instant::now(),
-        };
+        }));
         let colors_override = config.colors.clone();
 
-        // Spawn a background loader thread that decodes each image in
-        // order and pushes the resulting Slide into the shared vec.
-        // Render reads from the same Arc — the first image becomes
-        // visible the moment it's decoded, even if later ones are still
-        // in flight. App startup is no longer blocked on this work.
+        // Resolve every config entry once, up front. `target_count` reflects
+        // the post-expansion total so "Loading m/n images…" gives an honest
+        // denominator from the first frame; it's shared with the loader so
+        // periodic rescans can update it.
+        let initial_paths = expand_all_patterns(&config.images);
+        let target_count = Arc::new(std::sync::atomic::AtomicUsize::new(initial_paths.len()));
+
+        // Floor non-zero rescan intervals at 30s; `0` disables the loop.
+        let rescan_interval = if config.rescan_interval_secs == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(config.rescan_interval_secs.max(30))
+        };
+
+        // The background loader: decode every path once on startup, then
+        // (when rescan is enabled and the config has at least one glob)
+        // re-expand patterns periodically and reconcile the slide list.
+        // Reads from the same Arc that `render` walks, so the first image
+        // appears the moment it's decoded.
         let slides: Arc<Mutex<Vec<Slide>>> =
-            Arc::new(Mutex::new(Vec::with_capacity(config.images.len())));
-        let target_count = config.images.len();
-        if target_count > 0 {
-            let slides = slides.clone();
-            let paths = config.images.clone();
+            Arc::new(Mutex::new(Vec::with_capacity(initial_paths.len())));
+        let loader_stop = Arc::new(AtomicBool::new(false));
+
+        if !config.images.is_empty() {
+            let slides_for_loader = slides.clone();
+            let target_for_loader = target_count.clone();
+            let cache_for_loader = cache.clone();
+            let patterns = config.images.clone();
+            let stop = loader_stop.clone();
+            let current_for_loader = current.clone();
+            let has_globs = config.images.iter().any(|s| s.contains('*'));
             std::thread::Builder::new()
                 .name("glint-gallery-loader".into())
                 .spawn(move || {
                     let mut picker = picker;
-                    for raw in paths {
-                        let path = expand_tilde(&raw);
-                        let label = path
-                            .file_name()
-                            .map(|f| f.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| raw.clone());
-                        match load_image(&path) {
-                            Ok(img) => {
-                                // Downscale to a cap that covers ~2× any
-                                // realistic pane size on a typical
-                                // terminal. The bound is generous (1600 px
-                                // on the long side) to handle resizes
-                                // without forcing a re-decode. Phone-camera
-                                // sources (4032×3024 etc.) shrink to ~6×
-                                // smaller, which translates to roughly 6×
-                                // less peak RAM per slide and a noticeable
-                                // speed-up when the protocol re-encodes
-                                // for a new render area.
-                                let img = downscale_to_max_dim(img, MAX_IMAGE_DIM);
-                                let pixel_size = (img.width(), img.height());
-                                let protocol = picker.new_resize_protocol(img);
-                                let slide = Slide {
-                                    label,
-                                    protocol: Some(Mutex::new(protocol)),
-                                    pixel_size,
-                                };
-                                if let Ok(mut guard) = slides.lock() {
-                                    guard.push(slide);
-                                }
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    path = %path.display(),
-                                    error = %err,
-                                    "gallery: failed to load image, skipping"
-                                );
+
+                    // Initial pass — order matches expand_all_patterns,
+                    // which preserves the user's config order.
+                    for path in initial_paths {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if let Some(slide) = build_slide(&mut picker, &cache_for_loader, &path) {
+                            if let Ok(mut guard) = slides_for_loader.lock() {
+                                guard.push(slide);
                             }
                         }
+                    }
+
+                    if rescan_interval.is_zero() || !has_globs {
+                        return;
+                    }
+                    // Periodic rescan loop: wake on `rescan_interval`,
+                    // re-expand patterns, add new images, drop vanished
+                    // ones. Sleep is chunked into 1s slices so a config
+                    // reload's stop flag is honoured promptly.
+                    loop {
+                        if !sleep_with_cancel(rescan_interval, &stop) {
+                            return;
+                        }
+                        let next = expand_all_patterns(&patterns);
+                        target_for_loader.store(next.len(), Ordering::Relaxed);
+                        reconcile_slides(
+                            &mut picker,
+                            &cache_for_loader,
+                            &slides_for_loader,
+                            &current_for_loader,
+                            &next,
+                        );
                     }
                 })
                 .expect("spawn gallery loader thread");
@@ -247,7 +282,7 @@ impl GalleryWidget {
             display_name_cache,
             slides,
             target_count,
-            current: Arc::new(Mutex::new(state)),
+            current,
             rotation_interval,
             font_size,
             colors_override,
@@ -255,6 +290,8 @@ impl GalleryWidget {
             theme,
             shortcut: None,
             shortcut_prefs,
+            cache,
+            loader_stop,
         }
     }
 
@@ -399,8 +436,12 @@ impl Widget for GalleryWidget {
             return;
         }
 
+        // Snapshot once per render so all status-line variants agree on the
+        // same denominator even if the rescan loop swaps it underneath us.
+        let target_total = self.target_count.load(Ordering::Relaxed);
+
         // No images configured at all — easy to spot guidance message.
-        if self.target_count == 0 {
+        if target_total == 0 {
             let msg = Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -463,7 +504,7 @@ impl Widget for GalleryWidget {
             let msg = Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    format!("Loading 0/{}…", self.target_count),
+                    format!("Loading 0/{target_total}…"),
                     self.theme.text_dim,
                 )),
             ])
@@ -489,12 +530,9 @@ impl Widget for GalleryWidget {
             }
 
             if let Some(status_area) = status_area {
-                let mut line = format!("{}/{}  ·  {}", idx + 1, self.target_count, label);
-                if loaded_count < self.target_count {
-                    line.push_str(&format!(
-                        "  ·  loading {}/{}",
-                        loaded_count, self.target_count
-                    ));
+                let mut line = format!("{}/{}  ·  {}", idx + 1, target_total, label);
+                if loaded_count < target_total {
+                    line.push_str(&format!("  ·  loading {}/{}", loaded_count, target_total));
                 }
                 if paused {
                     line.push_str("  ·  paused");
@@ -590,8 +628,9 @@ impl Widget for GalleryWidget {
         let new_config: GalleryConfig =
             serde_json::from_value(config).context("invalid gallery config payload")?;
         let app_theme = self.app_theme.clone();
+        let cache = self.cache.clone();
         let instance = self.instance.clone();
-        *self = Self::with_config(instance, new_config, app_theme);
+        *self = Self::with_config(instance, new_config, app_theme, cache);
         Ok(())
     }
 
@@ -644,6 +683,116 @@ fn expand_tilde(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
+/// Image-format extensions recognised by directory expansion. Match the
+/// formats `image` crate decodes by default; cased-insensitively at match
+/// time so `IMG_1234.JPG` and `cover.PNG` both qualify.
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "ico",
+];
+
+fn is_image_file(path: &Path) -> bool {
+    let Some(ext) = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+    else {
+        return false;
+    };
+    IMAGE_EXTENSIONS.iter().any(|e| *e == ext)
+}
+
+/// Cheap glob matcher for the basename portion of a `images` entry.
+/// Supports `*` standalone, `*<suffix>` (e.g. `*.jpg`), and `<prefix>*`
+/// (e.g. `cover_*`). Anything else is treated as a literal filename.
+fn match_basename(pattern: &str, name: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        if !suffix.contains('*') {
+            return name.ends_with(suffix);
+        }
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        if !prefix.contains('*') {
+            return name.starts_with(prefix);
+        }
+    }
+    name == pattern
+}
+
+/// Expand one `images` entry into the list of concrete file paths it
+/// resolves to. Literal paths (no `*`) round-trip as a single-element vec;
+/// glob entries enumerate their parent directory and filter by image
+/// extension. Returns an empty vec when a directory is unreadable so
+/// failures degrade gracefully.
+fn expand_pattern(raw: &str) -> Vec<PathBuf> {
+    let resolved = expand_tilde(raw);
+    let as_str = resolved.to_string_lossy().into_owned();
+    if !as_str.contains('*') {
+        return vec![resolved];
+    }
+
+    // Split into "directory" / "basename pattern" at the final separator.
+    let (dir_part, basename) = match as_str.rsplit_once('/') {
+        Some((d, n)) => (PathBuf::from(d), n.to_string()),
+        None => (PathBuf::from("."), as_str),
+    };
+
+    let rd = match std::fs::read_dir(&dir_part) {
+        Ok(rd) => rd,
+        Err(err) => {
+            tracing::warn!(
+                dir = %dir_part.display(),
+                error = %err,
+                "gallery: directory unreadable for glob"
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut matches: Vec<PathBuf> = Vec::new();
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !match_basename(&basename, name) {
+            continue;
+        }
+        // Untyped `/dir/*` should only catch image files. Typed patterns
+        // (`/dir/*.jpg`) already self-filter via the basename match, so the
+        // extension check is a no-op there.
+        if !is_image_file(&p) {
+            continue;
+        }
+        matches.push(p);
+    }
+    // Alphabetical order so the slideshow has a stable cycle even when the
+    // filesystem returns entries in directory order.
+    matches.sort();
+    matches
+}
+
+/// Expand every config entry, preserving the user's outer ordering and
+/// deduplicating across patterns (the same file matched by two globs
+/// renders once).
+fn expand_all_patterns(patterns: &[String]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for raw in patterns {
+        for p in expand_pattern(raw) {
+            if seen.insert(p.clone()) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 /// Read + decode an image file. Wraps the `image` crate's reader so the
 /// error chain (`failed to open` / `unsupported format` / etc.) reaches
 /// the tracing warning intact.
@@ -656,6 +805,225 @@ fn load_image(path: &std::path::Path) -> Result<DynamicImage> {
         .decode()
         .with_context(|| format!("decode {}", path.display()))?;
     Ok(img)
+}
+
+/// Cache-aware thumb loader. Strategy:
+///
+/// 1. Build a stable cache key from the canonical absolute path (falls back
+///    to the raw path string when canonicalisation fails — happens when the
+///    image was deleted mid-run).
+/// 2. If the cache holds a thumb whose `stored_at` is newer than the source
+///    file's mtime, decode just the thumb (JPEG, ~10x faster than full
+///    source) and return.
+/// 3. Otherwise re-decode + downscale the source and write the result back
+///    to the cache.
+///
+/// JPEG was picked over PNG because thumbs at 1600 px long-side are visually
+/// indistinguishable at terminal-grid resolution and the size difference is
+/// 3-5×. Files land at `~/.cache/glint/gallery/<instance>/thumb-<sha>.bin`.
+fn load_thumb(cache: &ScopedCache, path: &Path) -> Result<DynamicImage> {
+    let cache_key = thumb_cache_key(path);
+    let src_mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+
+    if let Some(entry) = cache.load_bytes(&cache_key) {
+        let stored: std::time::SystemTime = entry.stored_at.into();
+        // When the source mtime is unreadable (file moved / removed / on a
+        // disconnected drive) the cache is the best we have — serve it
+        // rather than erroring. Otherwise the cache is fresh iff it was
+        // stored at or after the source's last modification.
+        let fresh = src_mtime.map_or(true, |m| stored >= m);
+        if fresh {
+            match image::load_from_memory(&entry.value) {
+                Ok(img) => return Ok(img),
+                Err(err) => {
+                    // Stored bytes won't decode — drop them and fall through
+                    // to a fresh source decode + re-encode.
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "gallery: cached thumb undecodable, refreshing"
+                    );
+                }
+            }
+        }
+    }
+
+    let img = downscale_to_max_dim(load_image(path)?, MAX_IMAGE_DIM);
+
+    // Encode the thumb as JPEG so the cached payload stays small. JPEG can't
+    // hold an alpha channel; flatten to RGB before encoding so RGBA sources
+    // (PNG, etc.) don't fail.
+    let rgb = img.to_rgb8();
+    let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
+    if let Err(err) = DynamicImage::ImageRgb8(rgb).write_to(
+        &mut std::io::Cursor::new(&mut buf),
+        image::ImageFormat::Jpeg,
+    ) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "gallery: thumb encode failed; serving uncached"
+        );
+        return Ok(img);
+    }
+    if let Err(err) = cache.store_bytes(&cache_key, &buf) {
+        tracing::warn!(error = %err, "gallery thumb cache store failed");
+    }
+    Ok(img)
+}
+
+/// Stable cache key derived from the source path. The path is hashed as-is
+/// (no symlink resolution) so a cache lookup gives the same answer whether
+/// or not the source file currently exists — important when a previously
+/// indexed image was moved or deleted between runs.
+fn thumb_cache_key(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(path.as_os_str().as_encoded_bytes());
+    let mut key = String::with_capacity(22);
+    key.push_str("thumb-");
+    for b in &digest[..8] {
+        use std::fmt::Write;
+        let _ = write!(key, "{b:02x}");
+    }
+    key
+}
+
+/// Decode `path` (cache-aware) and bundle the result into a `Slide`.
+/// Returns `None` on decode failure; the loader logs and skips.
+fn build_slide(
+    picker: &mut Picker,
+    cache: &ScopedCache,
+    path: &Path,
+) -> Option<Slide> {
+    let label = path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    match load_thumb(cache, path) {
+        Ok(img) => {
+            let pixel_size = (img.width(), img.height());
+            let protocol = picker.new_resize_protocol(img);
+            Some(Slide {
+                source_path: path.to_path_buf(),
+                label,
+                protocol: Some(Mutex::new(protocol)),
+                pixel_size,
+            })
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "gallery: failed to load image, skipping"
+            );
+            None
+        }
+    }
+}
+
+/// Sleep for `total`, but check `stop` once per second so a cancellation
+/// signal (typically from a config reload) is honoured promptly. Returns
+/// `false` when cancelled, `true` when the full duration elapsed.
+fn sleep_with_cancel(total: Duration, stop: &AtomicBool) -> bool {
+    let tick = Duration::from_secs(1);
+    let mut remaining = total;
+    while !remaining.is_zero() {
+        if stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        let step = if remaining > tick { tick } else { remaining };
+        std::thread::sleep(step);
+        remaining = remaining.saturating_sub(step);
+    }
+    !stop.load(Ordering::Relaxed)
+}
+
+/// Reconcile the slide list against a freshly-expanded `next` path set.
+///
+/// - Newly discovered paths are decoded (via `build_slide`, which routes
+///   through the persistent cache) and appended at the end. They appear in
+///   the slideshow without further user action.
+/// - Paths that vanished from the expansion are removed.
+/// - Ordering otherwise follows `next` so the user's pattern order stays
+///   authoritative across rescans.
+/// - The currently-visible slide's identity (by `source_path`) is preserved
+///   when possible; if it was removed, the index snaps to 0.
+fn reconcile_slides(
+    picker: &mut Picker,
+    cache: &ScopedCache,
+    slides: &Arc<Mutex<Vec<Slide>>>,
+    current: &Arc<Mutex<GalleryState>>,
+    next: &[PathBuf],
+) {
+    // Build new slides outside the lock so decode work doesn't stall render.
+    let existing_paths: std::collections::HashSet<PathBuf> = {
+        let guard = match slides.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        guard.iter().map(|s| s.source_path.clone()).collect()
+    };
+    let mut additions: Vec<Slide> = Vec::new();
+    for path in next.iter() {
+        if existing_paths.contains(path) {
+            continue;
+        }
+        if let Some(slide) = build_slide(picker, cache, path) {
+            additions.push(slide);
+        }
+    }
+    let next_set: std::collections::HashSet<&Path> = next.iter().map(|p| p.as_path()).collect();
+
+    // Apply the diff atomically: reorder + drop removed + append new.
+    let visible_path = {
+        let st = match current.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let guard = match slides.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        guard.get(st.idx).map(|s| s.source_path.clone())
+    };
+
+    let mut guard = match slides.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    // Drop slides whose paths are no longer matched by any pattern.
+    guard.retain(|s| next_set.contains(s.source_path.as_path()));
+    // Reorder retained slides to match `next`'s order.
+    guard.sort_by_key(|s| {
+        next.iter()
+            .position(|p| p == &s.source_path)
+            .unwrap_or(usize::MAX)
+    });
+    guard.extend(additions);
+    // Re-locate the previously-visible slide and snap the index back to it
+    // (or 0 when it's gone).
+    let new_idx = visible_path
+        .as_ref()
+        .and_then(|p| guard.iter().position(|s| &s.source_path == p))
+        .unwrap_or(0);
+    drop(guard);
+
+    if let Ok(mut st) = current.lock() {
+        st.idx = new_idx;
+    }
+}
+
+pub const KIND: &str = "gallery";
+
+pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
+    let cfg: GalleryConfig =
+        crate::config::load_widget_toml_for_instance(KIND, &ctx.instance).unwrap_or_default();
+    Box::new(GalleryWidget::with_config(
+        ctx.instance.clone(),
+        cfg,
+        ctx.theme.clone(),
+        ctx.cache.clone(),
+    ))
 }
 
 #[cfg(test)]
@@ -693,6 +1061,7 @@ mod tests {
             "main".to_string(),
             cfg,
             Arc::new(Theme::builtin_defaults()),
+            ScopedCache::ephemeral(),
         );
         let st = widget.current.lock().unwrap();
         assert!(st.paused);
@@ -709,6 +1078,7 @@ mod tests {
             "main".to_string(),
             cfg,
             Arc::new(Theme::builtin_defaults()),
+            ScopedCache::ephemeral(),
         );
         let st = widget.current.lock().unwrap();
         assert!(!st.paused);
@@ -721,12 +1091,14 @@ mod tests {
             "main".into(),
             GalleryConfig::default(),
             Arc::new(Theme::builtin_defaults()),
+            ScopedCache::ephemeral(),
         );
         assert_eq!(main.id(), "gallery");
         let inst = GalleryWidget::with_config(
             "kids".into(),
             GalleryConfig::default(),
             Arc::new(Theme::builtin_defaults()),
+            ScopedCache::ephemeral(),
         );
         assert_eq!(inst.id(), "gallery@kids");
         assert_eq!(inst.display_name(), "Gallery (kids)");
@@ -738,8 +1110,132 @@ mod tests {
             "main".into(),
             GalleryConfig::default(),
             Arc::new(Theme::builtin_defaults()),
+            ScopedCache::ephemeral(),
         );
         assert_eq!(w.shortcut_preferences(), &['g', 'a', 'l', 'r', 'y']);
+    }
+
+    #[test]
+    fn is_image_file_is_case_insensitive() {
+        assert!(is_image_file(Path::new("/tmp/a.JPG")));
+        assert!(is_image_file(Path::new("/tmp/a.png")));
+        assert!(is_image_file(Path::new("/tmp/a.WebP")));
+        assert!(!is_image_file(Path::new("/tmp/a.txt")));
+        assert!(!is_image_file(Path::new("/tmp/a")));
+    }
+
+    #[test]
+    fn match_basename_handles_star_suffix_prefix_and_literal() {
+        assert!(match_basename("*", "anything.jpg"));
+        assert!(match_basename("*.jpg", "cover.jpg"));
+        assert!(!match_basename("*.jpg", "cover.png"));
+        assert!(match_basename("cover_*", "cover_2024.png"));
+        assert!(!match_basename("cover_*", "anything.png"));
+        assert!(match_basename("exact.png", "exact.png"));
+        assert!(!match_basename("exact.png", "different.png"));
+    }
+
+    #[test]
+    fn expand_pattern_returns_literal_unchanged() {
+        let out = expand_pattern("/some/where/img.png");
+        assert_eq!(out, vec![PathBuf::from("/some/where/img.png")]);
+    }
+
+    #[test]
+    fn expand_pattern_globs_image_files_in_directory() {
+        // Write three files into a fresh dir: two images + one non-image.
+        // The non-image must be filtered out.
+        use image::{Rgb, RgbImage};
+        let dir = std::env::temp_dir().join(format!(
+            "glint-gallery-glob-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png_a = dir.join("a.png");
+        let png_b = dir.join("b.png");
+        let txt = dir.join("readme.txt");
+        RgbImage::from_pixel(8, 8, Rgb([0, 0, 0])).save(&png_a).unwrap();
+        RgbImage::from_pixel(8, 8, Rgb([0, 0, 0])).save(&png_b).unwrap();
+        std::fs::write(&txt, b"hi").unwrap();
+
+        let mut out = expand_pattern(&format!("{}/*", dir.display()));
+        out.sort();
+        assert_eq!(out, vec![png_a.clone(), png_b.clone()]);
+
+        // Extension-typed glob: only one match.
+        let out2 = expand_pattern(&format!("{}/*.png", dir.display()));
+        assert_eq!(out2.len(), 2);
+
+        let out3 = expand_pattern(&format!("{}/*.jpg", dir.display()));
+        assert!(out3.is_empty());
+
+        // Cleanup.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn expand_pattern_handles_missing_dir() {
+        let out = expand_pattern("/this/directory/does/not/exist/*");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn expand_all_patterns_dedups_across_entries() {
+        let dir = std::env::temp_dir().join(format!(
+            "glint-gallery-dedup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.png");
+        image::RgbImage::from_pixel(8, 8, image::Rgb([0, 0, 0]))
+            .save(&p)
+            .unwrap();
+
+        let patterns = vec![
+            p.to_string_lossy().into_owned(),
+            format!("{}/*", dir.display()),
+        ];
+        let out = expand_all_patterns(&patterns);
+        assert_eq!(out, vec![p.clone()], "same file matched twice should appear once");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_thumb_round_trips_through_cache() {
+        // Write a tiny PNG to a temp file, load it through load_thumb,
+        // then load again and confirm the second call doesn't re-touch the
+        // source file (i.e. removing the source between calls still works).
+        use image::{Rgb, RgbImage};
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!(
+            "glint-gallery-test-{}-{}.png",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let img = RgbImage::from_pixel(64, 32, Rgb([200, 100, 50]));
+        img.save(&tmp).expect("write source image");
+
+        let cache = ScopedCache::ephemeral();
+        let first = load_thumb(&cache, &tmp).expect("first decode");
+        assert_eq!((first.width(), first.height()), (64, 32));
+
+        // Cache should now hold a thumb. Delete the source; a second
+        // load_thumb call must still succeed via the cached bytes.
+        std::fs::remove_file(&tmp).expect("remove source");
+        let second = load_thumb(&cache, &tmp).expect("second decode (cached)");
+        assert_eq!((second.width(), second.height()), (64, 32));
     }
 
     #[test]
@@ -803,6 +1299,7 @@ mod tests {
             "main".into(),
             cfg,
             Arc::new(Theme::builtin_defaults()),
+            ScopedCache::ephemeral(),
         );
         assert_eq!(widget.slide_count(), 0);
     }

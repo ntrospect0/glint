@@ -89,11 +89,7 @@ mod tests {
     fn cache_get_returns_the_put_value() {
         let cache = ResponseCache::with_capacity(8);
         let key = CacheKey(42);
-        let val = LlmResponse {
-            text: "cached".into(),
-            input_tokens: 10,
-            output_tokens: 5,
-        };
+        let val = LlmResponse { text: "cached".into() };
         cache.put(key, val.clone());
         let got = cache.get(key).unwrap();
         assert_eq!(got.text, "cached");

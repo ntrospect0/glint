@@ -9,7 +9,9 @@ use tokio::sync::mpsc;
 pub enum Event {
     Key(KeyEvent),
     Mouse(MouseEvent),
-    Resize(#[allow(dead_code)] u16, #[allow(dead_code)] u16),
+    /// Terminal resize. Ratatui recomputes layout from the next `terminal.size()`
+    /// on draw, so the new dimensions don't need to ride the event.
+    Resize,
     Tick,
     /// One of the user's TOML config files changed — main loop will re-read
     /// and hot-apply via Widget::apply_config.
@@ -57,7 +59,7 @@ async fn run_loop(
                 let mapped = match evt {
                     CtEvent::Key(k) => Some(Event::Key(k)),
                     CtEvent::Mouse(m) => Some(Event::Mouse(m)),
-                    CtEvent::Resize(w, h) => Some(Event::Resize(w, h)),
+                    CtEvent::Resize(_, _) => Some(Event::Resize),
                     _ => None,
                 };
                 if let Some(e) = mapped {

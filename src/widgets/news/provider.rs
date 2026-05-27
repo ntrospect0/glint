@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// One normalized item across RSS/Atom/JSON feeds.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Article {
     pub title: String,
     pub url: String,
@@ -18,9 +18,6 @@ pub struct Article {
 #[async_trait]
 pub trait NewsProvider: Send + Sync {
     async fn fetch(&self) -> Result<Vec<Article>>;
-
-    #[allow(dead_code)] // surfaced in status bar in later phases.
-    fn name(&self) -> &str;
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -131,10 +128,6 @@ impl NewsProvider for RssProvider {
         dedup_by_url(&mut all);
         all.sort_by_key(|a| std::cmp::Reverse(a.published));
         Ok(all)
-    }
-
-    fn name(&self) -> &str {
-        "rss"
     }
 }
 

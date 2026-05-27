@@ -19,48 +19,40 @@ use crate::ui::{big_digits, decorated_title_line};
 
 use super::{AppContext, EventResult, Widget};
 
-/// User-configurable clock options (loaded from `~/.config/glint/clock.toml`).
+/// Loaded from `~/.config/glint/clock.toml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClockConfig {
-    /// IANA timezone name for the primary clock. Defaults to system local time.
+    /// IANA timezone for the primary clock. `None` = system local time.
     #[serde(default)]
     pub timezone: Option<String>,
 
-    /// Show seconds inside the big block-digit display (e.g. `HH:MM:SS`).
     #[serde(default)]
     pub show_seconds: bool,
 
-    /// Show a small ticking `HH:MM:SS` text line below the big digits.
+    /// Small ticking `HH:MM:SS` line below the big digits.
     #[serde(default = "default_show_seconds_ticker")]
     pub show_seconds_ticker: bool,
 
     #[serde(default = "default_show_date")]
     pub show_date: bool,
 
-    /// `"12h"` or `"24h"` (alternatively the bare integers `12` / `24` for
-    /// backward compatibility). Anything else falls back to 24-hour.
+    /// `"12h"` or `"24h"`.
     #[serde(default = "default_hour_format", deserialize_with = "deserialize_hour_format")]
     pub hour_format: u8,
 
-    /// Additional world clocks rendered below the primary display when the
-    /// cell is tall enough.
+    /// World clocks rendered below the primary display when the cell is tall enough.
     #[serde(default)]
     pub secondary_timezones: Vec<SecondaryTimezone>,
 
-    /// Big-digit visual style. `"normal"` (default) keeps the current single-
-    /// color block digits; the other variants apply a top-to-bottom color
-    /// gradient using half-height block rendering. Press `g` while focused
-    /// on the clock widget to cycle through them at runtime.
+    /// Big-digit gradient style. `g` cycles at runtime.
     #[serde(default)]
     pub gradient: big_digits::Gradient,
 
-    /// Per-widget style overrides layered on top of the active app color
-    /// scheme. Any role omitted here inherits from the app theme.
+    /// Per-widget overrides layered on the app theme.
     #[serde(default)]
     pub colors: ColorScheme,
 
-    /// Prioritized `Shift+<letter>` focus shortcut preferences. Leave
-    /// empty to use the built-in default (`['c', 'l', 'o', 'k']`).
+    /// `Shift+<letter>` focus shortcuts; falls back to `['c', 'l', 'o', 'k']`.
     #[serde(default)]
     pub shortcuts: Vec<char>,
 }
@@ -68,9 +60,7 @@ pub struct ClockConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SecondaryTimezone {
     pub label: String,
-    /// IANA timezone identifier. Accepts the old short `tz` field for
-    /// backward compatibility with existing user configs.
-    #[serde(alias = "tz")]
+    /// IANA timezone identifier (e.g. `"America/New_York"`).
     pub timezone: String,
 }
 
@@ -84,33 +74,20 @@ fn default_hour_format() -> u8 {
     24
 }
 
-/// Accept either `"12h"`/`"24h"` strings or the bare integers `12`/`24` so
-/// the field reads consistently with other enum-style settings while keeping
-/// existing user configs working.
+/// Parse `"12h"` / `"24h"` into the corresponding integer.
 fn deserialize_hour_format<'de, D>(deserializer: D) -> Result<u8, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::de::Error;
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Repr {
-        Str(String),
-        Int(u8),
+    let s = String::deserialize(deserializer)?;
+    match s.trim().to_lowercase().as_str() {
+        "12h" => Ok(12),
+        "24h" => Ok(24),
+        other => Err(D::Error::custom(format!(
+            "unknown hour_format {other:?}, expected \"12h\" or \"24h\""
+        ))),
     }
-    let n = match Repr::deserialize(deserializer)? {
-        Repr::Int(n) => n,
-        Repr::Str(s) => match s.trim().to_lowercase().as_str() {
-            "12h" | "12" => 12,
-            "24h" | "24" => 24,
-            other => {
-                return Err(D::Error::custom(format!(
-                    "unknown hour_format {other:?}, expected \"12h\" or \"24h\""
-                )))
-            }
-        },
-    };
-    Ok(n)
 }
 
 impl Default for ClockConfig {
@@ -718,6 +695,22 @@ impl Widget for ClockWidget {
     fn set_shortcut(&mut self, shortcut: Option<char>) {
         self.shortcut = shortcut;
     }
+}
+
+/// Registry kind string for the clock widget. Single source of truth — used
+/// by the widget descriptor, the config file resolver, and the wizard.
+pub const KIND: &str = "clock";
+
+/// Registry factory. Reads the on-disk TOML for this instance and constructs
+/// the widget with the dependencies it needs from `WidgetCtx`.
+pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
+    let cfg: ClockConfig =
+        crate::config::load_widget_toml_for_instance(KIND, &ctx.instance).unwrap_or_default();
+    Box::new(ClockWidget::with_config(
+        ctx.instance.clone(),
+        cfg,
+        ctx.theme.clone(),
+    ))
 }
 
 #[cfg(test)]

@@ -1,11 +1,15 @@
 use anyhow::{Context, Result};
+// rustc's `unused_imports` lint mis-fires on proc-macro attribute imports
+// when there's exactly one use site in this file. The compile fails without
+// the import, so suppress the false-positive locally.
+#[allow(unused_imports)]
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::auth;
 
 use super::{cache::CacheKey, cache::ResponseCache, rate_limiter::RateLimiter, LimitsConfig};
-use super::{LlmMessage, LlmProvider, LlmRequest, LlmResponse, Role};
+use super::{LlmProvider, LlmRequest, LlmResponse, Role};
 
 const API_VERSION: &str = "2023-06-01";
 const MESSAGES_PATH: &str = "/v1/messages";
@@ -95,10 +99,6 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
-    fn name(&self) -> &str {
-        "anthropic"
-    }
-
     async fn complete(&self, request: LlmRequest) -> Result<LlmResponse> {
         let key = CacheKey::of(&request);
         if let Some(cached) = self.cache.get(key) {
@@ -134,28 +134,9 @@ impl LlmProvider for AnthropicProvider {
             .filter_map(|c| if c.kind == "text" { Some(c.text) } else { None })
             .collect::<Vec<_>>()
             .join("\n");
-        let out = LlmResponse {
-            text,
-            input_tokens: parsed.usage.input_tokens,
-            output_tokens: parsed.usage.output_tokens,
-        };
+        let out = LlmResponse { text };
         self.cache.put(key, out.clone());
         Ok(out)
-    }
-
-    async fn health_check(&self) -> Result<bool> {
-        // Cheapest possible round-trip: tiny prompt with max_tokens=1.
-        let req = LlmRequest {
-            model: None,
-            system: None,
-            messages: vec![LlmMessage {
-                role: Role::User,
-                content: "ping".into(),
-            }],
-            max_tokens: 1,
-            cache_system: false,
-        };
-        Ok(self.complete(req).await.is_ok())
     }
 }
 
@@ -193,8 +174,6 @@ struct CacheControl {
 struct MessagesResponse {
     #[serde(default)]
     content: Vec<ContentBlock>,
-    #[serde(default)]
-    usage: Usage,
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,14 +182,6 @@ struct ContentBlock {
     kind: String,
     #[serde(default)]
     text: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct Usage {
-    #[serde(default)]
-    input_tokens: u32,
-    #[serde(default)]
-    output_tokens: u32,
 }
 
 fn build_request_body<'a>(

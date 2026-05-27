@@ -349,11 +349,17 @@ fn render_unknown(frame: &mut Frame, area: Rect, id: &str, focused: bool, theme:
             decorate_title(focused, id),
             Style::default().add_modifier(Modifier::DIM),
         ));
+    // `id` looks like `gallery` or `gallery@home`; strip the instance suffix
+    // so the cargo-feature hint matches the on-disk feature name.
+    let kind = id.split_once('@').map(|(k, _)| k).unwrap_or(id);
     let body = Paragraph::new(vec![
         Line::from(""),
-        Line::from(format!("Widget '{id}' is not registered.")),
+        Line::from(format!("Widget '{id}' is not available in this build.")),
         Line::from(""),
-        Line::from("Coming in a later phase."),
+        Line::from(format!(
+            "Rebuild with --features widget-{kind} to enable it,"
+        )),
+        Line::from("or remove this cell from your layout in config.toml."),
     ])
     .alignment(Alignment::Center)
     .block(block);

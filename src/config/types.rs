@@ -4,11 +4,10 @@ use super::layout::LayoutConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    #[allow(dead_code)] // surfaced once we start migrating configs across versions.
+    #[allow(dead_code)] // read when migrating configs across versions.
     #[serde(default = "default_version")]
     pub version: u32,
 
-    #[allow(dead_code)] // wired into status bar + command bar in later phases.
     #[serde(default)]
     pub global: GlobalConfig,
 
@@ -20,9 +19,7 @@ fn default_version() -> u32 {
     1
 }
 
-// Phase 1 parses these for forward-compat; they're read in later phases
-// (status bar, command bar, log routing, theme overrides).
-#[allow(dead_code)]
+#[allow(dead_code)] // surfaced by status bar + command bar render paths.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GlobalConfig {
     #[serde(default = "default_theme")]
@@ -39,6 +36,21 @@ pub struct GlobalConfig {
 
     #[serde(default)]
     pub log_file: Option<String>,
+
+    /// Vertical mouse-wheel direction. `"natural"` (default) means a wheel-up
+    /// scroll moves a list selection or pane content *up*. `"inverted"` flips
+    /// every scroll event at the dispatch boundary so widgets — which always
+    /// write up=up / down=down — automatically honor the user's preference.
+    #[serde(default)]
+    pub mouse_scroll: MouseScroll,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MouseScroll {
+    #[default]
+    Natural,
+    Inverted,
 }
 
 fn default_theme() -> String {
@@ -65,6 +77,7 @@ impl Default for GlobalConfig {
             refresh_all_on_focus: default_refresh_on_focus(),
             log_level: default_log_level(),
             log_file: None,
+            mouse_scroll: MouseScroll::default(),
         }
     }
 }

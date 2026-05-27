@@ -19,8 +19,8 @@ use ratatui::{
 };
 use serde::Deserialize;
 
+use crate::cache::ScopedCache;
 use crate::geolocation::{self, GeoLocation};
-use crate::providers::DataProvider;
 use crate::theme::{ColorScheme, Theme};
 use crate::ui::decorated_title_line;
 
@@ -30,18 +30,16 @@ use provider::{
     describe_code, icon_for_code, render_icon, OpenMeteoProvider, Units, WeatherData,
 };
 
-/// User-configurable weather options (loaded from `~/.config/glint/weather.toml`).
+/// Loaded from `~/.config/glint/weather.toml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WeatherConfig {
-    /// Display label for the location. If omitted, the IP-geolocation result is used.
+    /// Display label. Falls back to the IP-geolocation result.
     #[serde(default)]
     pub label: Option<String>,
 
-    /// Explicit latitude. If omitted and `auto_locate` is true, ipapi.co is used.
     #[serde(default)]
     pub latitude: Option<f64>,
 
-    /// Explicit longitude. If omitted and `auto_locate` is true, ipapi.co is used.
     #[serde(default)]
     pub longitude: Option<f64>,
 
@@ -51,18 +49,15 @@ pub struct WeatherConfig {
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
 
-    /// When true and lat/lon are missing, glint geolocates by IP on first
-    /// refresh and caches the result for the session.
+    /// IP-geolocate (via ipapi.co) when lat/lon are missing. Cached per session.
     #[serde(default = "default_auto_locate")]
     pub auto_locate: bool,
 
-    /// Per-widget style overrides layered on top of the active app
-    /// color scheme. Any role omitted here inherits from the app theme.
+    /// Per-widget overrides layered on the app theme.
     #[serde(default)]
     pub colors: ColorScheme,
 
-    /// Prioritized `Shift+<letter>` focus shortcut preferences. Leave
-    /// empty to use the built-in default (`['w', 'e', 'a', 't', 'h', 'r']`).
+    /// `Shift+<letter>` focus shortcuts; falls back to `['w', 'e', 'a', 't', 'h', 'r']`.
     #[serde(default)]
     pub shortcuts: Vec<char>,
 }
@@ -111,6 +106,8 @@ struct WeatherState {
     transient_searching: bool,
 }
 
+const CACHE_KEY_CURRENT: &str = "current";
+
 pub struct WeatherWidget {
     id: String,
     instance: String,
@@ -130,6 +127,8 @@ pub struct WeatherWidget {
     shortcut: Option<char>,
     /// Effective shortcut preference list (TOML override or built-in).
     shortcut_prefs: Vec<char>,
+    /// Persistent cache of the last successful WeatherData snapshot.
+    cache: ScopedCache,
 }
 
 impl Default for WeatherWidget {
@@ -138,12 +137,18 @@ impl Default for WeatherWidget {
             "main".to_string(),
             WeatherConfig::default(),
             Arc::new(Theme::builtin_defaults()),
+            ScopedCache::ephemeral(),
         )
     }
 }
 
 impl WeatherWidget {
-    pub fn with_config(instance: String, config: WeatherConfig, app_theme: Arc<Theme>) -> Self {
+    pub fn with_config(
+        instance: String,
+        config: WeatherConfig,
+        app_theme: Arc<Theme>,
+        cache: ScopedCache,
+    ) -> Self {
         // If the user specified explicit lat/lon, seed the location immediately
         // so we skip the geolocation hop.
         let initial_location = match (config.latitude, config.longitude) {
@@ -158,10 +163,20 @@ impl WeatherWidget {
             }),
             _ => None,
         };
-        let state = Arc::new(Mutex::new(WeatherState {
+        let poll_interval = Duration::from_secs(config.poll_interval_secs.max(30));
+        // Seed from cache so the first frame shows the previous reading.
+        // Mapping wall-clock age onto the monotonic `last_attempt` lets the
+        // existing poll-interval gate suppress redundant refetches.
+        let mut initial_state = WeatherState {
             location: initial_location,
             ..WeatherState::default()
-        }));
+        };
+        if let Some(entry) = cache.load::<WeatherData>(CACHE_KEY_CURRENT) {
+            let age = entry.age().min(poll_interval);
+            initial_state.data = Some(entry.value);
+            initial_state.last_attempt = Some(Instant::now() - age);
+        }
+        let state = Arc::new(Mutex::new(initial_state));
         let theme = app_theme.with_overrides(&config.colors);
         let shortcut_prefs = if config.shortcuts.is_empty() {
             vec!['w', 'e', 'a', 't', 'h', 'r']
@@ -182,13 +197,14 @@ impl WeatherWidget {
             id,
             instance,
             display_name_cache,
-            poll_interval: Duration::from_secs(config.poll_interval_secs.max(30)),
+            poll_interval,
             config,
             state,
             app_theme,
             theme,
             shortcut: None,
             shortcut_prefs,
+            cache,
         }
     }
 
@@ -302,6 +318,7 @@ impl WeatherWidget {
         }
         let units = self.config.units;
         let state = self.state.clone();
+        let cache = self.cache.clone();
         tokio::spawn(async move {
             let provider = OpenMeteoProvider::new(lat, lon, units);
             let result = provider.fetch().await;
@@ -309,6 +326,9 @@ impl WeatherWidget {
             st.inflight = false;
             match result {
                 Ok(data) => {
+                    if let Err(err) = cache.store(CACHE_KEY_CURRENT, &data) {
+                        tracing::warn!(error = %err, "weather cache store failed");
+                    }
                     st.data = Some(data);
                     st.last_error = None;
                 }
@@ -511,8 +531,9 @@ impl Widget for WeatherWidget {
         let new_config: WeatherConfig =
             serde_json::from_value(config).context("invalid weather config payload")?;
         let app_theme = self.app_theme.clone();
+        let cache = self.cache.clone();
         let instance = self.instance.clone();
-        *self = Self::with_config(instance, new_config, app_theme);
+        *self = Self::with_config(instance, new_config, app_theme, cache);
         Ok(())
     }
 
@@ -764,6 +785,19 @@ fn weekday_short(w: chrono::Weekday) -> &'static str {
     }
 }
 
+pub const KIND: &str = "weather";
+
+pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
+    let cfg: WeatherConfig =
+        crate::config::load_widget_toml_for_instance(KIND, &ctx.instance).unwrap_or_default();
+    Box::new(WeatherWidget::with_config(
+        ctx.instance.clone(),
+        cfg,
+        ctx.theme.clone(),
+        ctx.cache.clone(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,6 +807,7 @@ mod tests {
             "main".to_string(),
             cfg,
             Arc::new(Theme::builtin_defaults()),
+            ScopedCache::ephemeral(),
         )
     }
 

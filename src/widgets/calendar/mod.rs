@@ -37,6 +37,7 @@ use provider::{CalendarProvider, Event};
 
 use crate::auth::google::{store::GoogleToken, OAuthClientConfig as GoogleClientConfig};
 use crate::auth::microsoft::{store::MicrosoftToken, OAuthClientConfig as MicrosoftClientConfig};
+use crate::cache::ScopedCache;
 use crate::theme::{ColorScheme, Theme};
 use crate::ui::{big_digits, decorated_title_line};
 
@@ -75,64 +76,39 @@ pub struct CalendarConfig {
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
 
-    /// Single-provider config (legacy / convenience). For multi-provider use,
-    /// fill in `[[providers]]` blocks instead — both forms are accepted.
-    #[serde(default)]
-    pub provider: ProviderKind,
-
-    /// Legacy single-provider calendar IDs. Used when `provider` is set and
-    /// `providers` is empty.
-    #[serde(default)]
-    pub calendar_ids: Vec<String>,
-
-    /// Multi-provider config — each entry is one calendar account. When
-    /// non-empty, takes precedence over the singular `provider` field. Lets
-    /// you merge events from Google + Outlook + CalDAV into one timeline.
+    /// Calendar sources. Empty = local-only (use `[[events]]` below).
     #[serde(default)]
     pub providers: Vec<ProviderEntry>,
 
-    /// CalDAV-specific options. Used by any `caldav`-kind provider entry
-    /// that doesn't supply its own `calendar_ids`. Kept for backward compat.
+    /// Fallback URLs for any `caldav` entry without explicit `calendar_ids`.
     #[serde(default)]
     pub caldav: CalDavConfig,
 
-    /// Local events to seed the provider. Kept here so `config::load_widget_toml`
-    /// returns the full file in one shot.
+    /// Events for the built-in local provider.
     #[serde(default)]
     pub events: Vec<local::RawEvent>,
 
-    /// Optional override for the default color sequence cycled across
-    /// calendars. Names follow the standard ANSI palette (e.g. `red`,
-    /// `light_blue`, `magenta`). Calendars are assigned colors by the order
-    /// they appear in `[[providers]]`; the sequence wraps if there are more
-    /// calendars than colors.
+    /// ANSI palette cycled across calendars in `[[providers]]` order. Names
+    /// like `red`, `light_blue`. Wraps when more calendars than colors.
     #[serde(default)]
     pub color_palette: Vec<String>,
 
-    /// Optional per-calendar overrides. Keys are `"<source>:<calendar_id>"`,
-    /// e.g. `"google:primary"` or `"outlook:primary"` — using the same
-    /// strings the `[[providers]]` block lists for `calendar_ids`. An explicit
-    /// override beats the sequence assignment.
+    /// Per-calendar overrides keyed by `"<source>:<calendar_id>"`
+    /// (e.g. `"google:primary"`). Wins over the palette sequence.
     #[serde(default)]
     pub calendar_colors: HashMap<String, String>,
 
-    /// Big-digit visual style for the day-of-month numeral in Day view.
-    /// `"normal"` (default) keeps the current solid-color rendering; the
-    /// other variants apply a top-to-bottom gradient using half-height block
-    /// rendering. Press `g` while focused on the calendar to cycle. Gradient
-    /// only applies to today's date — anchor and preview days keep their
-    /// dimmed single-color treatment so today still stands out.
+    /// Big-digit gradient for the day-of-month numeral in Day view.
+    /// `g` cycles. Only applies to today — anchor/preview days stay solid.
     #[serde(default)]
     pub gradient: big_digits::Gradient,
 
-    /// Per-widget style overrides layered on top of the active app
-    /// color scheme. Any role omitted here inherits from the app theme.
-    /// Distinct from the per-provider `calendar_colors` palette above.
+    /// Per-widget overrides layered on the app theme. Distinct from
+    /// `calendar_colors`, which colors per-provider event blocks.
     #[serde(default)]
     pub colors: ColorScheme,
 
-    /// Prioritized `Shift+<letter>` focus shortcut preferences. Leave
-    /// empty to use the built-in default (`['c', 'd', 'a', 'l', 'e', 'n', 'r']`).
+    /// `Shift+<letter>` focus shortcuts; falls back to `['c', 'd', 'a', 'l', 'e', 'n', 'r']`.
     #[serde(default)]
     pub shortcuts: Vec<char>,
 }
@@ -140,18 +116,16 @@ pub struct CalendarConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderEntry {
     pub kind: ProviderKind,
-    /// Provider-specific calendar identifiers — Google calendar IDs, Outlook
-    /// calendar IDs, or CalDAV calendar URLs. Empty = the provider's default
-    /// (e.g. Google "primary", Outlook default calendar, all CalDAV calendars).
+    /// Google IDs, Outlook IDs, or CalDAV URLs. Empty = the provider's default
+    /// (Google `"primary"`, Outlook default, every CalDAV calendar).
     #[serde(default)]
     pub calendar_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CalDavConfig {
-    /// Optional explicit calendar URLs to fetch. When empty, the provider
-    /// discovers them automatically by walking the standard CalDAV chain
-    /// (current-user-principal → calendar-home-set → calendars).
+    /// Explicit calendar URLs. Empty = walk the CalDAV principal chain
+    /// (current-user-principal → calendar-home-set → calendars) to discover.
     #[serde(default)]
     pub calendars: Vec<String>,
 }
@@ -165,8 +139,6 @@ impl Default for CalendarConfig {
         Self {
             default_view: CalendarView::default(),
             poll_interval_secs: default_poll_interval(),
-            provider: ProviderKind::default(),
-            calendar_ids: Vec::new(),
             providers: Vec::new(),
             caldav: CalDavConfig::default(),
             events: Vec::new(),
@@ -207,6 +179,8 @@ struct CalendarState {
     agenda_autoscroll_done: bool,
 }
 
+const CACHE_KEY_EVENTS: &str = "events";
+
 pub struct CalendarWidget {
     id: String,
     instance: String,
@@ -241,16 +215,31 @@ pub struct CalendarWidget {
     shortcut: Option<char>,
     /// Effective shortcut preference list (TOML override or built-in).
     shortcut_prefs: Vec<char>,
+    /// Persistent cache of the merged event timeline.
+    cache: ScopedCache,
 }
 
 impl CalendarWidget {
-    pub fn with_config(instance: String, config: CalendarConfig, app_theme: Arc<Theme>) -> Self {
+    pub fn with_config(
+        instance: String,
+        config: CalendarConfig,
+        app_theme: Arc<Theme>,
+        cache: ScopedCache,
+    ) -> Self {
         let (provider, source_label, auth_hint) = build_provider(&config);
         let colors = CalendarColors::build(&config);
-        let state = CalendarState {
+        let poll_interval = Duration::from_secs(config.poll_interval_secs.max(15));
+        let mut state = CalendarState {
             gradient: config.gradient,
             ..CalendarState::default()
         };
+        // Seed events from cache so the first frame shows last session's
+        // timeline while the provider refresh runs in the background.
+        if let Some(entry) = cache.load::<Vec<Event>>(CACHE_KEY_EVENTS) {
+            let age = entry.age().min(poll_interval);
+            state.events = entry.value;
+            state.last_attempt = Some(Instant::now() - age);
+        }
         let colors_override = config.colors.clone();
         let theme = app_theme.with_overrides(&colors_override);
         let shortcut_prefs = if config.shortcuts.is_empty() {
@@ -279,12 +268,13 @@ impl CalendarWidget {
             auth_hint,
             colors,
             state: Arc::new(Mutex::new(state)),
-            poll_interval: Duration::from_secs(config.poll_interval_secs.max(15)),
+            poll_interval,
             app_theme,
             colors_override,
             theme,
             shortcut: None,
             shortcut_prefs,
+            cache,
         }
     }
 
@@ -330,12 +320,16 @@ impl CalendarWidget {
         }
         let provider = self.provider.clone();
         let state = self.state.clone();
+        let cache = self.cache.clone();
         tokio::spawn(async move {
             let result = provider.fetch_range(start, end).await;
             let mut st = state.lock().expect("calendar state poisoned");
             st.inflight = false;
             match result {
                 Ok(events) => {
+                    if let Err(err) = cache.store(CACHE_KEY_EVENTS, &events) {
+                        tracing::warn!(error = %err, "calendar cache store failed");
+                    }
                     st.events = events;
                     st.last_error = None;
                 }
@@ -381,15 +375,6 @@ impl CalendarWidget {
     fn snapshot_events(&self) -> Vec<Event> {
         let st = self.state.lock().expect("calendar state poisoned");
         st.events.clone()
-    }
-
-    #[allow(dead_code)] // kept for parity with handle_key's `step` calc; may be re-used later.
-    fn nav_step(&self) -> ChronoDuration {
-        match self.view {
-            CalendarView::Day => ChronoDuration::days(1),
-            CalendarView::Week => ChronoDuration::days(7),
-            CalendarView::Month => ChronoDuration::days(30),
-        }
     }
 
     /// In week view the inner area is split into 7 equal-ratio columns, with
@@ -527,19 +512,12 @@ fn build_provider(
         }
     };
 
-    // Normalize the user's config into a list of provider entries. The new
-    // [[providers]] form wins when present; otherwise we synthesize a single
-    // entry from the legacy top-level `provider` + `calendar_ids` fields.
-    let entries: Vec<ProviderEntry> = if !config.providers.is_empty() {
-        config.providers.clone()
-    } else if config.provider != ProviderKind::Local {
-        vec![ProviderEntry {
-            kind: config.provider,
-            calendar_ids: config.calendar_ids.clone(),
-        }]
-    } else {
+    // Empty `[[providers]]` means "local only" — bail with the seeded
+    // LocalCalendarProvider from above.
+    if config.providers.is_empty() {
         return (local, "local".into(), None);
-    };
+    }
+    let entries: Vec<ProviderEntry> = config.providers.clone();
 
     let mut built: Vec<(Arc<dyn CalendarProvider>, &'static str)> = Vec::new();
     let mut hints: Vec<String> = Vec::new();
@@ -614,7 +592,7 @@ fn build_outlook_entry(calendar_ids: &[String]) -> Result<Arc<dyn CalendarProvid
         })?;
     let token = MicrosoftToken::load()
         .map_err(|err| format!("Outlook token unreadable: {err}"))?
-        .ok_or_else(|| "Run `glint --auth outlook` to connect Microsoft Outlook".to_string())?;
+        .ok_or_else(|| "Run `glint --auth microsoft` to connect Microsoft Outlook".to_string())?;
     OutlookCalendarProvider::new(client, token, calendar_ids.to_vec())
         .map(|p| Arc::new(p) as Arc<dyn CalendarProvider>)
         .map_err(|err| format!("Outlook init failed: {err}"))
@@ -688,10 +666,6 @@ impl CalendarProvider for CompositeProvider {
         }
         all.sort_by_key(|e| e.start);
         Ok(all)
-    }
-
-    fn name(&self) -> &str {
-        "composite"
     }
 }
 
@@ -878,20 +852,10 @@ impl CalendarColors {
             overrides.insert((source.to_string(), calendar.to_string()), color);
         }
 
-        // Walk `[[providers]]` (or the legacy single-provider form) in order
-        // and assign each declared calendar the next palette index. Overrides
-        // are skipped here — they don't consume a slot, so the next non-
-        // overridden calendar still gets palette[0].
-        let entries: Vec<ProviderEntry> = if !config.providers.is_empty() {
-            config.providers.clone()
-        } else if config.provider != ProviderKind::Local {
-            vec![ProviderEntry {
-                kind: config.provider,
-                calendar_ids: config.calendar_ids.clone(),
-            }]
-        } else {
-            Vec::new()
-        };
+        // Walk `[[providers]]` in order and assign each declared calendar
+        // the next palette index. Overrides don't consume a slot, so the
+        // next non-overridden calendar still gets palette[0].
+        let entries: Vec<ProviderEntry> = config.providers.clone();
 
         let mut assigned: HashMap<(String, String), usize> = HashMap::new();
         let mut next_idx: usize = 0;
@@ -1898,8 +1862,9 @@ impl Widget for CalendarWidget {
         let new_config: CalendarConfig =
             serde_json::from_value(config).context("invalid calendar config payload")?;
         let app_theme = self.app_theme.clone();
+        let cache = self.cache.clone();
         let instance = self.instance.clone();
-        *self = Self::with_config(instance, new_config, app_theme);
+        *self = Self::with_config(instance, new_config, app_theme, cache);
         Ok(())
     }
 
@@ -1917,6 +1882,19 @@ impl Widget for CalendarWidget {
     }
 }
 
+pub const KIND: &str = "calendar";
+
+pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
+    let cfg: CalendarConfig =
+        crate::config::load_widget_toml_for_instance(KIND, &ctx.instance).unwrap_or_default();
+    Box::new(CalendarWidget::with_config(
+        ctx.instance.clone(),
+        cfg,
+        ctx.theme.clone(),
+        ctx.cache.clone(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1926,6 +1904,7 @@ mod tests {
             "main".to_string(),
             cfg,
             Arc::new(Theme::builtin_defaults()),
+            ScopedCache::ephemeral(),
         )
     }
 

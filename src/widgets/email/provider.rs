@@ -5,11 +5,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Local, Utc};
+use serde::{Deserialize, Serialize};
 
 /// A single normalized email message. Provider-specific bodies and headers
 /// are reduced to plain text before reaching the widget; everything renderable
 /// is on this struct.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmailMessage {
     /// Provider-specific id. Used as the key in the local seen-store and as
     /// the trailing segment of `web_url` (for Gmail).

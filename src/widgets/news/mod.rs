@@ -19,6 +19,7 @@ use ratatui::{
 };
 use serde::Deserialize;
 
+use crate::cache::ScopedCache;
 use crate::llm::{LlmMessage, LlmProvider, LlmRequest, Role};
 use crate::theme::{ColorScheme, Theme};
 use crate::ui::decorated_title_line;
@@ -31,9 +32,8 @@ use provider::{Article, FeedConfig, NewsProvider, RssProvider, Topic};
 enum SummaryState {
     Requested,
     Ready(String),
-    /// LLM call failed; we already logged the reason via tracing, so just
-    /// remember the failure so the render path can fall back to the raw RSS
-    /// excerpt rather than re-requesting.
+    /// LLM call failed. The render path falls back to the raw RSS excerpt;
+    /// the reason was logged via tracing.
     Failed,
 }
 
@@ -48,27 +48,31 @@ pub struct NewsConfig {
     #[serde(default)]
     pub topics: Vec<Topic>,
 
-    /// When true, horizontal mouse scroll cycles the filter tabs. Default is
-    /// false because trackpad horizontal-scroll gestures often fire
-    /// accidentally while scrolling vertically.
+    /// Cycle filter tabs on horizontal scroll. Off by default — trackpad
+    /// sideways gestures often fire accidentally while scrolling vertically.
     #[serde(default)]
     pub horizontal_scroll_filters: bool,
 
-    /// When true, each article's meta row trails with its detected topic
-    /// labels (e.g. `[Business,World]`). Many users find the categorization
-    /// noise unhelpful — flip this off to suppress it. Default true.
+    /// Trail each meta row with detected topic labels (e.g. `[Business,World]`).
     #[serde(default = "default_show_topic_labels")]
     pub show_topic_labels: bool,
 
-    /// Per-widget style overrides layered on top of the active app
-    /// color scheme. Any role omitted here inherits from the app theme.
+    /// Per-widget overrides layered on the app theme.
     #[serde(default)]
     pub colors: ColorScheme,
 
-    /// Prioritized `Shift+<letter>` focus shortcut preferences. Leave
-    /// empty to use the built-in default (`['n', 'e', 'w', 's']`).
+    /// `Shift+<letter>` focus shortcuts; falls back to `['n', 'e', 'w', 's']`.
     #[serde(default)]
     pub shortcuts: Vec<char>,
+
+    /// On-demand article summarisation when an LLM provider is configured.
+    /// Flip false to stay fully offline.
+    #[serde(default = "default_summarize_with_llm")]
+    pub summarize_with_llm: bool,
+}
+
+fn default_summarize_with_llm() -> bool {
+    true
 }
 
 fn default_show_topic_labels() -> bool {
@@ -89,6 +93,7 @@ impl Default for NewsConfig {
             show_topic_labels: default_show_topic_labels(),
             colors: ColorScheme::default(),
             shortcuts: Vec::new(),
+            summarize_with_llm: default_summarize_with_llm(),
         }
     }
 }
@@ -184,6 +189,28 @@ capturing the key facts and any direct quotes. Do not editorialize, do not \
 add preamble, do not use markdown. If the input is too sparse to summarize \
 faithfully, respond with the single sentence: \"Insufficient content to summarize.\"";
 
+const CACHE_KEY_ARTICLES: &str = "articles";
+
+/// Cache-key namespace for LLM-generated article summaries. Each summary is
+/// keyed by `summary-<short-sha256-of-url>` so URLs with query strings and
+/// non-filesystem-safe characters round-trip cleanly. Summaries are
+/// content-stable derivations of the article body — safe to persist across
+/// restarts; orphaned entries (articles that fell out of the feed) age out
+/// when the user clears the cache.
+const SUMMARY_CACHE_PREFIX: &str = "summary-";
+
+fn summary_cache_key(url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(url.as_bytes());
+    let mut key = String::with_capacity(SUMMARY_CACHE_PREFIX.len() + 16);
+    key.push_str(SUMMARY_CACHE_PREFIX);
+    for b in &digest[..8] {
+        use std::fmt::Write;
+        let _ = write!(key, "{b:02x}");
+    }
+    key
+}
+
 pub struct NewsWidget {
     id: String,
     instance: String,
@@ -194,6 +221,10 @@ pub struct NewsWidget {
     state: Arc<Mutex<NewsState>>,
     poll_interval: Duration,
     feeds_configured: bool,
+    /// Persistent article cache so the first frame after launch can show the
+    /// previous session's results while the network refresh runs in the
+    /// background. Cloned into spawned tasks to persist newly fetched data.
+    cache: ScopedCache,
     /// Tabs across the top of the cell. Index 0 is always `All`; the rest
     /// mirror the topic labels in news.toml.
     filter_tabs: Vec<String>,
@@ -230,8 +261,8 @@ impl NewsWidget {
             "main".to_string(),
             config,
             None,
-            false,
             Arc::new(Theme::builtin_defaults()),
+            ScopedCache::ephemeral(),
         )
     }
 
@@ -239,12 +270,13 @@ impl NewsWidget {
         instance: String,
         config: NewsConfig,
         llm: Option<Arc<dyn LlmProvider>>,
-        llm_summarize_enabled: bool,
         app_theme: Arc<Theme>,
+        cache: ScopedCache,
     ) -> Self {
         let feeds_configured = !config.feeds.is_empty();
         let horizontal_scroll_filters = config.horizontal_scroll_filters;
         let show_topic_labels = config.show_topic_labels;
+        let llm_summarize_enabled = config.summarize_with_llm;
         let mut filter_tabs = vec![ALL_TAB_LABEL.to_string()];
         filter_tabs.extend(config.topics.iter().map(|t| t.label.clone()));
         let colors_override = config.colors.clone();
@@ -271,14 +303,29 @@ impl NewsWidget {
         } else {
             format!("News ({instance})")
         };
+        // Seed state from disk so the first render shows the previous run's
+        // articles immediately. last_attempt is set from the cache timestamp
+        // (translated to monotonic time) so the poll-interval gate naturally
+        // suppresses a refetch when the cache is fresh.
+        let poll_interval = Duration::from_secs(config.poll_interval_secs.max(60));
+        let mut initial_state = NewsState::default();
+        if let Some(entry) = cache.load::<Vec<Article>>(CACHE_KEY_ARTICLES) {
+            // Map wall-clock age onto the monotonic Instant clock so the same
+            // `is_due()` check used for in-session polling honours the cache.
+            let age = entry.age().min(poll_interval);
+            initial_state.articles = entry.value;
+            initial_state.last_attempt = Some(Instant::now() - age);
+        }
+
         Self {
             id,
             instance,
             display_name_cache,
             provider,
-            state: Arc::new(Mutex::new(NewsState::default())),
-            poll_interval: Duration::from_secs(config.poll_interval_secs.max(60)),
+            state: Arc::new(Mutex::new(initial_state)),
+            poll_interval,
             feeds_configured,
+            cache,
             filter_tabs,
             llm,
             llm_summarize_enabled,
@@ -292,12 +339,17 @@ impl NewsWidget {
         }
     }
 
-    /// Kick off an LLM summarization task for the given article if we have a
-    /// provider, summaries are enabled, and we haven't already requested one.
-    /// Skips the round-trip when the raw RSS excerpt already has enough
-    /// substance — the LLM's contribution there is marginal at best, and
-    /// replacing a useful paragraph with "Insufficient content to summarize."
-    /// is a net loss.
+    /// Resolve a summary for `article`, in priority order:
+    ///   1. Already-known in-memory state (incl. earlier successful or failed
+    ///      requests this session) — no-op.
+    ///   2. Persisted LLM summary in the cache — hydrate state synchronously.
+    ///   3. Otherwise spawn an LLM request; cache the result on success.
+    ///
+    /// Skips the round-trip entirely when the raw RSS excerpt is already
+    /// substantive — the LLM's contribution there is marginal and "Insufficient
+    /// content to summarize." is a net loss compared to the original paragraph.
+    /// Failures are *not* persisted: a retry after restart is cheap and a
+    /// flaky network call shouldn't poison the cache.
     fn ensure_summary_requested(&self, article: &Article) {
         if !self.llm_summarize_enabled || self.llm.is_none() {
             return;
@@ -311,10 +363,18 @@ impl NewsWidget {
                 return;
             }
         }
+        let cache_key = summary_cache_key(&article.url);
+        if let Some(entry) = self.cache.load::<String>(&cache_key) {
+            let mut st = self.state.lock().expect("news state poisoned");
+            st.summaries
+                .insert(article.url.clone(), SummaryState::Ready(entry.value));
+            return;
+        }
         let Some(llm) = self.llm.clone() else {
             return;
         };
         let state = self.state.clone();
+        let cache = self.cache.clone();
         let url = article.url.clone();
         let title = article.title.clone();
         let raw = article.summary.clone().unwrap_or_default();
@@ -352,6 +412,11 @@ impl NewsWidget {
                     SummaryState::Failed
                 }
             };
+            if let SummaryState::Ready(text) = &outcome {
+                if let Err(err) = cache.store(&cache_key, text) {
+                    tracing::warn!(error = %err, url = %url, "news summary cache store failed");
+                }
+            }
             let mut st = state.lock().expect("news state poisoned");
             st.summaries.insert(url, outcome);
         });
@@ -574,12 +639,16 @@ impl NewsWidget {
         }
         let provider = self.provider.clone();
         let state = self.state.clone();
+        let cache = self.cache.clone();
         tokio::spawn(async move {
             let result = provider.fetch().await;
             let mut st = state.lock().expect("news state poisoned");
             st.inflight = false;
             match result {
                 Ok(articles) => {
+                    if let Err(err) = cache.store(CACHE_KEY_ARTICLES, &articles) {
+                        tracing::warn!(error = %err, "news cache store failed");
+                    }
                     st.articles = articles;
                     st.last_error = None;
                     // Look up the previously-selected URL in the NEW filtered
@@ -658,9 +727,6 @@ struct EmptyProvider;
 impl NewsProvider for EmptyProvider {
     async fn fetch(&self) -> Result<Vec<Article>> {
         Ok(Vec::new())
-    }
-    fn name(&self) -> &str {
-        "empty"
     }
 }
 
@@ -828,44 +894,67 @@ impl Widget for NewsWidget {
         // The selected article expands to (1 + 1 + up to MAX_SUMMARY_LINES)
         // when `expanded` is true.
         const ROWS_PER_ITEM: usize = 2;
-        let items_visible = (list_height as usize / ROWS_PER_ITEM).max(1);
-        // Keep the selected article in view, but don't snap it to the top
-        // on expand — let it grow in place so the articles above stay
-        // visible. The summary may run past the pane bottom and get
-        // clipped; ↑/↓ scrolls to bring it back.
-        if selected < scroll {
-            scroll = selected;
-        }
-        if selected >= scroll + items_visible {
-            scroll = selected + 1 - items_visible;
-        }
 
         let now = Utc::now();
         let inner_width = inner.width as usize;
-        let mut lines: Vec<Line<'_>> = Vec::with_capacity(items_visible * ROWS_PER_ITEM);
+
+        // Resolve the selected article's expanded summary up front so the
+        // scroll calc can factor its real height in. Without this, a tall
+        // expansion at the visible bottom would push title+meta past
+        // list_height and the loop would break before emitting anything —
+        // the user would lose the article entirely.
+        let selected_summary_lines: Vec<String> = if expanded && selected < articles.len() {
+            let article = &articles[selected];
+            self.ensure_summary_requested(article);
+            expanded_summary_lines(
+                article,
+                &self.state,
+                inner_width.saturating_sub(3),
+                self.llm_summarize_enabled && self.llm.is_some(),
+            )
+        } else {
+            Vec::new()
+        };
+        let selected_height = ROWS_PER_ITEM as u16 + selected_summary_lines.len() as u16;
+
+        if selected < scroll {
+            scroll = selected;
+        }
+        // Scroll just enough that the selected article (including its
+        // expanded summary, if any) fits. When the expansion alone is
+        // taller than the pane, `available_above` saturates to 0 and
+        // `min_scroll` snaps selected to the top so the title stays
+        // visible and the summary tail clips at the bottom.
+        let available_above = list_height.saturating_sub(selected_height);
+        let max_compact_items_above = (available_above / ROWS_PER_ITEM as u16) as usize;
+        let min_scroll = selected.saturating_sub(max_compact_items_above);
+        if scroll < min_scroll {
+            scroll = min_scroll;
+        }
+
+        let mut lines: Vec<Line<'_>> = Vec::with_capacity(list_height as usize);
         let mut rows_emitted: u16 = 0;
         for (i, article) in articles.iter().enumerate().skip(scroll) {
             let is_selected = i == selected;
             let expand_this = is_selected && expanded;
 
-            // Trigger LLM summarization the first time an article is expanded.
-            if expand_this {
-                self.ensure_summary_requested(article);
-            }
-
-            // How many rows would this item consume?
-            let summary_lines: Vec<String> = if expand_this {
-                expanded_summary_lines(
-                    article,
-                    &self.state,
-                    inner_width.saturating_sub(3),
-                    self.llm_summarize_enabled && self.llm.is_some(),
-                )
+            let summary_lines: &[String] = if expand_this {
+                &selected_summary_lines
             } else {
-                Vec::new()
+                &[]
             };
             let needed = ROWS_PER_ITEM as u16 + summary_lines.len() as u16;
-            if rows_emitted + needed > list_height {
+            let rows_remaining = list_height.saturating_sub(rows_emitted);
+
+            // Can't render anything useful without room for title+meta.
+            if rows_remaining < ROWS_PER_ITEM as u16 {
+                break;
+            }
+            // Non-expanded items either fit completely or stop the loop.
+            // The selected expanded item is allowed to render its
+            // title+meta plus a clipped tail of summary lines — better
+            // than vanishing entirely if the expansion overruns the pane.
+            if !expand_this && needed > rows_remaining {
                 break;
             }
 
@@ -907,14 +996,21 @@ impl Widget for NewsWidget {
                 self.theme.text_dim,
             )));
 
-            for sline in &summary_lines {
+            let summary_room = rows_remaining.saturating_sub(ROWS_PER_ITEM as u16) as usize;
+            let summary_to_render = summary_lines.len().min(summary_room);
+            for sline in summary_lines.iter().take(summary_to_render) {
                 lines.push(Line::from(Span::styled(
                     format!("   {sline}"),
                     Style::default(),
                 )));
             }
 
-            rows_emitted += needed;
+            rows_emitted += ROWS_PER_ITEM as u16 + summary_to_render as u16;
+
+            if expand_this && summary_to_render < summary_lines.len() {
+                // Summary clipped at the pane bottom — no room for items below.
+                break;
+            }
         }
         frame.render_widget(Paragraph::new(lines), list_area);
 
@@ -1040,7 +1136,9 @@ impl Widget for NewsWidget {
             }
         }
 
-        // Article list click
+        // Article list click. Clicking an unselected article selects it
+        // and expands; clicking the currently selected article toggles its
+        // expanded state — mirrors `e` on the keyboard.
         if list_area.height > 0
             && mouse.row >= list_area.y
             && mouse.row < list_area.y + list_area.height
@@ -1050,7 +1148,12 @@ impl Widget for NewsWidget {
             let filtered = self.filtered_articles();
             if let Some(idx) = self.article_index_at(mouse.row, list_area, &filtered) {
                 let mut st = self.state.lock().expect("news state poisoned");
-                st.selected = idx;
+                if st.selected == idx {
+                    st.expanded = !st.expanded;
+                } else {
+                    st.selected = idx;
+                    st.expanded = true;
+                }
                 return EventResult::Handled;
             }
         }
@@ -1098,14 +1201,13 @@ impl Widget for NewsWidget {
     fn apply_config(&mut self, config: serde_json::Value) -> Result<()> {
         let new_config: NewsConfig =
             serde_json::from_value(config).context("invalid news config payload")?;
-        // Preserve the active LLM provider + summarize flag across reloads —
-        // those are app-level, not user-config-level. Same goes for the
-        // app theme and the widget's instance identity.
+        // App-level state (LLM provider, theme, cache, instance id) survives
+        // a reload; everything else is rebuilt from the parsed TOML.
         let llm = self.llm.clone();
-        let summarize = self.llm_summarize_enabled;
         let app_theme = self.app_theme.clone();
+        let cache = self.cache.clone();
         let instance = self.instance.clone();
-        *self = Self::with_config_and_llm(instance, new_config, llm, summarize, app_theme);
+        *self = Self::with_config_and_llm(instance, new_config, llm, app_theme, cache);
         Ok(())
     }
 
@@ -1265,6 +1367,20 @@ fn age_label(now: chrono::DateTime<Utc>, published: chrono::DateTime<Utc>) -> St
     } else {
         format!("{}mo", secs / (86400 * 30))
     }
+}
+
+pub const KIND: &str = "news";
+
+pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
+    let cfg: NewsConfig =
+        crate::config::load_widget_toml_for_instance(KIND, &ctx.instance).unwrap_or_default();
+    Box::new(NewsWidget::with_config_and_llm(
+        ctx.instance.clone(),
+        cfg,
+        ctx.llm.clone(),
+        ctx.theme.clone(),
+        ctx.cache.clone(),
+    ))
 }
 
 #[cfg(test)]

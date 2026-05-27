@@ -1,6 +1,6 @@
 [package]
 name = "glint-tui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A fast, extensible terminal dashboard for stocks, calendar, news, and beyond"
 license = "MIT"
@@ -14,6 +14,37 @@ categories = ["command-line-interface"]
 [[bin]]
 name = "glint"
 path = "src/main.rs"
+
+# ── Widget features ──────────────────────────────────────────────────────────
+# Each widget compiles in only when its feature is enabled. `default` aliases
+# the `widgets-all` umbrella so a plain `cargo install glint-tui` ships with
+# every widget — the slim-build path is available for downstream packagers
+# (and binary-size-sensitive deployments) via `--no-default-features` plus a
+# hand-picked subset.
+#
+# Adding a new widget is purely additive: declare its feature here, include
+# it in the `widgets-all` umbrella, add the WidgetDescriptor in
+# src/widgets/registry.rs, and the build tree picks it up.
+[features]
+default = ["widgets-all"]
+widget-clock = []
+widget-weather = []
+widget-calendar = []
+widget-news = []
+widget-stocks = []
+widget-email = []
+widget-resources = []
+widget-gallery = []
+widgets-all = [
+  "widget-clock",
+  "widget-weather",
+  "widget-calendar",
+  "widget-news",
+  "widget-stocks",
+  "widget-email",
+  "widget-resources",
+  "widget-gallery",
+]
 
 [dependencies]
 # TUI

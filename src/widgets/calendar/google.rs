@@ -117,10 +117,6 @@ impl CalendarProvider for GoogleCalendarProvider {
         events.sort_by_key(|e| e.start);
         Ok(events)
     }
-
-    fn name(&self) -> &str {
-        "google-calendar"
-    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -266,8 +266,8 @@ cargo clippy               # lints
 cargo fmt                  # format
 ```
 
-See `docs/glint-spec.md` for the original design spec and `CLAUDE.md`
-for the architecture overview targeted at AI assistants.
+See `docs/glint-spec.md` for the original design spec and `AGENTS.md`
+for the architecture overview targeted at contributors and AI assistants.
 
 ---
 

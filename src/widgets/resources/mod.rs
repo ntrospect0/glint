@@ -1,18 +1,5 @@
-//! Resources widget — htop-style CPU/memory/process view.
-//!
-//! Built on the `sysinfo` crate so we don't carry platform-specific FFI of
-//! our own. The widget refreshes its data inside the async `update` tick
-//! (default 2s) and renders a snapshot in `render`. Three sections:
-//!
-//!   - **Header**: hostname, uptime, load average.
-//!   - **CPU**: per-core usage bars (with overall % as the title row).
-//!   - **Memory**: used/total + swap bar.
-//!   - **Processes**: top N by CPU (or by memory, configurable).
-//!
-//! Theme/shortcut/multi-instance support follows the standard widget
-//! pattern. The shortcut letter assigned by the app's preference pass is
-//! painted inside the title via `text.shortcut` (R is the leading char of
-//! "Resources" so the highlight lands naturally).
+//! Resources widget — htop-style CPU / memory / process view.
+//! Backed by `sysinfo` (cross-platform; no FFI of our own).
 
 use std::{
     sync::{Arc, Mutex},
@@ -37,33 +24,26 @@ use crate::ui::decorated_title_line;
 
 use super::{AppContext, EventResult, Widget};
 
-/// User-configurable Resources options (loaded from
-/// `~/.config/glint/resources.toml` or `<resources>@<instance>.toml`).
+/// Loaded from `~/.config/glint/resources.toml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResourcesConfig {
-    /// Refresh cadence in seconds (clamped to ≥1s — anything faster
-    /// hammers `sysinfo` for negligible visual gain).
+    /// Clamped to ≥1s (sub-second refresh hammers sysinfo for no visual gain).
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
 
-    /// Number of top processes to surface. Clamped at construction to a
-    /// sensible upper bound (40) so misconfiguration can't blow up the
-    /// render budget.
+    /// Top processes to surface. Clamped to ≤40 at construction.
     #[serde(default = "default_top_n")]
     pub top_n_processes: usize,
 
-    /// Sort the process list by memory usage instead of CPU. Default CPU
-    /// matches the default htop view.
+    /// Sort processes by memory instead of CPU.
     #[serde(default)]
     pub sort_by_memory: bool,
 
-    /// Per-widget style overrides layered on top of the active app
-    /// color scheme.
+    /// Per-widget overrides layered on the app theme.
     #[serde(default)]
     pub colors: ColorScheme,
 
-    /// Prioritized `Shift+<letter>` shortcut preferences. Leave empty for
-    /// the built-in default `['r', 'e', 's', 'm']`.
+    /// `Shift+<letter>` focus shortcuts; falls back to `['r', 'e', 's', 'm']`.
     #[serde(default)]
     pub shortcuts: Vec<char>,
 }
@@ -628,6 +608,18 @@ fn truncate(s: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+pub const KIND: &str = "resources";
+
+pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
+    let cfg: ResourcesConfig =
+        crate::config::load_widget_toml_for_instance(KIND, &ctx.instance).unwrap_or_default();
+    Box::new(ResourcesWidget::with_config(
+        ctx.instance.clone(),
+        cfg,
+        ctx.theme.clone(),
+    ))
 }
 
 #[cfg(test)]
