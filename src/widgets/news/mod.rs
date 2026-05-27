@@ -1371,6 +1371,482 @@ fn age_label(now: chrono::DateTime<Utc>, published: chrono::DateTime<Utc>) -> St
 
 pub const KIND: &str = "news";
 
+/// Curated catalogue of major news topic categories surfaced as
+/// checkboxes in the wizard. Each entry pairs a label with a default
+/// keyword list — articles whose title or summary contains any keyword
+/// (case-insensitive substring) are tagged with that topic at runtime.
+/// Users can edit individual keyword lists in news.toml; the wizard
+/// preserves their edits when the same label stays ticked.
+pub const TOPIC_CATALOGUE: &[(&str, &[&str])] = &[
+    (
+        "Tech",
+        &[
+            "AI", "OpenAI", "Anthropic", "LLM", "GPU", "developer", "Linux",
+            "Rust", "Apple", "Google", "Microsoft", "Meta", "chip", "software",
+            "startup", "open source", "GitHub",
+        ],
+    ),
+    (
+        "Business",
+        &[
+            "CEO", "merger", "acquisition", "IPO", "revenue", "earnings",
+            "quarterly", "Wall Street", "market", "Fed", "inflation",
+            "interest rate", "Bitcoin", "crypto", "yield", "treasury",
+            "stocks", "bonds", "dividend", "trader",
+        ],
+    ),
+    (
+        "World",
+        &[
+            "Ukraine", "Russia", "China", "EU", "UN", "climate", "war",
+            "election", "summit", "treaty", "Israel", "Gaza", "Iran", "NATO",
+            "global", "Brussels", "international",
+        ],
+    ),
+    (
+        "Canada",
+        &[
+            "Canada", "Canadian", "Ottawa", "Toronto", "Vancouver", "Montreal",
+            "Quebec", "Alberta", "B.C.", "Trudeau", "Carney", "CBC",
+            "Bank of Canada", "Loonie",
+        ],
+    ),
+    (
+        "Entertainment",
+        &[
+            "movie", "film", "actor", "actress", "Hollywood", "Netflix", "HBO",
+            "Disney", "Oscar", "Grammy", "Emmy", "show", "series", "trailer",
+            "album", "song", "single", "artist", "band", "concert", "tour",
+            "music", "EP", "soundtrack",
+        ],
+    ),
+];
+
+/// Curated catalogue of well-known RSS / Atom feeds surfaced as
+/// checkboxes in the wizard. `(label, url)` pairs are `&'static str` so
+/// they can drop straight into `ChoiceOption`. Users with custom feeds
+/// add `[[feeds]]` blocks in news.toml after the wizard runs — those
+/// are preserved across `--setup` re-runs.
+pub const FEED_CATALOGUE: &[(&str, &str)] = &[
+    // Tech
+    ("Hacker News", "https://hnrss.org/frontpage"),
+    ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
+    ("The Verge", "https://www.theverge.com/rss/index.xml"),
+    ("Engadget", "https://www.engadget.com/rss.xml"),
+    ("Phoronix", "https://www.phoronix.com/rss.php"),
+    // World
+    ("BBC News", "http://feeds.bbci.co.uk/news/rss.xml"),
+    ("BBC World", "http://feeds.bbci.co.uk/news/world/rss.xml"),
+    ("Guardian World", "https://www.theguardian.com/world/rss"),
+    ("NPR World", "https://feeds.npr.org/1004/rss.xml"),
+    // Business / Markets
+    ("BBC Business", "http://feeds.bbci.co.uk/news/business/rss.xml"),
+    ("Yahoo Finance", "https://finance.yahoo.com/news/rssindex"),
+    ("MarketWatch", "http://feeds.marketwatch.com/marketwatch/topstories/"),
+    ("CNBC Top", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
+    // Canada
+    ("CBC News", "https://www.cbc.ca/webfeed/rss/rss-topstories"),
+    ("CBC Politics", "https://www.cbc.ca/webfeed/rss/rss-politics"),
+    ("CBC Business", "https://www.cbc.ca/webfeed/rss/rss-business"),
+    ("CTV News", "https://www.ctvnews.ca/rss/ctvnews-ca-top-stories-public-rss-1.822009"),
+    // Culture
+    ("Pitchfork", "https://pitchfork.com/rss/news/"),
+    ("Hollywood Reporter", "https://www.hollywoodreporter.com/feed/"),
+];
+
+/// Wizard descriptor. Surfaces a checkbox list of common feeds the user
+/// can toggle, plus the four common scalar toggles. The feed catalogue
+/// here is a curated subset; custom `[[feeds]]` blocks in news.toml
+/// outside this list are preserved verbatim across `--setup` re-runs.
+pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
+    use crate::wizard::descriptor::{
+        ChoiceOption, WizardDescriptor, WizardField, WizardFieldKind,
+    };
+    let feed_options: Vec<ChoiceOption> = FEED_CATALOGUE
+        .iter()
+        .map(|(label, url)| ChoiceOption {
+            value: *url,
+            label,
+            help: None,
+        })
+        .collect();
+    // A small starting set so a brand-new install sees something useful
+    // immediately. Picked to span tech + world + markets.
+    let default_feeds: Vec<&'static str> = vec![
+        "https://hnrss.org/frontpage",
+        "https://www.theverge.com/rss/index.xml",
+        "http://feeds.bbci.co.uk/news/rss.xml",
+        "https://finance.yahoo.com/news/rssindex",
+    ];
+    WizardDescriptor {
+        display_name: "News",
+        blurb: "RSS aggregator with topic filtering and optional LLM-generated \
+                summaries. Tick the feeds you'd like; topic keywords + any \
+                custom feeds you add by hand survive `--setup` re-runs.",
+        load_from_toml: Some(load_news_from_toml),
+        render_toml: Some(render_news_toml),
+        fields: vec![
+            WizardField {
+                key: "topics",
+                label: "Topic categories",
+                help: "↑/↓ to move, Space toggles. Ticked categories \
+                       become [[topics]] blocks in news.toml; articles \
+                       matching any of a category's keywords get the \
+                       label rendered in their meta row. Keyword lists \
+                       live in news.toml — hand-edits survive re-runs.",
+                required: false,
+                kind: WizardFieldKind::MultiChoice {
+                    options: TOPIC_CATALOGUE
+                        .iter()
+                        .map(|(label, _)| ChoiceOption {
+                            value: label,
+                            label,
+                            help: None,
+                        })
+                        .collect(),
+                    defaults: vec!["Tech", "World", "Business"],
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "feeds",
+                label: "Active news feeds",
+                help: "↑/↓ to move, Space toggles. Custom RSS / Atom feeds \
+                       you add by editing news.toml's [[feeds]] section will \
+                       be preserved here even though they don't appear in \
+                       this checkbox list.",
+                required: false,
+                kind: WizardFieldKind::MultiChoice {
+                    options: feed_options,
+                    defaults: default_feeds,
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "poll_interval_secs",
+                label: "Feed refresh interval (seconds)",
+                help: "How often to re-poll each RSS feed. 900s (15 min) is \
+                       a polite default for free public feeds.",
+                required: true,
+                kind: WizardFieldKind::Number {
+                    default: Some(900.0),
+                    range: Some((60.0, 86_400.0)),
+                    integer: true,
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "show_topic_labels",
+                label: "Show topic labels on each article",
+                help: "Adds `[Business,World]`-style tags to the meta row \
+                       when a feed's keywords match. Quieter look without \
+                       them; toggle freely after install.",
+                required: false,
+                kind: WizardFieldKind::Bool { default: true },
+                validate: None,
+            },
+            WizardField {
+                key: "summarize_with_llm",
+                label: "Summarise expanded articles with LLM",
+                help: "Requires an Anthropic key in credentials/anthropic_key.toml \
+                       (or set via the Global step). When off, glint stays \
+                       fully offline and shows raw RSS excerpts.",
+                required: false,
+                kind: WizardFieldKind::Bool { default: true },
+                validate: None,
+            },
+            WizardField {
+                key: "horizontal_scroll_filters",
+                label: "Horizontal scroll cycles filter tabs",
+                help: "Off by default — trackpad sideways gestures often \
+                       fire accidentally and you don't want them stealing \
+                       focus mid-read.",
+                required: false,
+                kind: WizardFieldKind::Bool { default: false },
+                validate: None,
+            },
+        ],
+    }
+}
+
+/// Inverse of [`render_news_toml`]: pull the wizard-managed scalars and
+/// derive the MultiChoice feed selection from any `[[feeds]]` whose URL
+/// matches an entry in [`FEED_CATALOGUE`]. Custom feeds (URLs not in
+/// the catalogue) are not surfaced to the wizard — they survive
+/// untouched because the renderer preserves them verbatim.
+fn load_news_from_toml(
+    doc: &toml::Value,
+) -> std::collections::HashMap<String, crate::wizard::descriptor::WizardValue> {
+    use crate::wizard::descriptor::WizardValue;
+    let mut out = std::collections::HashMap::new();
+    if let Some(n) = doc.get("poll_interval_secs").and_then(|v| v.as_integer()) {
+        out.insert("poll_interval_secs".into(), WizardValue::Number(n as f64));
+    } else if let Some(f) = doc.get("poll_interval_secs").and_then(|v| v.as_float()) {
+        out.insert("poll_interval_secs".into(), WizardValue::Number(f));
+    }
+    if let Some(b) = doc.get("show_topic_labels").and_then(|v| v.as_bool()) {
+        out.insert("show_topic_labels".into(), WizardValue::Bool(b));
+    }
+    if let Some(b) = doc.get("summarize_with_llm").and_then(|v| v.as_bool()) {
+        out.insert("summarize_with_llm".into(), WizardValue::Bool(b));
+    }
+    if let Some(b) = doc
+        .get("horizontal_scroll_filters")
+        .and_then(|v| v.as_bool())
+    {
+        out.insert(
+            "horizontal_scroll_filters".into(),
+            WizardValue::Bool(b),
+        );
+    }
+    if let Some(arr) = doc.get("feeds").and_then(|v| v.as_array()) {
+        let catalogue_urls: std::collections::HashSet<&'static str> =
+            FEED_CATALOGUE.iter().map(|(_, url)| *url).collect();
+        let selected: Vec<String> = arr
+            .iter()
+            .filter_map(|entry| entry.get("url").and_then(|v| v.as_str()))
+            .filter(|url| catalogue_urls.contains(*url))
+            .map(String::from)
+            .collect();
+        out.insert("feeds".into(), WizardValue::MultiChoice(selected));
+    }
+    if let Some(arr) = doc.get("topics").and_then(|v| v.as_array()) {
+        let catalogue_labels: std::collections::HashSet<&'static str> =
+            TOPIC_CATALOGUE.iter().map(|(label, _)| *label).collect();
+        let selected: Vec<String> = arr
+            .iter()
+            .filter_map(|entry| entry.get("label").and_then(|v| v.as_str()))
+            .filter(|label| catalogue_labels.contains(*label))
+            .map(String::from)
+            .collect();
+        out.insert("topics".into(), WizardValue::MultiChoice(selected));
+    }
+    out
+}
+
+/// Render the news widget's TOML. We:
+///   1. Compute the [[feeds]] set: catalogue selections from the
+///      wizard, plus any custom feeds the user had in their existing
+///      news.toml whose URLs aren't in the catalogue (so hand-curated
+///      feeds survive `--setup` re-runs).
+///   2. Take the existing file as the base — or `DEFAULT_NEWS_TOML`
+///      on a fresh install — strip its [[feeds]] blocks, merge the
+///      wizard's top-level scalars, then append the new [[feeds]]
+///      list. [[topics]], [colors], shortcuts, and comments stay put.
+fn render_news_toml(
+    values: &std::collections::HashMap<String, crate::wizard::descriptor::WizardValue>,
+    existing: Option<&str>,
+) -> String {
+    use crate::wizard::descriptor::WizardValue;
+
+    let scalars: Vec<(&str, String)> = vec![
+        (
+            "poll_interval_secs",
+            match values.get("poll_interval_secs") {
+                Some(WizardValue::Number(n)) => format!("{}", *n as i64),
+                _ => "900".into(),
+            },
+        ),
+        (
+            "show_topic_labels",
+            match values.get("show_topic_labels") {
+                Some(WizardValue::Bool(b)) => b.to_string(),
+                _ => "true".into(),
+            },
+        ),
+        (
+            "summarize_with_llm",
+            match values.get("summarize_with_llm") {
+                Some(WizardValue::Bool(b)) => b.to_string(),
+                _ => "true".into(),
+            },
+        ),
+        (
+            "horizontal_scroll_filters",
+            match values.get("horizontal_scroll_filters") {
+                Some(WizardValue::Bool(b)) => b.to_string(),
+                _ => "false".into(),
+            },
+        ),
+    ];
+
+    // Build the new [[feeds]] list.
+    let selected_urls: Vec<&str> = match values.get("feeds") {
+        Some(WizardValue::MultiChoice(items)) => {
+            items.iter().map(String::as_str).collect()
+        }
+        _ => Vec::new(),
+    };
+    let catalogue_urls: std::collections::HashSet<&'static str> =
+        FEED_CATALOGUE.iter().map(|(_, url)| *url).collect();
+    let mut feed_blocks = String::new();
+    let mut emitted_urls: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for url in &selected_urls {
+        let Some((label, _)) = FEED_CATALOGUE.iter().find(|(_, u)| u == url)
+        else {
+            continue;
+        };
+        feed_blocks.push_str("\n[[feeds]]\n");
+        feed_blocks.push_str(&format!("label = {}\n", toml_quote(label)));
+        feed_blocks.push_str(&format!("url = {}\n", toml_quote(url)));
+        emitted_urls.insert((*url).to_string());
+    }
+    // Carry forward any custom feeds (not in catalogue) the user has
+    // on disk so a wizard re-run never silently deletes their work.
+    if let Some(text) = existing {
+        if let Ok(doc) = toml::from_str::<toml::Value>(text) {
+            if let Some(arr) = doc.get("feeds").and_then(|v| v.as_array()) {
+                for entry in arr {
+                    let Some(url) =
+                        entry.get("url").and_then(|v| v.as_str())
+                    else {
+                        continue;
+                    };
+                    if catalogue_urls.contains(url) || emitted_urls.contains(url) {
+                        continue;
+                    }
+                    let label = entry
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(url);
+                    feed_blocks.push_str("\n[[feeds]]\n");
+                    feed_blocks.push_str(&format!("label = {}\n", toml_quote(label)));
+                    feed_blocks.push_str(&format!("url = {}\n", toml_quote(url)));
+                    emitted_urls.insert(url.to_string());
+                }
+            }
+        }
+    }
+
+    // Build the new [[topics]] list. Same preservation pattern as
+    // feeds: selected catalogue entries (reusing existing keyword lists
+    // when the same label was on disk), plus any custom topics whose
+    // labels aren't in the catalogue.
+    let selected_topics: Vec<&str> = match values.get("topics") {
+        Some(WizardValue::MultiChoice(items)) => {
+            items.iter().map(String::as_str).collect()
+        }
+        _ => Vec::new(),
+    };
+    let catalogue_topic_labels: std::collections::HashSet<&'static str> =
+        TOPIC_CATALOGUE.iter().map(|(label, _)| *label).collect();
+    let existing_topics: std::collections::HashMap<String, Vec<String>> =
+        existing
+            .and_then(|t| toml::from_str::<toml::Value>(t).ok())
+            .and_then(|doc| {
+                doc.get("topics").and_then(|v| v.as_array()).cloned()
+            })
+            .map(|arr| {
+                arr.into_iter()
+                    .filter_map(|entry| {
+                        let label = entry.get("label")?.as_str()?.to_string();
+                        let keywords = entry
+                            .get("keywords")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        Some((label, keywords))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+    let mut topic_blocks = String::new();
+    let mut emitted_topic_labels: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for label in &selected_topics {
+        let keywords: Vec<String> = if let Some(existing_kws) =
+            existing_topics.get(*label)
+        {
+            existing_kws.clone()
+        } else {
+            // First time we've seen this topic — use the catalogue default.
+            TOPIC_CATALOGUE
+                .iter()
+                .find(|(l, _)| l == label)
+                .map(|(_, kws)| kws.iter().map(|s| (*s).to_string()).collect())
+                .unwrap_or_default()
+        };
+        topic_blocks.push_str("\n[[topics]]\n");
+        topic_blocks.push_str(&format!("label = {}\n", toml_quote(label)));
+        let kw_list = keywords
+            .iter()
+            .map(|k| toml_quote(k))
+            .collect::<Vec<_>>()
+            .join(", ");
+        topic_blocks.push_str(&format!("keywords = [{kw_list}]\n"));
+        emitted_topic_labels.insert((*label).to_string());
+    }
+    // Preserve custom topics whose labels aren't in the catalogue.
+    for (label, keywords) in &existing_topics {
+        if catalogue_topic_labels.contains(label.as_str())
+            || emitted_topic_labels.contains(label)
+        {
+            continue;
+        }
+        topic_blocks.push_str("\n[[topics]]\n");
+        topic_blocks.push_str(&format!("label = {}\n", toml_quote(label)));
+        let kw_list = keywords
+            .iter()
+            .map(|k| toml_quote(k))
+            .collect::<Vec<_>>()
+            .join(", ");
+        topic_blocks.push_str(&format!("keywords = [{kw_list}]\n"));
+    }
+
+    let base: std::borrow::Cow<str> = match existing {
+        Some(text) => std::borrow::Cow::Borrowed(text),
+        None => std::borrow::Cow::Borrowed(crate::config::DEFAULT_NEWS_TOML),
+    };
+    let stripped =
+        crate::wizard::toml_merge::strip_array_of_tables_blocks(&base, "feeds");
+    let stripped =
+        crate::wizard::toml_merge::strip_array_of_tables_blocks(&stripped, "topics");
+    let merged =
+        crate::wizard::toml_merge::merge_top_level_scalars(&stripped, &scalars);
+
+    // Append the new topics + feeds lists. Topics first (smaller; reads
+    // like a config sidecar), then the larger feeds list.
+    let mut out = merged;
+    if !out.ends_with("\n\n") {
+        if out.ends_with('\n') {
+            out.push('\n');
+        } else {
+            out.push_str("\n\n");
+        }
+    }
+    if !topic_blocks.is_empty() {
+        out.push_str(topic_blocks.trim_start_matches('\n'));
+        if !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+    }
+    out.push_str(feed_blocks.trim_start_matches('\n'));
+    out
+}
+
+fn toml_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
     let cfg: NewsConfig =
         crate::config::load_widget_toml_for_instance(KIND, &ctx.instance).unwrap_or_default();

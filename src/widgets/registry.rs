@@ -12,6 +12,7 @@
 //! Registration, first-run defaults, and auth prompts all walk `WIDGETS`.
 
 use crate::auth::registry::AuthRequirement;
+use crate::wizard::descriptor::WizardDescriptor;
 
 use super::{Widget, WidgetCtx, WidgetFactory};
 
@@ -35,6 +36,13 @@ pub struct WidgetDescriptor {
     /// widgets leave this empty.
     #[allow(dead_code)] // surfaced by the wizard's auth-prompt step.
     pub auth_requirements: &'static [AuthRequirement],
+
+    /// Wizard descriptor — the declarative setup-page schema the wizard
+    /// driver uses to render this widget's configuration UI. Widgets that
+    /// haven't been migrated to the schema yet return a `defer_to_toml`
+    /// descriptor that points the user at the widget's TOML file.
+    #[allow(dead_code)] // consumed by the wizard driver.
+    pub wizard: fn() -> WizardDescriptor,
 }
 
 /// The full set of widgets compiled into this build. Order is significant
@@ -47,6 +55,7 @@ pub const WIDGETS: &[WidgetDescriptor] = &[
         factory: super::stocks::build,
         default_in_first_run: true,
         auth_requirements: &[],
+        wizard: super::stocks::wizard_descriptor,
     },
     #[cfg(feature = "widget-clock")]
     WidgetDescriptor {
@@ -54,6 +63,7 @@ pub const WIDGETS: &[WidgetDescriptor] = &[
         factory: super::clock::build,
         default_in_first_run: true,
         auth_requirements: &[],
+        wizard: super::clock::wizard_descriptor,
     },
     #[cfg(feature = "widget-weather")]
     WidgetDescriptor {
@@ -61,6 +71,7 @@ pub const WIDGETS: &[WidgetDescriptor] = &[
         factory: super::weather::build,
         default_in_first_run: true,
         auth_requirements: &[],
+        wizard: super::weather::wizard_descriptor,
     },
     #[cfg(feature = "widget-calendar")]
     WidgetDescriptor {
@@ -77,6 +88,7 @@ pub const WIDGETS: &[WidgetDescriptor] = &[
                 scope_hints: &["Calendars.Read"],
             },
         ],
+        wizard: super::calendar::wizard_descriptor,
     },
     #[cfg(feature = "widget-news")]
     WidgetDescriptor {
@@ -84,6 +96,7 @@ pub const WIDGETS: &[WidgetDescriptor] = &[
         factory: super::news::build,
         default_in_first_run: true,
         auth_requirements: &[],
+        wizard: super::news::wizard_descriptor,
     },
     #[cfg(feature = "widget-email")]
     WidgetDescriptor {
@@ -100,6 +113,7 @@ pub const WIDGETS: &[WidgetDescriptor] = &[
                 scope_hints: &["Mail.Read"],
             },
         ],
+        wizard: super::email::wizard_descriptor,
     },
     #[cfg(feature = "widget-resources")]
     WidgetDescriptor {
@@ -107,6 +121,7 @@ pub const WIDGETS: &[WidgetDescriptor] = &[
         factory: super::resources::build,
         default_in_first_run: false,
         auth_requirements: &[],
+        wizard: super::resources::wizard_descriptor,
     },
     #[cfg(feature = "widget-gallery")]
     WidgetDescriptor {
@@ -114,6 +129,7 @@ pub const WIDGETS: &[WidgetDescriptor] = &[
         factory: super::gallery::build,
         default_in_first_run: false,
         auth_requirements: &[],
+        wizard: super::gallery::wizard_descriptor,
     },
 ];
 

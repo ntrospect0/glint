@@ -84,6 +84,13 @@ fn main() -> Result<()> {
             // The wizard is fully synchronous — it does plain stdin/stdout
             // text prompts and never touches the tokio runtime. The runtime
             // already exists at this point; we just don't use it here.
+            //
+            // Seed any missing default config files first. `init_default_config`
+            // is idempotent: existing files are left untouched, so it's safe
+            // to call here even when the user is just re-running the wizard.
+            // Without this, fresh installs hit the theme picker with no
+            // colorschemes.toml on disk and the scheme list is empty.
+            config::init_default_config()?;
             return wizard::run();
         }
         if let Some(target) = cli.auth.as_deref() {
@@ -96,6 +103,7 @@ fn main() -> Result<()> {
             eprintln!("No config detected at ~/.config/glint/config.toml — launching the setup wizard.");
             eprintln!("(You can re-run `glint --setup` later to make changes.)");
             eprintln!();
+            config::init_default_config()?;
             wizard::run()?;
             eprintln!();
             eprintln!("Launching glint…");

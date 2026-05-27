@@ -69,19 +69,40 @@ impl GmailProvider {
         }
         let token = match self.access_token().await {
             Ok(t) => t,
-            Err(_) => return,
+            Err(err) => {
+                tracing::warn!(error = %err, "gmail profile access_token failed");
+                return;
+            }
         };
         let url = format!("{GMAIL_BASE}/users/me/profile");
         let resp = match self.http.get(&url).bearer_auth(&token).send().await {
             Ok(r) => r,
-            Err(_) => return,
+            Err(err) => {
+                tracing::warn!(error = %err, "gmail profile request failed");
+                return;
+            }
         };
         if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = %status,
+                body = %body,
+                "gmail /users/me/profile returned non-success"
+            );
             return;
         }
-        if let Ok(p) = resp.json::<ProfileResponse>().await {
-            if let Some(addr) = p.email_address {
-                *self.account.lock().expect("gmail account cache poisoned") = Some(addr);
+        match resp.json::<ProfileResponse>().await {
+            Ok(p) => {
+                if let Some(addr) = p.email_address {
+                    *self.account.lock().expect("gmail account cache poisoned") =
+                        Some(addr);
+                } else {
+                    tracing::warn!("gmail profile returned without emailAddress");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "gmail profile parse failed");
             }
         }
     }
@@ -91,6 +112,72 @@ impl GmailProvider {
             .lock()
             .expect("gmail account cache poisoned")
             .clone()
+    }
+
+    /// Externally prime the cache (e.g. from the widget's persistent
+    /// scoped cache). Only seeds when the cache is empty so a fresh
+    /// `/me` resolution can still overwrite a stale value.
+    pub fn seed_account_cache(&self, address: &str) {
+        let mut guard = self.account.lock().expect("gmail account cache poisoned");
+        if guard.is_none() {
+            *guard = Some(address.to_string());
+        }
+    }
+
+    /// Public folder-listing entry point used by the wizard to populate
+    /// its checkbox picker. Returns `(value, label)` pairs where `value`
+    /// is what gets written to email.toml's `folders` array (a Gmail
+    /// label name like `INBOX` or `Bills/Utilities`) and `label` is the
+    /// display string. System labels come first (in stable order),
+    /// then user labels sorted by name.
+    pub async fn list_folders_for_picker(&self) -> Result<Vec<(String, String)>> {
+        let token = self.access_token().await?;
+        let url = format!("{GMAIL_BASE}/users/me/labels");
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("Gmail labels request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Gmail labels returned {status}: {body}");
+        }
+        let parsed: LabelsResponse = resp
+            .json()
+            .await
+            .context("failed to deserialize Gmail labels")?;
+        // System labels first (INBOX, SENT, …); user labels after.
+        // Hide `CATEGORY_*` system labels (Gmail-internal tabs that
+        // most users don't think of as folders).
+        let mut system: Vec<(String, String)> = Vec::new();
+        let mut user: Vec<(String, String)> = Vec::new();
+        for l in parsed.labels {
+            if l.name.starts_with("CATEGORY_") {
+                continue;
+            }
+            let bucket = match l.label_type.as_deref() {
+                Some("system") => &mut system,
+                _ => &mut user,
+            };
+            bucket.push((l.name.clone(), l.name));
+        }
+        // Stable system-label order; alphabetised user labels.
+        let priority: &[&str] = &[
+            "INBOX", "STARRED", "IMPORTANT", "UNREAD", "SENT", "DRAFT",
+            "SPAM", "TRASH",
+        ];
+        system.sort_by_key(|(name, _)| {
+            priority
+                .iter()
+                .position(|p| *p == name.as_str())
+                .unwrap_or(usize::MAX)
+        });
+        user.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        system.extend(user);
+        Ok(system)
     }
 
     /// Fetch (or return the cached) lowercased-name → label-id map. Gmail's

@@ -612,6 +612,59 @@ fn truncate(s: &str, max: usize) -> String {
 
 pub const KIND: &str = "resources";
 
+/// Wizard descriptor. Three flat scalar fields; default field-by-field
+/// TOML renderer handles emission.
+pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
+    use crate::wizard::descriptor::{WizardDescriptor, WizardField, WizardFieldKind};
+    WizardDescriptor {
+        display_name: "Resources",
+        blurb: "htop-style CPU, memory, and top-process view. Backed by \
+                the `sysinfo` crate (cross-platform, no FFI).",
+        load_from_toml: None,
+        render_toml: None,
+        fields: vec![
+            WizardField {
+                key: "poll_interval_secs",
+                label: "Refresh interval (seconds)",
+                help: "How often to sample CPU / memory / processes. \
+                       Clamped to ≥1 second at runtime — sysinfo's CPU \
+                       sampling needs ~200ms between calls for a stable %.",
+                required: true,
+                kind: WizardFieldKind::Number {
+                    default: Some(2.0),
+                    range: Some((1.0, 60.0)),
+                    integer: true,
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "top_n_processes",
+                label: "Top processes to show",
+                help: "Number of process rows under the CPU / memory bars. \
+                       Clamped to ≤40 at construction so a misconfigured \
+                       value can't blow out the render budget.",
+                required: true,
+                kind: WizardFieldKind::Number {
+                    default: Some(10.0),
+                    range: Some((1.0, 40.0)),
+                    integer: true,
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "sort_by_memory",
+                label: "Sort processes by memory",
+                help: "Off — sort by CPU usage (htop's default). On — sort \
+                       by RSS memory. Press `m` in the widget to toggle at \
+                       runtime.",
+                required: false,
+                kind: WizardFieldKind::Bool { default: false },
+                validate: None,
+            },
+        ],
+    }
+}
+
 pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
     let cfg: ResourcesConfig =
         crate::config::load_widget_toml_for_instance(KIND, &ctx.instance).unwrap_or_default();

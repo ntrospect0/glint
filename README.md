@@ -15,7 +15,8 @@ news, and more. Written in Rust with [ratatui](https://ratatui.rs).
 - **Multi-instance** — run the same widget kind in several panes (e.g. two
   Stocks panes for different watchlists, two Clocks for home + office).
 - **Theming** — bundled color schemes (default · chalktone · gruvbox ·
-  gruvbox-dark · nord · bluloco · miasma); switch live with `:scheme nord`.
+  tokyonight · rosepine · nord · bluloco · onedark · miasma); switch
+  live with `:scheme nord`.
 - **Per-widget focus shortcuts** — `Shift+C` / `Shift+W` / `Shift+N` / …
   jump straight to that widget. The shortcut letter is painted in the
   title.

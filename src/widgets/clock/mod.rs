@@ -701,6 +701,239 @@ impl Widget for ClockWidget {
 /// by the widget descriptor, the config file resolver, and the wizard.
 pub const KIND: &str = "clock";
 
+/// Wizard descriptor for the clock widget. Serves as the reference
+/// implementation other widgets follow when they migrate from
+/// `defer_to_toml_descriptor` to a real schema.
+pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
+    use crate::wizard::descriptor::{
+        ChoiceOption, WizardDescriptor, WizardField, WizardFieldKind,
+    };
+
+    // Helper for the three optional secondary-timezone fields. Each is a
+    // Lookup over the same IANA list with allow_blank so the user can
+    // leave any slot empty.
+    fn secondary_field(key: &'static str, label: &'static str) -> WizardField {
+        WizardField {
+            key,
+            label,
+            help: "Optional. Type to filter the IANA zone list (e.g. \
+                   \"tokyo\", \"london\"). Space picks the highlighted row; \
+                   Tab moves to the next field. Pick \"(none)\" to skip this \
+                   slot. For more than three world clocks, hand-edit \
+                   [[secondary_timezones]] in clock.toml after setup.",
+            required: false,
+            kind: WizardFieldKind::Lookup {
+                options: iana_timezone_options(),
+                default: None,
+                allow_blank: true,
+                blank_label: "(none)",
+            },
+            validate: None,
+        }
+    }
+
+    WizardDescriptor {
+        display_name: "Clock",
+        blurb: "Time display with optional secondary world clocks. The wizard \
+                covers the basics; gradient styles and additional secondary \
+                zones live in clock.toml for hand-tuning.",
+        load_from_toml: Some(load_clock_from_toml),
+        render_toml: Some(render_clock_toml),
+        fields: vec![
+            WizardField {
+                key: "timezone",
+                label: "Primary timezone",
+                help: "Type to filter (e.g. \"vancouver\", \"tokyo\"). ↑/↓ \
+                       navigates; PgUp/PgDn jumps by 10. Space picks the \
+                       highlighted row. Pick \"(system local time)\" to \
+                       follow the host clock.",
+                required: false,
+                kind: WizardFieldKind::Lookup {
+                    options: iana_timezone_options(),
+                    default: None,
+                    allow_blank: true,
+                    blank_label: "(system local time)",
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "hour_format",
+                label: "Hour format",
+                help: "\"12h\" — am/pm. \"24h\" — military time.",
+                required: true,
+                kind: WizardFieldKind::Choice {
+                    options: vec![
+                        ChoiceOption {
+                            value: "24h",
+                            label: "24-hour",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "12h",
+                            label: "12-hour (am/pm)",
+                            help: None,
+                        },
+                    ],
+                    default: Some("24h"),
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "show_seconds",
+                label: "Show seconds in the big digits",
+                help: "Adds :SS to the block-digit display. The small ticking \
+                       line below the big digits always shows seconds.",
+                required: false,
+                kind: WizardFieldKind::Bool { default: false },
+                validate: None,
+            },
+            WizardField {
+                key: "show_date",
+                label: "Show the date row",
+                help: "Renders today's date under the big digits.",
+                required: false,
+                kind: WizardFieldKind::Bool { default: true },
+                validate: None,
+            },
+            secondary_field("secondary_tz_1", "Secondary world clock 1"),
+            secondary_field("secondary_tz_2", "Secondary world clock 2"),
+            secondary_field("secondary_tz_3", "Secondary world clock 3"),
+        ],
+    }
+}
+
+/// Every IANA zone the host's chrono-tz database knows about, formatted as
+/// `(value, label)` pairs for the wizard's `Lookup` dropdown. Both halves
+/// of each tuple are the canonical name (`"America/Los_Angeles"`) — the
+/// dropdown's filter matches against the label, which means the user can
+/// type either the continent or the city.
+fn iana_timezone_options() -> Vec<(&'static str, &'static str)> {
+    chrono_tz::TZ_VARIANTS
+        .iter()
+        .map(|tz| {
+            let name = tz.name();
+            (name, name)
+        })
+        .collect()
+}
+
+/// Render the clock widget's TOML from wizard values. We render
+/// `secondary_timezones` as repeated `[[secondary_timezones]]` tables to
+/// match the existing `ClockConfig` deserialiser; labels are derived from
+/// the city portion of the IANA name.
+fn render_clock_toml(
+    values: &std::collections::HashMap<String, crate::wizard::descriptor::WizardValue>,
+    _existing: Option<&str>,
+) -> String {
+    use crate::wizard::descriptor::WizardValue;
+    let mut out = String::new();
+    out.push_str(
+        "# Generated by `glint --setup`. Hand-edit freely; the wizard\n\
+         # preserves advanced keys it doesn't manage (e.g. [colors], gradient).\n\n",
+    );
+    // The timezone field is a Lookup that commits as WizardValue::Choice.
+    // Accept Text too so older state buffers (Phase A.5 Text version) keep
+    // working after this upgrade.
+    let tz = match values.get("timezone") {
+        Some(WizardValue::Choice(s)) | Some(WizardValue::Text(s)) => s.trim(),
+        _ => "",
+    };
+    if !tz.is_empty() {
+        out.push_str(&format!("timezone = {}\n", toml_quote(tz)));
+    }
+    if let Some(WizardValue::Choice(hf)) = values.get("hour_format") {
+        out.push_str(&format!("hour_format = {}\n", toml_quote(hf)));
+    }
+    if let Some(WizardValue::Bool(b)) = values.get("show_seconds") {
+        out.push_str(&format!("show_seconds = {b}\n"));
+    }
+    if let Some(WizardValue::Bool(b)) = values.get("show_date") {
+        out.push_str(&format!("show_date = {b}\n"));
+    }
+    out.push_str("show_seconds_ticker = true\n");
+
+    // Up to three optional secondary world clocks, each in its own Lookup
+    // field. Empty / unset slots are skipped; the user reaches for clock.toml
+    // directly when they want more than three.
+    for key in ["secondary_tz_1", "secondary_tz_2", "secondary_tz_3"] {
+        let zone = match values.get(key) {
+            Some(WizardValue::Choice(s)) | Some(WizardValue::Text(s)) => s.trim(),
+            _ => "",
+        };
+        if zone.is_empty() {
+            continue;
+        }
+        let label = label_from_iana_zone(zone);
+        out.push_str("\n[[secondary_timezones]]\n");
+        out.push_str(&format!("label = {}\n", toml_quote(&label)));
+        out.push_str(&format!("timezone = {}\n", toml_quote(zone)));
+    }
+    out
+}
+
+/// Derive a friendly label from an IANA zone like `"America/New_York"` →
+/// `"New York"`. Falls back to the full zone when there's no `/`.
+fn label_from_iana_zone(zone: &str) -> String {
+    let tail = zone.rsplit('/').next().unwrap_or(zone);
+    tail.replace('_', " ")
+}
+
+/// Inverse of [`render_clock_toml`]: parse a clock TOML and surface the
+/// scalar fields plus the first three `[[secondary_timezones]]` entries
+/// into the wizard's three Lookup slots. Additional entries beyond the
+/// third are intentionally ignored — the user can hand-edit clock.toml
+/// for more — and the wizard's render path will preserve only the three
+/// it knows about, so users with custom clocks should not lose them
+/// silently. (Hydration only seeds keys; the user is then expected to
+/// confirm and re-finalize through the wizard.)
+fn load_clock_from_toml(
+    doc: &toml::Value,
+) -> std::collections::HashMap<String, crate::wizard::descriptor::WizardValue> {
+    use crate::wizard::descriptor::WizardValue;
+    let mut out = std::collections::HashMap::new();
+    if let Some(s) = doc.get("timezone").and_then(|v| v.as_str()) {
+        out.insert("timezone".into(), WizardValue::Choice(s.into()));
+    }
+    if let Some(s) = doc.get("hour_format").and_then(|v| v.as_str()) {
+        out.insert("hour_format".into(), WizardValue::Choice(s.into()));
+    }
+    if let Some(b) = doc.get("show_seconds").and_then(|v| v.as_bool()) {
+        out.insert("show_seconds".into(), WizardValue::Bool(b));
+    }
+    if let Some(b) = doc.get("show_date").and_then(|v| v.as_bool()) {
+        out.insert("show_date".into(), WizardValue::Bool(b));
+    }
+    if let Some(arr) = doc.get("secondary_timezones").and_then(|v| v.as_array()) {
+        for (i, entry) in arr.iter().take(3).enumerate() {
+            let Some(zone) = entry.get("timezone").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let key = match i {
+                0 => "secondary_tz_1",
+                1 => "secondary_tz_2",
+                _ => "secondary_tz_3",
+            };
+            out.insert(key.into(), WizardValue::Choice(zone.into()));
+        }
+    }
+    out
+}
+
+fn toml_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Registry factory. Reads the on-disk TOML for this instance and constructs
 /// the widget with the dependencies it needs from `WidgetCtx`.
 pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
@@ -720,6 +953,51 @@ mod tests {
 
     fn build_widget(cfg: ClockConfig) -> ClockWidget {
         ClockWidget::with_config("main".to_string(), cfg, Arc::new(Theme::builtin_defaults()))
+    }
+
+    #[test]
+    fn label_from_iana_zone_strips_underscores_and_continent() {
+        assert_eq!(label_from_iana_zone("America/New_York"), "New York");
+        assert_eq!(label_from_iana_zone("Asia/Tokyo"), "Tokyo");
+        assert_eq!(label_from_iana_zone("UTC"), "UTC");
+        assert_eq!(label_from_iana_zone("Pacific/Auckland"), "Auckland");
+    }
+
+    #[test]
+    fn render_clock_toml_emits_secondary_zone_tables() {
+        use crate::wizard::descriptor::WizardValue;
+        let mut values: std::collections::HashMap<String, WizardValue> = Default::default();
+        values.insert(
+            "timezone".into(),
+            WizardValue::Choice("America/Vancouver".into()),
+        );
+        values.insert("hour_format".into(), WizardValue::Choice("24h".into()));
+        values.insert("show_seconds".into(), WizardValue::Bool(false));
+        values.insert("show_date".into(), WizardValue::Bool(true));
+        // Two filled secondary-zone slots, one left blank.
+        values.insert(
+            "secondary_tz_1".into(),
+            WizardValue::Choice("America/New_York".into()),
+        );
+        values.insert(
+            "secondary_tz_2".into(),
+            WizardValue::Choice("Europe/London".into()),
+        );
+        values.insert("secondary_tz_3".into(), WizardValue::Choice("".into()));
+        let body = render_clock_toml(&values, None);
+        assert!(body.contains("timezone = \"America/Vancouver\""));
+        assert!(body.contains("hour_format = \"24h\""));
+        assert!(body.contains("[[secondary_timezones]]"));
+        assert!(body.contains("label = \"New York\""));
+        assert!(body.contains("timezone = \"America/New_York\""));
+        assert!(body.contains("label = \"London\""));
+        // Round-trips through the existing deserialiser; the empty slot is
+        // omitted entirely.
+        let parsed: ClockConfig =
+            toml::from_str(&body).expect("wizard-rendered clock.toml parses");
+        assert_eq!(parsed.timezone.as_deref(), Some("America/Vancouver"));
+        assert_eq!(parsed.hour_format, 24);
+        assert_eq!(parsed.secondary_timezones.len(), 2);
     }
 
     #[test]

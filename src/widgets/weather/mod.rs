@@ -787,6 +787,207 @@ fn weekday_short(w: chrono::Weekday) -> &'static str {
 
 pub const KIND: &str = "weather";
 
+/// Wizard descriptor. Lat/lon are optional Text fields so users can leave
+/// them blank to opt into IP geolocation; a validator rejects malformed
+/// numeric input. The custom `render_toml` omits empty optionals so the
+/// resulting `weather.toml` parses cleanly into `WeatherConfig`.
+pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
+    use crate::wizard::descriptor::{
+        ChoiceOption, WizardDescriptor, WizardField, WizardFieldKind, WizardValue,
+    };
+
+    fn validate_latitude(v: &WizardValue) -> Result<(), String> {
+        if let WizardValue::Text(s) = v {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(());
+            }
+            match trimmed.parse::<f64>() {
+                Ok(n) if (-90.0..=90.0).contains(&n) => Ok(()),
+                Ok(_) => Err("Latitude must be between -90 and 90".into()),
+                Err(_) => Err("Latitude must be a number (e.g. 49.166) or blank".into()),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_longitude(v: &WizardValue) -> Result<(), String> {
+        if let WizardValue::Text(s) = v {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(());
+            }
+            match trimmed.parse::<f64>() {
+                Ok(n) if (-180.0..=180.0).contains(&n) => Ok(()),
+                Ok(_) => Err("Longitude must be between -180 and 180".into()),
+                Err(_) => Err("Longitude must be a number (e.g. -123.133) or blank".into()),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    WizardDescriptor {
+        display_name: "Weather",
+        blurb: "Open-Meteo current conditions and short-term forecast. \
+                Leave latitude/longitude blank to use IP geolocation on \
+                first fetch.",
+        load_from_toml: None,
+        render_toml: Some(render_weather_toml),
+        fields: vec![
+            WizardField {
+                key: "label",
+                label: "Location label",
+                help: "Optional display name shown in the cell title \
+                       (e.g. \"Richmond, BC\"). Falls back to the \
+                       IP-geolocation result when blank.",
+                required: false,
+                kind: WizardFieldKind::Text {
+                    default: None,
+                    placeholder: Some("(use geolocation)"),
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "latitude",
+                label: "Latitude",
+                help: "Decimal degrees in [-90, 90]. Leave blank to \
+                       IP-geolocate on first fetch.",
+                required: false,
+                kind: WizardFieldKind::Text {
+                    default: None,
+                    placeholder: Some("e.g. 49.166"),
+                },
+                validate: Some(validate_latitude),
+            },
+            WizardField {
+                key: "longitude",
+                label: "Longitude",
+                help: "Decimal degrees in [-180, 180]. Leave blank to \
+                       IP-geolocate on first fetch.",
+                required: false,
+                kind: WizardFieldKind::Text {
+                    default: None,
+                    placeholder: Some("e.g. -123.133"),
+                },
+                validate: Some(validate_longitude),
+            },
+            WizardField {
+                key: "units",
+                label: "Units",
+                help: "\"metric\" — °C and km/h. \"imperial\" — °F and mph.",
+                required: true,
+                kind: WizardFieldKind::Choice {
+                    options: vec![
+                        ChoiceOption {
+                            value: "metric",
+                            label: "Metric (°C, km/h)",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "imperial",
+                            label: "Imperial (°F, mph)",
+                            help: None,
+                        },
+                    ],
+                    default: Some("metric"),
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "poll_interval_secs",
+                label: "Refresh interval (seconds)",
+                help: "How often to fetch fresh conditions. Open-Meteo is \
+                       fast and free; 600 (10 minutes) is plenty for a \
+                       dashboard.",
+                required: true,
+                kind: WizardFieldKind::Number {
+                    default: Some(600.0),
+                    range: Some((30.0, 3600.0)),
+                    integer: true,
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "auto_locate",
+                label: "IP-geolocate when lat/lon are blank",
+                help: "On — the widget calls ipapi.co on first fetch when \
+                       no coordinates are configured. Off — the widget \
+                       renders a \"location needed\" placeholder until \
+                       coordinates are supplied.",
+                required: false,
+                kind: WizardFieldKind::Bool { default: true },
+                validate: None,
+            },
+        ],
+    }
+}
+
+/// Render weather.toml from wizard values. Optional fields (label, lat,
+/// lon) are omitted when blank so the on-disk file parses cleanly into
+/// `WeatherConfig` with its `Option<…>` shapes.
+fn render_weather_toml(
+    values: &std::collections::HashMap<String, crate::wizard::descriptor::WizardValue>,
+    _existing: Option<&str>,
+) -> String {
+    use crate::wizard::descriptor::WizardValue;
+    let mut out = String::from(
+        "# Generated by `glint --setup`. Hand-edit freely; the wizard preserves\n\
+         # advanced keys it doesn't manage (e.g. [colors], custom shortcuts).\n\n",
+    );
+
+    if let Some(WizardValue::Text(label)) = values.get("label") {
+        let trimmed = label.trim();
+        if !trimmed.is_empty() {
+            out.push_str(&format!("label = {}\n", weather_toml_quote(trimmed)));
+        }
+    }
+    if let Some(lat) = optional_float(values.get("latitude")) {
+        out.push_str(&format!("latitude = {lat}\n"));
+    }
+    if let Some(lon) = optional_float(values.get("longitude")) {
+        out.push_str(&format!("longitude = {lon}\n"));
+    }
+    if let Some(WizardValue::Choice(units)) = values.get("units") {
+        out.push_str(&format!("units = {}\n", weather_toml_quote(units)));
+    }
+    if let Some(WizardValue::Number(secs)) = values.get("poll_interval_secs") {
+        out.push_str(&format!("poll_interval_secs = {}\n", *secs as i64));
+    }
+    if let Some(WizardValue::Bool(b)) = values.get("auto_locate") {
+        out.push_str(&format!("auto_locate = {b}\n"));
+    }
+    out
+}
+
+/// Coerce either a Text("49.166") or a Number(49.166) wizard value into an
+/// f64. Empty / unparseable / wrong-kind inputs return None so the caller
+/// can omit the field from the rendered TOML.
+fn optional_float(v: Option<&crate::wizard::descriptor::WizardValue>) -> Option<f64> {
+    use crate::wizard::descriptor::WizardValue;
+    match v? {
+        WizardValue::Text(s) => s.trim().parse().ok(),
+        WizardValue::Number(n) => Some(*n),
+        _ => None,
+    }
+}
+
+fn weather_toml_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
     let cfg: WeatherConfig =
         crate::config::load_widget_toml_for_instance(KIND, &ctx.instance).unwrap_or_default();
@@ -809,6 +1010,43 @@ mod tests {
             Arc::new(Theme::builtin_defaults()),
             ScopedCache::ephemeral(),
         )
+    }
+
+    #[test]
+    fn render_weather_toml_omits_blank_optionals_and_roundtrips() {
+        use crate::wizard::descriptor::WizardValue;
+        use std::collections::HashMap;
+        // Case 1: all-defaults, blank label + lat/lon → omitted in output.
+        let mut values: HashMap<String, WizardValue> = HashMap::new();
+        values.insert("label".into(), WizardValue::Text("".into()));
+        values.insert("latitude".into(), WizardValue::Text("".into()));
+        values.insert("longitude".into(), WizardValue::Text("".into()));
+        values.insert("units".into(), WizardValue::Choice("metric".into()));
+        values.insert("poll_interval_secs".into(), WizardValue::Number(600.0));
+        values.insert("auto_locate".into(), WizardValue::Bool(true));
+        let body = render_weather_toml(&values, None);
+        assert!(!body.contains("label"));
+        assert!(!body.contains("latitude"));
+        assert!(!body.contains("longitude"));
+        assert!(body.contains("units = \"metric\""));
+        let parsed: WeatherConfig = toml::from_str(&body).expect("parses");
+        assert!(parsed.label.is_none());
+        assert!(parsed.latitude.is_none());
+        assert!(parsed.longitude.is_none());
+        assert!(parsed.auto_locate);
+
+        // Case 2: explicit coords → keys present, deserialise to Some(_).
+        values.insert("label".into(), WizardValue::Text("Richmond, BC".into()));
+        values.insert("latitude".into(), WizardValue::Text("49.166".into()));
+        values.insert("longitude".into(), WizardValue::Text("-123.133".into()));
+        let body = render_weather_toml(&values, None);
+        assert!(body.contains("label = \"Richmond, BC\""));
+        assert!(body.contains("latitude = 49.166"));
+        assert!(body.contains("longitude = -123.133"));
+        let parsed: WeatherConfig = toml::from_str(&body).expect("parses");
+        assert_eq!(parsed.label.as_deref(), Some("Richmond, BC"));
+        assert!((parsed.latitude.unwrap() - 49.166).abs() < 1e-9);
+        assert!((parsed.longitude.unwrap() - -123.133).abs() < 1e-9);
     }
 
     #[test]

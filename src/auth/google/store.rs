@@ -29,7 +29,19 @@ impl OAuthClientConfig {
         }
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
+        let cfg: OAuthClientConfig = toml::from_str(&contents)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        if cfg.client_id.is_empty()
+            || cfg.client_id.starts_with("REPLACE_WITH_")
+            || cfg.client_secret.is_empty()
+            || cfg.client_secret.starts_with("REPLACE_WITH_")
+        {
+            anyhow::bail!(
+                "{} is still the template — fill in client_id + client_secret from your Google Cloud OAuth client.",
+                path.display()
+            );
+        }
+        Ok(cfg)
     }
 }
 

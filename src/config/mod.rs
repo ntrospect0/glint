@@ -82,7 +82,9 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"version = 1
 
 [global]
 # Active color scheme — looked up in colorschemes.toml under [schemes.<name>].
-# Ships with "default", "nord", and "gruvbox_dark". An unrecognized name falls
+# Ships with "default", "chalktone", "gruvbox", "tokyonight",
+# "rosepine", "nord", "bluloco", "onedark", and "miasma". An
+# unrecognized name falls
 # back to glint's built-in palette.
 theme = "default"
 command_key = ":"
@@ -408,19 +410,37 @@ text.selected    = { fg = "#fe8019", modifiers = ["bold"] }
 text.focused     = { fg = "#8ec07c", modifiers = ["bold"] }
 text.shortcut    = { fg = "#fb4934", modifiers = ["bold"] }
 
-# ── Gruvbox Dark (legacy) ───────────────────────────────────────────────────
-# Kept under its original name so existing configs keep working. Subtly
-# different from `gruvbox` above (cooler aqua focus, deeper unfocused border).
-[schemes.gruvbox_dark]
-border.focused   = { fg = "#fabd2f", modifiers = ["bold"] }
-border.unfocused = "#504945"
-widget_title     = { fg = "#ebdbb2", modifiers = ["bold"] }
-text.plain       = { fg = "#bdae93" }
-text.brilliant   = { fg = "#fbf1c7", modifiers = ["bold"] }
-text.dim         = { fg = "#665c54" }
-text.selected    = { fg = "#fe8019", modifiers = ["bold"] }
-text.focused     = { fg = "#83a598", modifiers = ["bold"] }
-text.shortcut    = { fg = "#cc241d", modifiers = ["bold"] }
+# ── Tokyo Night ─────────────────────────────────────────────────────────────
+# Cool, modern dark palette — derivation of the Storm variant of
+# https://github.com/folke/tokyonight.nvim
+# Blue/cyan accents over a deep indigo bg, with the signature warm
+# yellow used here for selection.
+[schemes.tokyonight]
+border.focused   = { fg = "#7aa2f7", modifiers = ["bold"] }
+border.unfocused = "#3b4261"
+widget_title     = { fg = "#c0caf5", modifiers = ["bold"] }
+text.plain       = { fg = "#a9b1d6" }
+text.brilliant   = { fg = "#c0caf5", modifiers = ["bold"] }
+text.dim         = { fg = "#565f89" }
+text.selected    = { fg = "#e0af68", modifiers = ["bold"] }
+text.focused     = { fg = "#7dcfff", modifiers = ["bold"] }
+text.shortcut    = { fg = "#f7768e", modifiers = ["bold"] }
+
+# ── Rose Pine ───────────────────────────────────────────────────────────────
+# Soho-vibes warm minimalism — derivation of the Main variant of
+# https://github.com/rose-pine/neovim (see also rosepinetheme.com).
+# Muted purples + foam/iris accents, with gold for selection and love
+# for shortcuts.
+[schemes.rosepine]
+border.focused   = { fg = "#9ccfd8", modifiers = ["bold"] }
+border.unfocused = "#403d52"
+widget_title     = { fg = "#e0def4", modifiers = ["bold"] }
+text.plain       = { fg = "#908caa" }
+text.brilliant   = { fg = "#e0def4", modifiers = ["bold"] }
+text.dim         = { fg = "#6e6a86" }
+text.selected    = { fg = "#f6c177", modifiers = ["bold"] }
+text.focused     = { fg = "#9ccfd8", modifiers = ["bold"] }
+text.shortcut    = { fg = "#eb6f92", modifiers = ["bold"] }
 
 # ── Nord ─────────────────────────────────────────────────────────────────────
 # Arctic, north-bluish palette — derivation of
@@ -450,6 +470,21 @@ text.dim         = { fg = "#5c6370" }
 text.selected    = { fg = "#f9c859", modifiers = ["bold"] }
 text.focused     = { fg = "#4090f7", modifiers = ["bold"] }
 text.shortcut    = { fg = "#ff6480", modifiers = ["bold"] }
+
+# ── OneDark ─────────────────────────────────────────────────────────────────
+# Atom-derived modern dark — derivation of the default `dark` style of
+# https://github.com/navarasu/onedark.nvim
+# Signature One blue (#61afef), warm yellow for selection, cyan focus.
+[schemes.onedark]
+border.focused   = { fg = "#61afef", modifiers = ["bold"] }
+border.unfocused = "#3e4452"
+widget_title     = { fg = "#c8ccd4", modifiers = ["bold"] }
+text.plain       = { fg = "#abb2bf" }
+text.brilliant   = { fg = "#c8ccd4", modifiers = ["bold"] }
+text.dim         = { fg = "#5c6370" }
+text.selected    = { fg = "#e5c07b", modifiers = ["bold"] }
+text.focused     = { fg = "#56b6c2", modifiers = ["bold"] }
+text.shortcut    = { fg = "#e06c75", modifiers = ["bold"] }
 
 # ── Miasma ──────────────────────────────────────────────────────────────────
 # Horror-tinged, earthy decay — derivation of
@@ -493,6 +528,27 @@ pub const DEFAULT_ANTHROPIC_KEY_TEMPLATE: &str = r#"# Anthropic API key. Get one
 api_key = "REPLACE_WITH_YOUR_KEY"
 "#;
 
+pub const DEFAULT_GOOGLE_CLIENT_TEMPLATE: &str = r#"# Google OAuth client config for Calendar + Gmail access.
+#
+# One-time setup (free; no billing required):
+#   1. Go to https://console.cloud.google.com/ and create a project (or
+#      reuse an existing one).
+#   2. APIs & Services → Library → enable "Google Calendar API". If you
+#      want Gmail in the email widget, also enable "Gmail API".
+#   3. APIs & Services → OAuth consent screen → External → fill in the
+#      app name + your email. Add yourself under "Test users" so you
+#      can sign in while the app is in "Testing" mode (no review needed
+#      for personal/local use).
+#   4. APIs & Services → Credentials → Create credentials → OAuth client
+#      ID. Application type: "Desktop app". Name it "glint". Click
+#      Create. Copy the Client ID and Client secret into the values
+#      below.
+#   5. Save this file, then in glint press Space on the "Authorize
+#      Google" wizard field (or run:  glint --auth google).
+client_id = "REPLACE_WITH_GOOGLE_CLIENT_ID"
+client_secret = "REPLACE_WITH_GOOGLE_CLIENT_SECRET"
+"#;
+
 pub const DEFAULT_MICROSOFT_CLIENT_TEMPLATE: &str = r#"# Microsoft OAuth client config for Outlook calendar access.
 #
 # One-time setup:
@@ -505,7 +561,9 @@ pub const DEFAULT_MICROSOFT_CLIENT_TEMPLATE: &str = r#"# Microsoft OAuth client 
 #   4. Sidebar → Authentication → "Add a platform" → "Mobile and desktop
 #      applications" → check the "http://localhost" loopback option. Save.
 #   5. Sidebar → API permissions → "Add a permission" → Microsoft Graph →
-#      Delegated permissions → check `Calendars.Read` → Add.
+#      Delegated permissions → check `Calendars.Read`, `Mail.Read`, and
+#      `User.Read` (the last is required for the email widget to display
+#      your address — without it the title shows "(loading…)" forever). Add.
 #   6. Back here, save this file, then run:  glint --auth microsoft
 #
 # `tenant` defaults to "common" which accepts both personal and work/school
@@ -646,6 +704,10 @@ pub fn init_default_config() -> Result<PathBuf> {
     seed_credentials(&credentials.join("anthropic_key.toml"), DEFAULT_ANTHROPIC_KEY_TEMPLATE)?;
     seed_credentials(&credentials.join("caldav.toml"), DEFAULT_CALDAV_TEMPLATE)?;
     seed_credentials(
+        &credentials.join("google_oauth_client.toml"),
+        DEFAULT_GOOGLE_CLIENT_TEMPLATE,
+    )?;
+    seed_credentials(
         &credentials.join("microsoft_oauth_client.toml"),
         DEFAULT_MICROSOFT_CLIENT_TEMPLATE,
     )?;
@@ -708,9 +770,11 @@ mod tests {
         for expected in [
             "chalktone",
             "gruvbox",
-            "gruvbox_dark",
+            "tokyonight",
+            "rosepine",
             "nord",
             "bluloco",
+            "onedark",
             "miasma",
         ] {
             assert!(
@@ -718,6 +782,12 @@ mod tests {
                 "expected scheme {expected:?} in seed"
             );
         }
+        // `gruvbox_dark` was intentionally removed (was a near-duplicate
+        // of `gruvbox`); guard against it silently coming back.
+        assert!(
+            !file.schemes.contains_key("gruvbox_dark"),
+            "gruvbox_dark was removed in favour of single gruvbox + new tokyonight/rosepine"
+        );
     }
 
     #[test]

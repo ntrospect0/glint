@@ -94,6 +94,15 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 ratatui-image = { version = "2", default-features = false, features = ["image-defaults", "crossterm", "rustix"] }
 image = "0.25"
 
+# IMAP support for the Email widget's IMAP provider (third option
+# alongside Gmail OAuth and Outlook OAuth). The sync `imap` crate is
+# the mature option; we run its calls under `tokio::task::spawn_blocking`
+# so the wider async runtime isn't held up. `mail-parser` parses RFC
+# 5322 message bodies (To/From/Subject/text) once IMAP delivers them.
+imap = "2"
+native-tls = "0.2"
+mail-parser = "0.9"
+
 [dev-dependencies]
 wiremock = "0.6"
 tokio-test = "0.4"

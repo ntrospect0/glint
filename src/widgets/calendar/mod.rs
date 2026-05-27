@@ -1453,16 +1453,20 @@ impl CalendarWidget {
                     } else {
                         format!("{:02}:{:02}", e.start.hour(), e.start.minute())
                     };
-                    // First line is "<prefix> <first wrapped chunk>".
-                    let title_lines = wrap_event_title(&e.title, wrap_width, 3);
-                    let (first, rest) = title_lines.split_first().map(|(f, r)| (f.clone(), r)).unwrap_or((String::new(), &[][..]));
-                    lines.push(Line::from(Span::styled(
-                        format!("{prefix} {first}"),
-                        Style::default().fg(color),
-                    )));
-                    for cont in rest {
+                    // Combine the prefix and title so the wrap function
+                    // accounts for the prefix's column cost on line 1.
+                    // The previous version wrapped the bare title at
+                    // wrap_width and then glued the prefix onto line 1
+                    // — which pushed line 1 past the column edge so
+                    // ratatui silently truncated those characters,
+                    // making it look like the title had "lost" its
+                    // middle when really the wrap function had already
+                    // moved on past them on line 2.
+                    let combined = format!("{prefix} {}", e.title);
+                    let title_lines = wrap_event_title(&combined, wrap_width, 3);
+                    for line in title_lines {
                         lines.push(Line::from(Span::styled(
-                            cont.clone(),
+                            line,
                             Style::default().fg(color),
                         )));
                     }
@@ -1543,58 +1547,54 @@ impl CalendarWidget {
 }
 
 /// Greedy word-wrap for event titles in week view. Splits on whitespace and
-/// fills each line up to `max_width` columns, returning at most `max_lines`
-/// lines. If the title doesn't fit, the last line gets an ellipsis. Oversized
-/// single words are character-truncated.
+/// Character-level wrap: fills each line to `max_width` columns
+/// regardless of word boundaries, returning at most `max_lines` lines.
+/// If the title doesn't fit, the last line gets an ellipsis (replacing
+/// the last visible character when the line is already at width).
+///
+/// Word-aware wrapping left each line short whenever the next word
+/// didn't fit, which in a Week view's narrow event cells meant most
+/// lines ended with several columns of blank space. Char-level packing
+/// makes use of every column; the human eye reconstructs broken words
+/// from context, and the alternative (dropped trailing characters)
+/// was worse.
 fn wrap_event_title(text: &str, max_width: usize, max_lines: usize) -> Vec<String> {
     if max_width == 0 || max_lines == 0 {
         return Vec::new();
     }
-    let words: Vec<&str> = text.split_whitespace().collect();
+    let chars: Vec<char> = text.chars().collect();
     let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut consumed = 0usize;
-    for (i, word) in words.iter().enumerate() {
-        let needed = if current.is_empty() {
-            word.chars().count()
-        } else {
-            current.chars().count() + 1 + word.chars().count()
-        };
-        if needed <= max_width {
-            if !current.is_empty() {
-                current.push(' ');
+    let mut idx = 0;
+    while idx < chars.len() && lines.len() < max_lines {
+        // After the first line, skip any leading whitespace at the
+        // start of a wrapped line. Spaces happen to land at line
+        // starts when the previous slice ended on a non-space; without
+        // this skip, narrow columns end up with ugly leading gaps on
+        // continuation lines.
+        if !lines.is_empty() {
+            while idx < chars.len() && chars[idx].is_whitespace() {
+                idx += 1;
             }
-            current.push_str(word);
-            consumed = i + 1;
-        } else if current.is_empty() {
-            // word longer than the column — character-truncate with ellipsis.
-            let t: String = word.chars().take(max_width.saturating_sub(1)).collect();
-            lines.push(format!("{t}…"));
-            consumed = i + 1;
-            if lines.len() == max_lines {
-                return lines;
-            }
-        } else {
-            lines.push(std::mem::take(&mut current));
-            if lines.len() == max_lines {
+            if idx >= chars.len() {
                 break;
             }
-            current.push_str(word);
-            consumed = i + 1;
         }
+        let end = (idx + max_width).min(chars.len());
+        lines.push(chars[idx..end].iter().collect());
+        idx = end;
     }
-    if !current.is_empty() && lines.len() < max_lines {
-        lines.push(current);
-    }
-    if consumed < words.len() {
+    // Add ellipsis when we ran out of line budget before consuming all
+    // characters. Inline replacement (pop the last visible char) keeps
+    // the line width invariant.
+    if idx < chars.len() {
         if let Some(last) = lines.last_mut() {
             if last.chars().count() < max_width {
                 last.push('…');
             } else if !last.ends_with('…') {
-                let mut chars: Vec<char> = last.chars().collect();
-                chars.pop();
-                chars.push('…');
-                *last = chars.into_iter().collect();
+                let mut tail: Vec<char> = last.chars().collect();
+                tail.pop();
+                tail.push('…');
+                *last = tail.into_iter().collect();
             }
         }
     }
@@ -1884,6 +1884,241 @@ impl Widget for CalendarWidget {
 
 pub const KIND: &str = "calendar";
 
+/// Wizard descriptor. Covers the core common knobs (refresh interval +
+/// per-provider OAuth handoff); structured data like
+/// [[providers]] / [[events]] / `[calendar_colors]` lives in
+/// calendar.toml and is preserved across `--setup` re-runs.
+pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
+    use crate::wizard::descriptor::{
+        ChoiceOption, WizardDescriptor, WizardField, WizardFieldKind,
+    };
+    WizardDescriptor {
+        display_name: "Calendar",
+        blurb: "Day / week / month agenda views across Google, Outlook, \
+                CalDAV, and a built-in local provider. Tick the calendars \
+                you'd like to pull from; the wizard runs the OAuth \
+                handshakes; per-calendar IDs + CalDAV details live in \
+                calendar.toml for hand-tuning.",
+        load_from_toml: Some(load_calendar_from_toml),
+        render_toml: Some(render_calendar_toml),
+        fields: vec![
+            WizardField {
+                key: "sources",
+                label: "Calendar sources",
+                help: "Each ticked source becomes a [[providers]] block in \
+                       calendar.toml. Google + Outlook need their OAuth \
+                       handshake (next two fields). CalDAV credentials \
+                       live in credentials/caldav.toml. Local needs no \
+                       setup — uses [[events]] entries in calendar.toml.",
+                required: false,
+                kind: WizardFieldKind::MultiChoice {
+                    options: vec![
+                        ChoiceOption {
+                            value: "google",
+                            label: "Google Calendar",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "outlook",
+                            label: "Outlook (Microsoft 365)",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "caldav",
+                            label: "CalDAV (iCloud, Fastmail, Nextcloud, …)",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "local",
+                            label: "Local events (defined in calendar.toml)",
+                            help: None,
+                        },
+                    ],
+                    defaults: vec!["local"],
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "poll_interval_secs",
+                label: "Refresh interval (seconds)",
+                help: "How often the calendar re-fetches events from each \
+                       configured provider. 60–300s is usual.",
+                required: true,
+                kind: WizardFieldKind::Number {
+                    default: Some(60.0),
+                    range: Some((30.0, 3600.0)),
+                    integer: true,
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "authorize_google",
+                label: "Authorize Google Calendar",
+                help: "Required if you want calendar.toml to include \
+                       a [[providers]] block with kind = \"google\". Opens \
+                       a browser to console.cloud.google.com for the OAuth \
+                       consent, then captures the token on a loopback port.",
+                required: false,
+                kind: WizardFieldKind::OAuth { provider: "google" },
+                validate: None,
+            },
+            WizardField {
+                key: "authorize_microsoft",
+                label: "Authorize Microsoft (Outlook calendar)",
+                help: "Required for an Outlook calendar provider. Opens a \
+                       browser to login.microsoftonline.com; if you haven't \
+                       set up an Azure app yet, see \
+                       credentials/microsoft_oauth_client.toml.",
+                required: false,
+                kind: WizardFieldKind::OAuth { provider: "microsoft" },
+                validate: None,
+            },
+        ],
+    }
+}
+
+fn load_calendar_from_toml(
+    doc: &toml::Value,
+) -> std::collections::HashMap<String, crate::wizard::descriptor::WizardValue> {
+    use crate::wizard::descriptor::WizardValue;
+    let mut out = std::collections::HashMap::new();
+    if let Some(n) = doc.get("poll_interval_secs").and_then(|v| v.as_integer()) {
+        out.insert("poll_interval_secs".into(), WizardValue::Number(n as f64));
+    }
+    // Derive the MultiChoice from existing [[providers]] blocks. We
+    // accept the same aliases the runtime deserializer does
+    // (apple/icloud → caldav, microsoft/ms365 → outlook) so a
+    // hand-edited file round-trips cleanly.
+    if let Some(arr) = doc.get("providers").and_then(|v| v.as_array()) {
+        let mut sources: Vec<String> = Vec::new();
+        for entry in arr {
+            if let Some(kind) = entry.get("kind").and_then(|v| v.as_str()) {
+                let canonical = match kind {
+                    "google" => "google",
+                    "outlook" | "microsoft" | "ms365" => "outlook",
+                    "caldav" | "apple" | "icloud" => "caldav",
+                    "local" => "local",
+                    _ => continue,
+                };
+                if !sources.iter().any(|s| s == canonical) {
+                    sources.push(canonical.to_string());
+                }
+            }
+        }
+        if !sources.is_empty() {
+            out.insert("sources".into(), WizardValue::MultiChoice(sources));
+        }
+    }
+    out
+}
+
+fn render_calendar_toml(
+    values: &std::collections::HashMap<String, crate::wizard::descriptor::WizardValue>,
+    existing: Option<&str>,
+) -> String {
+    use crate::wizard::descriptor::WizardValue;
+
+    let scalars: Vec<(&str, String)> = vec![(
+        "poll_interval_secs",
+        match values.get("poll_interval_secs") {
+            Some(WizardValue::Number(n)) => format!("{}", *n as i64),
+            _ => "60".into(),
+        },
+    )];
+
+    // Build [[providers]] blocks. For each selected source, reuse the
+    // user's existing block (preserving calendar_ids etc.) when one
+    // exists, else emit a minimal default.
+    let selected_kinds: Vec<String> = match values.get("sources") {
+        Some(WizardValue::MultiChoice(items)) => items.clone(),
+        _ => vec!["local".into()],
+    };
+    let existing_blocks: std::collections::HashMap<String, String> =
+        existing_provider_blocks_by_kind(existing.unwrap_or(""));
+
+    let mut provider_blocks = String::new();
+    for kind in &selected_kinds {
+        if let Some(block) = existing_blocks.get(kind) {
+            provider_blocks.push_str("\n");
+            provider_blocks.push_str(block);
+        } else {
+            provider_blocks.push_str(&format!(
+                "\n[[providers]]\nkind = \"{kind}\"\n"
+            ));
+        }
+    }
+
+    let base: std::borrow::Cow<str> = match existing {
+        Some(text) => std::borrow::Cow::Borrowed(text),
+        None => std::borrow::Cow::Borrowed(crate::config::DEFAULT_CALENDAR_TOML),
+    };
+    let stripped = crate::wizard::toml_merge::strip_array_of_tables_blocks(
+        &base, "providers",
+    );
+    let merged =
+        crate::wizard::toml_merge::merge_top_level_scalars(&stripped, &scalars);
+
+    let mut out = merged;
+    if !out.ends_with("\n\n") {
+        if out.ends_with('\n') {
+            out.push('\n');
+        } else {
+            out.push_str("\n\n");
+        }
+    }
+    out.push_str(provider_blocks.trim_start_matches('\n'));
+    out
+}
+
+/// Pull each existing `[[providers]]` block out of the text, keyed by
+/// canonicalised kind (apple/icloud → caldav, etc.) so a re-render can
+/// preserve the user's `calendar_ids` lists when they keep that
+/// source ticked.
+fn existing_provider_blocks_by_kind(
+    text: &str,
+) -> std::collections::HashMap<String, String> {
+    let mut out: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let Ok(doc) = toml::from_str::<toml::Value>(text) else {
+        return out;
+    };
+    let Some(arr) = doc.get("providers").and_then(|v| v.as_array()) else {
+        return out;
+    };
+    for entry in arr {
+        let Some(kind) = entry.get("kind").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let canonical = match kind {
+            "google" => "google",
+            "outlook" | "microsoft" | "ms365" => "outlook",
+            "caldav" | "apple" | "icloud" => "caldav",
+            "local" => "local",
+            _ => continue,
+        };
+        // Re-emit the block from the parsed Value so we don't have to
+        // line-scan the source for boundaries. Manual emit keeps the
+        // output predictable (kind first, then calendar_ids).
+        let mut block = String::from("[[providers]]\n");
+        block.push_str(&format!("kind = \"{canonical}\"\n"));
+        if let Some(ids) = entry.get("calendar_ids").and_then(|v| v.as_array()) {
+            let items: Vec<String> = ids
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
+                .collect();
+            if !items.is_empty() {
+                block.push_str(&format!(
+                    "calendar_ids = [{}]\n",
+                    items.join(", ")
+                ));
+            }
+        }
+        out.insert(canonical.to_string(), block);
+    }
+    out
+}
+
 pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
     let cfg: CalendarConfig =
         crate::config::load_widget_toml_for_instance(KIND, &ctx.instance).unwrap_or_default();
@@ -2071,10 +2306,49 @@ mod tests {
     }
 
     #[test]
-    fn wrap_event_title_truncates_oversized_word() {
+    fn wrap_event_title_fills_to_column_width() {
+        // Char-level wrap: every line except the last (or one short of
+        // the truncation point) should hit max_width exactly, so we
+        // use every available column instead of leaving trailing
+        // whitespace from a word-boundary-only wrap.
+        let lines = wrap_event_title("Project planning meeting with vendor", 10, 4);
+        for line in lines.iter().take(lines.len() - 1) {
+            assert_eq!(
+                line.chars().count(),
+                10,
+                "non-final line should fill the column: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_event_title_splits_oversized_word_across_lines() {
+        // A single 20-char word at column width 5: should occupy 4
+        // lines of 5 chars each — no characters dropped, no
+        // mid-string ellipsis.
+        let lines = wrap_event_title("supercalifragilistic", 5, 4);
+        assert_eq!(lines, vec!["super", "calif", "ragil", "istic"]);
+    }
+
+    #[test]
+    fn wrap_event_title_ellipsises_truncated_oversized_word() {
+        // Same word, only 3 lines available: the first 15 chars land
+        // intact across lines 1+2, the last line keeps 4 chars + the
+        // ellipsis (replacing the would-be 5th char).
         let lines = wrap_event_title("supercalifragilistic", 5, 3);
-        assert!(lines[0].ends_with('…'));
-        assert!(lines[0].chars().count() <= 5);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[2].ends_with('…'));
+        assert_eq!(lines[2].chars().count(), 5);
+    }
+
+    #[test]
+    fn wrap_event_title_skips_leading_space_on_continuation() {
+        // When the break lands right before a space, the continuation
+        // line shouldn't begin with that space — the user would see
+        // an awkward indent.
+        let lines = wrap_event_title("Hello World", 5, 3);
+        assert_eq!(lines[0], "Hello");
+        assert_eq!(lines[1], "World");
     }
 
     fn make_event(start: chrono::DateTime<Local>, end: chrono::DateTime<Local>, title: &str) -> Event {

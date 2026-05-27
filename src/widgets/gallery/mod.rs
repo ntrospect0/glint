@@ -362,7 +362,18 @@ fn centered_horizontal_area(
     // Height-bound: scale so img height = area height, then derive width.
     let scale = area_h / img_cells_h;
     let target_w = (img_cells_w * scale).round() as u16;
-    let target_w = target_w.min(area.width).max(1);
+    let mut target_w = target_w.min(area.width).max(1);
+    // Centering correction: integer division `(area.width - target_w) /
+    // 2` rounds the offset toward zero, so any odd gap (e.g. area=50,
+    // target=47 → gap=3) systematically biases the image one cell to
+    // the left of pane center. We'd rather lose a single cell of
+    // width than render every height-bound image off-centre, so when
+    // the natural target_w produces an odd gap we shrink it by 1.
+    // Shrinking (vs. growing) avoids any horizontal stretching of the
+    // source image's aspect ratio.
+    if target_w >= 2 && (area.width - target_w) % 2 != 0 {
+        target_w -= 1;
+    }
     let x_offset = (area.width - target_w) / 2;
     Rect {
         x: area.x + x_offset,
@@ -1015,6 +1026,67 @@ fn reconcile_slides(
 
 pub const KIND: &str = "gallery";
 
+/// Wizard descriptor. `images` accepts a comma-separated list of literal
+/// paths and `/dir/*` globs; rotation + rescan are flat Number fields.
+/// Default field-by-field TOML renderer handles emission.
+pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
+    use crate::wizard::descriptor::{Separator, WizardDescriptor, WizardField, WizardFieldKind};
+    WizardDescriptor {
+        display_name: "Gallery",
+        blurb: "Rotating inline image slideshow with optional periodic \
+                directory rescan. Decoded thumbnails are cached under \
+                ~/.cache/glint/gallery/ so subsequent launches are fast.",
+        load_from_toml: None,
+        render_toml: None,
+        fields: vec![
+            WizardField {
+                key: "images",
+                label: "Image sources (comma-separated)",
+                help: "Each entry is a literal path (\"~/Pictures/cover.png\") \
+                       or a simple glob (\"~/Pictures/*\", \"/photos/*.jpg\"). \
+                       `~/` expands to $HOME. Failed loads skip with a \
+                       glint.log warning.",
+                required: false,
+                kind: WizardFieldKind::TextList {
+                    default: Vec::new(),
+                    separator: Separator::Comma,
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "rotation_secs",
+                label: "Rotation interval (seconds)",
+                help: "Seconds between slides. `0` starts the slideshow \
+                       paused — press `p` in the widget to play / pause, \
+                       `n`/`N` to step manually.",
+                required: true,
+                kind: WizardFieldKind::Number {
+                    default: Some(10.0),
+                    range: Some((0.0, 3600.0)),
+                    integer: true,
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "rescan_interval_secs",
+                label: "Directory rescan interval (seconds)",
+                help: "How often the loader re-walks glob patterns to pick \
+                       up newly-added images. `0` disables periodic rescans \
+                       (the initial expansion still runs); literal paths in \
+                       `images` are unaffected either way. Floored to 30s \
+                       when non-zero.",
+                required: true,
+                kind: WizardFieldKind::Number {
+                    default: Some(300.0),
+                    range: Some((0.0, 86400.0)),
+                    integer: true,
+                },
+                validate: None,
+            },
+        ],
+    }
+}
+
 pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
     let cfg: GalleryConfig =
         crate::config::load_widget_toml_for_instance(KIND, &ctx.instance).unwrap_or_default();
@@ -1268,6 +1340,38 @@ mod tests {
     fn centered_area_handles_zero_area_gracefully() {
         let zero = Rect::new(5, 7, 0, 0);
         assert_eq!(centered_horizontal_area(zero, (100, 100), (10, 10)), zero);
+    }
+
+    #[test]
+    fn centered_area_yields_even_gap_for_perfect_centering() {
+        // Construct a height-bound image whose natural target_w would
+        // be an odd number of cells against an even pane width — the
+        // classic case that pre-fix biased one cell left of centre.
+        // 700×1000 at 10×10 cells = 70×100 cell-equivalents → aspect
+        // 0.7. Pane 50×20 → height-bound. width-after-fit =
+        // 20 * (70/100) = 14 (even, no shrink). gap = 36, x = 18.
+        let area = Rect::new(0, 0, 50, 20);
+        let out = centered_horizontal_area(area, (700, 1000), (10, 10));
+        let left = out.x - area.x;
+        let right = area.width - out.width - left;
+        assert_eq!(
+            left, right,
+            "even-gap case must be symmetrically centred: {out:?} in {area:?}"
+        );
+    }
+
+    #[test]
+    fn centered_area_shrinks_one_cell_when_natural_gap_is_odd() {
+        // 750×1000 at 10×10 = 75×100 cell-equivalents → aspect 0.75.
+        // Pane 50×20 height-bound, raw target_w = 20 * 0.75 = 15
+        // (odd) → gap 35 (odd) → would left-bias by 1 cell. We
+        // shrink target_w to 14 so gap = 36 (even) → perfect centering.
+        let area = Rect::new(0, 0, 50, 20);
+        let out = centered_horizontal_area(area, (750, 1000), (10, 10));
+        let left = out.x - area.x;
+        let right = area.width - out.width - left;
+        assert_eq!(left, right, "odd-gap shrink must restore symmetry");
+        assert_eq!(out.width, 14, "should have shrunk by 1 cell");
     }
 
     #[test]

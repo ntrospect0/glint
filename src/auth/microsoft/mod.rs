@@ -5,13 +5,15 @@ pub use store::OAuthClientConfig;
 
 /// Scopes requested for Microsoft Graph. `Calendars.Read` powers the calendar
 /// widget, `Mail.Read` powers the Email widget (read-only — glint never marks
-/// or modifies server-side state). `offline_access` is what gets us a refresh
-/// token from Microsoft's identity platform.
+/// or modifies server-side state). `User.Read` is required for `/me` to
+/// return the signed-in account's email address; without it the email
+/// widget's title row shows "(loading…)" forever. `offline_access` is what
+/// gets us a refresh token from Microsoft's identity platform.
 ///
-/// Tokens issued against the old (Calendars-only) scope will keep working for
-/// the calendar widget; the Email widget needs the user to re-run
-/// `glint --auth microsoft` so the additional Mail.Read scope is granted.
-pub const SCOPE: &str = "Calendars.Read Mail.Read offline_access";
+/// Tokens issued under older scope strings keep working for whatever they
+/// already cover; users who upgrade to a build with new scopes need to
+/// re-authorize (Wizard → Authorize Microsoft, or `glint --auth microsoft`).
+pub const SCOPE: &str = "Calendars.Read Mail.Read User.Read offline_access";
 
 /// `common` accepts both personal Microsoft accounts (outlook.com /
 /// hotmail.com) and work/school accounts. The Azure app registration must

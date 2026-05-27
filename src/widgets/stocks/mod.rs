@@ -2018,6 +2018,143 @@ fn provider_dummy() -> YahooFinanceProvider {
 
 pub const KIND: &str = "stocks";
 
+/// Wizard descriptor for the stocks widget. All fields are flat — the
+/// default field-by-field TOML renderer handles emission, so no custom
+/// `render_toml` is needed.
+pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
+    use crate::wizard::descriptor::{
+        ChoiceOption, Separator, WizardDescriptor, WizardField, WizardFieldKind,
+    };
+    WizardDescriptor {
+        display_name: "Stocks",
+        blurb: "Watchlist quotes + intraday and historical graphs via Yahoo \
+                Finance. Index tickers stay separate from the user-defined \
+                watchlist so the header row pinning works correctly.",
+        load_from_toml: None,
+        render_toml: None,
+        fields: vec![
+            WizardField {
+                key: "indices",
+                label: "Index tickers (comma-separated)",
+                help: "Yahoo conventions: ^DJI (Dow), ^GSPC (S&P 500), \
+                       ^IXIC (Nasdaq Composite). Indices render in a \
+                       pinned header row above the user watchlist.",
+                required: false,
+                kind: WizardFieldKind::TextList {
+                    default: vec!["^DJI".into(), "^GSPC".into(), "^IXIC".into()],
+                    separator: Separator::Comma,
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "watchlist",
+                label: "Watchlist tickers (comma-separated)",
+                help: "Free-form watchlist. Use standard exchange suffixes \
+                       for non-US markets (e.g. SHOP.TO for Toronto).",
+                required: false,
+                kind: WizardFieldKind::TextList {
+                    default: vec![
+                        "AAPL".into(),
+                        "MSFT".into(),
+                        "NVDA".into(),
+                        "GOOGL".into(),
+                        "AMZN".into(),
+                    ],
+                    separator: Separator::Comma,
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "poll_interval_secs",
+                label: "Quote refresh interval (seconds)",
+                help: "How often to repoll Yahoo for live quotes. Yahoo's \
+                       free API tolerates 15s pretty well; 60s is a safer \
+                       default for a long-running dashboard.",
+                required: true,
+                kind: WizardFieldKind::Number {
+                    default: Some(60.0),
+                    range: Some((15.0, 3600.0)),
+                    integer: true,
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "default_display_mode",
+                label: "Change-column display",
+                help: "How the rightmost column renders today's move: \
+                       \"percent\" — ±N%; \"dollar\" — ±$N; \"change\" — \
+                       absolute price change. Press `c` in the widget to \
+                       cycle at runtime.",
+                required: true,
+                kind: WizardFieldKind::Choice {
+                    options: vec![
+                        ChoiceOption {
+                            value: "percent",
+                            label: "Percent (±N%)",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "dollar",
+                            label: "Dollar (±$N)",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "change",
+                            label: "Absolute change",
+                            help: None,
+                        },
+                    ],
+                    default: Some("percent"),
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "default_period",
+                label: "Initial graph period",
+                help: "Time window the graph opens with. Press `1`-`9` or \
+                       `←`/`→` in the widget to cycle at runtime.",
+                required: true,
+                kind: WizardFieldKind::Choice {
+                    options: vec![
+                        ChoiceOption {
+                            value: "1d",
+                            label: "1 day (intraday 5m bars)",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "1w",
+                            label: "1 week (30m bars)",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "1m",
+                            label: "1 month (daily)",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "6m",
+                            label: "6 months (daily)",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "ytd",
+                            label: "Year to date",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "1y",
+                            label: "1 year",
+                            help: None,
+                        },
+                    ],
+                    default: Some("1d"),
+                },
+                validate: None,
+            },
+        ],
+    }
+}
+
 pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
     let cfg: StocksConfig =
         crate::config::load_widget_toml_for_instance(KIND, &ctx.instance).unwrap_or_default();

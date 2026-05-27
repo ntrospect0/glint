@@ -73,23 +73,44 @@ impl OutlookEmailProvider {
         }
         let token = match self.access_token().await {
             Ok(t) => t,
-            Err(_) => return,
+            Err(err) => {
+                tracing::warn!(error = %err, "outlook /me access_token failed; title stays (loading…)");
+                return;
+            }
         };
         let url = format!("{GRAPH_BASE}/me?$select=mail,userPrincipalName");
         let resp = match self.http.get(&url).bearer_auth(&token).send().await {
             Ok(r) => r,
-            Err(_) => return,
+            Err(err) => {
+                tracing::warn!(error = %err, "outlook /me request failed");
+                return;
+            }
         };
         if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = %status,
+                body = %body,
+                "outlook /me returned non-success — most often a missing User.Read scope; re-authorize via the wizard's Authorize Microsoft step"
+            );
             return;
         }
         let parsed: MeResponse = match resp.json().await {
             Ok(p) => p,
-            Err(_) => return,
+            Err(err) => {
+                tracing::warn!(error = %err, "outlook /me parse failed");
+                return;
+            }
         };
         let addr = parsed.mail.or(parsed.user_principal_name);
         if let Some(a) = addr {
             *self.account.lock().expect("email account cache poisoned") = Some(a);
+        } else {
+            tracing::warn!(
+                "outlook /me returned without mail or userPrincipalName; \
+                 token likely lacks the User.Read scope"
+            );
         }
     }
 
@@ -310,6 +331,71 @@ impl OutlookEmailProvider {
             .lock()
             .expect("email account cache poisoned")
             .clone()
+    }
+
+    /// Externally prime the cache from a persisted value. Only seeds
+    /// when the cache is empty so a fresh `/me` resolution can still
+    /// overwrite a stale value.
+    pub fn seed_account_cache(&self, address: &str) {
+        let mut guard = self
+            .account
+            .lock()
+            .expect("email account cache poisoned");
+        if guard.is_none() {
+            *guard = Some(address.to_string());
+        }
+    }
+
+    /// Public folder-listing entry point used by the wizard to populate
+    /// its checkbox picker. Walks just the top-level mail folders
+    /// (`/me/mailFolders`) — deep recursion isn't worth the latency for
+    /// a one-shot setup picker, and most users only surface top-level
+    /// folders (Inbox, Sent Items, …). Returns `(value, label)` pairs
+    /// where both halves are the folder's display name (what email.toml
+    /// expects).
+    pub async fn list_folders_for_picker(
+        &self,
+    ) -> Result<Vec<(String, String)>> {
+        let token = self.access_token().await?;
+        let url = format!(
+            "{GRAPH_BASE}/me/mailFolders?$top=100&includeHiddenFolders=true"
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("Outlook mailFolders request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Outlook mailFolders returned {status}: {body}");
+        }
+        let parsed: FoldersResponse = resp
+            .json()
+            .await
+            .context("failed to deserialize Outlook mailFolders")?;
+        let priority: &[&str] =
+            &["Inbox", "Sent Items", "Drafts", "Archive", "Junk Email", "Deleted Items"];
+        let mut folders: Vec<(String, String)> = parsed
+            .value
+            .into_iter()
+            .map(|f| (f.display_name.clone(), f.display_name))
+            .collect();
+        folders.sort_by(|a, b| {
+            let ai = priority
+                .iter()
+                .position(|p| *p == a.0.as_str())
+                .unwrap_or(usize::MAX);
+            let bi = priority
+                .iter()
+                .position(|p| *p == b.0.as_str())
+                .unwrap_or(usize::MAX);
+            ai.cmp(&bi)
+                .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+        });
+        Ok(folders)
     }
 }
 

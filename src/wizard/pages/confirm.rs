@@ -1,0 +1,157 @@
+//! Confirmation page. Summary of what's about to be written + the
+//! "Complete and Save" trigger. Points the user at the relevant TOMLs for
+//! further hand-tuning.
+
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{
+    layout::Rect,
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Wrap},
+    Frame,
+};
+
+use super::PageAction;
+use crate::wizard::{app::WizardApp, state::LayoutChoice, style};
+
+pub fn handle_key(key: KeyEvent, _app: &mut WizardApp) -> PageAction {
+    match key.code {
+        KeyCode::Enter | KeyCode::Char(' ') => PageAction::Advance,
+        KeyCode::Esc => PageAction::Back,
+        _ => PageAction::Stay,
+    }
+}
+
+pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Confirm — review and save ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Files that will be written or updated:",
+        style::section_header(),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from("  ~/.config/glint/config.toml"));
+    for assignment in &app.state.assignments {
+        let stem = if assignment.instance == "main" {
+            assignment.kind.clone()
+        } else {
+            format!("{}@{}", assignment.kind, assignment.instance)
+        };
+        lines.push(Line::from(format!("  ~/.config/glint/{stem}.toml")));
+    }
+    if let crate::wizard::descriptor::WizardValue::Text(key) =
+        app.state
+            .global_get("llm_api_key")
+            .cloned()
+            .unwrap_or(crate::wizard::descriptor::WizardValue::Text(String::new()))
+    {
+        if !key.trim().is_empty() {
+            lines.push(Line::from(
+                "  ~/.config/glint/credentials/anthropic_key.toml",
+            ));
+        }
+    }
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(
+        "Summary:",
+        style::section_header(),
+    )));
+    lines.push(Line::from(""));
+    let layout_summary = match &app.state.layout {
+        LayoutChoice::Preset { name } => format!("  Layout         : {name} preset"),
+        LayoutChoice::KeepExisting => "  Layout         : keep existing".into(),
+    };
+    lines.push(Line::from(layout_summary));
+    lines.push(Line::from(format!(
+        "  Widgets        : {}",
+        app.state.assignments.len()
+    )));
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(
+        "Hand-tuning beyond what the wizard sets:",
+        style::section_header(),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "  Custom layout pane sizes        → [layout] in config.toml",
+    ));
+    lines.push(Line::from(
+        "  Custom RSS feed URLs            → [[feeds]] in news.toml",
+    ));
+    lines.push(Line::from(
+        "  Adjust topic keyword lists      → [[topics]] keywords in news.toml",
+    ));
+    lines.push(Line::from(
+        "  Pick which calendars to show    → calendar_ids = [...] per [[providers]] in calendar.toml",
+    ));
+    lines.push(Line::from(
+        "  Mailbox folders / Gmail labels  → folders = [...] in email.toml",
+    ));
+    lines.push(Line::from(
+        "  CalDAV server + credentials     → credentials/caldav.toml",
+    ));
+    lines.push(Line::from(
+        "  Multi-instance widgets          → e.g. clock@home.toml + a layout cell pointing to clock@home",
+    ));
+    lines.push(Line::from(
+        "  Gallery image directories       → images = [...] in gallery.toml",
+    ));
+    lines.push(Line::from(
+        "  Per-widget color overrides      → [colors] block in each widget's TOML",
+    ));
+    lines.push(Line::from(
+        "  Define more color schemes       → colorschemes.toml",
+    ));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Further reading:",
+        style::section_header(),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "  INSTRUCTIONS.md — step-by-step walkthrough for Google Cloud, Azure,",
+    ));
+    lines.push(Line::from(
+        "                    CalDAV (iCloud/Fastmail), Anthropic key setup, plus a",
+    ));
+    lines.push(Line::from(
+        "                    troubleshooting guide. Read this when re-authorizing or",
+    ));
+    lines.push(Line::from(
+        "                    setting up a new mailbox.",
+    ));
+    lines.push(Line::from(
+        "  README.md       — install, keybindings, color schemes, multi-instance",
+    ));
+    lines.push(Line::from(
+        "                    widgets, layout overview.",
+    ));
+    lines.push(Line::from(
+        "  docs/glint-spec.md — full architecture spec + per-widget TOML reference.",
+    ));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Tip: every <widget>.toml is plain TOML — open it in your editor, save, and \
+         the next time glint launches (or :reload at runtime) the change takes effect.",
+        style::blurb(),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("[ Save & Start Glint ]", style::page_button_focused()),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "    Enter activates · Esc to go back · Ctrl-C to bail (state is preserved)."
+            .to_string(),
+        style::help_text(),
+    )));
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para, inner);
+}

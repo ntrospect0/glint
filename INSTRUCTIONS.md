@@ -1,0 +1,285 @@
+# Glint setup instructions
+
+This file is the long-form companion to glint's interactive `--setup` wizard. The wizard collects the basics inline; the steps below cover the one-time provider setup (Google Cloud, Microsoft Azure, CalDAV) and the moving parts the TUI can't walk you through itself (browser tabs, third-party portals).
+
+If you're stuck, see [Troubleshooting](#troubleshooting) at the bottom or open an issue at https://github.com/ntrospect0/glint/issues.
+
+---
+
+## Why you have to create OAuth credentials yourself
+
+The Calendar and Email widgets use **OAuth 2.0** to read your calendar / mailbox. OAuth requires the application (in this case, glint) to identify itself to Google or Microsoft with a **Client ID** (and, for Google, a **Client Secret**).
+
+For commercial apps (Fantastical, Spark, Thunderbird), the developer goes through Google's / Microsoft's **verification process** — a multi-step review that requires a registered business, a published privacy policy, a brand-verified domain, and (for Gmail-level scopes) an annual security audit costing ~$4,500. Once verified, the developer ships one Client ID for all users.
+
+Glint is open-source, single-developer, and free. Two reasons we can't ship a single shared Client ID:
+
+1. **OAuth secrets in OSS aren't really secret.** Google's terms forbid embedding client secrets in publicly readable code and will revoke clients found there.
+2. **All-users-one-app would get flagged.** Even unverified shared clients trip anomaly detection within days; everyone's calendar would go dark at once.
+
+So glint asks you to spin up **your own** OAuth credentials in 5–10 minutes. They're free, never leave your machine, and never re-prompted.
+
+If you'd rather skip OAuth entirely, glint also supports:
+
+- **CalDAV** for calendar (works with iCloud, Fastmail, Nextcloud, Synology, generic CalDAV servers) — uses an app password instead of OAuth. See [CalDAV](#caldav-icloud--fastmail--nextcloud) below.
+- **IMAP** for email (Gmail with app-password, iCloud, Fastmail, Yahoo, self-hosted). See [IMAP](#imap-gmail--icloud--fastmail--self-hosted) below.
+
+---
+
+## Google: Calendar + Gmail
+
+You'll create a Google Cloud project, enable the two APIs glint uses, configure an OAuth consent screen, and create a Desktop OAuth client. The credentials get pasted into the wizard's "Authorize Google" page.
+
+### One-time setup
+
+1. **Open https://console.cloud.google.com/** (sign in with the Google account whose calendar / mail you want glint to read).
+2. **Create a project.** Top-left project picker → *New Project*. Name it whatever you like (e.g. `glint`). Click *Create*.
+3. **Enable APIs.** Left sidebar → *APIs & Services* → *Library*.
+   - Search for **"Google Calendar API"** → click → *Enable*.
+   - Search for **"Gmail API"** → click → *Enable* (skip if you don't plan to use the email widget).
+4. **Configure the OAuth consent screen.** Left sidebar → *APIs & Services* → *OAuth consent screen*.
+   - User type: pick **External** (the only choice unless you have a Google Workspace org). Click *Create*.
+   - App name: `glint` (or whatever you like).
+   - User support email + Developer contact email: your own email.
+   - Skip the optional logo / domain fields. *Save and Continue*.
+   - Scopes step: *Save and Continue* (we'll request scopes from the OAuth flow itself).
+   - **Test users step**: click *+ Add Users*, add **your own email address**, *Save and Continue*. This is what keeps the app usable while it's in "Testing" mode — Google requires test users for unverified apps.
+   - *Back to Dashboard*. Leave the publishing status as "Testing" — you don't need to publish anything for personal use.
+5. **Create the OAuth client.** Left sidebar → *APIs & Services* → *Credentials* → *+ Create credentials* → *OAuth client ID*.
+   - Application type: **Desktop app**.
+   - Name: `glint`.
+   - Click *Create*.
+6. **Copy the credentials.** Google shows you a dialog with the **Client ID** (looks like `1234567-abcdef.apps.googleusercontent.com`) and **Client Secret** (a short random string). Keep this dialog open — you'll paste both into glint's wizard in a moment.
+
+### In the wizard
+
+1. Go to *Configure email* (or *Configure calendar*) → press **Space** on **Authorize Google**.
+2. Paste your Client ID and Client Secret into the inline form. Press Tab to move between fields.
+3. Press Enter on **[ Save & Authorize ]**. The wizard:
+   - Writes `~/.config/glint/credentials/google_oauth_client.toml` with `0600` perms.
+   - Opens your browser to Google's consent screen.
+   - Listens on a temporary localhost port for the redirect.
+4. In the browser, sign in with the same Google account you added as a Test user. You'll see a warning that "Google hasn't verified this app" — that's expected for personal-use clients. Click *Continue* → *Continue* → tick the permissions glint asks for → *Continue*.
+5. The browser shows a success page; glint's wizard resumes automatically, the title row shows your email address, and the folder picker loads your Gmail labels.
+
+### What's stored where
+
+- **Client credentials** → `~/.config/glint/credentials/google_oauth_client.toml` (your responsibility to back up if you reinstall).
+- **Access + refresh token** → `~/.config/glint/credentials/google_oauth_token.toml` (auto-refreshed; safe to delete to force re-auth).
+
+---
+
+## Microsoft: Outlook calendar + mail
+
+You'll register an Azure app, configure it to accept loopback redirects (so the browser can hand the token back to glint), add the Graph API permissions glint uses, and copy the Application (client) ID into the wizard.
+
+Note: Microsoft uses **PKCE**, so there's no Client Secret to handle — just the Client ID.
+
+### One-time setup
+
+1. **Open https://portal.azure.com/** (sign in with the Microsoft account whose calendar / mail you want glint to read — personal or work/school both work).
+2. **Open App registrations.** Search bar → type *Microsoft Entra ID* → click → left sidebar → *App registrations*.
+3. **New registration.**
+   - Name: `glint`.
+   - Supported account types: **Accounts in any organizational directory and personal Microsoft accounts**.
+   - Redirect URI: leave blank for now.
+   - Click *Register*.
+4. **Copy the Application (client) ID** from the new app's overview page. You'll paste it into glint's wizard.
+5. **Authentication settings.** Left sidebar → *Authentication* → *Add a platform* → **Mobile and desktop applications**.
+   - Tick **http://localhost** under the Custom redirect URIs list (the loopback option).
+   - Click *Configure*.
+6. **API permissions.** Left sidebar → *API permissions* → *Add a permission* → *Microsoft Graph* → *Delegated permissions*. Tick:
+   - `Calendars.Read` — read your calendars (calendar widget).
+   - `Mail.Read` — read your mail (email widget).
+   - `User.Read` — read your account profile (**required** for the email widget to show your address; without it the title row stays "(loading…)" forever).
+   - Click *Add permissions*.
+
+### In the wizard
+
+1. Press **Space** on **Authorize Microsoft (Outlook calendar)** or **Authorize Microsoft (for Outlook)**.
+2. Paste the Application (client) ID into the inline form. Tab → Enter on [ Save & Authorize ].
+3. Browser opens to login.microsoftonline.com. Sign in, approve the permissions glint asked for. The browser shows a success page; glint resumes.
+
+### What's stored where
+
+- **Client config** → `~/.config/glint/credentials/microsoft_oauth_client.toml`.
+- **Access + refresh token** → `~/.config/glint/credentials/microsoft_oauth_token.toml`.
+
+---
+
+## CalDAV (iCloud / Fastmail / Nextcloud)
+
+CalDAV is the open standard for calendar sync; it bypasses OAuth in favour of an app-specific password. Glint already ships the credentials template — you just fill it in.
+
+### Apple iCloud
+
+1. Go to https://appleid.apple.com and sign in.
+2. *Sign-In and Security* → *App-Specific Passwords* → *+ Generate*.
+3. Name it `glint` and copy the generated 4-block password (looks like `abcd-efgh-ijkl-mnop`).
+4. Edit `~/.config/glint/credentials/caldav.toml`:
+
+   ```toml
+   server = "https://caldav.icloud.com"
+   username = "your.apple.id@icloud.com"
+   app_password = "abcd-efgh-ijkl-mnop"
+   ```
+5. In the wizard's Calendar page, tick **CalDAV** under *Calendar sources*.
+
+### Fastmail
+
+1. https://www.fastmail.com/settings/security/devicekeys → *New app password* → scope: *CalDAV*.
+2. Same `caldav.toml` layout, with `server = "https://caldav.fastmail.com"`.
+
+### Nextcloud, Synology, generic CalDAV
+
+Use your normal username + an app-specific password from the server's UI. Server URL is whatever the server exposes (e.g. `https://nextcloud.example.com/remote.php/dav`).
+
+---
+
+## IMAP (Gmail / iCloud / Fastmail / self-hosted)
+
+IMAP skips OAuth entirely — you provide host, port, username, and an app-specific password and glint connects directly. Works against any IMAP4rev1 server.
+
+### Per-provider hosts + app-password recipes
+
+| Provider | Host | Port | App-password URL |
+|---|---|---|---|
+| Gmail | `imap.gmail.com` | 993 | https://myaccount.google.com/ → Security → 2-Step Verification → App passwords |
+| iCloud | `imap.mail.me.com` | 993 | https://appleid.apple.com → Sign-In and Security → App-Specific Passwords |
+| Fastmail | `imap.fastmail.com` | 993 | https://www.fastmail.com/settings/security/devicekeys → *New app password* → scope *IMAP* |
+| Yahoo | `imap.mail.yahoo.com` | 993 | https://login.yahoo.com/account/security → Generate app password |
+| Outlook / O365 | `outlook.office365.com` | 993 | OAuth recommended — Microsoft is phasing out basic auth for IMAP |
+| Self-hosted | whatever your server exposes | usually 993 | depends on the server (Mailcow / Dovecot / etc.) |
+
+(Gmail requires 2-Step Verification to be enabled before you can generate app passwords. iCloud and Fastmail also force app passwords for third-party clients — your account password won't work.)
+
+### In the wizard
+
+1. *Configure email* → Provider → tick **IMAP**.
+2. Press **Space** on **Set up IMAP credentials**.
+3. Fill in the form: host, port (993 unless you know you need otherwise), username (usually your full email), app password. Press Enter on **[ Save & Authorize ]**.
+4. The wizard writes `~/.config/glint/credentials/imap.toml` with 0600 perms, then loads your mailbox folders so the folder picker populates.
+5. If the password is wrong, the folder picker stays on its "showing defaults" hint and `~/.config/glint/glint.log` has a `wizard: failed to fetch IMAP folders for picker` warning with the underlying error.
+
+### Manual setup (skipping the wizard)
+
+Drop a file at `~/.config/glint/credentials/imap.toml`:
+
+```toml
+host = "imap.gmail.com"
+port = 993
+use_tls = true
+username = "alice@gmail.com"
+app_password = "abcd-efgh-ijkl-mnop"
+```
+
+Then in `email.toml`:
+
+```toml
+provider = "imap"
+folders = ["INBOX"]
+```
+
+Glint will connect lazily on the first fetch.
+
+---
+
+## Anthropic API key (optional, for LLM summaries)
+
+The news + email widgets can summarise expanded items using Claude.
+
+1. https://console.anthropic.com/ → *Get API Keys* → create a key.
+2. Either paste it into the wizard's *Global → Anthropic API key* field, or edit `~/.config/glint/credentials/anthropic_key.toml`:
+
+   ```toml
+   api_key = "sk-ant-..."
+   ```
+3. Make sure `summarize_with_llm = true` in `news.toml` / `email.toml`.
+
+If no key is configured, the `s summarize` keyboard hint stays hidden in the email widget; the news widget renders the raw RSS excerpt instead.
+
+---
+
+## Troubleshooting
+
+### Google: "Access blocked: glint has not completed the Google verification process"
+
+Expected for personal-use clients. You're seeing the unverified-app warning. Click *Advanced* → *Go to glint (unsafe)*. This isn't actually unsafe — *you* are the developer in this scenario, and only the test users you added (yourself) can sign in.
+
+### Microsoft: email widget shows "(loading…)" forever
+
+Your token is missing the `User.Read` Graph permission. Re-authorize:
+
+- **In the wizard:** open *Configure email* → Space on *Authorize Microsoft*.
+- **Outside the wizard:** `glint --auth microsoft`.
+
+When the browser asks for permissions, make sure "View your basic profile" is part of the consent.
+
+### "The wizard says 'Wrote a template at … press Space again' but I edited the file and pressing Space still complains"
+
+The wizard re-reads the file on each attempt. Double-check:
+
+- File path is `~/.config/glint/credentials/<provider>_oauth_client.toml`.
+- Values are quoted: `client_id = "1234-abcdef.apps.googleusercontent.com"`.
+- Neither value still starts with `REPLACE_WITH_…`.
+
+### "Folder picker shows '(showing defaults — list refreshes after you authorize)' but never updates"
+
+The post-OAuth fetch is non-blocking and runs synchronously on auth completion. If it didn't populate, check `~/.config/glint/glint.log` for a `wizard: failed to fetch …` warning. The most common cause is a token without the right scope; re-authorize to refresh.
+
+### Calendar / email shows "Last fetch failed: …"
+
+Read the message — it carries the provider's error verbatim. Common causes:
+
+- **Token expired and refresh failed**: re-authorize.
+- **API quota**: only matters at very high call volumes; glint's defaults (60s calendar poll, 5min email poll) are well below any free-tier limit.
+- **Network**: corporate proxies + loopback OAuth sometimes interact badly. Try from a non-corporate network or set `HTTPS_PROXY` if needed.
+
+### I deleted my token file, now what?
+
+Re-run the wizard's Authorize step or `glint --auth <provider>`. Glint will open a fresh browser flow and write a new token.
+
+### I want to start completely fresh
+
+```bash
+rm -rf ~/.config/glint
+glint --setup
+```
+
+This wipes everything — config, tokens, cache. The wizard seeds fresh defaults from glint's built-in templates.
+
+---
+
+## What lives where on disk
+
+```
+~/.config/glint/
+├── config.toml                   # [global] + [layout] + [[layout.cells]]
+├── clock.toml                    # primary timezone, secondary clocks
+├── calendar.toml                 # providers, calendar_ids, [[events]]
+├── email.toml                    # provider, folders, summarize_with_llm
+├── news.toml                     # [[feeds]], [[topics]], summarize
+├── stocks.toml                   # indices, watchlist
+├── weather.toml                  # lat/lon, units
+├── gallery.toml                  # image dirs, rotation
+├── resources.toml                # poll cadence, top-N processes
+├── colorschemes.toml             # named [schemes.*] palettes
+└── credentials/                  # 0600-mode
+    ├── google_oauth_client.toml
+    ├── google_oauth_token.toml
+    ├── microsoft_oauth_client.toml
+    ├── microsoft_oauth_token.toml
+    ├── caldav.toml
+    ├── imap.toml
+    └── anthropic_key.toml
+```
+
+Every `.toml` is plain text — edit in your favourite editor and either restart glint or hit `:reload` from the runtime command bar. The wizard preserves keys it doesn't manage (custom feeds, topic keywords, per-widget color overrides, etc.) across `--setup` re-runs.
+
+---
+
+## Further reading
+
+- `README.md` — install, keybindings, color schemes, multi-instance widgets.
+- `docs/glint-spec.md` — full architecture spec + per-widget TOML reference.
+- https://github.com/ntrospect0/glint — source, issues, releases.
