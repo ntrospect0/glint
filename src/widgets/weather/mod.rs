@@ -6,7 +6,7 @@ pub mod provider;
 
 use std::{
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -29,9 +29,7 @@ use crate::ui::{apply_title_row, MetadataEmphasis};
 
 use super::{AppContext, EventResult, Widget};
 
-use provider::{
-    describe_code, icon_for_code, render_icon, OpenMeteoProvider, Units, WeatherData,
-};
+use provider::{describe_code, icon_for_code, render_icon, OpenMeteoProvider, Units, WeatherData};
 
 /// Loaded from `~/.config/glint/weather.toml`.
 #[derive(Debug, Clone, Deserialize)]
@@ -100,13 +98,17 @@ struct WeatherState {
     geolocation_error: Option<String>,
     data: Option<WeatherData>,
     last_error: Option<String>,
-    last_attempt: Option<Instant>,
+    poll: crate::polling::PollTracker,
     inflight: bool,
     /// Set by `:weather <city>` — when Some, overrides `location` for fetches.
     /// Cleared by `x`.
     transient_location: Option<GeoLocation>,
     /// True while a `:weather <city>` lookup is in flight.
     transient_searching: bool,
+    /// Display-state dirty bit drained by `take_dirty`. Set true by
+    /// every async-task / tick-time mutation site so the main loop's
+    /// dirty-flag gate triggers a redraw.
+    dirty: bool,
 }
 
 const CACHE_KEY_CURRENT: &str = "current";
@@ -119,7 +121,6 @@ pub struct WeatherWidget {
     display_name_cache: String,
     config: WeatherConfig,
     state: Arc<Mutex<WeatherState>>,
-    poll_interval: Duration,
     /// App-level theme; kept so live config reloads can rebuild `theme`
     /// from updated `colors` overrides.
     app_theme: Arc<Theme>,
@@ -168,17 +169,18 @@ impl WeatherWidget {
         };
         let poll_interval = Duration::from_secs(config.poll_interval_secs.max(30));
         // Seed from cache so the first frame shows the previous reading.
-        // Mapping wall-clock age onto the monotonic `last_attempt` lets the
-        // existing poll-interval gate suppress redundant refetches.
         let mut initial_state = WeatherState {
             location: initial_location,
+            poll: crate::polling::PollTracker::new(poll_interval),
             ..WeatherState::default()
         };
         if let Some(entry) = cache.load::<WeatherData>(CACHE_KEY_CURRENT) {
-            let age = entry.age().min(poll_interval);
+            initial_state.poll.seed_from_cache_age(entry.age());
             initial_state.data = Some(entry.value);
-            initial_state.last_attempt = Some(Instant::now() - age);
         }
+        initial_state
+            .poll
+            .apply_jitter(&format!("weather@{instance}"));
         let state = Arc::new(Mutex::new(initial_state));
         let theme = app_theme.with_overrides(&config.colors);
         let shortcut_prefs = if config.shortcuts.is_empty() {
@@ -200,7 +202,6 @@ impl WeatherWidget {
             id,
             instance,
             display_name_cache,
-            poll_interval,
             config,
             state,
             app_theme,
@@ -230,11 +231,7 @@ impl WeatherWidget {
         if st.inflight {
             return NextAction::Wait;
         }
-        let due = match st.last_attempt {
-            None => true,
-            Some(t) => t.elapsed() >= self.poll_interval,
-        };
-        if due {
+        if st.poll.is_due() {
             NextAction::Fetch
         } else {
             NextAction::Wait
@@ -248,6 +245,7 @@ impl WeatherWidget {
         {
             let mut st = self.state.lock().expect("weather state poisoned");
             st.transient_searching = true;
+            st.dirty = true;
         }
         let state = self.state.clone();
         let query = query.to_string();
@@ -255,12 +253,13 @@ impl WeatherWidget {
             let result = crate::geolocation::by_name(&query).await;
             let mut st = state.lock().expect("weather state poisoned");
             st.transient_searching = false;
+            st.dirty = true;
             match result {
                 Ok(loc) => {
                     st.transient_location = Some(loc);
                     // Clear cached weather + force refetch on the next tick.
                     st.data = None;
-                    st.last_attempt = None;
+                    st.poll.mark_dirty();
                 }
                 Err(err) => {
                     tracing::warn!(query = %query, error = %err, "weather geocoding failed");
@@ -275,7 +274,7 @@ impl WeatherWidget {
         let mut st = self.state.lock().expect("weather state poisoned");
         if st.transient_location.take().is_some() {
             st.data = None;
-            st.last_attempt = None;
+            st.poll.mark_dirty();
         }
     }
 
@@ -283,12 +282,14 @@ impl WeatherWidget {
         {
             let mut st = self.state.lock().expect("weather state poisoned");
             st.locating = true;
+            st.dirty = true;
         }
         let state = self.state.clone();
         tokio::spawn(async move {
             let result = geolocation::by_ip().await;
             let mut st = state.lock().expect("weather state poisoned");
             st.locating = false;
+            st.dirty = true;
             match result {
                 Ok(loc) => {
                     st.location = Some(loc);
@@ -305,11 +306,7 @@ impl WeatherWidget {
     fn spawn_refresh(&self) {
         let (lat, lon) = {
             let st = self.state.lock().expect("weather state poisoned");
-            let Some(loc) = st
-                .transient_location
-                .as_ref()
-                .or(st.location.as_ref())
-            else {
+            let Some(loc) = st.transient_location.as_ref().or(st.location.as_ref()) else {
                 return;
             };
             (loc.latitude, loc.longitude)
@@ -317,7 +314,8 @@ impl WeatherWidget {
         {
             let mut st = self.state.lock().expect("weather state poisoned");
             st.inflight = true;
-            st.last_attempt = Some(Instant::now());
+            st.poll.mark_attempted();
+            st.dirty = true;
         }
         let units = self.config.units;
         let state = self.state.clone();
@@ -327,6 +325,7 @@ impl WeatherWidget {
             let result = provider.fetch().await;
             let mut st = state.lock().expect("weather state poisoned");
             st.inflight = false;
+            st.dirty = true;
             match result {
                 Ok(data) => {
                     if let Err(err) = cache.store(CACHE_KEY_CURRENT, &data) {
@@ -378,6 +377,11 @@ impl Widget for WeatherWidget {
         Ok(())
     }
 
+    fn take_dirty(&mut self) -> bool {
+        let mut st = self.state.lock().expect("weather state poisoned");
+        std::mem::replace(&mut st.dirty, false)
+    }
+
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
         let snapshot = {
             let st = self.state.lock().expect("weather state poisoned");
@@ -407,7 +411,7 @@ impl Widget for WeatherWidget {
                 data: st.data.clone(),
                 last_error: st.last_error.clone(),
                 inflight: st.inflight || st.transient_searching,
-                attempted: st.last_attempt.is_some(),
+                attempted: st.poll.has_attempted(),
                 revert_target,
                 override_active,
             }
@@ -443,26 +447,25 @@ impl Widget for WeatherWidget {
         // Reserve a bottom row for the override hint when `:weather <city>`
         // is active. Falls back to the full inner area when there's no
         // override or the cell is too short to spare a row.
-        let (body_area, hint_area) =
-            if snapshot.revert_target.is_some() && inner.height >= 2 {
-                let h = inner.height - 1;
-                (
-                    Rect {
-                        x: inner.x,
-                        y: inner.y,
-                        width: inner.width,
-                        height: h,
-                    },
-                    Some(Rect {
-                        x: inner.x,
-                        y: inner.y + h,
-                        width: inner.width,
-                        height: 1,
-                    }),
-                )
-            } else {
-                (inner, None)
-            };
+        let (body_area, hint_area) = if snapshot.revert_target.is_some() && inner.height >= 2 {
+            let h = inner.height - 1;
+            (
+                Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: inner.width,
+                    height: h,
+                },
+                Some(Rect {
+                    x: inner.x,
+                    y: inner.y + h,
+                    width: inner.width,
+                    height: 1,
+                }),
+            )
+        } else {
+            (inner, None)
+        };
 
         // When we have weather data, the ASCII art needs its own fixed-width
         // sub-rect so each art row lands at the same x offset. Centered
@@ -527,7 +530,7 @@ impl Widget for WeatherWidget {
             }
             "refresh" => {
                 let mut st = self.state.lock().expect("weather state poisoned");
-                st.last_attempt = None;
+                st.poll.mark_dirty();
                 Ok(true)
             }
             _ => Ok(false),
@@ -564,6 +567,16 @@ impl Widget for WeatherWidget {
     fn set_app_theme(&mut self, theme: Arc<Theme>) {
         self.theme = theme.with_overrides(&self.config.colors);
         self.app_theme = theme;
+    }
+
+    fn poll_snapshot(&self) -> Option<crate::polling::PollSnapshot> {
+        Some(
+            self.state
+                .lock()
+                .expect("weather state poisoned")
+                .poll
+                .snapshot(),
+        )
     }
 
     fn shortcut_preferences(&self) -> &[char] {
@@ -609,7 +622,6 @@ struct Snapshot {
     /// itself has been tail-truncated by a narrow widget cell.
     override_active: bool,
 }
-
 
 fn render_with_art(
     frame: &mut Frame,
@@ -804,17 +816,10 @@ fn loading_lines(s: &Snapshot, theme: &Theme) -> Vec<Line<'static>> {
     lines
 }
 
-/// Format a duration in seconds as a compact `45s`, `7m`, `3h`, or `2d` label.
+/// Compact `Ns / Nm / Nh / Nd` data-age label. Delegates to the
+/// shared [`crate::format::short_duration_label`].
 fn format_age(secs: i64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h", secs / 3600)
-    } else {
-        format!("{}d", secs / 86_400)
-    }
+    crate::format::short_duration_label(secs)
 }
 
 fn weekday_short(w: chrono::Weekday) -> &'static str {
@@ -1099,7 +1104,10 @@ mod tests {
         let w = WeatherWidget::default();
         let st = w.state.lock().unwrap();
         assert!(st.data.is_none());
-        let loc = st.location.as_ref().expect("default should bake in Richmond");
+        let loc = st
+            .location
+            .as_ref()
+            .expect("default should bake in Richmond");
         assert_eq!(loc.latitude, 49.166);
         assert_eq!(loc.longitude, -123.133);
         assert!(!st.inflight);
@@ -1128,7 +1136,13 @@ mod tests {
             ..WeatherConfig::default()
         };
         let w = build_widget(cfg);
-        assert_eq!(w.poll_interval, Duration::from_secs(30));
+        let interval = w
+            .state
+            .lock()
+            .expect("weather state poisoned")
+            .poll
+            .interval();
+        assert_eq!(interval, Duration::from_secs(30));
     }
 
     #[test]
@@ -1165,6 +1179,12 @@ mod tests {
             ..WeatherConfig::default()
         };
         let w = build_widget(cfg);
+        // Constructor applies a jitter offset so the first fire lands
+        // inside the configured window instead of at t=0 (avoids the
+        // refresh-storm pile-up with other widgets). Mark dirty here
+        // so the test sees the "no recent attempt" branch under test
+        // rather than the jitter-deferred state.
+        w.state.lock().unwrap().poll.mark_dirty();
         assert!(matches!(w.next_action(), NextAction::Fetch));
     }
 

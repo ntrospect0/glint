@@ -40,7 +40,10 @@ pub struct ClockConfig {
     pub show_date: bool,
 
     /// `"12h"` or `"24h"`.
-    #[serde(default = "default_hour_format", deserialize_with = "deserialize_hour_format")]
+    #[serde(
+        default = "default_hour_format",
+        deserialize_with = "deserialize_hour_format"
+    )]
     pub hour_format: u8,
 
     /// World clocks rendered below the primary display when the cell is tall enough.
@@ -153,6 +156,14 @@ pub struct ClockWidget {
     shortcut: Option<char>,
     /// Effective shortcut preference list (TOML override or built-in).
     shortcut_prefs: Vec<char>,
+    /// Last whole-second the display was confirmed against — the ticker
+    /// row prints seconds even when `show_seconds = false`, so the
+    /// display changes at 1Hz and `take_dirty` needs to detect that
+    /// without redrawing on every 250ms tick.
+    last_tick_second: Option<i64>,
+    /// Display-state dirty flag — see Widget::take_dirty. True at
+    /// construction so the initial render lands.
+    dirty: bool,
 }
 
 impl Default for ClockWidget {
@@ -212,6 +223,8 @@ impl ClockWidget {
             theme,
             shortcut: None,
             shortcut_prefs,
+            last_tick_second: None,
+            dirty: true,
         }
     }
 
@@ -353,7 +366,12 @@ impl ClockWidget {
     fn world_clock_entries(&self) -> Vec<(String, String)> {
         let now = chrono::Utc::now();
         let mut out: Vec<(String, String)> = Vec::with_capacity(self.secondaries.len() + 2);
-        let transient = self.state.lock().expect("clock state poisoned").transient_tz.clone();
+        let transient = self
+            .state
+            .lock()
+            .expect("clock state poisoned")
+            .transient_tz
+            .clone();
 
         // When a `:time <location>` override is active the big-digit display
         // is showing that override, so pin Local to the top of the World
@@ -489,7 +507,16 @@ impl Widget for ClockWidget {
     }
 
     async fn update(&mut self, _ctx: &AppContext) -> Result<()> {
+        let now_secs = chrono::Utc::now().timestamp();
+        if self.last_tick_second != Some(now_secs) {
+            self.last_tick_second = Some(now_secs);
+            self.dirty = true;
+        }
         Ok(())
+    }
+
+    fn take_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.dirty, false)
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
@@ -548,11 +575,7 @@ impl Widget for ClockWidget {
         } else {
             self.theme.text_focused
         };
-        let gradient = self
-            .state
-            .lock()
-            .expect("clock state poisoned")
-            .gradient;
+        let gradient = self.state.lock().expect("clock state poisoned").gradient;
         let big_lines = big_digits::render_styled(&time, gradient, big_style);
 
         let mut lines: Vec<Line<'_>> = Vec::new();
@@ -574,10 +597,7 @@ impl Widget for ClockWidget {
         }
 
         if !ampm.is_empty() {
-            lines.push(Line::from(Span::styled(
-                ampm,
-                self.theme.text_dim,
-            )));
+            lines.push(Line::from(Span::styled(ampm, self.theme.text_dim)));
         }
         if !date.is_empty() {
             // No blank line above the date — the ticker and the day-date sit
@@ -634,7 +654,11 @@ impl Widget for ClockWidget {
                     self.theme.text_dim,
                 )));
 
-                let max_label = clocks.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0);
+                let max_label = clocks
+                    .iter()
+                    .map(|(l, _)| l.chars().count())
+                    .max()
+                    .unwrap_or(0);
                 // Local — and whichever entry the big-digit display is showing
                 // — get colored so the user can see at a glance which row
                 // matches the big clock. Local picks up `text.focused` from
@@ -644,11 +668,8 @@ impl Widget for ClockWidget {
                 let local_highlight_style = self.theme.text_focused;
                 let override_highlight_style = self.theme.text_selected;
                 let has_override = transient.is_some();
-                for (idx, (label, time_str)) in clocks
-                    .iter()
-                    .enumerate()
-                    .skip(scroll)
-                    .take(visible_count)
+                for (idx, (label, time_str)) in
+                    clocks.iter().enumerate().skip(scroll).take(visible_count)
                 {
                     // Highlight is keyed off the *absolute* index in the full
                     // list (not the visible window) so the colored row keeps
@@ -664,12 +685,7 @@ impl Widget for ClockWidget {
                     } else {
                         Style::default()
                     };
-                    let line = format!(
-                        "{:<width$}  {}",
-                        label,
-                        time_str,
-                        width = max_label
-                    );
+                    let line = format!("{:<width$}  {}", label, time_str, width = max_label);
                     lines.push(Line::from(Span::styled(line, style)));
                 }
             } else {
@@ -686,10 +702,7 @@ impl Widget for ClockWidget {
         // pinned to the bottom of the cell so the user has an obvious
         // escape route back to Local time.
         if transient.is_some() {
-            let hint = Line::from(Span::styled(
-                "x: revert to Local",
-                self.theme.text_dim,
-            ));
+            let hint = Line::from(Span::styled("x: revert to Local", self.theme.text_dim));
             let body = Paragraph::new(lines).alignment(Alignment::Center);
             let body_h = inner.height.saturating_sub(1);
             let body_area = Rect {
@@ -831,9 +844,7 @@ pub const KIND: &str = "clock";
 /// implementation other widgets follow when they migrate from
 /// `defer_to_toml_descriptor` to a real schema.
 pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
-    use crate::wizard::descriptor::{
-        ChoiceOption, WizardDescriptor, WizardField, WizardFieldKind,
-    };
+    use crate::wizard::descriptor::{ChoiceOption, WizardDescriptor, WizardField, WizardFieldKind};
 
     // Helper for the three optional secondary-timezone fields. Each is a
     // Lookup over the same IANA list with allow_blank so the user can
@@ -1118,8 +1129,7 @@ mod tests {
         assert!(body.contains("label = \"London\""));
         // Round-trips through the existing deserialiser; the empty slot is
         // omitted entirely.
-        let parsed: ClockConfig =
-            toml::from_str(&body).expect("wizard-rendered clock.toml parses");
+        let parsed: ClockConfig = toml::from_str(&body).expect("wizard-rendered clock.toml parses");
         assert_eq!(parsed.timezone.as_deref(), Some("America/Vancouver"));
         assert_eq!(parsed.hour_format, 24);
         assert_eq!(parsed.secondary_timezones.len(), 2);
@@ -1258,8 +1268,11 @@ mod tests {
             );
             // Month abbreviation
             assert!(
-                ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-                    .contains(&parts[3]),
+                [
+                    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
+                    "Dec"
+                ]
+                .contains(&parts[3]),
                 "unexpected month: {:?}",
                 parts[3]
             );

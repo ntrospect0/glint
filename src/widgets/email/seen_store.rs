@@ -174,7 +174,10 @@ mod tests {
 
     #[test]
     fn sanitize_replaces_at_and_specials() {
-        assert_eq!(sanitize_account("Alice@Example.com"), "alice_at_example.com");
+        assert_eq!(
+            sanitize_account("Alice@Example.com"),
+            "alice_at_example.com"
+        );
         assert_eq!(sanitize_account("foo+bar@baz.io"), "foo_bar_at_baz.io");
         assert_eq!(sanitize_account("a/b\\c"), "a_b_c");
     }

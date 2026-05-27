@@ -5,149 +5,241 @@
 //! choices here keeps the page renderers visually consistent and saves
 //! every page from inventing its own ad-hoc `Style::default()` rules.
 //!
-//! The palette uses ratatui's named ANSI colours rather than hex so it
-//! inherits the user's terminal theme — the wizard doesn't load the
-//! glint app's full `Theme` (we'd have to plumb in colorschemes.toml just
-//! for the setup flow) but ANSI colours respect the terminal's palette
-//! mapping.
+//! Colors are derived from the user's active [`crate::theme::Theme`]: the
+//! wizard starts on Nord by default and refreshes the palette when the
+//! user picks a different scheme on the Global page. Schemes that don't
+//! exist on disk degrade to built-in defaults via [`crate::theme::load`].
 
-use ratatui::style::{Color, Modifier, Style};
+#![allow(dead_code)] // border_* helpers are surface for the next round of theming.
 
-/// Page section header — page title in the body chrome ("Welcome",
-/// "Configure clock", etc.). Bold + magenta to stand out from field
-/// content.
+use std::sync::{OnceLock, RwLock};
+
+use ratatui::{
+    layout::Rect,
+    style::{Color, Modifier, Style},
+};
+
+use crate::theme::Theme;
+
+/// Default scheme the wizard boots on when the user hasn't picked one yet.
+pub const DEFAULT_SCHEME: &str = "nord";
+
+/// Resolved style table painted from the active theme. Held behind a
+/// process-global `RwLock` so the Global page can swap palettes
+/// mid-flow without rethreading the theme through every page renderer.
+#[derive(Debug, Clone)]
+pub struct WizardPalette {
+    pub border_focused: Style,
+    pub border_unfocused: Style,
+    pub section_header: Style,
+    pub blurb: Style,
+    pub label: Style,
+    pub label_focused: Style,
+    pub help_text: Style,
+    pub value_idle: Style,
+    pub value_focused: Style,
+    pub option_selected: Style,
+    pub option_idle: Style,
+    pub marker_active: Style,
+    pub marker_idle: Style,
+    pub required: Style,
+    pub error: Style,
+    pub progress_filled: Style,
+    pub progress_empty: Style,
+    pub key_hint: Style,
+    pub key_hint_desc: Style,
+    pub page_button_focused: Style,
+    pub page_button_idle: Style,
+    pub cursor: Style,
+}
+
+impl WizardPalette {
+    /// Build a palette from a resolved [`Theme`]. The wizard's UI roles
+    /// don't map 1:1 onto the dashboard's roles, so we pull from the
+    /// theme's closest equivalents and add appropriate modifiers (bold,
+    /// underline) for wizard-only emphasis.
+    pub fn from_theme(theme: &Theme) -> Self {
+        let accent_focused = theme.text_focused; // bold accent color
+        let accent_selected = theme.text_selected; // selection / important
+        let plain = theme.text_plain;
+        let brilliant = theme.text_brilliant;
+        let dim = theme.text_dim;
+        let shortcut = theme.text_shortcut;
+
+        let accent_focused_fg = accent_focused.fg.unwrap_or(Color::Cyan);
+        let accent_selected_fg = accent_selected.fg.unwrap_or(Color::Yellow);
+        let dim_fg = dim.fg.unwrap_or(Color::DarkGray);
+        let plain_fg = plain.fg.unwrap_or(Color::White);
+        let brilliant_fg = brilliant.fg.unwrap_or(Color::White);
+
+        Self {
+            border_focused: theme.border_focused,
+            border_unfocused: theme.border_unfocused,
+            section_header: Style::default()
+                .fg(accent_focused_fg)
+                .add_modifier(Modifier::BOLD),
+            blurb: Style::default().fg(dim_fg).add_modifier(Modifier::ITALIC),
+            label: Style::default()
+                .fg(accent_focused_fg)
+                .add_modifier(Modifier::BOLD),
+            label_focused: Style::default()
+                .fg(accent_selected_fg)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            help_text: Style::default().fg(dim_fg).add_modifier(Modifier::ITALIC),
+            value_idle: Style::default().fg(plain_fg),
+            value_focused: Style::default()
+                .fg(accent_selected_fg)
+                .add_modifier(Modifier::BOLD),
+            option_selected: Style::default()
+                .bg(accent_selected_fg)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+            option_idle: Style::default().fg(plain_fg),
+            marker_active: Style::default()
+                .fg(accent_focused_fg)
+                .add_modifier(Modifier::BOLD),
+            marker_idle: Style::default().fg(dim_fg),
+            required: Style::default()
+                .fg(accent_selected_fg)
+                .add_modifier(Modifier::BOLD),
+            error: Style::default()
+                .fg(shortcut.fg.unwrap_or(Color::Red))
+                .add_modifier(Modifier::BOLD),
+            progress_filled: Style::default()
+                .fg(accent_focused_fg)
+                .add_modifier(Modifier::BOLD),
+            progress_empty: Style::default().fg(dim_fg),
+            key_hint: Style::default()
+                .fg(accent_focused_fg)
+                .add_modifier(Modifier::BOLD),
+            key_hint_desc: Style::default().fg(dim_fg),
+            page_button_focused: Style::default()
+                .bg(accent_focused_fg)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+            page_button_idle: Style::default()
+                .fg(accent_focused_fg)
+                .add_modifier(Modifier::BOLD),
+            cursor: Style::default()
+                .fg(brilliant_fg)
+                .add_modifier(Modifier::SLOW_BLINK | Modifier::BOLD),
+        }
+    }
+}
+
+static PALETTE: OnceLock<RwLock<WizardPalette>> = OnceLock::new();
+
+fn palette_lock() -> &'static RwLock<WizardPalette> {
+    PALETTE.get_or_init(|| {
+        let theme = crate::theme::load(DEFAULT_SCHEME)
+            .unwrap_or_else(|_| std::sync::Arc::new(Theme::builtin_defaults()));
+        RwLock::new(WizardPalette::from_theme(&theme))
+    })
+}
+
+/// Reload the wizard's active palette from a named color scheme. Called
+/// by the Global page when the user picks a new theme so the rest of the
+/// wizard refreshes immediately. Unknown / missing schemes fall back to
+/// built-in defaults (already handled by [`crate::theme::load`]).
+pub fn set_active_scheme(name: &str) {
+    let theme = match crate::theme::load(name) {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::warn!(scheme = %name, error = %err, "wizard could not load scheme, keeping current palette");
+            return;
+        }
+    };
+    if let Ok(mut guard) = palette_lock().write() {
+        *guard = WizardPalette::from_theme(&theme);
+    }
+}
+
+fn read<R>(f: impl FnOnce(&WizardPalette) -> R) -> R {
+    let guard = palette_lock().read().expect("wizard palette poisoned");
+    f(&guard)
+}
+
+pub fn border_focused() -> Style {
+    read(|p| p.border_focused)
+}
+pub fn border_unfocused() -> Style {
+    read(|p| p.border_unfocused)
+}
 pub fn section_header() -> Style {
-    Style::default()
-        .fg(Color::Magenta)
-        .add_modifier(Modifier::BOLD)
+    read(|p| p.section_header)
 }
-
-/// Page-level blurb sentence under the section header. Dim italic so it
-/// reads as context, not a field.
 pub fn blurb() -> Style {
-    Style::default()
-        .fg(Color::Gray)
-        .add_modifier(Modifier::ITALIC)
+    read(|p| p.blurb)
 }
-
-/// Field label. Bold cyan; clearly distinguished from value rows + help.
 pub fn label() -> Style {
-    Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD)
+    read(|p| p.label)
 }
-
-/// Focused field label — same as `label` but with an additional underline
-/// so the eye finds the active field immediately when scanning.
 pub fn label_focused() -> Style {
-    Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    read(|p| p.label_focused)
 }
-
-/// Inline help / explanation text under a focused field. Dim gray so it
-/// recedes from labels + values when scanning.
 pub fn help_text() -> Style {
-    Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::ITALIC)
+    read(|p| p.help_text)
 }
-
-/// Field value when its field is NOT focused.
 pub fn value_idle() -> Style {
-    Style::default().fg(Color::White)
+    read(|p| p.value_idle)
 }
-
-/// Field value when its field IS focused — single highlighted state used
-/// by Text / Number / Bool / TextList. Choice/MultiChoice use the
-/// per-row selection helpers below.
 pub fn value_focused() -> Style {
-    Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD)
+    read(|p| p.value_focused)
 }
-
-/// A row inside a Choice / MultiChoice / Lookup list that's currently
-/// highlighted by the up/down cursor.
 pub fn option_selected() -> Style {
-    Style::default()
-        .fg(Color::Black)
-        .bg(Color::Yellow)
-        .add_modifier(Modifier::BOLD)
+    read(|p| p.option_selected)
 }
-
-/// A row inside a Choice / MultiChoice / Lookup list that's NOT
-/// highlighted.
 pub fn option_idle() -> Style {
-    Style::default().fg(Color::White)
+    read(|p| p.option_idle)
 }
-
-/// The `[x]` / `(•)` filled-marker glyph: the option is currently picked
-/// (radio) or checked (multi-select).
 pub fn marker_active() -> Style {
-    Style::default()
-        .fg(Color::Green)
-        .add_modifier(Modifier::BOLD)
+    read(|p| p.marker_active)
 }
-
-/// The `[ ]` / `( )` empty marker.
 pub fn marker_idle() -> Style {
-    Style::default().fg(Color::DarkGray)
+    read(|p| p.marker_idle)
 }
-
-/// "*" required-field indicator + general "needs attention" colour.
 pub fn required() -> Style {
-    Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD)
+    read(|p| p.required)
 }
-
-/// Inline validation error message.
 pub fn error() -> Style {
-    Style::default()
-        .fg(Color::Red)
-        .add_modifier(Modifier::BOLD)
+    read(|p| p.error)
 }
-
-/// Filled portion of the progress bar.
 pub fn progress_filled() -> Style {
-    Style::default()
-        .fg(Color::Green)
-        .add_modifier(Modifier::BOLD)
+    read(|p| p.progress_filled)
 }
-
-/// Unfilled portion of the progress bar.
 pub fn progress_empty() -> Style {
-    Style::default().fg(Color::DarkGray)
+    read(|p| p.progress_empty)
 }
-
-/// Footer key-hint label (the actual key, e.g. "Tab").
 pub fn key_hint() -> Style {
-    Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD)
+    read(|p| p.key_hint)
 }
-
-/// `[ Save & Next ]`-style page-advance button row, when it has focus.
-/// Reuses the option_selected highlight so the visual idiom is
-/// consistent with multi-choice cursor highlighting.
-pub fn page_button_focused() -> Style {
-    Style::default()
-        .fg(Color::Black)
-        .bg(Color::Green)
-        .add_modifier(Modifier::BOLD)
-}
-
-/// Page-advance button when not focused — visible but not loud.
-pub fn page_button_idle() -> Style {
-    Style::default()
-        .fg(Color::Green)
-        .add_modifier(Modifier::BOLD)
-}
-
-/// Footer key-hint description ("focus", "advance"…).
 pub fn key_hint_desc() -> Style {
-    Style::default().fg(Color::Gray)
+    read(|p| p.key_hint_desc)
+}
+pub fn page_button_focused() -> Style {
+    read(|p| p.page_button_focused)
+}
+pub fn page_button_idle() -> Style {
+    read(|p| p.page_button_idle)
+}
+pub fn cursor() -> Style {
+    read(|p| p.cursor)
+}
+
+/// One-cell padding applied inside every page's body block. Shrinks
+/// `rect` by 1 on all sides so the content doesn't butt up against the
+/// border. Returns the original rect when it's too small to pad (so we
+/// don't accidentally hand callers a zero-sized area on tiny terminals).
+pub fn pad_inner(rect: Rect) -> Rect {
+    if rect.width < 4 || rect.height < 4 {
+        return rect;
+    }
+    Rect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        width: rect.width - 2,
+        height: rect.height - 2,
+    }
 }
 
 /// Width of the progress bar in cells.
@@ -190,5 +282,44 @@ mod tests {
         // Avoid division-by-zero; degrade to "fully empty".
         let (f, e) = progress_chars(0, 0);
         assert_eq!(f.chars().count() + e.chars().count(), PROGRESS_BAR_WIDTH);
+    }
+
+    #[test]
+    fn pad_inner_shrinks_by_one_on_each_side() {
+        let r = Rect {
+            x: 5,
+            y: 5,
+            width: 20,
+            height: 10,
+        };
+        let p = pad_inner(r);
+        assert_eq!((p.x, p.y, p.width, p.height), (6, 6, 18, 8));
+    }
+
+    #[test]
+    fn pad_inner_no_op_when_too_small() {
+        let r = Rect {
+            x: 0,
+            y: 0,
+            width: 3,
+            height: 3,
+        };
+        assert_eq!(pad_inner(r), r);
+    }
+
+    #[test]
+    fn palette_from_nord_theme_uses_nord_accent() {
+        // Sanity: a manually-built Nord-ish theme produces a palette whose
+        // accent styles use the configured fg colors.
+        let mut theme = Theme::builtin_defaults();
+        theme.text_focused = Style::default()
+            .fg(Color::Rgb(0x88, 0xc0, 0xd0))
+            .add_modifier(Modifier::BOLD);
+        theme.text_selected = Style::default()
+            .fg(Color::Rgb(0xeb, 0xcb, 0x8b))
+            .add_modifier(Modifier::BOLD);
+        let p = WizardPalette::from_theme(&theme);
+        assert_eq!(p.section_header.fg, Some(Color::Rgb(0x88, 0xc0, 0xd0)));
+        assert_eq!(p.label_focused.fg, Some(Color::Rgb(0xeb, 0xcb, 0x8b)));
     }
 }

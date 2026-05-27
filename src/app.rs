@@ -193,16 +193,34 @@ impl App {
         self.command_feedback = Some((text.into(), severity, Instant::now()));
     }
 
-    /// Drop the feedback if it's older than `FEEDBACK_TTL`. Called right
-    /// before each draw so the chrome row reverts to the status bar on
-    /// its own — the event loop's 250 ms tick guarantees a redraw within
-    /// the TTL window without a per-frame timer.
-    fn expire_stale_feedback(&mut self) {
+    /// Drop the feedback if it's older than `FEEDBACK_TTL`. Returns
+    /// `true` when the bar was actually cleared so the tick path can
+    /// force a redraw — otherwise the now-stale "saved" / "error"
+    /// chrome would linger until the next user event.
+    fn expire_stale_feedback(&mut self) -> bool {
         if let Some((_, _, set_at)) = &self.command_feedback {
             if set_at.elapsed() >= FEEDBACK_TTL {
                 self.command_feedback = None;
+                return true;
             }
         }
+        false
+    }
+
+    /// Drain every widget's dirty bit and OR the results. Always calls
+    /// `take_dirty` on every widget — even when we already know the
+    /// answer is "draw" — so a queued change can't smuggle a stale
+    /// bit into the next tick and force a redundant redraw there.
+    fn drain_widget_dirty(&mut self) -> bool {
+        let mut dirty = false;
+        for id in self.manager.ids().to_vec() {
+            if let Some(w) = self.manager.get_mut(&id) {
+                if w.take_dirty() {
+                    dirty = true;
+                }
+            }
+        }
+        dirty
     }
 
     /// Borrow the current feedback as the ui-layer tuple, after expiring
@@ -294,8 +312,7 @@ impl App {
             // doesn't have to manually rotate first.
             (_, KeyCode::Char(c)) if c.is_ascii_uppercase() => {
                 let lower = c.to_ascii_lowercase();
-                if let Some((parent_id, child_id)) = self.shortcuts.get(&lower).cloned()
-                {
+                if let Some((parent_id, child_id)) = self.shortcuts.get(&lower).cloned() {
                     if let Some(pos) = self.focus_order.iter().position(|w| w == &parent_id) {
                         self.focus_idx = pos;
                     }
@@ -337,6 +354,13 @@ impl App {
             }
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 self.command_buffer = None;
+            }
+            // Ctrl-U mirrors the readline "kill to start of line" gesture.
+            // The leading ':' lives in the chrome, not the buffer, so
+            // clearing the buffer is exactly "wipe everything after the
+            // prompt while keeping the prompt in place".
+            (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
+                buf.clear();
             }
             (_, KeyCode::Backspace) if buf.pop().is_none() => {
                 self.command_buffer = None;
@@ -408,7 +432,10 @@ impl App {
         // happened; a write failure only downgrades the success line.
         match theme::persist_active_scheme(name) {
             Ok(()) => {
-                self.set_feedback(format!("scheme → {name}"), ui::FeedbackSeverity::Confirmation);
+                self.set_feedback(
+                    format!("scheme → {name}"),
+                    ui::FeedbackSeverity::Confirmation,
+                );
             }
             Err(err) => {
                 tracing::warn!(error = %err, scheme = %name, "failed to persist scheme");
@@ -584,9 +611,7 @@ fn widget_at(app: &App, full_area: Rect, col: u16, row: u16) -> Option<(String, 
 /// Returns the letter → `(parent_id, child_id)` map; each widget (or
 /// composite child) is notified via `set_shortcut`, including `None`
 /// for widgets whose preferences were all taken.
-fn assign_shortcuts(
-    manager: &mut WidgetManager,
-) -> HashMap<char, (String, Option<String>)> {
+fn assign_shortcuts(manager: &mut WidgetManager) -> HashMap<char, (String, Option<String>)> {
     // First pass: gather every (parent_id, child_id, prefs) triple.
     let mut targets: Vec<(String, Option<String>, Vec<char>)> = Vec::new();
     for parent_id in manager.ids().to_vec() {
@@ -628,8 +653,7 @@ fn assign_shortcuts(
             }
             if !shortcuts.contains_key(&letter) {
                 shortcuts.insert(letter, (parent_id.clone(), child_id.clone()));
-                assigned_letters
-                    .insert((parent_id.clone(), child_id.clone()), letter);
+                assigned_letters.insert((parent_id.clone(), child_id.clone()), letter);
                 break;
             }
         }
@@ -709,13 +733,11 @@ fn register_widgets_from_layout(
                 let scoped = cache.scoped(&kind, &instance);
                 let llm = llm_provider.clone();
                 let theme_c = theme.clone();
-                let built = registry::build_for(&kind, &instance, move |instance| {
-                    WidgetCtx {
-                        instance,
-                        theme: theme_c,
-                        llm,
-                        cache: scoped,
-                    }
+                let built = registry::build_for(&kind, &instance, move |instance| WidgetCtx {
+                    instance,
+                    theme: theme_c,
+                    llm,
+                    cache: scoped,
                 });
                 match built {
                     Some(w) => children.push(w),
@@ -846,6 +868,7 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
     let ctx = AppContext;
 
     while let Some(evt) = events.next().await {
+        let is_tick = matches!(evt, Event::Tick);
         match evt {
             Event::Key(key) => {
                 if key.kind != KeyEventKind::Press {
@@ -973,10 +996,21 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
             break;
         }
 
-        app.expire_stale_feedback();
-        terminal.draw(|frame| {
-            ui::render(frame, &app.render_state());
-        })?;
+        let feedback_cleared = app.expire_stale_feedback();
+        // Always drain widget dirty bits so they don't pile up between
+        // draws — even when we already know we're going to draw (non-tick
+        // events), so the next tick starts from a clean slate.
+        let widgets_dirty = app.drain_widget_dirty();
+        let should_draw = if is_tick {
+            widgets_dirty || feedback_cleared
+        } else {
+            true
+        };
+        if should_draw {
+            terminal.draw(|frame| {
+                ui::render(frame, &app.render_state());
+            })?;
+        }
     }
 
     Ok(())
@@ -996,7 +1030,12 @@ fn enter_tui() -> Result<Tui> {
     // before the rest of the buffer arrives. The Paste handler is
     // already wired up in the event loop (Event::Paste branch above);
     // this just turns on the terminal-side framing.
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
@@ -1124,7 +1163,10 @@ mod tests {
             .iter()
             .find_map(|(k, (parent, _child))| (parent == "clock@office").then_some(*k));
         assert!(home_letter.is_some(), "clock@home should have a shortcut");
-        assert!(office_letter.is_some(), "clock@office should have a shortcut");
+        assert!(
+            office_letter.is_some(),
+            "clock@office should have a shortcut"
+        );
         assert_ne!(home_letter, office_letter);
     }
 
@@ -1173,31 +1215,43 @@ mod tests {
         assert_eq!(ids, vec!["stack:clock+weather"]);
 
         // Both child kinds must end up addressable via Shift+letter.
-        let clock_short = app
-            .shortcuts
-            .iter()
-            .find_map(|(letter, (parent, child))| {
-                (parent == "stack:clock+weather" && child.as_deref() == Some("clock"))
-                    .then_some(*letter)
-            });
-        let weather_short = app
-            .shortcuts
-            .iter()
-            .find_map(|(letter, (parent, child))| {
-                (parent == "stack:clock+weather" && child.as_deref() == Some("weather"))
-                    .then_some(*letter)
-            });
-        assert!(clock_short.is_some(), "clock-inside-stack should claim a letter");
-        assert!(weather_short.is_some(), "weather-inside-stack should claim a letter");
+        let clock_short = app.shortcuts.iter().find_map(|(letter, (parent, child))| {
+            (parent == "stack:clock+weather" && child.as_deref() == Some("clock"))
+                .then_some(*letter)
+        });
+        let weather_short = app.shortcuts.iter().find_map(|(letter, (parent, child))| {
+            (parent == "stack:clock+weather" && child.as_deref() == Some("weather"))
+                .then_some(*letter)
+        });
+        assert!(
+            clock_short.is_some(),
+            "clock-inside-stack should claim a letter"
+        );
+        assert!(
+            weather_short.is_some(),
+            "weather-inside-stack should claim a letter"
+        );
         assert_ne!(clock_short, weather_short);
     }
 
     #[test]
     fn invert_scroll_flips_both_axes_and_passes_other_kinds_through() {
-        assert_eq!(invert_scroll(MouseEventKind::ScrollUp), MouseEventKind::ScrollDown);
-        assert_eq!(invert_scroll(MouseEventKind::ScrollDown), MouseEventKind::ScrollUp);
-        assert_eq!(invert_scroll(MouseEventKind::ScrollLeft), MouseEventKind::ScrollRight);
-        assert_eq!(invert_scroll(MouseEventKind::ScrollRight), MouseEventKind::ScrollLeft);
+        assert_eq!(
+            invert_scroll(MouseEventKind::ScrollUp),
+            MouseEventKind::ScrollDown
+        );
+        assert_eq!(
+            invert_scroll(MouseEventKind::ScrollDown),
+            MouseEventKind::ScrollUp
+        );
+        assert_eq!(
+            invert_scroll(MouseEventKind::ScrollLeft),
+            MouseEventKind::ScrollRight
+        );
+        assert_eq!(
+            invert_scroll(MouseEventKind::ScrollRight),
+            MouseEventKind::ScrollLeft
+        );
         // Non-scroll events are untouched.
         let click = MouseEventKind::Down(MouseButton::Left);
         assert_eq!(invert_scroll(click), click);

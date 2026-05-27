@@ -54,9 +54,7 @@ impl CalDavCredentials {
             .with_context(|| format!("failed to read {}", path.display()))?;
         let creds: CalDavCredentials = toml::from_str(&contents)
             .with_context(|| format!("failed to parse {}", path.display()))?;
-        if creds.app_password.is_empty()
-            || creds.app_password.starts_with("REPLACE_WITH_")
-        {
+        if creds.app_password.is_empty() || creds.app_password.starts_with("REPLACE_WITH_") {
             return Ok(None);
         }
         Ok(Some(creds))
@@ -243,8 +241,8 @@ async fn discover_calendars(
   </d:prop>
 </d:propfind>"#;
     let xml = propfind(client, creds, &home_url, "1", body).await?;
-    let doc =
-        roxmltree::Document::parse(&xml).context("failed to parse CalDAV calendar-home response")?;
+    let doc = roxmltree::Document::parse(&xml)
+        .context("failed to parse CalDAV calendar-home response")?;
 
     let mut calendars: Vec<String> = Vec::new();
     for response in doc
@@ -327,7 +325,10 @@ async fn propfind(
 
 /// Find the first `<DAV:href>` element nested inside a `<DAV:prop>` child
 /// matching `inside_local_name` (with any DAV-ish namespace).
-fn extract_first_href_inside(doc: &roxmltree::Document<'_>, inside_local_name: &str) -> Option<String> {
+fn extract_first_href_inside(
+    doc: &roxmltree::Document<'_>,
+    inside_local_name: &str,
+) -> Option<String> {
     for parent in doc.descendants() {
         if !node_matches(&parent, DAV_NS, inside_local_name)
             && !node_matches(&parent, CALDAV_NS, inside_local_name)
@@ -348,7 +349,10 @@ fn extract_first_href_inside(doc: &roxmltree::Document<'_>, inside_local_name: &
 fn node_matches(n: &roxmltree::Node<'_, '_>, ns: &str, local: &str) -> bool {
     n.is_element()
         && n.tag_name().name().eq_ignore_ascii_case(local)
-        && n.tag_name().namespace().map(|s| s.eq_ignore_ascii_case(ns)).unwrap_or(false)
+        && n.tag_name()
+            .namespace()
+            .map(|s| s.eq_ignore_ascii_case(ns))
+            .unwrap_or(false)
 }
 
 /// Combine a possibly-relative href with a base server URL.
@@ -535,7 +539,10 @@ mod tests {
     fn parse_ics_datetime_handles_all_forms() {
         let (dt, all_day) = parse_ics_datetime("20260520", true).unwrap();
         assert!(all_day);
-        assert_eq!(dt.date_naive(), NaiveDate::from_ymd_opt(2026, 5, 20).unwrap());
+        assert_eq!(
+            dt.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 5, 20).unwrap()
+        );
 
         let (_dt, all_day) = parse_ics_datetime("20260520T093000Z", false).unwrap();
         assert!(!all_day);

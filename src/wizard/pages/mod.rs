@@ -47,6 +47,15 @@ pub enum Page {
     AssignStack {
         cell_index: usize,
     },
+    /// Per-child configuration page for a stack cell. After visiting
+    /// every single-widget cell's Widget page, the wizard walks
+    /// through each stack cell's children one by one — same UI as
+    /// Widget(i), but the kind / widget_id come from
+    /// `assignments[cell_index].stack_children[child_index]`.
+    StackChild {
+        cell_index: usize,
+        child_index: usize,
+    },
     Confirm,
 }
 
@@ -61,6 +70,12 @@ impl Page {
             Page::Widget(i) => format!("widget-{i}"),
             Page::OAuthSetup { provider } => format!("oauth-setup-{provider}"),
             Page::AssignStack { cell_index } => format!("assign-stack-{cell_index}"),
+            Page::StackChild {
+                cell_index,
+                child_index,
+            } => {
+                format!("stack-child-{cell_index}-{child_index}")
+            }
             Page::Confirm => "confirm".into(),
         }
     }
@@ -77,7 +92,28 @@ impl Page {
                 None => "Widget".into(),
             },
             Page::OAuthSetup { provider } => format!("Authorize {provider}"),
-            Page::AssignStack { cell_index } => format!("Configure stack — cell {cell_index}"),
+            Page::AssignStack { cell_index } => {
+                format!("Configure stack — cell {}", cell_index + 1)
+            }
+            Page::StackChild {
+                cell_index,
+                child_index,
+            } => {
+                match state
+                    .assignments
+                    .get(*cell_index)
+                    .and_then(|a| a.stack_children.get(*child_index))
+                {
+                    Some(child) => {
+                        format!(
+                            "Configure {} (cell {} stack)",
+                            child.widget_id(),
+                            cell_index + 1
+                        )
+                    }
+                    None => "Configure stack child".into(),
+                }
+            }
             Page::Confirm => "Confirm".into(),
         }
     }
@@ -104,6 +140,12 @@ pub enum PageAction {
     /// app loop performs the navigation; the assign page emits this
     /// when the user picks "Stack" as the cell kind.
     OpenAssignStack(usize),
+    /// Commit the in-progress stack for `cell_index` and pop back to
+    /// the Assign page with focus advanced to the next cell. Mirrors
+    /// the single-widget Enter behavior on Assign (which also advances
+    /// focus after committing) so the user doesn't have to manually
+    /// Tab back through cells they've already configured.
+    AssignStackDone { cell_index: usize },
 }
 
 /// Dispatch a key event to the active page's `handle_key`.
@@ -116,9 +158,13 @@ pub fn dispatch_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
         Page::Global => global::handle_key(key, app),
         Page::Layout => layout::handle_key(key, app),
         Page::Assign => assign::handle_key(key, app),
-        Page::Widget(i) => widget::handle_key(key, app, i),
+        Page::Widget(i) => widget::handle_key(key, app, i, None),
         Page::OAuthSetup { provider } => oauth_setup::handle_key(key, app, &provider),
         Page::AssignStack { cell_index } => assign_stack::handle_key(key, app, cell_index),
+        Page::StackChild {
+            cell_index,
+            child_index,
+        } => widget::handle_key(key, app, cell_index, Some(child_index)),
         Page::Confirm => confirm::handle_key(key, app),
     }
 }
@@ -130,9 +176,13 @@ pub fn render_body(frame: &mut Frame, area: Rect, app: &WizardApp) {
         Page::Global => global::render(frame, area, app),
         Page::Layout => layout::render(frame, area, app),
         Page::Assign => assign::render(frame, area, app),
-        Page::Widget(i) => widget::render(frame, area, app, *i),
+        Page::Widget(i) => widget::render(frame, area, app, *i, None),
         Page::OAuthSetup { provider } => oauth_setup::render(frame, area, app, provider),
         Page::AssignStack { cell_index } => assign_stack::render(frame, area, app, *cell_index),
+        Page::StackChild {
+            cell_index,
+            child_index,
+        } => widget::render(frame, area, app, *cell_index, Some(*child_index)),
         Page::Confirm => confirm::render(frame, area, app),
     }
 }
@@ -144,10 +194,14 @@ pub fn render_body(frame: &mut Frame, area: Rect, app: &WizardApp) {
 /// when editing.
 pub fn on_enter(app: &mut WizardApp) {
     match app.page.clone() {
-        Page::Widget(i) => widget::on_enter(app, i),
+        Page::Widget(i) => widget::on_enter(app, i, None),
         Page::Assign => assign::on_enter(app),
         Page::OAuthSetup { provider } => oauth_setup::on_enter(app, &provider),
         Page::AssignStack { cell_index } => assign_stack::on_enter(app, cell_index),
+        Page::StackChild {
+            cell_index,
+            child_index,
+        } => widget::on_enter(app, cell_index, Some(child_index)),
         _ => {}
     }
 }

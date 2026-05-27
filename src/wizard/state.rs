@@ -258,8 +258,14 @@ mod tests {
             kind: String::new(),
             instance: "main".into(),
             stack_children: vec![
-                StackChild { kind: "clock".into(), instance: "main".into() },
-                StackChild { kind: "weather".into(), instance: "main".into() },
+                StackChild {
+                    kind: "clock".into(),
+                    instance: "main".into(),
+                },
+                StackChild {
+                    kind: "weather".into(),
+                    instance: "main".into(),
+                },
             ],
         };
         assert!(stack.is_stack());

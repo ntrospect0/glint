@@ -138,7 +138,9 @@ pub async fn refresh(client: &OAuthClientConfig, prev: &GoogleToken) -> Result<G
         .context("failed to parse refresh response")?;
     Ok(GoogleToken {
         access_token: tr.access_token,
-        refresh_token: tr.refresh_token.unwrap_or_else(|| prev.refresh_token.clone()),
+        refresh_token: tr
+            .refresh_token
+            .unwrap_or_else(|| prev.refresh_token.clone()),
         expires_at: Utc::now() + chrono::Duration::seconds(tr.expires_in),
         token_type: tr.token_type,
         scope: tr.scope,

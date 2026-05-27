@@ -107,6 +107,15 @@ pub struct WizardApp {
 impl WizardApp {
     pub fn new(state: WizardState) -> Self {
         let page = flow::start_page(&state);
+        // Seed the wizard's color palette: whatever theme the user already
+        // picked (resumed state) wins, otherwise we boot on the wizard's
+        // default scheme so even the first frame looks "themed" rather
+        // than ANSI-default.
+        let initial_scheme = match state.global_get("theme") {
+            Some(super::descriptor::WizardValue::Choice(s)) if !s.is_empty() => s.clone(),
+            _ => style::DEFAULT_SCHEME.to_string(),
+        };
+        style::set_active_scheme(&initial_scheme);
         Self {
             state,
             page,
@@ -202,13 +211,21 @@ pub fn run_wizard() -> Result<WizardOutcome> {
                 // History captures the user's actual forward path. On a
                 // mid-flow resume the stack is empty — fall back to the
                 // flow's logical prev_page so Esc still navigates back.
+                //
+                // When leaving the AssignStack breakout (Esc/cancel),
+                // restore focus to the cell the user was configuring
+                // instead of jumping to Cell 1.
+                let restore_focus = match &app.page {
+                    Page::AssignStack { cell_index } => Some(*cell_index),
+                    _ => None,
+                };
                 let target = app
                     .history
                     .pop()
                     .or_else(|| flow::prev_page(&app.page, &app.state));
                 if let Some(prev) = target {
                     app.page = prev;
-                    app.focus = 0;
+                    app.focus = restore_focus.unwrap_or(0);
                     app.text_buffer.clear();
                     app.lookup_offset = 0;
                     app.layout_phase = LayoutPhase::default();
@@ -247,11 +264,7 @@ pub fn run_wizard() -> Result<WizardOutcome> {
                 // OAuth flow's browser launcher and loopback HTTP server
                 // can use the real terminal.
                 let _ = disable_raw_mode();
-                let _ = execute!(
-                    io::stdout(),
-                    DisableMouseCapture,
-                    LeaveAlternateScreen
-                );
+                let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
 
                 let result = run_oauth_for_provider(&provider_name);
                 let status = match &result {
@@ -297,16 +310,40 @@ pub fn run_wizard() -> Result<WizardOutcome> {
                 // Push current Assign page onto history; switch to the
                 // AssignStack sub-page for this cell. Pop back happens
                 // when the sub-page returns PageAction::Back.
-                let prev = std::mem::replace(
-                    &mut app.page,
-                    Page::AssignStack { cell_index },
-                );
+                let prev = std::mem::replace(&mut app.page, Page::AssignStack { cell_index });
                 app.history.push(prev);
                 app.focus = 0;
                 app.text_buffer.clear();
                 app.lookup_offset = 0;
                 app.feedback = None;
                 super::pages::on_enter(&mut app);
+            }
+            PageAction::AssignStackDone { cell_index } => {
+                // Stack saved — pop back to Assign and advance focus
+                // to the next cell, mirroring the single-widget Enter
+                // path in assign.rs (which also advances after a pick).
+                // `focus_total = cell_count + 1` includes the trailing
+                // [Save & Next] button as the wrap target, same as the
+                // regular advance.
+                let target = app
+                    .history
+                    .pop()
+                    .or_else(|| flow::prev_page(&app.page, &app.state));
+                if let Some(prev) = target {
+                    app.page = prev;
+                    let cell_count = app.state.assignments.len();
+                    let focus_total = cell_count + 1;
+                    app.focus = if focus_total > 0 {
+                        (cell_index + 1) % focus_total
+                    } else {
+                        0
+                    };
+                    app.text_buffer.clear();
+                    app.lookup_offset = 0;
+                    app.layout_phase = LayoutPhase::default();
+                    app.feedback = None;
+                    super::pages::on_enter(&mut app);
+                }
             }
         }
     }
@@ -388,7 +425,10 @@ fn load_available_themes() -> Vec<(String, String)> {
     let mut rest: Vec<String> = names.into_iter().filter(|n| n != "default").collect();
     rest.sort();
     let mut out = Vec::with_capacity(rest.len() + 1);
-    out.push(("default".to_string(), "Default — built-in palette".to_string()));
+    out.push((
+        "default".to_string(),
+        "Default — built-in palette".to_string(),
+    ));
     for name in rest {
         let label = humanize_scheme_name(&name);
         out.push((name, label));
@@ -422,7 +462,10 @@ mod tests {
     fn humanize_scheme_name_title_cases_snake() {
         assert_eq!(humanize_scheme_name("nord"), "Nord");
         assert_eq!(humanize_scheme_name("gruvbox_dark"), "Gruvbox Dark");
-        assert_eq!(humanize_scheme_name("solarized_light_v2"), "Solarized Light V2");
+        assert_eq!(
+            humanize_scheme_name("solarized_light_v2"),
+            "Solarized Light V2"
+        );
         assert_eq!(humanize_scheme_name(""), "");
     }
 }
@@ -466,10 +509,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &WizardApp) {
             Span::styled(filled, style::progress_filled()),
             Span::styled(empty, style::progress_empty()),
             Span::raw("  "),
-            Span::styled(
-                format!("step {current}/{total}"),
-                style::key_hint_desc(),
-            ),
+            Span::styled(format!("step {current}/{total}"), style::key_hint_desc()),
             Span::raw("  "),
             Span::styled(format!("({pct}%)"), style::key_hint_desc()),
         ]),

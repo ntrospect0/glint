@@ -37,7 +37,7 @@ pub mod provider;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -54,6 +54,7 @@ use serde::Deserialize;
 
 use crate::cache::ScopedCache;
 use crate::theme::{ColorScheme, Theme};
+use crate::ui::status::{live_value, TimedFeedback};
 use crate::ui::{apply_title_row, MetadataEmphasis};
 
 use super::{AppContext, EventResult, Widget};
@@ -142,12 +143,7 @@ fn default_watchlist() -> Vec<String> {
 }
 
 fn default_crypto_watchlist() -> Vec<String> {
-    vec![
-        "BTC".into(),
-        "ETH".into(),
-        "SOL".into(),
-        "XRP".into(),
-    ]
+    vec!["BTC".into(), "ETH".into(), "SOL".into(), "XRP".into()]
 }
 
 fn default_poll_interval() -> u64 {
@@ -218,7 +214,7 @@ struct ForexState {
     /// already in the watchlist. Shown in a `── Lookup ──` section at
     /// the bottom of the list, cleared by `x`.
     transient_code: Option<String>,
-    last_attempt: Option<Instant>,
+    poll: crate::polling::PollTracker,
     any_inflight: bool,
     /// When `Some`, the amount cell is being edited. The buffer is the
     /// in-progress string so `e → 1 → 5 → 2 → backspace → Enter` shows
@@ -235,10 +231,37 @@ struct ForexState {
     /// straight into `set_period`.
     toggle_hits: ToggleHits,
     /// Visual confirmation after a successful 📋 click / `y` press:
-    /// the row index that was copied + the timestamp. Render swaps the
-    /// 📋 icon on that row for ✅ for `COPY_FEEDBACK_TTL`, then
-    /// reverts. `None` means no pulse active.
-    copy_feedback: Option<(usize, Instant)>,
+    /// the row index that was copied. Render swaps the 📋 icon on
+    /// that row for ✅ for `COPY_FEEDBACK_TTL`, then reverts.
+    /// `None` means no pulse active.
+    copy_feedback: Option<TimedFeedback<usize>>,
+    /// Currency code pending y/N removal confirmation. When `Some`,
+    /// the widget paints a modal and the key dispatcher swallows
+    /// everything except `y` (confirm) and any-other-key (cancel).
+    confirm_remove: Option<String>,
+    /// Transient status line for "Added BTC to crypto_watchlist" /
+    /// "Can't remove primary" feedback. Auto-cleared once the TTL
+    /// elapses.
+    status: Option<TimedFeedback<String>>,
+    /// Display-state dirty bit drained by `take_dirty`. Set true by
+    /// every async-task / tick-time mutation site so the main loop's
+    /// dirty-flag gate triggers a redraw. User-driven mutations don't
+    /// need to set it — non-tick events always redraw at the App level.
+    dirty: bool,
+}
+
+/// How long the status feedback line stays on screen after an
+/// add / remove action. Long enough to read, short enough to revert
+/// before the next interaction.
+const STATUS_TTL: Duration = Duration::from_millis(2500);
+
+/// Which on-disk array a currency belongs to. Known cryptos
+/// (per [`provider::is_crypto`]) go to `crypto_watchlist`;
+/// everything else goes to `watchlist`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForexListKind {
+    Watchlist,
+    CryptoWatchlist,
 }
 
 /// Screen-absolute click ranges for the period toggle bar (`[1D] [1W]
@@ -287,7 +310,10 @@ const CACHE_KEY_QUOTES_PREFIX: &str = "fx-quotes-";
 const COPY_FEEDBACK_TTL: Duration = Duration::from_millis(1000);
 
 fn quotes_cache_key(period: Period) -> String {
-    format!("{CACHE_KEY_QUOTES_PREFIX}{}", period.label().to_ascii_lowercase())
+    format!(
+        "{CACHE_KEY_QUOTES_PREFIX}{}",
+        period.label().to_ascii_lowercase()
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -301,7 +327,6 @@ pub struct ForexWidget {
     config: ForexConfig,
     provider: Arc<YahooForexProvider>,
     state: Arc<Mutex<ForexState>>,
-    poll_interval: Duration,
     /// Current primary currency. Starts at config.primary; swap actions
     /// flip it without rewriting the config. Kept in the widget (not
     /// state) since it changes synchronously and feeds row-build math.
@@ -342,7 +367,9 @@ impl ForexWidget {
             Ok(p) => Arc::new(p),
             Err(err) => {
                 tracing::warn!(error = %err, "failed to build Yahoo Forex provider, widget will be inert");
-                Arc::new(YahooForexProvider::new().expect("dummy yahoo forex provider should build"))
+                Arc::new(
+                    YahooForexProvider::new().expect("dummy yahoo forex provider should build"),
+                )
             }
         };
         let theme = app_theme.with_overrides(&config.colors);
@@ -369,38 +396,35 @@ impl ForexWidget {
         // `crypto_watchlist`, primary filtered out, codes normalized
         // to uppercase, duplicates dropped (first wins). The boundary
         // index drives section-header placement at render time.
-        let (alternates, crypto_start) = build_alternates(
-            &config.watchlist,
-            &config.crypto_watchlist,
-            &primary,
-        );
+        let (alternates, crypto_start) =
+            build_alternates(&config.watchlist, &config.crypto_watchlist, &primary);
 
         // Seed quotes from cache so the widget paints prior rates
         // immediately and survives transient fetch failures with the
         // last-known data (the user's first-launch experience is a
         // blank list until the first poll completes).
         let mut initial_state = ForexState::default();
+        initial_state.poll = crate::polling::PollTracker::new(poll_interval);
         if let Some(entry) = cache.load::<HashMap<String, ForexQuote>>(&quotes_cache_key(period)) {
-            let age = entry.age().min(poll_interval);
+            initial_state.poll.seed_from_cache_age(entry.age());
             initial_state.quotes = entry
                 .value
                 .into_iter()
                 .map(|(sym, q)| (sym, QuoteState::Ready(Box::new(q))))
                 .collect();
-            // Seed last_attempt so we don't blast a refresh immediately;
-            // is_due() will let one fire after `poll_interval - age`.
-            initial_state.last_attempt = Some(Instant::now() - age);
         }
         // Auto-highlight the first alternate so the stats column and
         // graph have something to show on first paint. Falls back to
         // the primary row when no alternates exist (empty watchlist).
         initial_state.selected = if alternates.is_empty() { 0 } else { 1 };
+        initial_state
+            .poll
+            .apply_jitter(&format!("forex@{instance}"));
 
         Self {
             id,
             instance,
             display_name_cache,
-            poll_interval,
             config,
             provider,
             state: Arc::new(Mutex::new(initial_state)),
@@ -455,15 +479,12 @@ impl ForexWidget {
         if st.any_inflight {
             return false;
         }
-        match st.last_attempt {
-            None => true,
-            Some(t) => t.elapsed() >= self.poll_interval,
-        }
+        st.poll.is_due()
     }
 
     fn mark_dirty(&self) {
         let mut st = self.state.lock().expect("forex state poisoned");
-        st.last_attempt = None;
+        st.poll.mark_dirty();
     }
 
     fn spawn_refresh(&self) {
@@ -482,11 +503,12 @@ impl ForexWidget {
         {
             let mut st = self.state.lock().expect("forex state poisoned");
             st.any_inflight = true;
-            st.last_attempt = Some(Instant::now());
+            st.poll.mark_attempted();
             for (base, quote) in &pairs {
                 let sym = YahooForexProvider::symbol_for(base, quote);
                 st.quotes.entry(sym).or_insert(QuoteState::Inflight);
             }
+            st.dirty = true;
         }
         let provider = self.provider.clone();
         let state = self.state.clone();
@@ -549,6 +571,7 @@ impl ForexWidget {
                 }
             }
             st.any_inflight = false;
+            st.dirty = true;
             drop(st);
             if persist_cache && !snapshot.is_empty() {
                 if let Err(err) = cache.store(&quotes_cache_key(period), &snapshot) {
@@ -714,9 +737,7 @@ impl ForexWidget {
                 .iter()
                 .map(|s| s.to_ascii_uppercase())
                 .collect();
-            let prepend = |code: &str,
-                           fiat: &mut Vec<String>,
-                           crypto: &mut Vec<String>| {
+            let prepend = |code: &str, fiat: &mut Vec<String>, crypto: &mut Vec<String>| {
                 let target = if category_of(code) { crypto } else { fiat };
                 target.retain(|c| c != code);
                 target.insert(0, code.to_string());
@@ -817,6 +838,228 @@ impl ForexWidget {
         }
     }
 
+    /// Classify a currency code as crypto vs fiat. Uses the curated
+    /// `provider::is_crypto` table (BTC, ETH, SOL, XRP, …); everything
+    /// else lands in `watchlist`. We *also* honor the user's existing
+    /// `crypto_watchlist` membership so a code they've already
+    /// classified manually stays in its current category on re-add.
+    fn classify_code(&self, code: &str) -> ForexListKind {
+        let upper = code.to_ascii_uppercase();
+        if self
+            .config
+            .crypto_watchlist
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&upper))
+        {
+            return ForexListKind::CryptoWatchlist;
+        }
+        if provider::is_crypto(&upper) {
+            ForexListKind::CryptoWatchlist
+        } else {
+            ForexListKind::Watchlist
+        }
+    }
+
+    fn set_status(&self, msg: impl Into<String>) {
+        let mut st = self.state.lock().expect("forex state poisoned");
+        st.status = Some(TimedFeedback::new(msg.into(), STATUS_TTL));
+    }
+
+    fn live_status(&self) -> Option<String> {
+        let mut st = self.state.lock().expect("forex state poisoned");
+        live_value(&mut st.status).cloned()
+    }
+
+    /// Persist the current `watchlist` + `crypto_watchlist` arrays
+    /// back to `~/.config/glint/<forex|forex@instance>.toml`. Logs
+    /// + surfaces status on failure.
+    fn persist_lists(&self) -> bool {
+        let fiat = self.config.watchlist.clone();
+        let crypto = self.config.crypto_watchlist.clone();
+        let mut ok = true;
+        if let Err(err) = crate::config::rewrite_widget_top_level_string_array(
+            "forex",
+            &self.instance,
+            "watchlist",
+            &fiat,
+        ) {
+            tracing::warn!(error = %err, "forex: failed to persist watchlist");
+            self.set_status(format!("Save failed: {err}"));
+            ok = false;
+        }
+        if let Err(err) = crate::config::rewrite_widget_top_level_string_array(
+            "forex",
+            &self.instance,
+            "crypto_watchlist",
+            &crypto,
+        ) {
+            tracing::warn!(error = %err, "forex: failed to persist crypto_watchlist");
+            self.set_status(format!("Save failed: {err}"));
+            ok = false;
+        }
+        ok
+    }
+
+    /// Recompute `alternates` + `crypto_start` from the *current*
+    /// config (watchlist + crypto_watchlist) and the active primary.
+    /// Called after add / remove to keep the rendered list in sync
+    /// with the on-disk lists without touching `self.primary`.
+    fn refresh_alternates(&mut self) {
+        let (alts, cs) = build_alternates(
+            &self.config.watchlist,
+            &self.config.crypto_watchlist,
+            &self.primary,
+        );
+        self.alternates = alts;
+        self.crypto_start = cs;
+    }
+
+    /// `-` on a selected row: prompt for confirmation. Disallowed on
+    /// the primary row (the widget is meaningless without one) and on
+    /// the transient lookup (use `x` to clear). Otherwise sets
+    /// `confirm_remove` so the modal opens on next render.
+    fn request_remove_selected(&self) {
+        let rows = self.all_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let (idx, has_transient) = {
+            let st = self.state.lock().expect("forex state poisoned");
+            (st.selected, st.transient_code.is_some())
+        };
+        if idx == 0 {
+            self.set_status("Can't remove primary; use ↔ / s to swap first");
+            return;
+        }
+        let is_transient_row = has_transient && idx == rows.len() - 1;
+        if is_transient_row {
+            self.set_status("Press `x` to clear the lookup row");
+            return;
+        }
+        let Some(code) = rows.get(idx).cloned() else {
+            return;
+        };
+        self.state
+            .lock()
+            .expect("forex state poisoned")
+            .confirm_remove = Some(code);
+    }
+
+    fn confirm_remove(&mut self) {
+        let code = match self
+            .state
+            .lock()
+            .expect("forex state poisoned")
+            .confirm_remove
+            .clone()
+        {
+            Some(c) => c,
+            None => return,
+        };
+        let target = self.classify_code(&code);
+        let list = match target {
+            ForexListKind::Watchlist => &mut self.config.watchlist,
+            ForexListKind::CryptoWatchlist => &mut self.config.crypto_watchlist,
+        };
+        let before = list.len();
+        list.retain(|c| !c.eq_ignore_ascii_case(&code));
+        let removed = list.len() < before;
+        if !removed {
+            self.state
+                .lock()
+                .expect("forex state poisoned")
+                .confirm_remove = None;
+            return;
+        }
+        // Rebuild alternates so the rendered list reflects the change.
+        self.refresh_alternates();
+        // Drop the stale rate so the row doesn't flash if re-added.
+        {
+            let mut st = self.state.lock().expect("forex state poisoned");
+            let primary = self.primary.clone();
+            let upper = code.to_ascii_uppercase();
+            let stale_symbol = format!("{primary}{upper}=X");
+            st.quotes.remove(&stale_symbol);
+            st.confirm_remove = None;
+            let total = 1 + self.alternates.len() + if st.transient_code.is_some() { 1 } else { 0 };
+            st.selected = st.selected.min(total.saturating_sub(1));
+        }
+        let label = match target {
+            ForexListKind::Watchlist => "watchlist",
+            ForexListKind::CryptoWatchlist => "crypto_watchlist",
+        };
+        if self.persist_lists() {
+            self.set_status(format!("Removed {code} from {label}"));
+        }
+    }
+
+    fn cancel_remove(&self) {
+        self.state
+            .lock()
+            .expect("forex state poisoned")
+            .confirm_remove = None;
+    }
+
+    /// `+` on the transient lookup row: route into watchlist or
+    /// crypto_watchlist per [`Self::classify_code`], persist, clear
+    /// the transient, and re-select the freshly-added row.
+    fn add_transient_to_list(&mut self) {
+        let code = {
+            let st = self.state.lock().expect("forex state poisoned");
+            st.transient_code.clone()
+        };
+        let Some(code) = code else {
+            self.set_status("No lookup row to add — run `:fx <code>` first");
+            return;
+        };
+        let upper = code.to_ascii_uppercase();
+        if upper == self.primary {
+            self.set_status(format!("{upper} is already the primary"));
+            return;
+        }
+        let in_fiat = self
+            .config
+            .watchlist
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&upper));
+        let in_crypto = self
+            .config
+            .crypto_watchlist
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&upper));
+        if in_fiat || in_crypto {
+            self.set_status(format!("{upper} is already in the list"));
+            return;
+        }
+        let target = self.classify_code(&upper);
+        match target {
+            ForexListKind::Watchlist => self.config.watchlist.push(upper.clone()),
+            ForexListKind::CryptoWatchlist => self.config.crypto_watchlist.push(upper.clone()),
+        }
+        self.refresh_alternates();
+        // Clear the transient marker; selection lands on the
+        // just-added row in its new permanent home.
+        let new_idx = self
+            .alternates
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(&upper))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        {
+            let mut st = self.state.lock().expect("forex state poisoned");
+            st.transient_code = None;
+            st.selected = new_idx;
+        }
+        let label = match target {
+            ForexListKind::Watchlist => "watchlist",
+            ForexListKind::CryptoWatchlist => "crypto_watchlist",
+        };
+        if self.persist_lists() {
+            self.set_status(format!("Added {upper} to {label}"));
+        }
+        self.mark_dirty();
+    }
+
     /// Swap the currently-selected row into the primary slot. Silent
     /// no-op when selection sits on the primary itself (which the
     /// selection-traversal rules prevent in practice, but we belt-and-
@@ -833,9 +1076,11 @@ impl ForexWidget {
         let Some(code) = self.selected_code() else {
             return;
         };
-        let template = self.config.jump_url_template.clone().unwrap_or_else(|| {
-            "https://finance.yahoo.com/quote/{base}{quote}=X".to_string()
-        });
+        let template = self
+            .config
+            .jump_url_template
+            .clone()
+            .unwrap_or_else(|| "https://finance.yahoo.com/quote/{base}{quote}=X".to_string());
         let url = template
             .replace("{base}", &urlencoding::encode(&self.primary))
             .replace("{quote}", &urlencoding::encode(&code));
@@ -880,7 +1125,7 @@ impl ForexWidget {
                 // both the `y` keystroke and the 📋 click paths land
                 // the pulse on the right row.
                 let mut st = self.state.lock().expect("forex state poisoned");
-                st.copy_feedback = Some((st.selected, Instant::now()));
+                st.copy_feedback = Some(TimedFeedback::new(st.selected, COPY_FEEDBACK_TTL));
             }
             Err(err) => {
                 tracing::warn!(error = %err, "OSC 52 clipboard write failed");
@@ -947,7 +1192,23 @@ impl Widget for ForexWidget {
         if self.is_due() {
             self.spawn_refresh();
         }
+        // Tick-time housekeeping for short-lived UI chrome: drop the
+        // status line and the 📋→✅ copy pulse when their TTLs elapse,
+        // and surface the change via the dirty bit so the gated draw
+        // path actually repaints.
+        let mut st = self.state.lock().expect("forex state poisoned");
+        if crate::ui::status::drain_if_expired(&mut st.status) {
+            st.dirty = true;
+        }
+        if crate::ui::status::drain_if_expired(&mut st.copy_feedback) {
+            st.dirty = true;
+        }
         Ok(())
+    }
+
+    fn take_dirty(&mut self) -> bool {
+        let mut st = self.state.lock().expect("forex state poisoned");
+        std::mem::replace(&mut st.dirty, false)
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
@@ -1040,8 +1301,9 @@ impl Widget for ForexWidget {
                 let st = self.state.lock().unwrap();
                 let pulse = st
                     .copy_feedback
-                    .filter(|(_, t)| t.elapsed() < COPY_FEEDBACK_TTL)
-                    .map(|(idx, _)| idx);
+                    .as_ref()
+                    .filter(|f| !f.is_expired())
+                    .map(|f| *f.value());
                 (st.selected, st.list_scroll, pulse)
             };
             let (new_scroll, hits) = render_list_panel(
@@ -1105,8 +1367,9 @@ impl Widget for ForexWidget {
                 let st = self.state.lock().unwrap();
                 let pulse = st
                     .copy_feedback
-                    .filter(|(_, t)| t.elapsed() < COPY_FEEDBACK_TTL)
-                    .map(|(idx, _)| idx);
+                    .as_ref()
+                    .filter(|f| !f.is_expired())
+                    .map(|f| *f.value());
                 (st.selected, st.list_scroll, pulse)
             };
             let (new_scroll, hits) = render_list_panel(
@@ -1152,12 +1415,31 @@ impl Widget for ForexWidget {
                 width: inner.width,
                 height: 1,
             };
-            let hint = "e edit · ⏎/s swap · d details · c canonical · y copy · r refresh";
+            // Status takes precedence over the hint so add/remove
+            // feedback grabs the user's eye.
+            let (text, style) = match self.live_status() {
+                Some(msg) => (msg, self.theme.text_selected),
+                None => (
+                    "e edit · ⏎/s swap · - remove · + add lookup · o open · y copy · r refresh"
+                        .to_string(),
+                    self.theme.text_dim,
+                ),
+            };
             frame.render_widget(
-                Paragraph::new(Span::styled(hint, self.theme.text_dim))
-                    .alignment(Alignment::Right),
+                Paragraph::new(Span::styled(text, style)).alignment(Alignment::Right),
                 footer,
             );
+        }
+
+        // Confirm-remove modal: paints last so it overlays everything.
+        let pending = self
+            .state
+            .lock()
+            .expect("forex state poisoned")
+            .confirm_remove
+            .clone();
+        if let Some(code) = pending {
+            self.render_confirm_modal(frame, inner, &code);
         }
     }
 
@@ -1185,6 +1467,23 @@ impl Widget for ForexWidget {
             return self.handle_key_in_edit_mode(key);
         }
 
+        // Confirm-remove modal takes priority over the normal
+        // dispatch so the user can't accidentally swap or cycle while
+        // the prompt is up.
+        if self
+            .state
+            .lock()
+            .expect("forex state poisoned")
+            .confirm_remove
+            .is_some()
+        {
+            match crate::ui::modal::dispatch_key(key) {
+                crate::ui::modal::ConfirmChoice::Confirm => self.confirm_remove(),
+                crate::ui::modal::ConfirmChoice::Cancel => self.cancel_remove(),
+            }
+            return EventResult::Handled;
+        }
+
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_selection(-1);
@@ -1201,10 +1500,12 @@ impl Widget for ForexWidget {
                 self.swap_selected_to_primary();
                 EventResult::Handled
             }
-            // `d` — "details" — opens the selected pair on Yahoo
-            // Finance in the system browser. Moved off Enter so the
-            // more common swap action gets the bigger key.
-            KeyCode::Char('d') => {
+            // `o` opens the selected pair's Yahoo Finance page in the
+            // browser. Per the platform convention `Enter` belongs
+            // to the in-place primary action (swap, above); the
+            // external-jump gesture lives on `o` here just like in
+            // stocks / news / wsj.
+            KeyCode::Char('o') => {
                 self.jump_to_external();
                 EventResult::Handled
             }
@@ -1226,6 +1527,19 @@ impl Widget for ForexWidget {
             }
             KeyCode::Char('x') => {
                 self.clear_transient();
+                EventResult::Handled
+            }
+            // `-` prompts to remove the selected currency / crypto.
+            // Refused on the primary row (status feedback only).
+            KeyCode::Char('-') => {
+                self.request_remove_selected();
+                EventResult::Handled
+            }
+            // `+` promotes the transient `:fx` lookup into the right
+            // list (crypto_watchlist for BTC/ETH/…, watchlist for the
+            // rest).
+            KeyCode::Char('+') => {
+                self.add_transient_to_list();
                 EventResult::Handled
             }
             KeyCode::Char(d @ '1'..='9') => {
@@ -1360,9 +1674,11 @@ impl Widget for ForexWidget {
             ("c", "reset amount to canonical unit"),
             ("Enter / s", "swap selected currency into primary slot"),
             ("y", "yank selected value to clipboard (OSC 52)"),
-            ("d", "open pair details on Yahoo Finance"),
+            ("o", "open pair details on Yahoo Finance"),
             ("r", "force refresh"),
             ("x", "clear :fx <code> lookup"),
+            ("-", "remove the selected currency (with confirmation)"),
+            ("+", "add the :fx lookup currency to the right list"),
             ("click ↔", "swap that currency to primary"),
             ("click 📋", "yank that row's value"),
             ("click code", "select that row"),
@@ -1375,7 +1691,7 @@ impl Widget for ForexWidget {
         serde_json::json!({
             "primary": self.primary,
             "watchlist": self.config.watchlist,
-            "poll_interval_secs": self.poll_interval.as_secs(),
+            "poll_interval_secs": self.config.poll_interval_secs,
             "period": self.period.label(),
             "amount": self.amount,
         })
@@ -1396,6 +1712,16 @@ impl Widget for ForexWidget {
         self.app_theme = theme;
     }
 
+    fn poll_snapshot(&self) -> Option<crate::polling::PollSnapshot> {
+        Some(
+            self.state
+                .lock()
+                .expect("forex state poisoned")
+                .poll
+                .snapshot(),
+        )
+    }
+
     fn shortcut_preferences(&self) -> &[char] {
         &self.shortcut_prefs
     }
@@ -1414,6 +1740,23 @@ impl Widget for ForexWidget {
 }
 
 impl ForexWidget {
+    /// "Remove <code>?" overlay modal. Mirrors the stocks widget's
+    /// equivalent so the gesture is consistent across both list
+    /// widgets.
+    fn render_confirm_modal(&self, frame: &mut Frame, parent: Rect, code: &str) {
+        crate::ui::modal::render(
+            frame,
+            parent,
+            &self.theme,
+            crate::ui::modal::ConfirmModal {
+                title: " Remove currency? ",
+                target: code,
+                hint: None,
+                max_width: 48,
+            },
+        );
+    }
+
     fn title_metadata_string(&self) -> Option<String> {
         let n = self.config.watchlist.len();
         Some(format!("{} · {n} pairs", self.primary))
@@ -1444,9 +1787,7 @@ impl ForexWidget {
                 }
                 EventResult::Handled
             }
-            KeyCode::Char(c)
-                if c.is_ascii_digit() || c == '.' || c == ',' =>
-            {
+            KeyCode::Char(c) if c.is_ascii_digit() || c == '.' || c == ',' => {
                 let mut st = self.state.lock().expect("forex state poisoned");
                 if let Some(buf) = st.editing_amount.as_mut() {
                     // Treat `,` as `.` (locale grace) and reject a
@@ -1528,17 +1869,11 @@ where
             let is_crypto_row = i >= crypto_row_start && !(has_transient && i == rows.len() - 1);
             if is_crypto_row && !crypto_header_emitted {
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "── Crypto ──",
-                    theme.text_dim,
-                )));
+                lines.push(Line::from(Span::styled("── Crypto ──", theme.text_dim)));
                 crypto_header_emitted = true;
             } else if !is_crypto_row && !currencies_header_emitted {
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "── Currencies ──",
-                    theme.text_dim,
-                )));
+                lines.push(Line::from(Span::styled("── Currencies ──", theme.text_dim)));
                 currencies_header_emitted = true;
             }
         }
@@ -1629,8 +1964,7 @@ where
         height: pinned_h as u16,
     };
     if pinned_h > 0 {
-        let pinned_visible: Vec<Line<'static>> =
-            lines.iter().take(pinned_h).cloned().collect();
+        let pinned_visible: Vec<Line<'static>> = lines.iter().take(pinned_h).cloned().collect();
         frame.render_widget(Paragraph::new(pinned_visible), pinned_rect);
     }
 
@@ -1644,8 +1978,12 @@ where
         let start = PINNED_LINES + scroll;
         let end = (start + scrollable_h).min(lines.len());
         if end > start {
-            let scrollable_visible: Vec<Line<'static>> =
-                lines.iter().skip(start).take(end - start).cloned().collect();
+            let scrollable_visible: Vec<Line<'static>> = lines
+                .iter()
+                .skip(start)
+                .take(end - start)
+                .cloned()
+                .collect();
             frame.render_widget(Paragraph::new(scrollable_visible), scrollable_rect);
         }
     }
@@ -1670,8 +2008,7 @@ where
                 frame.render_widget(Paragraph::new(line.clone()), cushion_rect);
             }
         } else if hidden_below >= 2 {
-            let arrow = Line::from(Span::styled("↓", theme.text_dim))
-                .alignment(Alignment::Center);
+            let arrow = Line::from(Span::styled("↓", theme.text_dim)).alignment(Alignment::Center);
             frame.render_widget(Paragraph::new(arrow), cushion_rect);
         }
     }
@@ -1946,9 +2283,7 @@ fn render_graph_panel(
         let msg = if target.is_empty() {
             "Select a currency".to_string()
         } else {
-            format!(
-                "{primary} is the primary — pick another row to chart its rate"
-            )
+            format!("{primary} is the primary — pick another row to chart its rate")
         };
         let para = Paragraph::new(Line::from(Span::styled(msg, theme.text_dim)))
             .alignment(Alignment::Center);
@@ -2005,7 +2340,12 @@ fn render_graph_panel(
         ),
         Span::raw("  "),
         Span::styled(
-            format!("{glyph} {:+.4} ({:+.2}%) {}", scaled_chg, pct, period.label()),
+            format!(
+                "{glyph} {:+.4} ({:+.2}%) {}",
+                scaled_chg,
+                pct,
+                period.label()
+            ),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
     ]);
@@ -2058,19 +2398,13 @@ fn render_graph_panel(
             height: 1,
         };
         let label = format!("{:>7.4} ", v);
-        frame.render_widget(
-            Paragraph::new(Span::styled(label, theme.text_dim)),
-            rect,
-        );
+        frame.render_widget(Paragraph::new(Span::styled(label, theme.text_dim)), rect);
     }
 
     let trace_w = if pad_intraday_to_full_day && matches!(period, Period::Day) {
         // FX is ~24/5 — proxy "fraction of day elapsed" via UTC hour.
-        let frac = (chrono::Utc::now()
-            .timestamp()
-            .rem_euclid(86_400) as f64
-            / 86_400.0)
-            .clamp(0.0, 1.0);
+        let frac =
+            (chrono::Utc::now().timestamp().rem_euclid(86_400) as f64 / 86_400.0).clamp(0.0, 1.0);
         let w = (plot_w as f64 * frac).round() as u16;
         w.clamp(2, plot_w)
     } else if matches!(period, Period::YearToDate) {
@@ -2081,7 +2415,11 @@ fn render_graph_panel(
         use chrono::Datelike;
         let now = chrono::Local::now();
         let day_of_year = now.ordinal() as f64; // 1..=366
-        let days_in_year = if is_leap_year(now.year()) { 366.0 } else { 365.0 };
+        let days_in_year = if is_leap_year(now.year()) {
+            366.0
+        } else {
+            365.0
+        };
         let frac = (day_of_year / days_in_year).clamp(0.0, 1.0);
         let w = (plot_w as f64 * frac).round() as u16;
         w.clamp(2, plot_w)
@@ -2116,7 +2454,11 @@ fn render_graph_panel(
     let anchor_value = if matches!(period, Period::Day) {
         quote.previous_close
     } else {
-        quote.series.first().copied().unwrap_or(quote.previous_close)
+        quote
+            .series
+            .first()
+            .copied()
+            .unwrap_or(quote.previous_close)
     };
     draw_reference_line(
         frame,
@@ -2165,9 +2507,7 @@ fn render_graph_panel(
         Period::Week => str_labels(&["Mon", "Tue", "Wed", "Thu", "Fri"]),
         Period::Month => str_labels(&["wk1", "wk2", "wk3", "wk4"]),
         Period::SixMonth => str_labels(&["1mo", "2mo", "3mo", "4mo", "5mo", "6mo"]),
-        Period::YearToDate => {
-            str_labels(&["Jan", "Mar", "May", "Jul", "Sep", "Nov", "Dec"])
-        }
+        Period::YearToDate => str_labels(&["Jan", "Mar", "May", "Jul", "Sep", "Nov", "Dec"]),
         Period::Year => rolling_year_month_labels(chrono::Local::now().date_naive()),
         Period::ThreeYear => str_labels(&["-3y", "-2y", "-1y", "now"]),
         Period::FiveYear => str_labels(&["-5y", "-4y", "-3y", "-2y", "-1y", "now"]),
@@ -2322,7 +2662,10 @@ fn render_period_toggle_bar(
     theme: &Theme,
 ) -> ToggleHits {
     if area.width == 0 {
-        return ToggleHits { row: area.y, ranges: Vec::new() };
+        return ToggleHits {
+            row: area.y,
+            ranges: Vec::new(),
+        };
     }
     let active_idx = Period::ALL.iter().position(|p| *p == active).unwrap_or(0);
     let widths: Vec<u16> = Period::ALL
@@ -2397,7 +2740,10 @@ fn render_period_toggle_bar(
         }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    ToggleHits { row: area.y, ranges }
+    ToggleHits {
+        row: area.y,
+        ranges,
+    }
 }
 
 fn label_rows(plot_h: u16) -> Vec<u16> {
@@ -2437,17 +2783,14 @@ fn render_stats_panel(
     theme: &Theme,
 ) {
     let Some(target) = selected else {
-        let para = Paragraph::new(Span::styled("(no stats)", theme.text_dim))
-            .alignment(Alignment::Center);
+        let para =
+            Paragraph::new(Span::styled("(no stats)", theme.text_dim)).alignment(Alignment::Center);
         frame.render_widget(para, area);
         return;
     };
     if target == primary {
-        let para = Paragraph::new(Span::styled(
-            "(primary — pick another row)",
-            theme.text_dim,
-        ))
-        .alignment(Alignment::Center);
+        let para = Paragraph::new(Span::styled("(primary — pick another row)", theme.text_dim))
+            .alignment(Alignment::Center);
         frame.render_widget(para, area);
         return;
     }
@@ -2473,21 +2816,26 @@ fn render_stats_panel(
     let title = if (primary_unit - 1.0).abs() < 1e-9 {
         format!("{}/{}", primary, target)
     } else {
-        format!("{}/{} (per {})", primary, target, format_unit_count(primary_unit))
+        format!(
+            "{}/{} (per {})",
+            primary,
+            target,
+            format_unit_count(primary_unit)
+        )
     };
     lines.push(Line::from(Span::styled(title, theme.text_focused)));
     lines.push(Line::from(""));
-    lines.push(stat_line("Rate", &format!("{:.6}", q.price * primary_unit), theme));
+    lines.push(stat_line(
+        "Rate",
+        &format!("{:.6}", q.price * primary_unit),
+        theme,
+    ));
     lines.push(stat_line(
         "Prev Close",
         &format!("{:.6}", q.previous_close * primary_unit),
         theme,
     ));
-    if let (Some(o), Some(h), Some(l)) = (
-        q.series.first().copied(),
-        q.day_high,
-        q.day_low,
-    ) {
+    if let (Some(o), Some(h), Some(l)) = (q.series.first().copied(), q.day_high, q.day_low) {
         lines.push(stat_line(
             "Day Open",
             &format!("{:.4}", o * primary_unit),
@@ -2534,11 +2882,7 @@ fn render_stats_panel(
         let baseline = q.series.first().copied().unwrap_or(q.price);
         if baseline > 0.0 {
             let pct = (q.price - baseline) / baseline * 100.0;
-            lines.push(stat_line(
-                "Period Δ",
-                &format!("{pct:+.2}%"),
-                theme,
-            ));
+            lines.push(stat_line("Period Δ", &format!("{pct:+.2}%"), theme));
         }
     }
     if let Some(vol) = rolling_volatility_30d(&q.series) {
@@ -2566,11 +2910,7 @@ fn period_change(q: &ForexQuote, period: Period) -> (f64, f64) {
     match period {
         Period::Day => (q.change(), q.change_pct()),
         _ => {
-            let baseline = q
-                .series
-                .iter()
-                .copied()
-                .find(|v| v.is_finite() && *v > 0.0);
+            let baseline = q.series.iter().copied().find(|v| v.is_finite() && *v > 0.0);
             match baseline {
                 Some(b) if b > 0.0 => {
                     let abs = q.price - b;
@@ -2718,7 +3058,9 @@ pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
 }
 
 pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
-    use crate::wizard::descriptor::{ChoiceOption, Separator, WizardDescriptor, WizardField, WizardFieldKind};
+    use crate::wizard::descriptor::{
+        ChoiceOption, Separator, WizardDescriptor, WizardField, WizardFieldKind,
+    };
     let primary_options: Vec<ChoiceOption> = COMMON_CURRENCIES
         .iter()
         .map(|c| ChoiceOption {
@@ -2790,15 +3132,51 @@ pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
                 required: true,
                 kind: WizardFieldKind::Choice {
                     options: vec![
-                        ChoiceOption { value: "1d", label: "1 day", help: None },
-                        ChoiceOption { value: "1w", label: "1 week", help: None },
-                        ChoiceOption { value: "1m", label: "1 month", help: None },
-                        ChoiceOption { value: "6m", label: "6 months", help: None },
-                        ChoiceOption { value: "ytd", label: "Year to date", help: None },
-                        ChoiceOption { value: "1y", label: "1 year", help: None },
-                        ChoiceOption { value: "3y", label: "3 years", help: None },
-                        ChoiceOption { value: "5y", label: "5 years", help: None },
-                        ChoiceOption { value: "10y", label: "10 years", help: None },
+                        ChoiceOption {
+                            value: "1d",
+                            label: "1 day",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "1w",
+                            label: "1 week",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "1m",
+                            label: "1 month",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "6m",
+                            label: "6 months",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "ytd",
+                            label: "Year to date",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "1y",
+                            label: "1 year",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "3y",
+                            label: "3 years",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "5y",
+                            label: "5 years",
+                            help: None,
+                        },
+                        ChoiceOption {
+                            value: "10y",
+                            label: "10 years",
+                            help: None,
+                        },
                     ],
                     default: Some("1y"),
                 },
@@ -2811,10 +3189,9 @@ pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
 /// ~30 most-traded ISO-4217 currencies — wizard `Choice` options. Keeps
 /// the dropdown navigable without forcing free-text input.
 const COMMON_CURRENCIES: &[&str] = &[
-    "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "CNY", "HKD",
-    "SGD", "KRW", "TWD", "INR", "MXN", "BRL", "ZAR", "TRY", "RUB", "PLN",
-    "SEK", "NOK", "DKK", "CZK", "HUF", "ILS", "THB", "IDR", "MYR", "PHP",
-    "VND", "AED", "SAR",
+    "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "CNY", "HKD", "SGD", "KRW", "TWD",
+    "INR", "MXN", "BRL", "ZAR", "TRY", "RUB", "PLN", "SEK", "NOK", "DKK", "CZK", "HUF", "ILS",
+    "THB", "IDR", "MYR", "PHP", "VND", "AED", "SAR",
 ];
 
 #[cfg(test)]
@@ -2828,15 +3205,13 @@ mod tests {
     #[test]
     fn build_list_row_swaps_clipboard_for_check_when_pulsing() {
         let theme = Theme::builtin_defaults();
-        let (line, hit) =
-            build_list_row("EUR", false, true, Some(1.0823), None, true, &theme);
-        let text: String = line
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
+        let (line, hit) = build_list_row("EUR", false, true, Some(1.0823), None, true, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains('✅'), "pulse should render ✅: {text:?}");
-        assert!(!text.contains('📋'), "📋 should be absent during pulse: {text:?}");
+        assert!(
+            !text.contains('📋'),
+            "📋 should be absent during pulse: {text:?}"
+        );
         assert!(
             hit.copy_present,
             "✅ cell must remain clickable so mid-pulse re-copy works"
@@ -2847,13 +3222,8 @@ mod tests {
     #[test]
     fn build_list_row_renders_clipboard_glyph_when_not_pulsing() {
         let theme = Theme::builtin_defaults();
-        let (line, _hit) =
-            build_list_row("EUR", false, true, Some(1.0823), None, false, &theme);
-        let text: String = line
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
+        let (line, _hit) = build_list_row("EUR", false, true, Some(1.0823), None, false, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains('📋'), "default should render 📋: {text:?}");
         assert!(!text.contains('✅'), "no pulse → no ✅: {text:?}");
     }
@@ -2861,9 +3231,13 @@ mod tests {
     #[test]
     fn build_alternates_concats_lists_dedupes_filters_primary() {
         let fiat: Vec<String> = ["EUR", "JPY", "USD", "eur"]
-            .iter().map(|s| s.to_string()).collect();
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let crypto: Vec<String> = ["BTC", "ETH", "btc"]
-            .iter().map(|s| s.to_string()).collect();
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let (out, cs) = build_alternates(&fiat, &crypto, "USD");
         assert_eq!(out, vec!["EUR", "JPY", "BTC", "ETH"]);
         assert_eq!(cs, 2, "crypto section starts after the two fiat entries");
@@ -3096,7 +3470,11 @@ mod tests {
         });
         assert_eq!(w.state.lock().unwrap().selected, 1);
         w.move_selection(-1);
-        assert_eq!(w.state.lock().unwrap().selected, 1, "↑ at top should not drop to primary");
+        assert_eq!(
+            w.state.lock().unwrap().selected,
+            1,
+            "↑ at top should not drop to primary"
+        );
         w.move_selection(1);
         assert_eq!(w.state.lock().unwrap().selected, 2);
         // Two moves down past the last alternate clamps at last row.
@@ -3443,7 +3821,10 @@ mod tests {
         // shift them. format_amount(15.0) → "          15" should
         // match the edit-mode render for buf="15".
         assert_eq!(fit_edit_buffer_right("15", 12), format_amount(15.0));
-        assert_eq!(fit_edit_buffer_right("1523.8000", 12), format_amount(1523.80));
+        assert_eq!(
+            fit_edit_buffer_right("1523.8000", 12),
+            format_amount(1523.80)
+        );
     }
 
     #[test]

@@ -79,7 +79,8 @@ pub fn on_enter(app: &mut WizardApp, provider: &str) {
             if s.is_empty() || s.starts_with("REPLACE_WITH_") {
                 continue;
             }
-            app.oauth_capture.insert(field.key.to_string(), s.to_string());
+            app.oauth_capture
+                .insert(field.key.to_string(), s.to_string());
         }
     }
 }
@@ -112,9 +113,7 @@ pub fn handle_key(key: KeyEvent, app: &mut WizardApp, provider: &str) -> PageAct
                 match save_and_authorize(app, spec, setup, provider) {
                     Ok(()) => PageAction::RunAuth(provider.to_string()),
                     Err(err) => {
-                        app.feedback = Some(format!(
-                            "Could not save credentials: {err}"
-                        ));
+                        app.feedback = Some(format!("Could not save credentials: {err}"));
                         PageAction::Stay
                     }
                 }
@@ -187,10 +186,7 @@ fn save_and_authorize(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            &path,
-            std::fs::Permissions::from_mode(0o600),
-        );
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
     tracing::info!(
         provider = %provider,
@@ -207,9 +203,7 @@ fn toml_quote(s: &str) -> String {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32))
-            }
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
     }
@@ -221,7 +215,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp, provider: &str) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" Authorize {provider} "));
-    let inner = block.inner(area);
+    let inner = style::pad_inner(block.inner(area));
     frame.render_widget(block, area);
 
     let Some((_, setup)) = schema_for(provider) else {
@@ -315,10 +309,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp, provider: &str) {
 
     if let Some(msg) = &app.feedback {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!("  {msg}"),
-            style::error(),
-        )));
+        lines.push(Line::from(Span::styled(format!("  {msg}"), style::error())));
     }
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);

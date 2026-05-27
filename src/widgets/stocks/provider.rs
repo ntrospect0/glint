@@ -174,11 +174,7 @@ impl YahooFinanceProvider {
         }
         // Seed the B / A1 cookies. Errors here are not fatal — getcrumb may
         // succeed anyway if cookies are already in the jar.
-        let _ = self
-            .client
-            .get("https://fc.yahoo.com/")
-            .send()
-            .await;
+        let _ = self.client.get("https://fc.yahoo.com/").send().await;
         let crumb = self
             .client
             .get(format!("{}/v1/test/getcrumb", self.summary_base_url))
@@ -334,9 +330,10 @@ impl YahooFinanceProvider {
             .await
             .with_context(|| format!("failed to deserialize search for {query:?}"))?;
         // Prefer equities; fall back to whatever's first.
-        let equity = resp.quotes.iter().find(|q| {
-            q.quote_type.as_deref() == Some("EQUITY") && q.symbol.is_some()
-        });
+        let equity = resp
+            .quotes
+            .iter()
+            .find(|q| q.quote_type.as_deref() == Some("EQUITY") && q.symbol.is_some());
         let pick = equity.or_else(|| resp.quotes.iter().find(|q| q.symbol.is_some()));
         let symbol = pick
             .and_then(|q| q.symbol.clone())
@@ -396,9 +393,7 @@ impl YahooFinanceProvider {
             dividend_yield: detail
                 .and_then(|d| d.dividend_yield.as_ref())
                 .and_then(|v| v.raw),
-            beta: stats
-                .and_then(|s| s.beta.as_ref())
-                .and_then(|v| v.raw),
+            beta: stats.and_then(|s| s.beta.as_ref()).and_then(|v| v.raw),
         })
     }
 }
@@ -469,7 +464,9 @@ struct RawF64 {
 
 impl RawF64 {
     fn raw_u64(&self) -> Option<u64> {
-        self.raw.filter(|v| v.is_finite() && *v >= 0.0).map(|v| v as u64)
+        self.raw
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(|v| v as u64)
     }
 }
 

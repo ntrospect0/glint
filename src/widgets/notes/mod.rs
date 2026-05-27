@@ -42,7 +42,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
     Frame,
 };
 use serde::Deserialize;
@@ -225,6 +225,12 @@ struct NotesState {
     /// Per-note undo / redo stacks. Keyed by note id so switching
     /// notes preserves each note's history.
     history: HashMap<String, NoteHistory>,
+    /// Display-state dirty bit drained by `take_dirty`. Notes is
+    /// almost entirely user-driven so most mutations don't need to
+    /// flip this — non-tick events always redraw. It only matters
+    /// for tick-time housekeeping: clearing the status line when
+    /// `STATUS_TTL` elapses.
+    dirty: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +273,7 @@ impl Default for NotesState {
             confirm_delete: None,
             status: None,
             history: HashMap::new(),
+            dirty: true,
         }
     }
 }
@@ -278,7 +285,9 @@ impl NotesState {
     /// pre-edit state. No-op when there's no active note.
     fn push_undo_snapshot(&mut self) {
         let Some(active) = self.active else { return };
-        let Some(note) = self.notes.get(active) else { return };
+        let Some(note) = self.notes.get(active) else {
+            return;
+        };
         let entry = HistoryEntry {
             body: note.body.clone(),
             cursor_row: self.cursor_row,
@@ -308,6 +317,14 @@ pub struct NotesWidget {
     /// every render.
     last_content_rect: Arc<Mutex<Rect>>,
     last_list_rect: Arc<Mutex<Rect>>,
+    /// Per-rendered-entry hit rectangle as `(real_entry_index,
+    /// top_y_absolute, row_count)`. Populated by `render_list` because
+    /// entries are variable-height (1-3 rows depending on how the
+    /// title wraps), so a click handler that just divides by a fixed
+    /// row-per-entry constant lands on the wrong note. Cleared at the
+    /// top of every render so stale entries don't leak across layout
+    /// changes.
+    last_list_entry_rows: Arc<Mutex<Vec<(usize, u16, u16)>>>,
     /// Highest valid `content_scroll` for the current note + pane width,
     /// updated by `render_content` after it knows the wrapped row count.
     /// The key handler reads this when bumping j/k so we never scroll
@@ -327,11 +344,7 @@ pub struct NotesWidget {
 }
 
 impl NotesWidget {
-    pub fn with_config(
-        instance: String,
-        config: NotesConfig,
-        app_theme: Arc<Theme>,
-    ) -> Self {
+    pub fn with_config(instance: String, config: NotesConfig, app_theme: Arc<Theme>) -> Self {
         let id = if instance == "main" {
             "notes".to_string()
         } else {
@@ -365,6 +378,7 @@ impl NotesWidget {
             shortcut_prefs,
             last_content_rect: Arc::new(Mutex::new(Rect::default())),
             last_list_rect: Arc::new(Mutex::new(Rect::default())),
+            last_list_entry_rows: Arc::new(Mutex::new(Vec::new())),
             last_max_content_scroll: Arc::new(Mutex::new(0)),
             last_max_list_scroll: Arc::new(Mutex::new(0)),
             last_outer_area: Arc::new(Mutex::new(Rect::default())),
@@ -397,7 +411,9 @@ impl NotesWidget {
     fn delete_active(&self) {
         let mut st = self.state.lock().expect("notes state poisoned");
         let Some(active) = st.active else { return };
-        let Some(note) = st.notes.get(active) else { return };
+        let Some(note) = st.notes.get(active) else {
+            return;
+        };
         let id = note.id.clone();
         if let Err(err) = store::delete(&self.instance, &id) {
             tracing::warn!(error = %err, "notes: delete failed");
@@ -424,7 +440,9 @@ impl NotesWidget {
     fn save_active(&self) {
         let mut st = self.state.lock().expect("notes state poisoned");
         let Some(active) = st.active else { return };
-        let Some(note) = st.notes.get_mut(active) else { return };
+        let Some(note) = st.notes.get_mut(active) else {
+            return;
+        };
         if let Err(err) = store::save(&self.instance, note) {
             tracing::warn!(error = %err, "notes: save failed");
             st.set_status(format!("Save failed: {err}"));
@@ -439,7 +457,9 @@ impl NotesWidget {
     fn yank_active(&self) {
         let mut st = self.state.lock().expect("notes state poisoned");
         let Some(active) = st.active else { return };
-        let Some(note) = st.notes.get(active) else { return };
+        let Some(note) = st.notes.get(active) else {
+            return;
+        };
         match crate::clipboard::copy(&note.body) {
             Ok(()) => st.set_status("Copied to clipboard"),
             Err(err) => st.set_status(format!("Copy failed: {err}")),
@@ -734,7 +754,9 @@ impl NotesWidget {
 
 fn active_line_count(st: &NotesState) -> usize {
     let Some(active) = st.active else { return 0 };
-    let Some(note) = st.notes.get(active) else { return 0 };
+    let Some(note) = st.notes.get(active) else {
+        return 0;
+    };
     active_line_count_for(&note.body)
 }
 
@@ -751,12 +773,17 @@ fn active_line_count_for(body: &str) -> usize {
 
 fn active_line_len(st: &NotesState) -> usize {
     let Some(active) = st.active else { return 0 };
-    let Some(note) = st.notes.get(active) else { return 0 };
+    let Some(note) = st.notes.get(active) else {
+        return 0;
+    };
     line_char_len(&note.body, st.cursor_row)
 }
 
 fn line_char_len(body: &str, row: usize) -> usize {
-    body.lines().nth(row).map(|l| l.chars().count()).unwrap_or(0)
+    body.lines()
+        .nth(row)
+        .map(|l| l.chars().count())
+        .unwrap_or(0)
 }
 
 /// Byte offset where `row` begins in `body`. `row` may equal the line
@@ -814,7 +841,27 @@ impl Widget for NotesWidget {
     }
 
     async fn update(&mut self, _ctx: &AppContext) -> Result<()> {
+        // Tick-time housekeeping: drop the title-row status line when
+        // its TTL has elapsed, and surface the change via the dirty
+        // bit so the gated draw path actually repaints.
+        let mut st = self.state.lock().expect("notes state poisoned");
+        if st.status.as_ref().is_some_and(|s| s.is_expired()) {
+            st.status = None;
+            st.dirty = true;
+        }
+        // Insert-mode cursor blinks at 500ms half-period; the render
+        // path reads wall-clock time, so we need to redraw on each
+        // tick to actually flip the cursor on/off. Normal mode hides
+        // the cursor entirely — no redraw needed for it.
+        if st.mode == Mode::Insert {
+            st.dirty = true;
+        }
         Ok(())
+    }
+
+    fn take_dirty(&mut self) -> bool {
+        let mut st = self.state.lock().expect("notes state poisoned");
+        std::mem::replace(&mut st.dirty, false)
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
@@ -864,9 +911,7 @@ impl Widget for NotesWidget {
         // Visual breathing: 1 row top + 1 row bottom on both sub-panes;
         // 1 col right pad on content (list's right edge is already
         // separated by the SEP_SIDE_PAD column).
-        let list_rect_padded = list_rect.map(|r| {
-            pad_rect(r, PANE_TOP_PAD, PANE_BOTTOM_PAD, 0)
-        });
+        let list_rect_padded = list_rect.map(|r| pad_rect(r, PANE_TOP_PAD, PANE_BOTTOM_PAD, 0));
         let content_rect_padded = pad_rect(
             content_rect,
             PANE_TOP_PAD,
@@ -985,13 +1030,11 @@ impl Widget for NotesWidget {
                 // the divider). Clicks land here → proportional jump;
                 // when no scrollbar is showing (or click was on the
                 // divider itself), fall through to entry-select.
-                let max_scroll =
-                    *self.last_max_list_scroll.lock().unwrap() as usize;
+                let max_scroll = *self.last_max_list_scroll.lock().unwrap() as usize;
                 let has_scrollbar = max_scroll > 0;
                 let footer_rows = LIST_FOOTER_ROWS.min(list_rect.height);
                 let entries_bottom = list_rect.y + list_rect.height.saturating_sub(footer_rows);
-                let scrollbar_x =
-                    list_rect.x + list_rect.width.saturating_sub(2);
+                let scrollbar_x = list_rect.x + list_rect.width.saturating_sub(2);
                 let on_scrollbar = has_scrollbar
                     && mouse.column == scrollbar_x
                     && mouse.row >= list_rect.y
@@ -1007,13 +1050,20 @@ impl Widget for NotesWidget {
                     }
                     return EventResult::Handled;
                 }
-                // Each list entry takes 2 rows; mouse.row within
-                // list_rect tells us which entry was clicked.
-                let st = self.state.lock().expect("notes state poisoned");
-                let inner_y = mouse.row.saturating_sub(list_rect.y);
-                let visible_idx = (inner_y / 2) as usize + st.list_scroll as usize;
-                drop(st);
-                self.select_note(visible_idx);
+                // Entries are variable-height (1-3 rows depending on
+                // how the title wraps), so we walk the per-entry rect
+                // cache `render_list` published this frame instead of
+                // dividing the click row by a fixed entries-per-row
+                // constant. Click outside any entry (e.g. into the
+                // bottom whitespace of a short list) is a no-op aside
+                // from claiming focus.
+                let entry_rows = self.last_list_entry_rows.lock().unwrap().clone();
+                let hit = entry_rows
+                    .iter()
+                    .find(|(_, top, h)| mouse.row >= *top && mouse.row < top.saturating_add(*h));
+                if let Some(&(real_idx, _, _)) = hit {
+                    self.select_note(real_idx);
+                }
                 let mut st = self.state.lock().expect("notes state poisoned");
                 st.focus = SubFocus::List;
                 EventResult::Handled
@@ -1028,8 +1078,7 @@ impl Widget for NotesWidget {
                 let scrollbar_x =
                     content_rect.x + content_rect.width.saturating_sub(CONTENT_SCROLLBAR_WIDTH);
                 let footer_rows = CONTENT_FOOTER_ROWS.min(content_rect.height);
-                let body_bottom =
-                    content_rect.y + content_rect.height.saturating_sub(footer_rows);
+                let body_bottom = content_rect.y + content_rect.height.saturating_sub(footer_rows);
                 let on_scrollbar = CONTENT_SCROLLBAR_WIDTH > 0
                     && mouse.column == scrollbar_x
                     && mouse.row >= content_rect.y
@@ -1037,8 +1086,7 @@ impl Widget for NotesWidget {
                 if on_scrollbar {
                     let body_h = body_bottom.saturating_sub(content_rect.y) as usize;
                     let click_row = (mouse.row - content_rect.y) as usize;
-                    let max_scroll =
-                        *self.last_max_content_scroll.lock().unwrap() as usize;
+                    let max_scroll = *self.last_max_content_scroll.lock().unwrap() as usize;
                     if max_scroll > 0 && body_h > 1 {
                         let target = (click_row * max_scroll) / (body_h - 1);
                         st.content_scroll = target.min(max_scroll) as u16;
@@ -1057,8 +1105,7 @@ impl Widget for NotesWidget {
                     let pane_w = content_rect
                         .width
                         .saturating_sub(CONTENT_SCROLLBAR_WIDTH)
-                        .saturating_sub(SCROLLBAR_GUTTER)
-                        as usize;
+                        .saturating_sub(SCROLLBAR_GUTTER) as usize;
                     if let Some((row, col)) =
                         cursor_position_for_click(&st, local_y, local_x, pane_w)
                     {
@@ -1108,8 +1155,8 @@ impl Widget for NotesWidget {
 
     fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
         vec![
-            ("+", "new note"),
-            ("-", "delete note (confirm)"),
+            ("n / +", "new note"),
+            ("d / -", "delete note (confirm)"),
             ("i", "switch to EDIT mode"),
             ("ESC", "exit EDIT → VIEW"),
             ("h / l", "focus list / focus content (VIEW mode)"),
@@ -1118,6 +1165,7 @@ impl Widget for NotesWidget {
             ("y", "yank entire note to clipboard"),
             ("Ctrl-A / Ctrl-E", "line start / end (EDIT mode)"),
             ("Ctrl-U", "delete current line (EDIT mode)"),
+            ("Ctrl-V", "paste from system clipboard (EDIT mode)"),
             ("Ctrl-Z / Ctrl-Shift-Z", "undo / redo (EDIT mode)"),
             ("mouse click", "position cursor (EDIT mode)"),
             ("mouse wheel", "scroll list or content (VIEW mode)"),
@@ -1176,10 +1224,7 @@ impl NotesWidget {
                 };
                 format!("{truncated} · {mode_tag} · {copy_hint}")
             }
-            None => format!(
-                "no notes · + to create · {} total",
-                st.notes.len()
-            ),
+            None => format!("no notes · + to create · {} total", st.notes.len()),
         };
         Some(active_label)
     }
@@ -1257,9 +1302,13 @@ impl NotesWidget {
         // reflects what the user can actually see (variable-row
         // entries make a simple "entries / total" approximation
         // close enough; the bar is for orientation, not exactness).
+        // We also stash per-entry `(real_idx, top_y, row_count)` so
+        // the click handler can hit-test variable-height entries
+        // without re-running the wrap math.
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(entries_height as usize);
         let mut y_used: u16 = 0;
         let mut entries_rendered: usize = 0;
+        let mut entry_rows: Vec<(usize, u16, u16)> = Vec::new();
         for (real_idx, note) in st.notes.iter().enumerate().skip(scroll) {
             let is_active = real_idx == active;
             let name = note.display_name();
@@ -1276,9 +1325,11 @@ impl NotesWidget {
                     Span::styled(piece.clone(), title_style),
                 ]));
             }
+            entry_rows.push((real_idx, area.y + y_used, wrapped.len() as u16));
             y_used += wrapped.len() as u16;
             entries_rendered += 1;
         }
+        *self.last_list_entry_rows.lock().unwrap() = entry_rows;
 
         if lines.is_empty() {
             // The footer already shows `+ new note · - delete`, so
@@ -1321,7 +1372,7 @@ impl NotesWidget {
                 footer_lines.push(Line::from(""));
             }
             footer_lines.push(Line::from(Span::styled(
-                "  + new note  ·  - delete",
+                "  n new note  ·  d delete",
                 self.theme.text_dim,
             )));
             frame.render_widget(Paragraph::new(footer_lines), footer_rect);
@@ -1373,7 +1424,10 @@ impl NotesWidget {
                 bar_lines.push(Line::from(Span::styled(glyph.to_string(), style)));
             }
             let scrollbar_rect = Rect {
-                x: area.x + area.width.saturating_sub(divider_w + CONTENT_SCROLLBAR_WIDTH),
+                x: area.x
+                    + area
+                        .width
+                        .saturating_sub(divider_w + CONTENT_SCROLLBAR_WIDTH),
                 y: area.y,
                 width: CONTENT_SCROLLBAR_WIDTH,
                 height: entries_height,
@@ -1415,11 +1469,7 @@ impl NotesWidget {
                 self.theme.text_selected,
             )
         } else {
-            (
-                LIST_PLAIN_PREFIX,
-                self.theme.text_dim,
-                self.theme.text_dim,
-            )
+            (LIST_PLAIN_PREFIX, self.theme.text_dim, self.theme.text_dim)
         }
     }
 
@@ -1462,8 +1512,8 @@ impl NotesWidget {
                 )),
                 Line::from(""),
                 header("Notes"),
-                row("+", "new note"),
-                row("-", "delete current note (confirm)"),
+                row("n", "new note (or +)"),
+                row("d", "delete current note (or -; confirms)"),
                 row("y", "yank entire note to clipboard"),
                 Line::from(""),
                 header("Navigation (VIEW mode)"),
@@ -1476,6 +1526,7 @@ impl NotesWidget {
                 row("ESC", "leave EDIT → VIEW"),
                 row("Ctrl-A / Ctrl-E", "jump to line start / end"),
                 row("Ctrl-U", "delete current line"),
+                row("Ctrl-V", "paste from system clipboard"),
                 row("Ctrl-Z", "undo"),
                 row("Ctrl-Shift-Z", "redo"),
                 row("mouse click", "position cursor"),
@@ -1509,7 +1560,10 @@ impl NotesWidget {
         } else {
             0
         };
-        let text_w = area.width.saturating_sub(scrollbar_w).saturating_sub(gutter_w);
+        let text_w = area
+            .width
+            .saturating_sub(scrollbar_w)
+            .saturating_sub(gutter_w);
         let pane_w = text_w as usize;
         let cont_w = pane_w.saturating_sub(CONTENT_HANGING_INDENT).max(1);
 
@@ -1594,8 +1648,7 @@ impl NotesWidget {
             let (_, wrap, is_cont) = &visual[vi];
             let indent: &str = if *is_cont { "  " } else { "" };
             let line = if Some(vi) == cursor_visual_idx {
-                let visual_col =
-                    indent.chars().count() + (cursor_col - wrap.source_col_start);
+                let visual_col = indent.chars().count() + (cursor_col - wrap.source_col_start);
                 let combined = format!("{indent}{}", wrap.text);
                 // Pass body_style so the non-cursor cells on the cursor
                 // line stay at the same brightness as every other body
@@ -1685,58 +1738,36 @@ impl NotesWidget {
     }
 
     fn render_confirm_modal(&self, frame: &mut Frame, parent: Rect, name: &str) {
+        // Truncate long note names so the modal body stays neat —
+        // the shared helper renders the target string verbatim.
         let title = truncate_for_meta(name, 40);
-        let inner_w = parent.width.min(54).max(28);
-        let inner_h: u16 = 7;
-        let x = parent.x + parent.width.saturating_sub(inner_w) / 2;
-        let y = parent.y + parent.height.saturating_sub(inner_h) / 2;
-        let modal = Rect {
-            x,
-            y,
-            width: inner_w,
-            height: inner_h,
-        };
-        frame.render_widget(Clear, modal);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(self.theme.border_focused)
-            .title(Span::styled(
-                " Delete note? ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        frame.render_widget(block, modal);
-        let lines: Vec<Line> = vec![
-            Line::from(""),
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled(title, self.theme.text_brilliant),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  [y] confirm  ·  any other key cancels",
-                self.theme.text_dim,
-            )),
-        ];
-        frame.render_widget(Paragraph::new(lines), inner);
+        crate::ui::modal::render(
+            frame,
+            parent,
+            &self.theme,
+            crate::ui::modal::ConfirmModal {
+                title: " Delete note? ",
+                target: &title,
+                hint: None,
+                // Notes likes a slightly wider modal than tickers
+                // (54 vs 48) to keep long-ish note names readable
+                // without truncation at the body row.
+                max_width: 54,
+            },
+        );
     }
 
     fn handle_confirm_key(&self, key: KeyEvent) -> EventResult {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.delete_active();
-                EventResult::Handled
-            }
-            _ => {
-                let mut st = self.state.lock().expect("notes state poisoned");
-                st.confirm_delete = None;
-                EventResult::Handled
+        match crate::ui::modal::dispatch_key(key) {
+            crate::ui::modal::ConfirmChoice::Confirm => self.delete_active(),
+            crate::ui::modal::ConfirmChoice::Cancel => {
+                self.state
+                    .lock()
+                    .expect("notes state poisoned")
+                    .confirm_delete = None;
             }
         }
+        EventResult::Handled
     }
 
     fn handle_normal_key(&self, key: KeyEvent) -> EventResult {
@@ -1746,24 +1777,37 @@ impl NotesWidget {
         // Two-key chord handling. `gg` jumps to top in this view-only
         // mode; `dd` was removed because there's no cursor to anchor
         // a "current line" against — line edits happen in insert mode.
+        //
+        // Chord completion is scoped to the content sub-pane (same as
+        // the `g` / `G` bindings below). When the chord was started
+        // from content focus and the user has since moved to list
+        // focus, drop the pending state and fall through.
         match st.pending {
-            PendingChord::G => {
+            PendingChord::G if st.focus == SubFocus::Content => {
                 st.pending = PendingChord::None;
                 if matches!(key.code, KeyCode::Char('g')) {
                     st.content_scroll = 0;
                     return EventResult::Handled;
                 }
             }
+            PendingChord::G => {
+                st.pending = PendingChord::None;
+            }
             PendingChord::None => {}
         }
 
         match key.code {
-            KeyCode::Char('+') => {
+            // `n` and `+` both create; `d` and `-` both delete. The
+            // letter forms match the platform convention (`n` =
+            // new, `d` = delete); the punctuation forms preserve
+            // muscle memory from the original bindings. Both will
+            // continue to work — pick whichever you reach for.
+            KeyCode::Char('n') | KeyCode::Char('+') => {
                 drop(st);
                 self.create_note();
                 EventResult::Handled
             }
-            KeyCode::Char('-') => {
+            KeyCode::Char('d') | KeyCode::Char('-') => {
                 if let Some(active) = st.active {
                     if let Some(note) = st.notes.get(active) {
                         st.confirm_delete = Some(note.display_name().to_string());
@@ -1779,15 +1823,11 @@ impl NotesWidget {
                 // than resuming wherever the cursor happened to be
                 // from a previous insert session.
                 if let Some(active) = st.active {
-                    if let Some((row, col)) = st
-                        .notes
-                        .get(active)
-                        .map(|note| {
-                            let total = active_line_count_for(&note.body);
-                            let last_row = total.saturating_sub(1);
-                            (last_row, line_char_len(&note.body, last_row))
-                        })
-                    {
+                    if let Some((row, col)) = st.notes.get(active).map(|note| {
+                        let total = active_line_count_for(&note.body);
+                        let last_row = total.saturating_sub(1);
+                        (last_row, line_char_len(&note.body, last_row))
+                    }) {
                         st.cursor_row = row;
                         st.cursor_col = col;
                     }
@@ -1799,11 +1839,18 @@ impl NotesWidget {
                 self.yank_active();
                 EventResult::Handled
             }
-            KeyCode::Char('g') => {
+            // `gg` / `G` are content-scroll gestures, so they only
+            // bind when the content sub-pane has focus. With list
+            // focus they fall through (Ignored) so the app's
+            // `Shift+<letter>` focus dispatcher can claim `Shift+G`
+            // for the Gallery widget — otherwise notes would shadow
+            // every G-prefix shortcut letter no matter which sub-
+            // pane was active.
+            KeyCode::Char('g') if st.focus == SubFocus::Content => {
                 st.pending = PendingChord::G;
                 EventResult::Handled
             }
-            KeyCode::Char('G') => {
+            KeyCode::Char('G') if st.focus == SubFocus::Content => {
                 // Scroll to bottom — use the render-published max so
                 // we land exactly at the last visual row instead of
                 // having render clamp from u16::MAX on the next pass.
@@ -1863,6 +1910,7 @@ impl NotesWidget {
         // Ctrl chords (insert mode only): editor-style line/edit ops.
         //   Ctrl-A / Ctrl-E — line start / line end
         //   Ctrl-U          — delete current line
+        //   Ctrl-V          — paste from system clipboard
         //   Ctrl-Z          — undo
         //   Ctrl-Shift-Z    — redo
         // Anything else with a Ctrl modifier is ignored so the global
@@ -1883,6 +1931,26 @@ impl NotesWidget {
                 }
                 KeyCode::Char('u') | KeyCode::Char('U') => {
                     self.delete_current_line();
+                    return EventResult::Handled;
+                }
+                // Direct system-clipboard read via arboard. Bracketed
+                // paste (Cmd+V on macOS terminals) is the primary path
+                // via `handle_paste`, but some terminal / event-reader
+                // combinations swallow the OSC sequence (notably Kitty's
+                // Cmd+V on some configurations), so Ctrl-V gives the
+                // user a deterministic fallback that talks to
+                // NSPasteboard / X11 directly. Routes through
+                // `paste_text` so a multi-paragraph paste still produces
+                // exactly one undo snapshot.
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    if let Some(text) = crate::clipboard::paste() {
+                        self.paste_text(&text);
+                    } else {
+                        self.state
+                            .lock()
+                            .expect("notes state poisoned")
+                            .set_status("Clipboard empty or unreachable");
+                    }
                     return EventResult::Handled;
                 }
                 KeyCode::Char('z') | KeyCode::Char('Z') => {
@@ -1956,7 +2024,11 @@ fn cursor_position_for_click(
     pane_w: usize,
 ) -> Option<(usize, usize)> {
     let active = st.active?;
-    let body = st.notes.get(active).map(|n| n.body.clone()).unwrap_or_default();
+    let body = st
+        .notes
+        .get(active)
+        .map(|n| n.body.clone())
+        .unwrap_or_default();
     let source_lines: Vec<String> = if body.is_empty() {
         vec![String::new()]
     } else {
@@ -2021,7 +2093,9 @@ fn pad_rect(rect: Rect, top: u16, bottom: u16, right: u16) -> Rect {
         ..after_top
     };
     Rect {
-        width: after_bottom.width.saturating_sub(right.min(after_bottom.width)),
+        width: after_bottom
+            .width
+            .saturating_sub(right.min(after_bottom.width)),
         ..after_bottom
     }
 }
@@ -2090,7 +2164,7 @@ fn render_cursor_line(
 /// pane has its own footer when focused there).
 fn content_footer_hint(mode: Mode, content_focused: bool) -> &'static str {
     match mode {
-        Mode::Insert => "  ESC exit EDIT mode",
+        Mode::Insert => "  ESC exit  ·  ^V paste  ·  ^U del-line  ·  ^Z undo  ·  ^⇧Z redo",
         Mode::Normal if content_focused => {
             "  VIEW mode  ·  i switch to EDIT  ·  ↑/↓ scroll  ·  ← navigate notes"
         }
@@ -2218,11 +2292,7 @@ fn wrap_title_lines(text: &str, first_w: usize, cont_w: usize, max_lines: usize)
 }
 
 fn truncate_for_meta(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{kept}…")
+    crate::text::truncate(s, max)
 }
 
 /// Wizard descriptor. Notes have no per-instance fields the
@@ -2273,7 +2343,9 @@ mod tests {
         w.create_note();
         // create_note drops into Insert mode.
         let st = w.state.lock().unwrap();
-        let meta = w.derive_title_metadata(&st).expect("active note → metadata");
+        let meta = w
+            .derive_title_metadata(&st)
+            .expect("active note → metadata");
         assert!(meta.contains("EDIT"), "should mention EDIT mode: {meta:?}");
         assert!(meta.contains('⧉'), "should still show the ⧉ icon: {meta:?}");
         assert!(
@@ -2289,9 +2361,14 @@ mod tests {
         w.create_note();
         w.state.lock().unwrap().mode = Mode::Normal;
         let st = w.state.lock().unwrap();
-        let meta = w.derive_title_metadata(&st).expect("active note → metadata");
+        let meta = w
+            .derive_title_metadata(&st)
+            .expect("active note → metadata");
         assert!(meta.contains("VIEW"), "should mention VIEW mode: {meta:?}");
-        assert!(meta.contains("⧉ y"), "should show ⧉ y hint in VIEW: {meta:?}");
+        assert!(
+            meta.contains("⧉ y"),
+            "should show ⧉ y hint in VIEW: {meta:?}"
+        );
     }
 
     /// Clicking the title-row metadata area (where ⧉ sits) yanks the
@@ -2456,7 +2533,12 @@ mod tests {
 
     #[test]
     fn pad_rect_trims_top_bottom_and_right() {
-        let r = Rect { x: 0, y: 5, width: 20, height: 10 };
+        let r = Rect {
+            x: 0,
+            y: 5,
+            width: 20,
+            height: 10,
+        };
         let p = pad_rect(r, 2, 1, 3);
         assert_eq!(p.y, 7);
         assert_eq!(p.height, 7);
@@ -2613,7 +2695,10 @@ mod tests {
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ));
         let body_after = w.state.lock().unwrap().notes[0].body.clone();
-        assert_eq!(body_before, body_after, "redo after new edit must be a no-op");
+        assert_eq!(
+            body_before, body_after,
+            "redo after new edit must be a no-op"
+        );
     }
 
     #[test]
@@ -2710,7 +2795,11 @@ mod tests {
         let r = w.handle_paste(pasted);
         assert_eq!(r, EventResult::Handled);
         let st = w.state.lock().unwrap();
-        assert_eq!(st.mode, Mode::Insert, "must stay in insert mode after paste");
+        assert_eq!(
+            st.mode,
+            Mode::Insert,
+            "must stay in insert mode after paste"
+        );
         assert_eq!(st.notes[0].body, pasted);
         assert_eq!(st.cursor_row, 1);
         assert_eq!(st.cursor_col, "There is no one\u{2026}".chars().count());

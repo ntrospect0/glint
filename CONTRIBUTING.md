@@ -94,7 +94,10 @@ glint is pre-launch v0.2 and shipping with deliberate restraint:
   additive — declare a `widget-<name>` feature, implement the
   `Widget` trait under `src/widgets/<name>/`, and append a
   `WidgetDescriptor` to `src/widgets/registry.rs`. No edits to
-  `app.rs`, `main.rs`, or the wizard are needed.
+  `app.rs`, `main.rs`, or the wizard are needed. See
+  [`docs/widget-sdk.md`](docs/widget-sdk.md) for the quickstart,
+  available platform capabilities (polling, theming, caching),
+  and reference patterns extracted from the shipped widgets.
 - **No design for hypothetical future requirements.** A bug fix
   doesn't need surrounding cleanup; a one-shot operation doesn't
   need a helper. Three similar lines is better than a premature

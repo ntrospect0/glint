@@ -115,6 +115,18 @@ pub fn load() -> RuntimeState {
 /// a sibling temp file + rename so a crash mid-write can't corrupt an
 /// existing state file. Errors log + return — callers should not
 /// abort on a failed save.
+/// Remove `runtime_state.toml`. The wizard calls this at finalize so a
+/// fresh layout doesn't inherit stack active-tab indices keyed by
+/// IDs that no longer exist. Idempotent — missing file is success.
+pub fn clear() -> Result<()> {
+    let path = state_path()?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
 pub fn save(state: &RuntimeState) -> Result<()> {
     let path = state_path()?;
     let dir = path
@@ -124,9 +136,8 @@ pub fn save(state: &RuntimeState) -> Result<()> {
     let body = toml::to_string_pretty(state).context("runtime-state serialize failed")?;
     let tmp = path.with_extension("toml.tmp");
     fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
-    fs::rename(&tmp, &path).with_context(|| {
-        format!("rename {} → {}", tmp.display(), path.display())
-    })?;
+    fs::rename(&tmp, &path)
+        .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
     Ok(())
 }
 
@@ -167,23 +178,49 @@ mod tests {
     #[test]
     fn snapshot_round_trips() {
         let mut state = RuntimeState::default();
-        state.stacks.insert(
-            "stack:a+b".into(),
-            StackEntry { active_tab: 1 },
-        );
-        state.stacks.insert(
-            "stack:c+d+e".into(),
-            StackEntry { active_tab: 2 },
-        );
+        state
+            .stacks
+            .insert("stack:a+b".into(), StackEntry { active_tab: 1 });
+        state
+            .stacks
+            .insert("stack:c+d+e".into(), StackEntry { active_tab: 2 });
         let snap = state.snapshot();
         assert_eq!(snap.get("stack:a+b"), Some(&1));
         assert_eq!(snap.get("stack:c+d+e"), Some(&2));
         let back = RuntimeState::from_snapshot(&snap);
         assert_eq!(back.stacks.len(), 2);
-        assert_eq!(
-            back.stacks.get("stack:a+b").map(|e| e.active_tab),
-            Some(1)
-        );
+        assert_eq!(back.stacks.get("stack:a+b").map(|e| e.active_tab), Some(1));
+    }
+
+    #[test]
+    #[ignore = "mutates the process-wide XDG_CONFIG_HOME — opt in with --ignored"]
+    fn clear_is_idempotent_when_file_missing() {
+        // Clear must succeed even when there's no state file yet — the
+        // wizard's post-finalize hook calls it unconditionally on every
+        // run, including the first.
+        let dir = std::env::temp_dir().join(format!(
+            "glint-runtime-state-clear-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        // No file present → still Ok.
+        assert!(clear().is_ok(), "clear on missing file must succeed");
+        // Create one, clear it, verify it's gone.
+        let mut state = RuntimeState::default();
+        state
+            .stacks
+            .insert("stack:a+b".into(), StackEntry { active_tab: 1 });
+        save(&state).unwrap();
+        let path = state_path().unwrap();
+        assert!(path.exists(), "save should have written the file");
+        clear().unwrap();
+        assert!(!path.exists(), "clear should have removed the file");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -199,10 +236,9 @@ mod tests {
             version: RUNTIME_STATE_VERSION,
             stacks: HashMap::new(),
         };
-        state.stacks.insert(
-            "stack:clock+weather".into(),
-            StackEntry { active_tab: 1 },
-        );
+        state
+            .stacks
+            .insert("stack:clock+weather".into(), StackEntry { active_tab: 1 });
         let text = toml::to_string_pretty(&state).unwrap();
         let parsed: RuntimeState = toml::from_str(&text).unwrap();
         assert_eq!(parsed.version, RUNTIME_STATE_VERSION);

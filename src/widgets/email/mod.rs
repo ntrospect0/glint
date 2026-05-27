@@ -18,7 +18,9 @@ pub mod provider;
 pub mod seen_store;
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::text::{pad_or_truncate, truncate, wrap};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -132,7 +134,14 @@ struct EmailState {
     /// Index into `folders`. 0 is always the first configured folder.
     active_folder_idx: usize,
     last_error: Option<String>,
-    last_attempt: Option<Instant>,
+    /// Two-tier polling: while `account` is unresolved we retry on a
+    /// fast 30 s cadence (capped so a failing profile endpoint
+    /// doesn't spin); once the account address lands we fall back
+    /// to the configured mail-refresh interval. Both stamp on every
+    /// spawn_refresh since `ensure_account` piggybacks on
+    /// `fetch_recent`.
+    account_poll: crate::polling::PollTracker,
+    mail_poll: crate::polling::PollTracker,
     inflight: bool,
     /// Cached account address (e.g. "alice@example.com") for the title row.
     /// Populated lazily from the provider once the first fetch resolves.
@@ -154,6 +163,10 @@ struct EmailState {
     /// Last-rendered list_area Rect — used together with `row_layout` to
     /// translate raw mouse coordinates into a clicked message index.
     last_list_area: Option<Rect>,
+    /// Display-state dirty bit drained by `take_dirty`. Set true by
+    /// every async-task / tick-time mutation site so the main loop's
+    /// dirty-flag gate triggers a redraw.
+    dirty: bool,
 }
 
 const CACHE_KEY_MESSAGES: &str = "messages";
@@ -187,7 +200,6 @@ pub struct EmailWidget {
     /// react to expand-induced changes without races.
     seen: Arc<Mutex<SeenStore>>,
     folders: Vec<String>,
-    poll_interval: Duration,
     latest_days: u32,
     summarize_with_llm: bool,
     llm: Option<Arc<dyn LlmProvider>>,
@@ -279,7 +291,8 @@ impl EmailWidget {
         } else {
             config.folders.clone()
         };
-        let (provider, provider_label, provider_ready, auth_hint) = build_provider(&config.provider);
+        let (provider, provider_label, provider_ready, auth_hint) =
+            build_provider(&config.provider);
 
         let colors_override = config.colors.clone();
         let theme = app_theme.with_overrides(&colors_override);
@@ -328,12 +341,15 @@ impl EmailWidget {
         let cached_address = cache
             .load::<String>(CACHE_KEY_ACCOUNT_ADDRESS)
             .map(|e| e.value);
-        let initial_account = config
-            .account_address
-            .clone()
-            .or(cached_address.clone());
+        let initial_account = config.account_address.clone().or(cached_address.clone());
         let mut initial_state = EmailState {
             account: initial_account.clone(),
+            // Fast retry while account is being resolved (~30s) plus
+            // the regular mail-refresh cadence. Both get stamped on
+            // every spawn_refresh; is_due picks which one to consult
+            // based on whether `account` has landed yet.
+            account_poll: crate::polling::PollTracker::new(Duration::from_secs(30)),
+            mail_poll: crate::polling::PollTracker::new(poll_interval),
             ..EmailState::default()
         };
         // Seed the provider's in-memory cache too so the first
@@ -343,16 +359,27 @@ impl EmailWidget {
             provider.seed_account_cache(addr);
         }
         if let Some(entry) = cache.load::<Vec<EmailMessage>>(CACHE_KEY_MESSAGES) {
-            let age = entry.age().min(poll_interval);
+            initial_state.mail_poll.seed_from_cache_age(entry.age());
+            // If we have cached messages, an account-resolution retry
+            // shouldn't fire instantly either — pretend account was
+            // checked recently so we don't double-hit on launch.
+            initial_state.account_poll.seed_from_cache_age(entry.age());
             let mut messages = entry.value;
-            // Old cache entries may have full-sized bodies; trim on read
-            // so the in-memory copy honours the same cap as fresh fetches.
             for m in &mut messages {
                 truncate_body_in_place(&mut m.plain_body, 4096);
             }
             initial_state.messages = messages;
-            initial_state.last_attempt = Some(Instant::now() - age);
         }
+        // Spread first-fire phases across instances so multiple
+        // 60s-cadence widgets don't all hit the network in the same
+        // 250ms tick. `account_poll` runs at 30s; jittering both keeps
+        // the two-stage startup from synchronising either.
+        initial_state
+            .mail_poll
+            .apply_jitter(&format!("email@{instance}"));
+        initial_state
+            .account_poll
+            .apply_jitter(&format!("email-account@{instance}"));
 
         Self {
             id,
@@ -362,7 +389,6 @@ impl EmailWidget {
             state: Arc::new(Mutex::new(initial_state)),
             seen: Arc::new(Mutex::new(seen)),
             folders,
-            poll_interval,
             latest_days: config.latest_days.max(1),
             summarize_with_llm: config.summarize_with_llm,
             llm,
@@ -382,7 +408,10 @@ impl EmailWidget {
         let st = self.state.lock().expect("email state poisoned");
         let folder = self
             .folders
-            .get(st.active_folder_idx.min(self.folders.len().saturating_sub(1)))
+            .get(
+                st.active_folder_idx
+                    .min(self.folders.len().saturating_sub(1)),
+            )
             .cloned()
             .unwrap_or_default();
         st.messages
@@ -397,30 +426,24 @@ impl EmailWidget {
         if st.inflight {
             return false;
         }
-        // If we haven't resolved the account address yet, force a
-        // refresh regardless of the poll cadence. ensure_account piggy-
-        // backs on fetch_recent, so this is the only way to break out
-        // of a "cache restored from disk but account never resolved"
-        // state where the title would otherwise read "(loading…)" for
-        // the full poll interval. The 30s minimum prevents spinning
-        // when the profile endpoint is failing for an unrelated reason.
-        const ACCOUNT_RETRY_MIN: std::time::Duration =
-            std::time::Duration::from_secs(30);
+        // Two-tier policy: while the account address is still being
+        // resolved, retry on `account_poll`'s fast 30s cadence so
+        // the title row doesn't sit on "(loading…)" for the full
+        // mail interval. Once the account lands, switch to the
+        // configured mail-refresh interval via `mail_poll`. The
+        // tracker's `is_due()` handles the elapsed-check uniformly.
         if st.account.is_none() {
-            return match st.last_attempt {
-                None => true,
-                Some(t) => t.elapsed() >= ACCOUNT_RETRY_MIN,
-            };
+            return st.account_poll.is_due();
         }
-        match st.last_attempt {
-            None => true,
-            Some(t) => t.elapsed() >= self.poll_interval,
-        }
+        st.mail_poll.is_due()
     }
 
     fn mark_dirty(&self) {
         let mut st = self.state.lock().expect("email state poisoned");
-        st.last_attempt = None;
+        // User-triggered refresh: dirty both timers so neither stops
+        // the next fetch.
+        st.account_poll.mark_dirty();
+        st.mail_poll.mark_dirty();
     }
 
     fn spawn_refresh(&self) {
@@ -430,7 +453,11 @@ impl EmailWidget {
         {
             let mut st = self.state.lock().expect("email state poisoned");
             st.inflight = true;
-            st.last_attempt = Some(Instant::now());
+            // ensure_account piggybacks on fetch_recent, so a single
+            // refresh advances both timers.
+            st.account_poll.mark_attempted();
+            st.mail_poll.mark_attempted();
+            st.dirty = true;
         }
         let provider = self.provider.clone();
         let state = self.state.clone();
@@ -441,6 +468,7 @@ impl EmailWidget {
             let Some(prov) = provider.as_provider() else {
                 let mut st = state.lock().expect("email state poisoned");
                 st.inflight = false;
+                st.dirty = true;
                 return;
             };
             let since = Utc::now() - chrono::Duration::days(latest_days as i64);
@@ -491,6 +519,7 @@ impl EmailWidget {
             if account.is_some() {
                 st.account = account;
             }
+            st.dirty = true;
         });
     }
 
@@ -503,8 +532,7 @@ impl EmailWidget {
         let was_expanded;
         {
             let mut st = self.state.lock().expect("email state poisoned");
-            new_idx = (st.selected as isize + delta)
-                .clamp(0, filtered.len() as isize - 1) as usize;
+            new_idx = (st.selected as isize + delta).clamp(0, filtered.len() as isize - 1) as usize;
             st.selected = new_idx;
             was_expanded = st.expanded;
         }
@@ -638,8 +666,7 @@ impl EmailWidget {
                 st.summary_view.insert(msg.id.clone(), true);
                 (true, true)
             } else {
-                let cur =
-                    *st.summary_view.get(&msg.id).unwrap_or(&false);
+                let cur = *st.summary_view.get(&msg.id).unwrap_or(&false);
                 let new = !cur;
                 st.summary_view.insert(msg.id.clone(), new);
                 (false, new)
@@ -680,6 +707,7 @@ impl EmailWidget {
             let mut st = self.state.lock().expect("email state poisoned");
             st.summaries
                 .insert(msg.id.clone(), SummaryState::Ready(entry.value));
+            st.dirty = true;
             return;
         }
         let Some(llm) = self.llm.clone() else {
@@ -690,6 +718,7 @@ impl EmailWidget {
         {
             let mut st = self.state.lock().expect("email state poisoned");
             st.summaries.insert(msg.id.clone(), SummaryState::Requested);
+            st.dirty = true;
         }
         let id = msg.id.clone();
         let body = msg.plain_body.clone();
@@ -703,7 +732,11 @@ impl EmailWidget {
                     role: Role::User,
                     content: format!(
                         "From: {from}\nSubject: {subject}\n\n{}",
-                        if body.is_empty() { "(empty body)" } else { body.as_str() }
+                        if body.is_empty() {
+                            "(empty body)"
+                        } else {
+                            body.as_str()
+                        }
                     ),
                 }],
                 max_tokens: 300,
@@ -712,7 +745,10 @@ impl EmailWidget {
             let outcome = match llm.complete(request).await {
                 Ok(resp) => {
                     let text = resp.text.trim();
-                    if text.to_ascii_lowercase().starts_with("insufficient content to summarize") {
+                    if text
+                        .to_ascii_lowercase()
+                        .starts_with("insufficient content to summarize")
+                    {
                         SummaryState::Failed
                     } else {
                         SummaryState::Ready(text.to_string())
@@ -730,6 +766,7 @@ impl EmailWidget {
             }
             let mut st = state.lock().expect("email state poisoned");
             st.summaries.insert(id, outcome);
+            st.dirty = true;
         });
     }
 
@@ -783,12 +820,27 @@ impl EmailWidget {
 fn build_provider(name: &str) -> (EmailProviderHandle, String, bool, Option<String>) {
     match name.to_ascii_lowercase().as_str() {
         "outlook" => match build_outlook() {
-            Ok(p) => (EmailProviderHandle::Outlook(p), "outlook".into(), true, None),
-            Err(hint) => (EmailProviderHandle::Empty, "outlook".into(), false, Some(hint)),
+            Ok(p) => (
+                EmailProviderHandle::Outlook(p),
+                "outlook".into(),
+                true,
+                None,
+            ),
+            Err(hint) => (
+                EmailProviderHandle::Empty,
+                "outlook".into(),
+                false,
+                Some(hint),
+            ),
         },
         "gmail" => match build_gmail() {
             Ok(p) => (EmailProviderHandle::Gmail(p), "gmail".into(), true, None),
-            Err(hint) => (EmailProviderHandle::Empty, "gmail".into(), false, Some(hint)),
+            Err(hint) => (
+                EmailProviderHandle::Empty,
+                "gmail".into(),
+                false,
+                Some(hint),
+            ),
         },
         "imap" => match build_imap() {
             Ok(p) => (EmailProviderHandle::Imap(p), "imap".into(), true, None),
@@ -850,8 +902,8 @@ fn build_imap() -> Result<imap::ImapProvider, String> {
     }
     let text = std::fs::read_to_string(&path)
         .map_err(|err| format!("read {} failed: {err}", path.display()))?;
-    let creds: imap::ImapCredentials = toml::from_str(&text)
-        .map_err(|err| format!("parse {} failed: {err}", path.display()))?;
+    let creds: imap::ImapCredentials =
+        toml::from_str(&text).map_err(|err| format!("parse {} failed: {err}", path.display()))?;
     if creds.username.trim().is_empty() || creds.app_password.trim().is_empty() {
         return Err(format!(
             "{} has empty username or app_password — edit and retry",
@@ -886,6 +938,11 @@ impl Widget for EmailWidget {
             self.spawn_refresh();
         }
         Ok(())
+    }
+
+    fn take_dirty(&mut self) -> bool {
+        let mut st = self.state.lock().expect("email state poisoned");
+        std::mem::replace(&mut st.dirty, false)
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
@@ -998,8 +1055,8 @@ impl Widget for EmailWidget {
             } else {
                 "No recent messages.".to_string()
             };
-            let body = Paragraph::new(vec![Line::from(""), Line::from(msg)])
-                .alignment(Alignment::Center);
+            let body =
+                Paragraph::new(vec![Line::from(""), Line::from(msg)]).alignment(Alignment::Center);
             frame.render_widget(body, inner);
             return;
         }
@@ -1030,10 +1087,8 @@ impl Widget for EmailWidget {
         // shorten).
         if expanded {
             if let Some(msg) = filtered.get(selected) {
-                let body_max_width =
-                    (list_area.width as usize).saturating_sub(3);
-                let subject_lines =
-                    wrap_text(&msg.subject, body_max_width, 2).len();
+                let body_max_width = (list_area.width as usize).saturating_sub(3);
+                let subject_lines = wrap_text(&msg.subject, body_max_width, 2).len();
                 let body_lines = expanded_body_lines(
                     msg,
                     &self.state,
@@ -1042,14 +1097,18 @@ impl Widget for EmailWidget {
                 )
                 .len();
                 let expansion_height = subject_lines + body_lines;
-                let want = (selected + 1 + expansion_height)
-                    .saturating_sub(items_visible);
+                let want = (selected + 1 + expansion_height).saturating_sub(items_visible);
                 scroll = scroll.max(want).min(selected);
             }
         }
 
         let now_local = Local::now();
-        let inner_width = list_area.width as usize;
+        // Reserve a 1-cell right buffer so the timestamp column
+        // doesn't run flush against the widget's right border.
+        // All column-width math below derives from `inner_width`,
+        // so shrinking it here automatically gives the row its
+        // trailing gutter without touching the per-row span list.
+        let inner_width = (list_area.width as usize).saturating_sub(1);
         // Column-width policy:
         //   * Date is fixed at 8 chars (matches the formats produced by
         //     `format_received`: "Fri 14:25", "Yesterday", "Mar 03", …).
@@ -1074,8 +1133,7 @@ impl Widget for EmailWidget {
 
         let mut sender_label_w = SENDER_LABEL_MIN;
         let mut sender_col_w = sender_label_w + INDICATOR_PREFIX_W;
-        let mut subject_col_w =
-            inner_width.saturating_sub(sender_col_w + DATE_COL_W + COL_GAPS_W);
+        let mut subject_col_w = inner_width.saturating_sub(sender_col_w + DATE_COL_W + COL_GAPS_W);
         // When subject would overflow the 95-char cap, donate the excess
         // to sender first (up to SENDER_LABEL_MAX). Any remaining surplus
         // stays in the subject column as trailing padding so the date
@@ -1085,8 +1143,7 @@ impl Widget for EmailWidget {
             let donate = excess.min(SENDER_LABEL_MAX - SENDER_LABEL_MIN);
             sender_label_w += donate;
             sender_col_w = sender_label_w + INDICATOR_PREFIX_W;
-            subject_col_w =
-                inner_width.saturating_sub(sender_col_w + DATE_COL_W + COL_GAPS_W);
+            subject_col_w = inner_width.saturating_sub(sender_col_w + DATE_COL_W + COL_GAPS_W);
         }
         let date_col_w = DATE_COL_W;
         let subject_text_w = subject_col_w.min(SUBJECT_TEXT_MAX);
@@ -1127,7 +1184,14 @@ impl Widget for EmailWidget {
             let date_padded = format!("{date:>w$}", w = date_col_w);
 
             let row = Line::from(vec![
-                Span::styled(format!("{indicator} "), if unread { self.theme.text_focused } else { self.theme.text_dim }),
+                Span::styled(
+                    format!("{indicator} "),
+                    if unread {
+                        self.theme.text_focused
+                    } else {
+                        self.theme.text_dim
+                    },
+                ),
                 Span::styled(sender_padded, row_style),
                 Span::raw(" "),
                 Span::styled(subject_padded, row_style),
@@ -1184,11 +1248,8 @@ impl Widget for EmailWidget {
         } else {
             "↑/↓ select · ←/→ folder · e/⏎/click expand · o open · r refresh"
         };
-        let footer = Paragraph::new(Line::from(Span::styled(
-            footer_text,
-            self.theme.text_dim,
-        )))
-        .alignment(Alignment::Right);
+        let footer = Paragraph::new(Line::from(Span::styled(footer_text, self.theme.text_dim)))
+            .alignment(Alignment::Right);
         frame.render_widget(footer, footer_area);
 
         // Persist scroll + the row layout so click handling can map
@@ -1360,10 +1421,17 @@ impl Widget for EmailWidget {
     }
 
     fn config(&self) -> serde_json::Value {
+        let mail_secs = self
+            .state
+            .lock()
+            .expect("email state poisoned")
+            .mail_poll
+            .interval()
+            .as_secs();
         serde_json::json!({
             "provider": self.provider_label,
             "latest_days": self.latest_days,
-            "refresh_minutes": self.poll_interval.as_secs() / 60,
+            "refresh_minutes": mail_secs / 60,
             "folders": self.folders,
             "summarize_with_llm": self.summarize_with_llm,
         })
@@ -1383,6 +1451,20 @@ impl Widget for EmailWidget {
     fn set_app_theme(&mut self, theme: Arc<Theme>) {
         self.theme = theme.with_overrides(&self.colors_override);
         self.app_theme = theme;
+    }
+
+    /// Return whichever tracker is currently in effect — account
+    /// resolution while we're still waiting for the address,
+    /// otherwise the configured mail-refresh cadence — so the
+    /// platform sees the cadence actually driving us right now.
+    fn poll_snapshot(&self) -> Option<crate::polling::PollSnapshot> {
+        let st = self.state.lock().expect("email state poisoned");
+        let snap = if st.account.is_none() {
+            st.account_poll.snapshot()
+        } else {
+            st.mail_poll.snapshot()
+        };
+        Some(snap)
     }
 
     fn shortcut_preferences(&self) -> &[char] {
@@ -1405,11 +1487,7 @@ impl Widget for EmailWidget {
         if label.is_empty() {
             return None;
         }
-        let account = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|st| st.account.clone());
+        let account = self.state.lock().ok().and_then(|st| st.account.clone());
         match account {
             Some(addr) => Some(format!("[{label}] {addr}")),
             None => Some(format!("[{label}]")),
@@ -1461,50 +1539,6 @@ fn truncate_body_in_place(body: &mut String, max_chars: usize) {
         .unwrap_or(body.len());
     body.truncate(cutoff);
     body.push_str("…");
-}
-
-/// `unicode-width`; control/zero-width chars report 0. When truncation
-/// happens, the trailing chars are replaced with `…` (1 cell) so the
-/// result still fits inside `max`.
-fn truncate(s: &str, max: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-    if UnicodeWidthStr::width(s) <= max {
-        return s.to_string();
-    }
-    if max == 0 {
-        return String::new();
-    }
-    // Reserve one cell for the ellipsis; keep adding chars until the
-    // next one wouldn't fit in the remaining budget. A wide char (2
-    // cells) that would land at `max - 1` is dropped — `…` then sits at
-    // cell `max - 1` and the result fits in `max` cells exactly.
-    let budget = max.saturating_sub(1);
-    let mut used: usize = 0;
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + w > budget {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out.push('…');
-    out
-}
-
-/// Pad `s` to exactly `width` *terminal cells*, truncating if `s`
-/// already exceeds the budget. Padding is plain ASCII spaces (1 cell
-/// each) so cell-width and char-count agree on the appended slice.
-fn pad_or_truncate(s: &str, width: usize) -> String {
-    use unicode_width::UnicodeWidthStr;
-    let s = truncate(s, width);
-    let visible = UnicodeWidthStr::width(s.as_str());
-    if visible < width {
-        format!("{s}{}", " ".repeat(width - visible))
-    } else {
-        s
-    }
 }
 
 fn expanded_body_lines(
@@ -1562,50 +1596,12 @@ fn expanded_body_lines(
     wrap_text(&msg.plain_body, max_width, MAX_SUMMARY_LINES)
 }
 
+/// Thin wrapper preserving the call sites' `wrap_text` name. The
+/// canonical implementation lives in [`crate::text::wrap`]; email
+/// always wants paragraph-preservation since `\n` in `msg.plain_body`
+/// separates real paragraphs.
 fn wrap_text(text: &str, max_width: usize, max_lines: usize) -> Vec<String> {
-    if max_width == 0 || max_lines == 0 {
-        return Vec::new();
-    }
-    let mut lines: Vec<String> = Vec::new();
-    for paragraph in text.lines() {
-        let words: Vec<&str> = paragraph.split_whitespace().collect();
-        if words.is_empty() {
-            continue;
-        }
-        let mut current = String::new();
-        for word in words {
-            let candidate_len = if current.is_empty() {
-                word.chars().count()
-            } else {
-                current.chars().count() + 1 + word.chars().count()
-            };
-            if candidate_len <= max_width {
-                if !current.is_empty() {
-                    current.push(' ');
-                }
-                current.push_str(word);
-            } else if current.is_empty() {
-                let trunc: String = word.chars().take(max_width.saturating_sub(1)).collect();
-                lines.push(format!("{trunc}…"));
-                if lines.len() >= max_lines {
-                    return lines;
-                }
-            } else {
-                lines.push(std::mem::take(&mut current));
-                if lines.len() >= max_lines {
-                    return lines;
-                }
-                current.push_str(word);
-            }
-        }
-        if !current.is_empty() && lines.len() < max_lines {
-            lines.push(current);
-        }
-        if lines.len() >= max_lines {
-            break;
-        }
-    }
-    lines
+    wrap(text, max_width, max_lines, true)
 }
 
 pub const KIND: &str = "email";
@@ -1622,9 +1618,7 @@ pub const KIND: &str = "email";
 /// path. For now, IMAP shows up as a disabled choice with explanatory
 /// help text.
 pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
-    use crate::wizard::descriptor::{
-        ChoiceOption, WizardDescriptor, WizardField, WizardFieldKind,
-    };
+    use crate::wizard::descriptor::{ChoiceOption, WizardDescriptor, WizardField, WizardFieldKind};
     WizardDescriptor {
         display_name: "Email",
         blurb: "Lightweight message list backed by Gmail or Outlook. Select \
@@ -1682,7 +1676,9 @@ pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
                        browser tab to login.microsoftonline.com; relies on \
                        credentials/microsoft_oauth_client.toml.",
                 required: false,
-                kind: WizardFieldKind::OAuth { provider: "microsoft" },
+                kind: WizardFieldKind::OAuth {
+                    provider: "microsoft",
+                },
                 validate: None,
             },
             WizardField {
@@ -1873,11 +1869,7 @@ mod tests {
 
     #[test]
     fn normalize_sender_prefers_display_name() {
-        let n = normalize_sender(
-            &Some("Alice Smith".into()),
-            "alice@example.com",
-            20,
-        );
+        let n = normalize_sender(&Some("Alice Smith".into()), "alice@example.com", 20);
         assert_eq!(n, "Alice Smith");
     }
 
@@ -1987,11 +1979,7 @@ mod tests {
 
     #[test]
     fn normalize_sender_strips_quotes_around_name() {
-        let n = normalize_sender(
-            &Some("\"Carol\"".into()),
-            "carol@example.com",
-            20,
-        );
+        let n = normalize_sender(&Some("\"Carol\"".into()), "carol@example.com", 20);
         assert_eq!(n, "Carol");
     }
 

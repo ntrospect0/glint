@@ -133,8 +133,8 @@ fn run_imap() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(async move { Ok(()) })
 }
 
-fn fetch_gmail_folders()
-    -> Pin<Box<dyn Future<Output = Result<(&'static str, Vec<(String, String)>)>> + Send>> {
+fn fetch_gmail_folders(
+) -> Pin<Box<dyn Future<Output = Result<(&'static str, Vec<(String, String)>)>> + Send>> {
     Box::pin(async move {
         let client = super::google::OAuthClientConfig::load()?;
         let token = super::google::store::GoogleToken::load()?
@@ -145,27 +145,25 @@ fn fetch_gmail_folders()
     })
 }
 
-fn fetch_outlook_folders()
-    -> Pin<Box<dyn Future<Output = Result<(&'static str, Vec<(String, String)>)>> + Send>> {
+fn fetch_outlook_folders(
+) -> Pin<Box<dyn Future<Output = Result<(&'static str, Vec<(String, String)>)>> + Send>> {
     Box::pin(async move {
         let client = super::microsoft::OAuthClientConfig::load()?;
         let token = super::microsoft::store::MicrosoftToken::load()?
             .ok_or_else(|| anyhow::anyhow!("no Microsoft token on disk yet"))?;
-        let provider =
-            crate::widgets::email::outlook::OutlookEmailProvider::new(client, token)?;
+        let provider = crate::widgets::email::outlook::OutlookEmailProvider::new(client, token)?;
         let opts = provider.list_folders_for_picker().await?;
         Ok(("email_folders", opts))
     })
 }
 
-fn fetch_imap_folders()
-    -> Pin<Box<dyn Future<Output = Result<(&'static str, Vec<(String, String)>)>> + Send>> {
+fn fetch_imap_folders(
+) -> Pin<Box<dyn Future<Output = Result<(&'static str, Vec<(String, String)>)>> + Send>> {
     Box::pin(async move {
         let dir = super::credentials_dir()?;
         let path = dir.join("imap.toml");
         let text = std::fs::read_to_string(&path)?;
-        let creds: crate::widgets::email::imap::ImapCredentials =
-            toml::from_str(&text)?;
+        let creds: crate::widgets::email::imap::ImapCredentials = toml::from_str(&text)?;
         let provider = crate::widgets::email::imap::ImapProvider::new(creds);
         let opts = provider.list_folders_for_picker().await?;
         Ok(("email_folders", opts))
@@ -300,12 +298,12 @@ pub fn needs_credential_capture(provider_name: &str) -> bool {
     let Ok(doc) = toml::from_str::<toml::Value>(&text) else {
         return true;
     };
-    spec.required_keys.iter().any(|key| {
-        match doc.get(*key).and_then(|v| v.as_str()) {
+    spec.required_keys
+        .iter()
+        .any(|key| match doc.get(*key).and_then(|v| v.as_str()) {
             None => true,
             Some(s) => s.trim().is_empty() || s.starts_with("REPLACE_WITH_"),
-        }
-    })
+        })
 }
 
 /// Write the provider's starter credentials template to `credentials/`
@@ -315,7 +313,6 @@ pub fn needs_credential_capture(provider_name: &str) -> bool {
 /// missing-file error. Providers without a `starter_template` (e.g.
 /// IMAP, captured inline) are no-ops.
 pub fn ensure_credentials_template(provider_name: &str) -> Result<()> {
-    use anyhow::Context as _;
     let Some(provider) = find(provider_name) else {
         return Ok(());
     };
@@ -325,21 +322,8 @@ pub fn ensure_credentials_template(provider_name: &str) -> Result<()> {
     let Some(contents) = spec.starter_template else {
         return Ok(());
     };
-    let dir = super::credentials_dir()?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create {}", dir.display()))?;
-    let path = dir.join(spec.filename);
-    if !path.exists() {
-        std::fs::write(&path, contents)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &path,
-                std::fs::Permissions::from_mode(0o600),
-            );
-        }
+    if crate::credentials::write_template_if_missing(spec.filename, contents)? {
+        let path = crate::credentials::path(spec.filename)?;
         anyhow::bail!(
             "Wrote a template at {}. Open it, paste in your OAuth credentials, save, then press Space again to authorize.",
             path.display()

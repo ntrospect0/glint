@@ -28,25 +28,59 @@ use crate::wizard::{
 /// TextList buffer from the field's current value (if applicable) and
 /// places the option-list cursor on the field's current value so users
 /// land on a sensible row instead of row 0.
-pub fn on_enter(app: &mut WizardApp, widget_idx: usize) {
-    let Some(assignment) = app.state.assignments.get(widget_idx).cloned() else {
+/// Resolve the kind + widget_id this page is configuring. `child_idx` is
+/// `None` for a regular single-widget cell (Page::Widget(i)) and
+/// `Some(k)` for the k-th child of a stack cell (Page::StackChild).
+/// Returns None if the assignment / child has been removed under us, or
+/// if the resolved kind is empty (which is the sentinel for "stack cell
+/// with no scalar widget").
+fn resolve_target(
+    app: &WizardApp,
+    cell_idx: usize,
+    child_idx: Option<usize>,
+) -> Option<(String, String)> {
+    let assignment = app.state.assignments.get(cell_idx)?;
+    let (kind, widget_id) = match child_idx {
+        None => {
+            if assignment.kind.is_empty() {
+                return None;
+            }
+            (assignment.kind.clone(), assignment.widget_id())
+        }
+        Some(k) => {
+            let child = assignment.stack_children.get(k)?;
+            if child.kind.is_empty() {
+                return None;
+            }
+            (child.kind.clone(), child.widget_id())
+        }
+    };
+    Some((kind, widget_id))
+}
+
+pub fn on_enter(app: &mut WizardApp, cell_idx: usize, child_idx: Option<usize>) {
+    let Some((kind, widget_id)) = resolve_target(app, cell_idx, child_idx) else {
         return;
     };
-    let Some(desc) = registry::find(&assignment.kind) else {
+    let Some(desc) = registry::find(&kind) else {
         return;
     };
     let wd = (desc.wizard)();
-    let widget_id = assignment.widget_id();
     app.text_buffer.clear();
     populate_textlist_buffer(app, &widget_id, &wd);
     app.lookup_offset = current_value_index(app, &widget_id, &wd);
 }
 
-pub fn handle_key(key: KeyEvent, app: &mut WizardApp, widget_idx: usize) -> PageAction {
-    let Some(assignment) = app.state.assignments.get(widget_idx).cloned() else {
+pub fn handle_key(
+    key: KeyEvent,
+    app: &mut WizardApp,
+    cell_idx: usize,
+    child_idx: Option<usize>,
+) -> PageAction {
+    let Some((kind, widget_id)) = resolve_target(app, cell_idx, child_idx) else {
         return PageAction::Advance;
     };
-    let Some(desc) = registry::find(&assignment.kind) else {
+    let Some(desc) = registry::find(&kind) else {
         return PageAction::Advance;
     };
     let wd = (desc.wizard)();
@@ -61,7 +95,8 @@ pub fn handle_key(key: KeyEvent, app: &mut WizardApp, widget_idx: usize) -> Page
     }
 
     let field_count = wd.fields.len();
-    let widget_id = assignment.widget_id();
+    // `widget_id` was resolved up top from the (cell, optional child)
+    // target so the rest of the body is target-agnostic.
     // Trailing focus slot is the [ Save & Next ] button. Tab past the
     // last field lands on it; Enter from inside a field also moves
     // here (per `move_focus`); Enter on the button advances the page.
@@ -125,9 +160,7 @@ pub fn handle_key(key: KeyEvent, app: &mut WizardApp, widget_idx: usize) -> Page
     // between fields. The actual run happens up in the app loop via
     // PageAction::RunAuth so the TUI can be suspended for the browser
     // handshake.
-    if let Some(WizardFieldKind::OAuth { provider }) =
-        wd.fields.get(app.focus).map(|f| &f.kind)
-    {
+    if let Some(WizardFieldKind::OAuth { provider }) = wd.fields.get(app.focus).map(|f| &f.kind) {
         match key.code {
             KeyCode::Char(' ') => {
                 return PageAction::RunAuth((*provider).to_string());
@@ -166,13 +199,26 @@ pub fn handle_key(key: KeyEvent, app: &mut WizardApp, widget_idx: usize) -> Page
             move_focus(app, &widget_id, &wd, -1, field_count);
             PageAction::Stay
         }
-        // Number gets ±step via ←/→; Bool toggles. Other kinds ignore.
-        KeyCode::Left | KeyCode::Char('h') => {
+        // Number gets ±step via ←/→. Vim-style h/l aliases only fire on
+        // Number fields — for Text / TextList / Path they'd otherwise
+        // eat the literal letters the user is trying to type (a Gallery
+        // path like `/Users/john/...` would lose every `h` and `l`).
+        // Bool already lives in `handle_options_key` above.
+        KeyCode::Left => {
             adjust_focused(app, &widget_id, &wd, false);
             PageAction::Stay
         }
-        KeyCode::Right | KeyCode::Char('l') => {
+        KeyCode::Right => {
             adjust_focused(app, &widget_id, &wd, true);
+            PageAction::Stay
+        }
+        KeyCode::Char('h') | KeyCode::Char('l')
+            if matches!(
+                wd.fields.get(app.focus).map(|f| &f.kind),
+                Some(WizardFieldKind::Number { .. })
+            ) =>
+        {
+            adjust_focused(app, &widget_id, &wd, key.code == KeyCode::Char('l'));
             PageAction::Stay
         }
         KeyCode::Char(' ') => {
@@ -261,8 +307,9 @@ fn handle_options_key(
 fn option_row_count_for(app: &WizardApp, kind: &WizardFieldKind) -> usize {
     match kind {
         WizardFieldKind::Bool { .. } => 2,
-        WizardFieldKind::Choice { options, .. }
-        | WizardFieldKind::MultiChoice { options, .. } => options.len(),
+        WizardFieldKind::Choice { options, .. } | WizardFieldKind::MultiChoice { options, .. } => {
+            options.len()
+        }
         WizardFieldKind::RemoteMultiChoice { source, defaults } => app
             .remote_options
             .get(*source)
@@ -311,10 +358,7 @@ fn commit_option_selection(app: &mut WizardApp, widget_id: &str, field: &WizardF
             // against the descriptor's `defaults` list, so the picker
             // still functions before authorization (e.g. the user can
             // pre-select INBOX before granting OAuth).
-            let resolved: Vec<(String, String)> = match app
-                .remote_options
-                .get(*source)
-            {
+            let resolved: Vec<(String, String)> = match app.remote_options.get(*source) {
                 Some(opts) => opts.clone(),
                 None => defaults
                     .iter()
@@ -482,10 +526,7 @@ fn current_choice(app: &WizardApp, widget_id: &str, field: &WizardField) -> Stri
 /// Build the dropdown view: blank entry first (when configured), then any
 /// `(value, label)` whose value or label contains the filter
 /// case-insensitively. An empty filter passes everything through.
-fn filtered_lookup_options<'a>(
-    field: &'a WizardField,
-    filter: &str,
-) -> Vec<(&'a str, &'a str)> {
+fn filtered_lookup_options<'a>(field: &'a WizardField, filter: &str) -> Vec<(&'a str, &'a str)> {
     let WizardFieldKind::Lookup {
         options,
         allow_blank,
@@ -550,7 +591,14 @@ fn adjust_focused(app: &mut WizardApp, widget_id: &str, wd: &WizardDescriptor, f
     let cur = current_value(app, widget_id, field);
     let next = match (&field.kind, cur) {
         (WizardFieldKind::Bool { .. }, WizardValue::Bool(b)) => WizardValue::Bool(!b),
-        (WizardFieldKind::Number { default, integer, range }, WizardValue::Number(n)) => {
+        (
+            WizardFieldKind::Number {
+                default,
+                integer,
+                range,
+            },
+            WizardValue::Number(n),
+        ) => {
             let step = if *integer { 1.0 } else { 0.1 };
             let mut next = if forward { n + step } else { n - step };
             if let Some((lo, hi)) = range {
@@ -726,14 +774,19 @@ fn split_list(joined: &str, separator: crate::wizard::descriptor::Separator) -> 
         .collect()
 }
 
-pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp, widget_idx: usize) {
-    let Some(assignment) = app.state.assignments.get(widget_idx) else {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    app: &WizardApp,
+    cell_idx: usize,
+    child_idx: Option<usize>,
+) {
+    let Some((kind, widget_id)) = resolve_target(app, cell_idx, child_idx) else {
         return;
     };
-    let widget_id = assignment.widget_id();
-    let Some(desc) = registry::find(&assignment.kind) else {
+    let Some(desc) = registry::find(&kind) else {
         frame.render_widget(
-            Paragraph::new(format!("Unknown widget kind: {}", assignment.kind))
+            Paragraph::new(format!("Unknown widget kind: {}", kind))
                 .block(Block::default().borders(Borders::ALL)),
             area,
         );
@@ -741,15 +794,36 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp, widget_idx: usize)
     };
     let wd = (desc.wizard)();
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" Configure {} ", widget_id));
-    let inner = block.inner(area);
+    // Stack-child pages add a "(stack child N of M)" suffix so the
+    // user can see they're inside a stack walkthrough; single-widget
+    // pages keep the unadorned widget id title.
+    let title = match child_idx {
+        Some(k) => {
+            let total = app
+                .state
+                .assignments
+                .get(cell_idx)
+                .map(|a| a.stack_children.len())
+                .unwrap_or(0);
+            format!(
+                " Configure {} (cell {} stack child {} of {}) ",
+                widget_id,
+                cell_idx + 1,
+                k + 1,
+                total
+            )
+        }
+        None => format!(" Configure {} ", widget_id),
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = style::pad_inner(block.inner(area));
     frame.render_widget(block, area);
 
     // Three-column split: form, 2-cell visual gap, layout preview. The
     // gap keeps the preview border from butting against the form's
-    // values + dropdown rows.
+    // values + dropdown rows. The preview highlights the PARENT cell
+    // regardless of whether we're on a stack-child page — the layout
+    // grid has no per-child slot to highlight.
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -763,12 +837,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp, widget_idx: usize)
         cols[2],
         &app.state.layout,
         &app.state.assignments,
-        Some(widget_idx),
+        Some(cell_idx),
     );
 
+    // Header gets an extra row so the blurb has a blank line of breathing
+    // room before the first input field. Without it, blurbs like "Time
+    // display with optional secondary…" butted directly into field 1.
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .constraints([Constraint::Length(4), Constraint::Min(1)])
         .split(cols[0]);
 
     let header = Paragraph::new(vec![
@@ -777,6 +854,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp, widget_idx: usize)
             style::section_header(),
         )),
         Line::from(Span::styled(wd.blurb.to_string(), style::blurb())),
+        Line::from(""),
     ])
     .wrap(Wrap { trim: false });
     frame.render_widget(header, rows[0]);
@@ -800,8 +878,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp, widget_idx: usize)
 // Indentation conventions inside the body block. Each field section is
 // numbered ("1.", "2.", …) flush-left; the value, dropdown rows, and
 // help text indent under it so the eye can follow the hierarchy.
-const FIELD_BODY_INDENT: &str = "      ";   // 6 spaces — under "1.  "
-const HELP_INDENT: &str = "       ";        // 7 spaces — slight in-set
+const FIELD_BODY_INDENT: &str = "      "; // 6 spaces — under "1.  "
+const HELP_INDENT: &str = "       "; // 7 spaces — slight in-set
 const DROPDOWN_INDENT: &str = "       ";
 
 fn render_fields(
@@ -856,8 +934,7 @@ fn render_fields(
     ]));
     if on_button {
         lines.push(Line::from(Span::styled(
-            "    Enter advances to the next page (Tab/↑ to return to fields)."
-                .to_string(),
+            "    Enter advances to the next page (Tab/↑ to return to fields).".to_string(),
             style::help_text(),
         )));
     }
@@ -879,9 +956,7 @@ fn render_field_body(
             render_multichoice_list(lines, app, widget_id, field, options, focused);
         }
         WizardFieldKind::RemoteMultiChoice { source, defaults } => {
-            render_remote_multichoice_list(
-                lines, app, widget_id, field, source, defaults, focused,
-            );
+            render_remote_multichoice_list(lines, app, widget_id, field, source, defaults, focused);
         }
         WizardFieldKind::Bool { .. } => {
             render_bool_list(lines, app, widget_id, field, focused);
@@ -896,20 +971,21 @@ fn render_field_body(
             // While editing, the raw text buffer is the source of truth —
             // it carries the un-split trailing commas and spaces the user
             // just typed. Display it directly so editing feels responsive.
+            // Append a blinking cursor so the user sees this field is
+            // typeable; the cursor lands at the end of any pre-seeded
+            // defaults (e.g. Stocks' default tickers) so further typing
+            // extends the list.
             let style_for_value = style::value_focused();
-            let text = if app.text_buffer.is_empty() {
-                "(empty — type entries separated by commas)".to_string()
-            } else {
-                app.text_buffer.clone()
-            };
-            lines.push(Line::from(vec![
-                Span::raw(FIELD_BODY_INDENT),
-                Span::styled(text, style_for_value),
-            ]));
+            let mut spans: Vec<Span> = vec![Span::raw(FIELD_BODY_INDENT)];
+            if !app.text_buffer.is_empty() {
+                spans.push(Span::styled(app.text_buffer.clone(), style_for_value));
+            }
+            spans.push(cursor_span());
+            lines.push(Line::from(spans));
         }
         _ => {
             let v = current_value(app, widget_id, field);
-            lines.push(render_value(&v, focused));
+            lines.push(render_value(&v, focused, field));
         }
     }
 }
@@ -948,8 +1024,7 @@ fn render_oauth_status(
         (false, Some(crate::wizard::state::AuthStatus::Authorized)) => {
             // Race: state says authorized but the token store can't
             // find it. Surface honestly so the user knows to retry.
-            "Authorization recorded but token not found on disk — retry recommended."
-                .to_string()
+            "Authorization recorded but token not found on disk — retry recommended.".to_string()
         }
         (false, _) => "Not authorized.".to_string(),
     };
@@ -994,8 +1069,15 @@ fn render_bool_list(
     field: &WizardField,
     focused: bool,
 ) {
-    let cur = matches!(current_value(app, widget_id, field), WizardValue::Bool(true));
-    let highlight = if focused { Some(app.lookup_offset.min(1)) } else { None };
+    let cur = matches!(
+        current_value(app, widget_id, field),
+        WizardValue::Bool(true)
+    );
+    let highlight = if focused {
+        Some(app.lookup_offset.min(1))
+    } else {
+        None
+    };
     for (i, (value, label)) in [(true, "yes"), (false, "no")].iter().enumerate() {
         let is_active = *value == cur;
         let is_highlighted = highlight == Some(i);
@@ -1057,10 +1139,7 @@ fn render_choice_list(
             Span::styled(opt.label.to_string(), label_style),
         ];
         if let Some(help) = opt.help {
-            spans.push(Span::styled(
-                format!("  — {help}"),
-                style::help_text(),
-            ));
+            spans.push(Span::styled(format!("  — {help}"), style::help_text()));
         }
         lines.push(Line::from(spans));
     }
@@ -1112,8 +1191,7 @@ fn render_remote_multichoice_list(
         lines.push(Line::from(vec![
             Span::raw(FIELD_BODY_INDENT),
             Span::styled(
-                "(showing defaults — list refreshes after you authorize)"
-                    .to_string(),
+                "(showing defaults — list refreshes after you authorize)".to_string(),
                 style::help_text(),
             ),
         ]));
@@ -1195,10 +1273,7 @@ fn render_multichoice_list(
             Span::styled(opt.label.to_string(), label_style),
         ];
         if let Some(help) = opt.help {
-            spans.push(Span::styled(
-                format!("  — {help}"),
-                style::help_text(),
-            ));
+            spans.push(Span::styled(format!("  — {help}"), style::help_text()));
         }
         lines.push(Line::from(spans));
     }
@@ -1298,12 +1373,35 @@ fn append_lookup_dropdown(lines: &mut Vec<Line<'static>>, app: &WizardApp, field
     lines.push(Line::from(Span::styled(footer, style::help_text())));
 }
 
-fn render_value(v: &WizardValue, focused: bool) -> Line<'static> {
+fn render_value(v: &WizardValue, focused: bool, field: &WizardField) -> Line<'static> {
     let style_for_value = if focused {
         style::value_focused()
     } else {
         style::value_idle()
     };
+    // Text-like fields get an inline blinking cursor while focused so the
+    // user sees they can type. For an empty field this replaces the
+    // "(empty)" placeholder entirely with just the cursor. The cursor
+    // sits at the end of any existing content.
+    let is_typeable = matches!(
+        field.kind,
+        WizardFieldKind::Text { .. }
+            | WizardFieldKind::Path { .. }
+            | WizardFieldKind::Number { .. }
+    );
+    if focused && is_typeable {
+        let mut spans: Vec<Span> = vec![Span::raw(FIELD_BODY_INDENT.to_string())];
+        let body = match v {
+            WizardValue::Text(s) | WizardValue::Path(s) => s.clone(),
+            WizardValue::Number(n) => format!("{n}"),
+            _ => String::new(),
+        };
+        if !body.is_empty() {
+            spans.push(Span::styled(body, style_for_value));
+        }
+        spans.push(cursor_span());
+        return Line::from(spans);
+    }
     let text = match v {
         WizardValue::Text(s) | WizardValue::Choice(s) | WizardValue::Path(s) => {
             if s.is_empty() {
@@ -1326,6 +1424,14 @@ fn render_value(v: &WizardValue, focused: bool) -> Line<'static> {
         Span::raw(FIELD_BODY_INDENT.to_string()),
         Span::styled(text, style_for_value),
     ])
+}
+
+/// Reverse-video blinking block painted at the end of a focused
+/// text-typeable field. Uses a single space cell with the cursor style
+/// from the palette (REVERSED + SLOW_BLINK) so it animates with the
+/// terminal's cursor blink rate.
+pub(crate) fn cursor_span() -> Span<'static> {
+    Span::styled("█".to_string(), style::cursor())
 }
 
 #[cfg(test)]
@@ -1628,7 +1734,7 @@ mod tests {
         let out = filtered_lookup_options(&f, "");
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].0, ""); // blank first
-        // Filter that matches the blank label keeps the blank entry.
+                                  // Filter that matches the blank label keeps the blank entry.
         let out = filtered_lookup_options(&f, "local");
         assert!(out.iter().any(|(v, _)| v.is_empty()));
         // Filter that matches only a real value drops the blank entry.

@@ -3,11 +3,14 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::auth;
+use crate::credentials;
+
+const CLIENT_FILE: &str = "microsoft_oauth_client.toml";
+const TOKEN_FILE: &str = "microsoft_oauth_token.toml";
 
 /// What we load from `~/.config/glint/credentials/microsoft_oauth_client.toml`.
 /// PKCE means there's no client secret to store — just the client_id from
@@ -28,17 +31,13 @@ fn default_tenant() -> String {
 
 impl OAuthClientConfig {
     pub fn load() -> Result<Self> {
-        let path = auth::credentials_dir()?.join("microsoft_oauth_client.toml");
-        if !path.exists() {
+        let path = credentials::path(CLIENT_FILE)?;
+        let Some(cfg): Option<OAuthClientConfig> = credentials::load(CLIENT_FILE)? else {
             anyhow::bail!(
                 "Microsoft OAuth client config missing at {}",
                 path.display()
             );
-        }
-        let contents = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let cfg: OAuthClientConfig = toml::from_str(&contents)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        };
         if cfg.client_id.is_empty() || cfg.client_id.starts_with("REPLACE_WITH_") {
             anyhow::bail!(
                 "{} is still the template — fill in your Azure app client_id",
@@ -59,37 +58,12 @@ pub struct MicrosoftToken {
 }
 
 impl MicrosoftToken {
-    pub fn path() -> Result<PathBuf> {
-        Ok(auth::credentials_dir()?.join("microsoft_oauth_token.toml"))
-    }
-
     pub fn load() -> Result<Option<Self>> {
-        let path = Self::path()?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        let contents = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let token: MicrosoftToken = toml::from_str(&contents)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
-        Ok(Some(token))
+        credentials::load(TOKEN_FILE)
     }
 
     pub fn save(&self) -> Result<PathBuf> {
-        let path = Self::path()?;
-        let body = toml::to_string_pretty(self)
-            .context("failed to serialize Microsoft token")?;
-        std::fs::write(&path, body)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &path,
-                std::fs::Permissions::from_mode(0o600),
-            );
-        }
-        Ok(path)
+        credentials::save(TOKEN_FILE, self)
     }
 
     /// True when the access token expires within `skew_secs` seconds.

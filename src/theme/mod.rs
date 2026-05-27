@@ -241,10 +241,7 @@ impl Theme {
         Self {
             border_focused: pick(&overrides.border.focused, self.border_focused),
             border_unfocused: pick(&overrides.border.unfocused, self.border_unfocused),
-            widget_title_focused: pick(
-                &overrides.widget_title.focused,
-                self.widget_title_focused,
-            ),
+            widget_title_focused: pick(&overrides.widget_title.focused, self.widget_title_focused),
             widget_title_unfocused: pick(
                 &overrides.widget_title.unfocused,
                 self.widget_title_unfocused,
@@ -325,8 +322,7 @@ pub fn load_schemes_file() -> Result<ColorSchemesFile> {
     }
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    toml::from_str(&contents)
-        .with_context(|| format!("failed to parse {}", path.display()))
+    toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 /// Load the app theme. Looks up scheme `name` in `~/.config/glint/colorschemes.toml`
@@ -489,7 +485,11 @@ fn is_theme_assignment(trimmed_line: &str) -> bool {
 /// Maps a color name or hex literal to a Ratatui [`Color`]. Returns `None`
 /// for `"default"`/`"reset"`/`"none"`/`""` so the caller can leave the field
 /// unset and inherit from the terminal.
-fn parse_color(s: &str) -> Option<Color> {
+///
+/// `pub(crate)` so widgets that surface per-thing color config (calendar
+/// sources, future heatmap legends, etc.) reuse one parser instead of
+/// re-implementing a subset that's missing hex support.
+pub(crate) fn parse_color(s: &str) -> Option<Color> {
     let norm = s.trim().to_ascii_lowercase().replace('-', "_");
     if norm.is_empty() || norm == "default" || norm == "reset" || norm == "none" {
         return None;
@@ -579,8 +579,7 @@ mod tests {
 
     #[test]
     fn hex_color_literal_parses() {
-        let spec: StyleSpec = toml::from_str::<toml::Value>(r##"x = "#7dd3fc""##)
-            .unwrap()["x"]
+        let spec: StyleSpec = toml::from_str::<toml::Value>(r##"x = "#7dd3fc""##).unwrap()["x"]
             .clone()
             .try_into()
             .unwrap();
@@ -589,8 +588,7 @@ mod tests {
 
     #[test]
     fn default_keyword_means_inherit() {
-        let spec: StyleSpec = toml::from_str::<toml::Value>(r#"x = "default""#)
-            .unwrap()["x"]
+        let spec: StyleSpec = toml::from_str::<toml::Value>(r#"x = "default""#).unwrap()["x"]
             .clone()
             .try_into()
             .unwrap();
@@ -772,6 +770,9 @@ theme = "default"
         let theme = Theme::builtin_defaults().with_overrides(&scheme);
         assert_eq!(theme.metadata_focused.fg, Some(Color::LightYellow));
         assert_eq!(theme.metadata_unfocused.fg, Some(Color::Gray));
-        assert!(theme.metadata_unfocused.add_modifier.contains(Modifier::DIM));
+        assert!(theme
+            .metadata_unfocused
+            .add_modifier
+            .contains(Modifier::DIM));
     }
 }

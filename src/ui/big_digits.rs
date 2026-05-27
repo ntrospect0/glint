@@ -154,10 +154,7 @@ fn palette(gradient: Gradient, base: (u8, u8, u8)) -> [Color; 10] {
         // Lighter top, darker bottom — same hue family.
         Gradient::Subtle => (lighten(base, 0.30), darken(base, 0.45)),
         // Bright top, hue-rotated darker bottom (cyan→blue, yellow→orange, ...).
-        Gradient::HueShift => (
-            lighten(base, 0.25),
-            darken(shift_hue(base, -30.0), 0.30),
-        ),
+        Gradient::HueShift => (lighten(base, 0.25), darken(shift_hue(base, -30.0), 0.30)),
         // Near-white tinted top, accent below.
         Gradient::Glow => (lighten(base, 0.70), base),
         // Accent top, neutral dark gray bottom.
@@ -342,11 +339,7 @@ mod tests {
 
     #[test]
     fn render_styled_gradient_uses_half_blocks() {
-        let lines = render_styled(
-            "8",
-            Gradient::Subtle,
-            Style::default().fg(Color::LightCyan),
-        );
+        let lines = render_styled("8", Gradient::Subtle, Style::default().fg(Color::LightCyan));
         assert_eq!(lines.len(), GLYPH_HEIGHT);
         let joined: String = lines
             .iter()

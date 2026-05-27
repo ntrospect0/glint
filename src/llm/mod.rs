@@ -19,8 +19,7 @@ pub use openai::OpenAiProvider;
 /// `provider` config block + the shared `limits` block and produces
 /// either a ready provider or `Ok(None)` if the provider is intentionally
 /// disabled (missing key, placeholder credentials, etc.).
-pub type LlmBuilder =
-    fn(&ProviderConfig, LimitsConfig) -> Result<Option<Arc<dyn LlmProvider>>>;
+pub type LlmBuilder = fn(&ProviderConfig, LimitsConfig) -> Result<Option<Arc<dyn LlmProvider>>>;
 
 /// One entry in the LLM provider registry. Adding a new provider means
 /// appending one [`LlmProviderDef`] to [`PROVIDERS`] — no changes

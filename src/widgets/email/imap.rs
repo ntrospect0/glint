@@ -160,8 +160,15 @@ fn list_folders_sync(creds: &ImapCredentials) -> Result<Vec<(String, String)>> {
     // Stable order: priority list first, then alphabetical for the
     // rest. INBOX is special-cased to always lead.
     let priority: &[&str] = &[
-        "INBOX", "Sent", "Sent Items", "Drafts", "Archive", "Junk",
-        "Spam", "Trash", "Deleted Messages",
+        "INBOX",
+        "Sent",
+        "Sent Items",
+        "Drafts",
+        "Archive",
+        "Junk",
+        "Spam",
+        "Trash",
+        "Deleted Messages",
     ];
     out.sort_by(|a, b| {
         let ai = priority
@@ -184,19 +191,11 @@ fn connect_concrete(creds: &ImapCredentials) -> Result<ConcreteSession> {
     let tls = native_tls::TlsConnector::builder()
         .build()
         .context("imap: failed to build TLS connector")?;
-    let client = imap::connect(
-        (creds.host.as_str(), creds.port),
-        &creds.host,
-        &tls,
-    )
-    .with_context(|| {
-        format!("imap: TLS connect to {}:{} failed", creds.host, creds.port)
-    })?;
+    let client = imap::connect((creds.host.as_str(), creds.port), &creds.host, &tls)
+        .with_context(|| format!("imap: TLS connect to {}:{} failed", creds.host, creds.port))?;
     client
         .login(&creds.username, &creds.app_password)
-        .map_err(|(err, _client)| {
-            anyhow!("imap: login failed for {}: {err}", creds.username)
-        })
+        .map_err(|(err, _client)| anyhow!("imap: login failed for {}: {err}", creds.username))
 }
 
 fn fetch_recent_sync(
@@ -318,11 +317,9 @@ impl EmailProvider for ImapProvider {
     ) -> Result<Vec<EmailMessage>> {
         let creds = self.creds.clone();
         let folder = folder.to_string();
-        tokio::task::spawn_blocking(move || {
-            fetch_recent_sync(&creds, &folder, since, max)
-        })
-        .await
-        .context("imap fetch task panicked")?
+        tokio::task::spawn_blocking(move || fetch_recent_sync(&creds, &folder, since, max))
+            .await
+            .context("imap fetch task panicked")?
     }
 
     fn provider_label(&self) -> &str {

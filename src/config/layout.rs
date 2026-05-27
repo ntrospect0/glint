@@ -90,7 +90,10 @@ impl GridCell {
         if stack.len() == 1 {
             return Some(stack.into_iter().next().unwrap());
         }
-        self.widget.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        self.widget
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     }
 
     /// Identity of the widget instance this cell renders, used to look
@@ -237,7 +240,10 @@ fn weights_to_constraints(weights: &[u16]) -> Vec<Constraint> {
     if weights.is_empty() {
         return vec![Constraint::Percentage(100)];
     }
-    weights.iter().map(|w| Constraint::Ratio(u32::from(*w), weights.iter().map(|x| u32::from(*x)).sum())).collect()
+    weights
+        .iter()
+        .map(|w| Constraint::Ratio(u32::from(*w), weights.iter().map(|x| u32::from(*x)).sum()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -253,7 +259,10 @@ mod tests {
             .iter()
             .map(|c| c.primary_widget().unwrap_or_default())
             .collect();
-        assert_eq!(widgets, vec!["clock", "calendar", "weather", "news", "stocks"]);
+        assert_eq!(
+            widgets,
+            vec!["clock", "calendar", "weather", "news", "stocks"]
+        );
     }
 
     #[test]
@@ -267,12 +276,18 @@ mod tests {
         assert_eq!(resolved[0].cell.primary_widget().as_deref(), Some("clock"));
         assert_eq!(resolved[0].area.x, 0);
         assert_eq!(resolved[0].area.y, 0);
-        assert_eq!(resolved[1].cell.primary_widget().as_deref(), Some("calendar"));
+        assert_eq!(
+            resolved[1].cell.primary_widget().as_deref(),
+            Some("calendar")
+        );
         assert_eq!(resolved[1].area.y, 0);
         assert!(resolved[1].area.x > 0);
 
         // Middle row: weather left, news right.
-        assert_eq!(resolved[2].cell.primary_widget().as_deref(), Some("weather"));
+        assert_eq!(
+            resolved[2].cell.primary_widget().as_deref(),
+            Some("weather")
+        );
         assert_eq!(resolved[3].cell.primary_widget().as_deref(), Some("news"));
         assert_eq!(resolved[2].area.y, resolved[3].area.y);
         assert!(resolved[2].area.y > resolved[0].area.y);

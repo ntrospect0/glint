@@ -54,9 +54,7 @@ pub async fn run(client: &OAuthClientConfig) -> Result<MicrosoftToken> {
     let auth_url = build_auth_url(client, &redirect_uri, &state, &challenge);
 
     eprintln!("Opening browser to authorize glint with Microsoft…");
-    eprintln!(
-        "If it doesn't open, paste this URL manually:\n\n  {auth_url}\n"
-    );
+    eprintln!("If it doesn't open, paste this URL manually:\n\n  {auth_url}\n");
     if let Err(err) = open::that(&auth_url) {
         tracing::warn!(error = %err, "failed to open browser automatically");
     }
@@ -122,9 +120,9 @@ async fn exchange_code(
         .json()
         .await
         .context("failed to parse Microsoft token response")?;
-    let refresh = tr
-        .refresh_token
-        .context("Microsoft did not return a refresh_token — check that `offline_access` is in your scope")?;
+    let refresh = tr.refresh_token.context(
+        "Microsoft did not return a refresh_token — check that `offline_access` is in your scope",
+    )?;
     Ok(MicrosoftToken {
         access_token: tr.access_token,
         refresh_token: refresh,
@@ -162,7 +160,9 @@ pub async fn refresh(client: &OAuthClientConfig, prev: &MicrosoftToken) -> Resul
         .context("failed to parse Microsoft refresh response")?;
     Ok(MicrosoftToken {
         access_token: tr.access_token,
-        refresh_token: tr.refresh_token.unwrap_or_else(|| prev.refresh_token.clone()),
+        refresh_token: tr
+            .refresh_token
+            .unwrap_or_else(|| prev.refresh_token.clone()),
         expires_at: Utc::now() + chrono::Duration::seconds(tr.expires_in),
         token_type: tr.token_type,
         scope: if tr.scope.is_empty() {
@@ -190,8 +190,7 @@ fn pkce_pair() -> Result<(String, String)> {
 /// Base64url-encode (RFC 4648 §5) without padding. ~30 lines vs. pulling in
 /// the `base64` crate just for this one call.
 fn base64_url_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut output = String::with_capacity((input.len() * 4).div_ceil(3));
     let chunks = input.chunks_exact(3);
     let rem = chunks.remainder();

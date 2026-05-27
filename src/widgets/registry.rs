@@ -150,6 +150,19 @@ pub const WIDGETS: &[WidgetDescriptor] = &[
         auth_requirements: &[],
         wizard: super::notes::wizard_descriptor,
     },
+    #[cfg(feature = "widget-wsj")]
+    WidgetDescriptor {
+        kind: super::wsj::KIND,
+        factory: super::wsj::build,
+        default_in_first_run: false,
+        // WSJ stores its session cookie in a widget-local credentials
+        // file rather than going through OAuth. No auth_requirements
+        // entry means the wizard's auth-prompt step skips us, which is
+        // intentional — the cookie is captured at runtime via the
+        // widget's own `a` (authorize) modal.
+        auth_requirements: &[],
+        wizard: super::wsj::wizard_descriptor,
+    },
 ];
 
 /// Look up a widget descriptor by kind string. `None` when the kind isn't
@@ -200,7 +213,8 @@ mod tests {
     #[test]
     fn find_returns_descriptor_for_each_kind() {
         for desc in WIDGETS {
-            let found = find(desc.kind).unwrap_or_else(|| panic!("find({}) returned None", desc.kind));
+            let found =
+                find(desc.kind).unwrap_or_else(|| panic!("find({}) returned None", desc.kind));
             assert_eq!(found.kind, desc.kind);
         }
         assert!(find("definitely-not-a-real-widget").is_none());
@@ -219,7 +233,10 @@ mod tests {
     #[test]
     fn core_widgets_are_present() {
         for kind in ["clock", "weather", "calendar", "news", "stocks"] {
-            assert!(find(kind).is_some(), "core widget {kind} missing from registry");
+            assert!(
+                find(kind).is_some(),
+                "core widget {kind} missing from registry"
+            );
         }
     }
 }

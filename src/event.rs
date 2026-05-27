@@ -12,6 +12,10 @@ use tokio::sync::mpsc;
 pub enum Event {
     Key(KeyEvent),
     Mouse(MouseEvent),
+    /// Bracketed-paste payload from the terminal — the entire pasted text
+    /// arrives atomically here instead of streaming as fake keystrokes,
+    /// which is what made multi-line pastes into text widgets misbehave.
+    Paste(String),
     /// Terminal resize. Ratatui recomputes layout from the next `terminal.size()`
     /// on draw, so the new dimensions don't need to ride the event.
     Resize,
@@ -62,6 +66,7 @@ async fn run_loop(
                 let mapped = match evt {
                     CtEvent::Key(k) => Some(Event::Key(k)),
                     CtEvent::Mouse(m) => Some(Event::Mouse(m)),
+                    CtEvent::Paste(text) => Some(Event::Paste(text)),
                     CtEvent::Resize(_, _) => Some(Event::Resize),
                     _ => None,
                 };

@@ -63,7 +63,9 @@ impl Cache {
     /// Open the default cache under `$XDG_CACHE_HOME/glint/` (falling back to
     /// `~/.cache/glint/`). The directory is created lazily on first write.
     pub fn open_default() -> Result<Self> {
-        Ok(Self { root: default_dir()? })
+        Ok(Self {
+            root: default_dir()?,
+        })
     }
 
     /// Open a cache at an explicit root. Used by tests and the home-dir
@@ -132,10 +134,7 @@ fn sweep_dir(dir: &Path, cutoff: SystemTime, removed: &mut usize) {
             // After recursing, drop the directory if it emptied out.
             let _ = fs::remove_dir(&path);
         } else if meta.is_file() {
-            let stale = meta
-                .modified()
-                .map(|m| m < cutoff)
-                .unwrap_or(false);
+            let stale = meta.modified().map(|m| m < cutoff).unwrap_or(false);
             if stale {
                 match fs::remove_file(&path) {
                     Ok(()) => *removed += 1,
@@ -285,9 +284,8 @@ impl ScopedCache {
     /// threads (wall-clock nanos can collide). Atomic rename resolves the
     /// last-write-wins on a shared destination.
     fn atomic_write(&self, final_path: &Path, bytes: &[u8], key: &str) -> Result<()> {
-        fs::create_dir_all(&self.dir).with_context(|| {
-            format!("failed to create cache dir {}", self.dir.display())
-        })?;
+        fs::create_dir_all(&self.dir)
+            .with_context(|| format!("failed to create cache dir {}", self.dir.display()))?;
         let tmp_path = self.dir.join(format!(
             ".{}.{}.{}.tmp",
             sanitize(key),
@@ -432,7 +430,11 @@ mod tests {
         let scoped = cache.scoped("news", "main");
         // Write garbage at the path the scope would use.
         std::fs::create_dir_all(dir.join("news").join("main")).unwrap();
-        std::fs::write(dir.join("news").join("main").join("articles.json"), b"{not json").unwrap();
+        std::fs::write(
+            dir.join("news").join("main").join("articles.json"),
+            b"{not json",
+        )
+        .unwrap();
         let got: Option<CacheEntry<Sample>> = scoped.load("articles");
         assert!(got.is_none());
     }
@@ -513,11 +515,23 @@ mod tests {
         let cache = Cache::at(&dir);
         cache
             .scoped("news", "main")
-            .store("a", &Sample { title: "1".into(), count: 1 })
+            .store(
+                "a",
+                &Sample {
+                    title: "1".into(),
+                    count: 1,
+                },
+            )
             .unwrap();
         cache
             .scoped("stocks", "main")
-            .store("b", &Sample { title: "2".into(), count: 2 })
+            .store(
+                "b",
+                &Sample {
+                    title: "2".into(),
+                    count: 2,
+                },
+            )
             .unwrap();
         cache.clear_widget("news").unwrap();
         assert!(cache.scoped("news", "main").load::<Sample>("a").is_none());
@@ -530,15 +544,30 @@ mod tests {
         let cache = Cache::at(&dir);
         cache
             .scoped("clock", "home")
-            .store("a", &Sample { title: "1".into(), count: 1 })
+            .store(
+                "a",
+                &Sample {
+                    title: "1".into(),
+                    count: 1,
+                },
+            )
             .unwrap();
         cache
             .scoped("clock", "office")
-            .store("a", &Sample { title: "2".into(), count: 2 })
+            .store(
+                "a",
+                &Sample {
+                    title: "2".into(),
+                    count: 2,
+                },
+            )
             .unwrap();
         cache.clear_instance("clock", "home").unwrap();
         assert!(cache.scoped("clock", "home").load::<Sample>("a").is_none());
-        assert!(cache.scoped("clock", "office").load::<Sample>("a").is_some());
+        assert!(cache
+            .scoped("clock", "office")
+            .load::<Sample>("a")
+            .is_some());
     }
 
     #[test]
@@ -555,11 +584,23 @@ mod tests {
         let cache = Cache::at(&dir);
         cache
             .scoped("news", "main")
-            .store("a", &Sample { title: "1".into(), count: 1 })
+            .store(
+                "a",
+                &Sample {
+                    title: "1".into(),
+                    count: 1,
+                },
+            )
             .unwrap();
         cache
             .scoped("stocks", "main")
-            .store("b", &Sample { title: "2".into(), count: 2 })
+            .store(
+                "b",
+                &Sample {
+                    title: "2".into(),
+                    count: 2,
+                },
+            )
             .unwrap();
         cache.clear_all().unwrap();
         assert!(cache.scoped("news", "main").load::<Sample>("a").is_none());
@@ -572,7 +613,13 @@ mod tests {
         let cache = Cache::at(&dir);
         let scoped = cache.scoped("news@home", "../../etc");
         scoped
-            .store("a/b", &Sample { title: "x".into(), count: 1 })
+            .store(
+                "a/b",
+                &Sample {
+                    title: "x".into(),
+                    count: 1,
+                },
+            )
             .unwrap();
         // Must round-trip even though every segment had unfriendly chars.
         let got: CacheEntry<Sample> = scoped.load("a/b").unwrap();
@@ -623,14 +670,17 @@ mod tests {
         let cache = Cache::at(tmpdir());
         let scoped = cache.scoped("gallery", "main");
         scoped
-            .store("meta", &Sample { title: "x".into(), count: 1 })
+            .store(
+                "meta",
+                &Sample {
+                    title: "x".into(),
+                    count: 1,
+                },
+            )
             .unwrap();
         scoped.store_bytes("meta", b"raw").unwrap();
         // Both round-trip independently.
-        assert_eq!(
-            scoped.load::<Sample>("meta").unwrap().value.title,
-            "x"
-        );
+        assert_eq!(scoped.load::<Sample>("meta").unwrap().value.title, "x");
         assert_eq!(scoped.load_bytes("meta").unwrap().value, b"raw");
     }
 
@@ -639,7 +689,13 @@ mod tests {
         let cache = Cache::at(tmpdir());
         let scoped = cache.scoped("gallery", "main");
         scoped
-            .store("meta", &Sample { title: "x".into(), count: 1 })
+            .store(
+                "meta",
+                &Sample {
+                    title: "x".into(),
+                    count: 1,
+                },
+            )
             .unwrap();
         scoped.store_bytes("meta", b"raw").unwrap();
         scoped.invalidate("meta").unwrap();
@@ -696,8 +752,24 @@ mod tests {
         let scoped = cache.scoped("news", "main");
 
         // Two entries: one we'll backdate, one we leave fresh.
-        scoped.store("stale", &Sample { title: "old".into(), count: 1 }).unwrap();
-        scoped.store("fresh", &Sample { title: "new".into(), count: 2 }).unwrap();
+        scoped
+            .store(
+                "stale",
+                &Sample {
+                    title: "old".into(),
+                    count: 1,
+                },
+            )
+            .unwrap();
+        scoped
+            .store(
+                "fresh",
+                &Sample {
+                    title: "new".into(),
+                    count: 2,
+                },
+            )
+            .unwrap();
 
         // Backdate the stale file by hand so we don't have to sleep.
         let stale_path = scoped.path_for("stale");

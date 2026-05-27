@@ -49,8 +49,8 @@ pub fn load() -> Result<Option<WizardState>> {
     if !path.exists() {
         return Ok(None);
     }
-    let contents = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let state: WizardState = match toml::from_str(&contents) {
         Ok(s) => s,
         Err(err) => {
@@ -93,9 +93,8 @@ pub fn save(state: &WizardState) -> Result<()> {
             .with_context(|| format!("failed to write {}", tmp.display()))?;
         f.sync_all().ok();
     }
-    fs::rename(&tmp, &path).with_context(|| {
-        format!("failed to rename {} → {}", tmp.display(), path.display())
-    })?;
+    fs::rename(&tmp, &path)
+        .with_context(|| format!("failed to rename {} → {}", tmp.display(), path.display()))?;
     Ok(())
 }
 

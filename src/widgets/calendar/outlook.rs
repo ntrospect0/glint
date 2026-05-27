@@ -209,7 +209,10 @@ impl RawGraphEvent {
             let e = parse_graph_datetime(&self.end.date_time, &self.end.time_zone)?;
             (s, e, false)
         };
-        let location = self.location.and_then(|l| l.display_name).filter(|s| !s.is_empty());
+        let location = self
+            .location
+            .and_then(|l| l.display_name)
+            .filter(|s| !s.is_empty());
         Some(Event {
             title,
             start,

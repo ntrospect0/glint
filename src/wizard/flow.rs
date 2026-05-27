@@ -35,9 +35,7 @@ fn page_from_id(id: &str) -> Option<Page> {
         "layout" => Some(Page::Layout),
         "assign" => Some(Page::Assign),
         "confirm" => Some(Page::Confirm),
-        s if s.starts_with("widget-") => {
-            s.strip_prefix("widget-")?.parse().ok().map(Page::Widget)
-        }
+        s if s.starts_with("widget-") => s.strip_prefix("widget-")?.parse().ok().map(Page::Widget),
         _ => None,
     }
 }
@@ -52,14 +50,36 @@ pub fn next_page(current: &Page, state: &WizardState) -> Option<Page> {
         Page::Welcome => Some(Page::Global),
         Page::Global => Some(Page::Layout),
         Page::Layout => Some(Page::Assign),
-        Page::Assign => match first_populated(state, 0) {
-            Some(i) => Some(Page::Widget(i)),
-            None => Some(Page::Confirm),
-        },
-        Page::Widget(i) => match first_populated(state, i + 1) {
-            Some(j) => Some(Page::Widget(j)),
-            None => Some(Page::Confirm),
-        },
+        Page::Assign => Some(
+            first_config_pos(state, 0)
+                .map(ConfigPos::to_page)
+                .unwrap_or(Page::Confirm),
+        ),
+        Page::Widget(i) => Some(
+            next_config_pos(
+                state,
+                ConfigPos {
+                    cell: *i,
+                    child: None,
+                },
+            )
+            .map(ConfigPos::to_page)
+            .unwrap_or(Page::Confirm),
+        ),
+        Page::StackChild {
+            cell_index,
+            child_index,
+        } => Some(
+            next_config_pos(
+                state,
+                ConfigPos {
+                    cell: *cell_index,
+                    child: Some(*child_index),
+                },
+            )
+            .map(ConfigPos::to_page)
+            .unwrap_or(Page::Confirm),
+        ),
         // OAuthSetup is out-of-band — it's never the "current" page in
         // the linear flow's forward sense; the app loop pushes/pops it
         // around the regular sequence via the history stack.
@@ -78,40 +98,141 @@ pub fn prev_page(current: &Page, state: &WizardState) -> Option<Page> {
         Page::Global => Some(Page::Welcome),
         Page::Layout => Some(Page::Global),
         Page::Assign => Some(Page::Layout),
-        Page::Widget(i) => match last_populated_before(state, *i) {
-            Some(j) => Some(Page::Widget(j)),
-            None => Some(Page::Assign),
-        },
+        Page::Widget(i) => Some(
+            prev_config_pos(
+                state,
+                ConfigPos {
+                    cell: *i,
+                    child: None,
+                },
+            )
+            .map(ConfigPos::to_page)
+            .unwrap_or(Page::Assign),
+        ),
+        Page::StackChild {
+            cell_index,
+            child_index,
+        } => Some(
+            prev_config_pos(
+                state,
+                ConfigPos {
+                    cell: *cell_index,
+                    child: Some(*child_index),
+                },
+            )
+            .map(ConfigPos::to_page)
+            .unwrap_or(Page::Assign),
+        ),
         Page::OAuthSetup { .. } => None,
         Page::AssignStack { .. } => None,
-        Page::Confirm => match last_populated_before(state, state.assignments.len()) {
-            Some(i) => Some(Page::Widget(i)),
-            None => Some(Page::Assign),
-        },
+        Page::Confirm => Some(
+            last_config_pos(state)
+                .map(ConfigPos::to_page)
+                .unwrap_or(Page::Assign),
+        ),
     }
 }
 
-/// Find the first populated cell at index `>= start`.
-fn first_populated(state: &WizardState, start: usize) -> Option<usize> {
-    state
-        .assignments
-        .iter()
-        .enumerate()
-        .skip(start)
-        .find(|(_, a)| !a.kind.is_empty())
-        .map(|(i, _)| i)
+/// A position in the per-widget walk: a single-widget cell, or a
+/// specific child of a stack cell. Drives next/prev navigation and the
+/// progress-step counter so stack children get the same per-page
+/// treatment that single-widget cells get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConfigPos {
+    cell: usize,
+    child: Option<usize>,
 }
 
-/// Find the largest populated cell index `< before`.
-fn last_populated_before(state: &WizardState, before: usize) -> Option<usize> {
-    state
-        .assignments
-        .iter()
-        .enumerate()
-        .take(before)
-        .rev()
-        .find(|(_, a)| !a.kind.is_empty())
-        .map(|(i, _)| i)
+impl ConfigPos {
+    fn to_page(self) -> Page {
+        match self.child {
+            None => Page::Widget(self.cell),
+            Some(k) => Page::StackChild {
+                cell_index: self.cell,
+                child_index: k,
+            },
+        }
+    }
+}
+
+/// First configurable position at cell index `>= start`. A cell counts
+/// when it has either a real `kind` (single widget) or non-empty
+/// `stack_children` (stack — we yield its first child).
+fn first_config_pos(state: &WizardState, start: usize) -> Option<ConfigPos> {
+    for (i, a) in state.assignments.iter().enumerate().skip(start) {
+        if !a.kind.is_empty() {
+            return Some(ConfigPos {
+                cell: i,
+                child: None,
+            });
+        }
+        if !a.stack_children.is_empty() {
+            return Some(ConfigPos {
+                cell: i,
+                child: Some(0),
+            });
+        }
+    }
+    None
+}
+
+/// Next configurable position strictly after `from`. Walks remaining
+/// stack children of the current cell, then moves on to subsequent
+/// cells via [`first_config_pos`].
+fn next_config_pos(state: &WizardState, from: ConfigPos) -> Option<ConfigPos> {
+    if let (Some(k), Some(a)) = (from.child, state.assignments.get(from.cell)) {
+        if k + 1 < a.stack_children.len() {
+            return Some(ConfigPos {
+                cell: from.cell,
+                child: Some(k + 1),
+            });
+        }
+    }
+    first_config_pos(state, from.cell + 1)
+}
+
+/// Previous configurable position strictly before `from`. Mirrors
+/// [`next_config_pos`]: walks earlier stack children of the current
+/// cell first, then earlier cells (landing on their last child if
+/// they're a stack).
+fn prev_config_pos(state: &WizardState, from: ConfigPos) -> Option<ConfigPos> {
+    if let (Some(k), _) = (from.child, state.assignments.get(from.cell)) {
+        if k > 0 {
+            return Some(ConfigPos {
+                cell: from.cell,
+                child: Some(k - 1),
+            });
+        }
+    }
+    last_config_pos_before(state, from.cell)
+}
+
+/// Last configurable position across the whole assignment list — used
+/// by Confirm's Back to land on the final widget page.
+fn last_config_pos(state: &WizardState) -> Option<ConfigPos> {
+    last_config_pos_before(state, state.assignments.len())
+}
+
+/// Last configurable position at cell index `< before`. If the last
+/// matching cell is a stack, returns its LAST child (so back-nav lands
+/// on the deepest position the user actually walked through).
+fn last_config_pos_before(state: &WizardState, before: usize) -> Option<ConfigPos> {
+    for i in (0..before.min(state.assignments.len())).rev() {
+        let a = &state.assignments[i];
+        if !a.kind.is_empty() {
+            return Some(ConfigPos {
+                cell: i,
+                child: None,
+            });
+        }
+        if !a.stack_children.is_empty() {
+            return Some(ConfigPos {
+                cell: i,
+                child: Some(a.stack_children.len() - 1),
+            });
+        }
+    }
+    None
 }
 
 /// 1-based step index for the progress header (`step 3 of 7`). Counts
@@ -124,7 +245,27 @@ pub fn current_step(current: &Page, state: &WizardState) -> usize {
         Page::Global => 2,
         Page::Layout => 3,
         Page::Assign => 4,
-        Page::Widget(i) => 4 + populated_position(state, *i),
+        Page::Widget(i) => {
+            4 + position_of(
+                state,
+                ConfigPos {
+                    cell: *i,
+                    child: None,
+                },
+            )
+        }
+        Page::StackChild {
+            cell_index,
+            child_index,
+        } => {
+            4 + position_of(
+                state,
+                ConfigPos {
+                    cell: *cell_index,
+                    child: Some(*child_index),
+                },
+            )
+        }
         // OAuthSetup overlays whatever widget page pushed it onto the
         // history stack; we can't recompute the originating widget
         // index cheaply, so report the last populated widget's step.
@@ -143,23 +284,202 @@ pub fn total_steps(state: &WizardState) -> usize {
     5 + populated_count(state).max(1)
 }
 
+/// Total number of configurable widget pages the wizard will walk
+/// through after Assign — counts single-widget cells once and every
+/// stack child individually, so the progress total reflects the full
+/// per-widget walk.
 fn populated_count(state: &WizardState) -> usize {
-    state.assignments.iter().filter(|a| !a.kind.is_empty()).count()
+    state
+        .assignments
+        .iter()
+        .map(|a| {
+            if !a.kind.is_empty() {
+                1
+            } else if !a.stack_children.is_empty() {
+                a.stack_children.len()
+            } else {
+                0
+            }
+        })
+        .sum()
 }
 
-/// 1-based position of cell `idx` among the populated cells (i.e. the
-/// nth populated cell). Used to derive widget-step numbers in the
-/// progress bar.
-fn populated_position(state: &WizardState, idx: usize) -> usize {
+/// 1-based position of `target` in the per-widget walk — counts each
+/// stack child individually, matching [`populated_count`].
+fn position_of(state: &WizardState, target: ConfigPos) -> usize {
     let mut pos = 0;
     for (i, a) in state.assignments.iter().enumerate() {
-        if a.kind.is_empty() {
-            continue;
-        }
-        pos += 1;
-        if i == idx {
-            return pos;
+        if !a.kind.is_empty() {
+            pos += 1;
+            if target.cell == i && target.child.is_none() {
+                return pos;
+            }
+        } else if !a.stack_children.is_empty() {
+            for k in 0..a.stack_children.len() {
+                pos += 1;
+                if target.cell == i && target.child == Some(k) {
+                    return pos;
+                }
+            }
         }
     }
     pos
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wizard::state::{CellAssignment, StackChild};
+
+    fn cell(kind: &str) -> CellAssignment {
+        CellAssignment {
+            cell_index: 0,
+            kind: kind.into(),
+            instance: "main".into(),
+            stack_children: Vec::new(),
+        }
+    }
+
+    fn stack_cell(children: &[&str]) -> CellAssignment {
+        CellAssignment {
+            cell_index: 0,
+            kind: String::new(),
+            instance: "main".into(),
+            stack_children: children
+                .iter()
+                .map(|k| StackChild {
+                    kind: (*k).into(),
+                    instance: "main".into(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Stack cells now route into a per-child walk instead of a
+    /// single empty Widget page. Single-cell assignments still
+    /// produce Widget(i); stack cells produce StackChild(i, k) for
+    /// each child in order.
+    #[test]
+    fn next_page_walks_into_stack_children() {
+        let mut state = WizardState::default();
+        state.assignments.push(cell("clock"));
+        state
+            .assignments
+            .push(stack_cell(&["news", "email", "notes"]));
+        state.assignments.push(cell("calendar"));
+
+        // Assign → first config = Widget(0) (clock).
+        assert_eq!(next_page(&Page::Assign, &state), Some(Page::Widget(0)));
+        // Clock → first stack child (cell 1, child 0 = news).
+        assert_eq!(
+            next_page(&Page::Widget(0), &state),
+            Some(Page::StackChild {
+                cell_index: 1,
+                child_index: 0,
+            })
+        );
+        // News → email (cell 1, child 1).
+        assert_eq!(
+            next_page(
+                &Page::StackChild {
+                    cell_index: 1,
+                    child_index: 0,
+                },
+                &state
+            ),
+            Some(Page::StackChild {
+                cell_index: 1,
+                child_index: 1,
+            })
+        );
+        // Email → notes.
+        assert_eq!(
+            next_page(
+                &Page::StackChild {
+                    cell_index: 1,
+                    child_index: 1,
+                },
+                &state
+            ),
+            Some(Page::StackChild {
+                cell_index: 1,
+                child_index: 2,
+            })
+        );
+        // Notes (last stack child) → calendar (cell 2).
+        assert_eq!(
+            next_page(
+                &Page::StackChild {
+                    cell_index: 1,
+                    child_index: 2,
+                },
+                &state
+            ),
+            Some(Page::Widget(2))
+        );
+        // Calendar → Confirm.
+        assert_eq!(next_page(&Page::Widget(2), &state), Some(Page::Confirm));
+    }
+
+    /// Esc/back from a stack child reverses the same walk — the user
+    /// shouldn't get teleported past sibling children or to the
+    /// parent cell's Assign page when there are earlier siblings to
+    /// visit.
+    #[test]
+    fn prev_page_unwalks_through_stack_children() {
+        let mut state = WizardState::default();
+        state.assignments.push(cell("clock"));
+        state.assignments.push(stack_cell(&["news", "email"]));
+
+        // Calendar wasn't assigned, so Confirm's prev is the last
+        // stack child of cell 1 (email).
+        assert_eq!(
+            prev_page(&Page::Confirm, &state),
+            Some(Page::StackChild {
+                cell_index: 1,
+                child_index: 1,
+            })
+        );
+        // Email → news (same stack, prev child).
+        assert_eq!(
+            prev_page(
+                &Page::StackChild {
+                    cell_index: 1,
+                    child_index: 1,
+                },
+                &state
+            ),
+            Some(Page::StackChild {
+                cell_index: 1,
+                child_index: 0,
+            })
+        );
+        // News (first child) → clock (cell 0).
+        assert_eq!(
+            prev_page(
+                &Page::StackChild {
+                    cell_index: 1,
+                    child_index: 0,
+                },
+                &state
+            ),
+            Some(Page::Widget(0))
+        );
+        // Clock → Assign.
+        assert_eq!(prev_page(&Page::Widget(0), &state), Some(Page::Assign));
+    }
+
+    /// populated_count counts each stack child individually so the
+    /// "step N of M" progress reflects the actual page sequence.
+    #[test]
+    fn populated_count_includes_each_stack_child() {
+        let mut state = WizardState::default();
+        state.assignments.push(cell("clock"));
+        state
+            .assignments
+            .push(stack_cell(&["news", "email", "notes"]));
+        state.assignments.push(cell("calendar"));
+        // 1 (clock) + 3 (stack children) + 1 (calendar) = 5.
+        assert_eq!(populated_count(&state), 5);
+    }
 }

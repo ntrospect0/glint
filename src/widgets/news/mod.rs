@@ -6,7 +6,7 @@ pub mod provider;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -23,7 +23,9 @@ use ratatui::{
 use serde::Deserialize;
 
 use crate::cache::ScopedCache;
+use crate::format::relative_time_label;
 use crate::llm::{LlmMessage, LlmProvider, LlmRequest, Role};
+use crate::text::{truncate, wrap};
 use crate::theme::{ColorScheme, Theme};
 use crate::ui::{apply_title_row, MetadataEmphasis};
 
@@ -208,7 +210,7 @@ struct NewsState {
     /// search tab when one exists). 0 is always `All`.
     active_filter_idx: usize,
     last_error: Option<String>,
-    last_attempt: Option<Instant>,
+    poll: crate::polling::PollTracker,
     inflight: bool,
     /// Per-article LLM summarization state, keyed by article URL.
     summaries: HashMap<String, SummaryState>,
@@ -221,6 +223,10 @@ struct NewsState {
     /// are surfaced (sorted by hit count). Cleared by `x` or `:news` with
     /// no args.
     search: Option<SearchFilter>,
+    /// Display-state dirty bit drained by `take_dirty`. Set true by
+    /// every async-task / tick-time mutation site so the main loop's
+    /// dirty-flag gate triggers a redraw.
+    dirty: bool,
 }
 
 const MAX_SUMMARY_LINES: usize = 6;
@@ -285,7 +291,6 @@ pub struct NewsWidget {
     display_name_cache: String,
     provider: Arc<dyn NewsProvider>,
     state: Arc<Mutex<NewsState>>,
-    poll_interval: Duration,
     feeds_configured: bool,
     /// Persistent article cache so the first frame after launch can show the
     /// previous session's results while the network refresh runs in the
@@ -385,13 +390,12 @@ impl NewsWidget {
         // suppresses a refetch when the cache is fresh.
         let poll_interval = Duration::from_secs(config.poll_interval_secs.max(60));
         let mut initial_state = NewsState::default();
+        initial_state.poll = crate::polling::PollTracker::new(poll_interval);
         if let Some(entry) = cache.load::<Vec<Article>>(CACHE_KEY_ARTICLES) {
-            // Map wall-clock age onto the monotonic Instant clock so the same
-            // `is_due()` check used for in-session polling honours the cache.
-            let age = entry.age().min(poll_interval);
+            initial_state.poll.seed_from_cache_age(entry.age());
             initial_state.articles = entry.value;
-            initial_state.last_attempt = Some(Instant::now() - age);
         }
+        initial_state.poll.apply_jitter(&format!("news@{instance}"));
 
         Self {
             id,
@@ -399,7 +403,6 @@ impl NewsWidget {
             display_name_cache,
             provider,
             state: Arc::new(Mutex::new(initial_state)),
-            poll_interval,
             feeds_configured,
             cache,
             filter_tabs,
@@ -424,10 +427,7 @@ impl NewsWidget {
     /// feed (shouldn't happen in practice — that'd mean an article
     /// got into state from a deleted feed) fall back to the default.
     fn fetch_body_enabled_for(&self, article: &Article) -> bool {
-        let feed = self
-            .feed_configs
-            .iter()
-            .find(|f| f.label == article.source);
+        let feed = self.feed_configs.iter().find(|f| f.label == article.source);
         feed.and_then(|f| f.fetch_body)
             .unwrap_or(self.fetch_body_for_summary_default)
     }
@@ -520,8 +520,8 @@ impl NewsWidget {
         );
         {
             let mut st = self.state.lock().expect("news state poisoned");
-            st.bodies
-                .insert(article.url.clone(), BodyState::Requested);
+            st.bodies.insert(article.url.clone(), BodyState::Requested);
+            st.dirty = true;
         }
         let url = article.url.clone();
         let title = article.title.clone();
@@ -554,6 +554,7 @@ impl NewsWidget {
             {
                 let mut st = state.lock().expect("news state poisoned");
                 st.bodies.insert(url.clone(), body_state_value);
+                st.dirty = true;
             }
             // Always chain to the summary task — body success uses the
             // extracted text, body failure falls back to the RSS excerpt.
@@ -575,15 +576,11 @@ impl NewsWidget {
     /// No-op when there are no articles or no LLM is configured.
     fn toggle_summary_view(&mut self) {
         if !self.llm_summarize_enabled {
-            tracing::debug!(
-                "news `s` ignored: summarize_with_llm = false in news.toml"
-            );
+            tracing::debug!("news `s` ignored: summarize_with_llm = false in news.toml");
             return;
         }
         if self.llm.is_none() {
-            tracing::debug!(
-                "news `s` ignored: no LLM provider configured (check llm.toml)"
-            );
+            tracing::debug!("news `s` ignored: no LLM provider configured (check llm.toml)");
             return;
         }
         // `selected` is an index into the *filtered* view the user
@@ -793,7 +790,12 @@ impl NewsWidget {
 
     /// Walks the same per-item layout as `render` (2 rows base, +N when
     /// expanded) and returns the article index whose rows contain `click_row`.
-    fn article_index_at(&self, click_row: u16, list_area: Rect, articles: &[Article]) -> Option<usize> {
+    fn article_index_at(
+        &self,
+        click_row: u16,
+        list_area: Rect,
+        articles: &[Article],
+    ) -> Option<usize> {
         let st = self.state.lock().expect("news state poisoned");
         let scroll = st.scroll;
         let selected = st.selected;
@@ -839,10 +841,7 @@ impl NewsWidget {
         if st.inflight {
             return false;
         }
-        match st.last_attempt {
-            None => true,
-            Some(t) => t.elapsed() >= self.poll_interval,
-        }
+        st.poll.is_due()
     }
 
     fn spawn_refresh(&self) {
@@ -869,7 +868,8 @@ impl NewsWidget {
         {
             let mut st = self.state.lock().expect("news state poisoned");
             st.inflight = true;
-            st.last_attempt = Some(Instant::now());
+            st.poll.mark_attempted();
+            st.dirty = true;
         }
         let provider = self.provider.clone();
         let state = self.state.clone();
@@ -878,6 +878,7 @@ impl NewsWidget {
             let result = provider.fetch().await;
             let mut st = state.lock().expect("news state poisoned");
             st.inflight = false;
+            st.dirty = true;
             match result {
                 Ok(articles) => {
                     if let Err(err) = cache.store(CACHE_KEY_ARTICLES, &articles) {
@@ -920,7 +921,7 @@ impl NewsWidget {
 
     fn mark_dirty(&self) {
         let mut st = self.state.lock().expect("news state poisoned");
-        st.last_attempt = None;
+        st.poll.mark_dirty();
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -994,6 +995,11 @@ impl Widget for NewsWidget {
             self.spawn_refresh();
         }
         Ok(())
+    }
+
+    fn take_dirty(&mut self) -> bool {
+        let mut st = self.state.lock().expect("news state poisoned");
+        std::mem::replace(&mut st.dirty, false)
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
@@ -1158,9 +1164,8 @@ impl Widget for NewsWidget {
             scroll = selected + 1 - items_visible;
         }
         if expanded {
-            let max_items_with_expansion = (list_height.saturating_sub(summary_rows)
-                / ROWS_PER_ITEM as u16)
-                .max(1) as usize;
+            let max_items_with_expansion =
+                (list_height.saturating_sub(summary_rows) / ROWS_PER_ITEM as u16).max(1) as usize;
             let want = (selected + 1).saturating_sub(max_items_with_expansion);
             scroll = scroll.max(want).min(selected);
         }
@@ -1213,7 +1218,11 @@ impl Widget for NewsWidget {
 
             // Row 2: 3-space indent + dim metadata. When expanded we drop the
             // summary excerpt from this row (it has its own block underneath).
-            let mut meta = format!("   {} · {}", age_label(now, article.published), article.source);
+            let mut meta = format!(
+                "   {} · {}",
+                age_label(now, article.published),
+                article.source
+            );
             if self.show_topic_labels && !article.topics.is_empty() {
                 meta.push_str(&format!(" · [{}]", article.topics.join(",")));
             }
@@ -1224,10 +1233,7 @@ impl Widget for NewsWidget {
                 }
             }
             let meta = truncate(&meta, inner_width.saturating_sub(1));
-            lines.push(Line::from(Span::styled(
-                meta,
-                self.theme.text_dim,
-            )));
+            lines.push(Line::from(Span::styled(meta, self.theme.text_dim)));
 
             let summary_room = rows_remaining.saturating_sub(ROWS_PER_ITEM as u16) as usize;
             let summary_to_render = summary_lines.len().min(summary_room);
@@ -1248,7 +1254,7 @@ impl Widget for NewsWidget {
         frame.render_widget(Paragraph::new(lines), list_area);
 
         let footer = Paragraph::new(Line::from(Span::styled(
-            "↑/↓ select · ←/→ filter · e expand · Enter open · g/G top/bot · r refresh",
+            "↑/↓ select · ←/→ filter · e/⏎ expand · o open · g/G top/bot · r refresh",
             self.theme.text_dim,
         )))
         .alignment(Alignment::Right);
@@ -1296,7 +1302,11 @@ impl Widget for NewsWidget {
                 self.jump_to(usize::MAX);
                 EventResult::Handled
             }
-            KeyCode::Enter => {
+            // `o` opens the selected article in the browser. Enter
+            // is reserved for the in-place primary action (expand
+            // the article inline — falls through to the `e` branch
+            // below).
+            KeyCode::Char('o') => {
                 self.open_selected();
                 EventResult::Handled
             }
@@ -1304,7 +1314,7 @@ impl Widget for NewsWidget {
                 self.mark_dirty();
                 EventResult::Handled
             }
-            KeyCode::Char('e') => {
+            KeyCode::Enter | KeyCode::Char('e') => {
                 let mut st = self.state.lock().expect("news state poisoned");
                 if !st.articles.is_empty() {
                     st.expanded = !st.expanded;
@@ -1430,19 +1440,28 @@ impl Widget for NewsWidget {
             ("PgUp / PgDn", "±10 articles"),
             ("g / Home", "jump to top"),
             ("End", "jump to bottom"),
-            ("Enter", "open article URL in browser"),
+            ("o", "open article URL in browser"),
+            ("Enter / e", "expand article inline"),
             ("e", "expand selected article (raw RSS excerpt)"),
             ("s", "toggle LLM summary for the expanded article"),
             ("x", "clear :news <terms> search filter"),
-            (":news <terms>", "filter articles by keyword (ranked by hits)"),
+            (
+                ":news <terms>",
+                "filter articles by keyword (ranked by hits)",
+            ),
             ("r", "force refresh"),
         ]
     }
 
     fn config(&self) -> serde_json::Value {
-        serde_json::json!({
-            "poll_interval_secs": self.poll_interval.as_secs(),
-        })
+        let secs = self
+            .state
+            .lock()
+            .expect("news state poisoned")
+            .poll
+            .interval()
+            .as_secs();
+        serde_json::json!({ "poll_interval_secs": secs })
     }
 
     fn apply_config(&mut self, config: serde_json::Value) -> Result<()> {
@@ -1461,6 +1480,16 @@ impl Widget for NewsWidget {
     fn set_app_theme(&mut self, theme: Arc<Theme>) {
         self.theme = theme.with_overrides(&self.colors_override);
         self.app_theme = theme;
+    }
+
+    fn poll_snapshot(&self) -> Option<crate::polling::PollSnapshot> {
+        Some(
+            self.state
+                .lock()
+                .expect("news state poisoned")
+                .poll
+                .snapshot(),
+        )
     }
 
     fn shortcut_preferences(&self) -> &[char] {
@@ -1486,17 +1515,6 @@ impl Widget for NewsWidget {
         } else {
             Some(format!("{n} articles"))
         }
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = chars.into_iter().take(max.saturating_sub(1)).collect();
-        out.push('…');
-        out
     }
 }
 
@@ -1566,6 +1584,7 @@ fn spawn_summary_llm_task(
         let mut st = state.lock().expect("news state poisoned");
         st.summaries
             .insert(url.clone(), SummaryState::Ready(entry.value));
+        st.dirty = true;
         return;
     }
     tracing::info!(
@@ -1577,6 +1596,7 @@ fn spawn_summary_llm_task(
     {
         let mut st = state.lock().expect("news state poisoned");
         st.summaries.insert(url.clone(), SummaryState::Requested);
+        st.dirty = true;
     }
     tokio::spawn(async move {
         let user_block = if content.trim().is_empty() {
@@ -1625,6 +1645,7 @@ fn spawn_summary_llm_task(
         }
         let mut st = state.lock().expect("news state poisoned");
         st.summaries.insert(url, outcome);
+        st.dirty = true;
     });
 }
 
@@ -1925,7 +1946,7 @@ fn expanded_summary_lines(
             if llm_enabled {
                 vec!["(no excerpt — press s for an AI summary)".to_string()]
             } else {
-                vec!["(no excerpt available — press Enter to open in browser)".to_string()]
+                vec!["(no excerpt available — press `o` to open in browser)".to_string()]
             }
         } else {
             wrap_text(raw, max_width, MAX_SUMMARY_LINES)
@@ -1945,7 +1966,11 @@ fn expanded_summary_lines(
         Some(SummaryState::Requested) => {
             let mut out = vec!["Summarizing…".to_string()];
             if !raw.is_empty() {
-                out.extend(wrap_text(raw, max_width, MAX_SUMMARY_LINES.saturating_sub(1)));
+                out.extend(wrap_text(
+                    raw,
+                    max_width,
+                    MAX_SUMMARY_LINES.saturating_sub(1),
+                ));
             }
             return out;
         }
@@ -1956,8 +1981,7 @@ fn expanded_summary_lines(
             // fallback is good content; show it as-is.
             if raw.is_empty() {
                 return vec![
-                    "(Couldn't extract article body — press Enter to open in browser)"
-                        .to_string(),
+                    "(Couldn't extract article body — press `o` to open in browser)".to_string(),
                 ];
             }
             return raw_lines();
@@ -1972,7 +1996,11 @@ fn expanded_summary_lines(
         Some(BodyState::Requested) => {
             let mut out = vec!["Fetching article…".to_string()];
             if !raw.is_empty() {
-                out.extend(wrap_text(raw, max_width, MAX_SUMMARY_LINES.saturating_sub(1)));
+                out.extend(wrap_text(
+                    raw,
+                    max_width,
+                    MAX_SUMMARY_LINES.saturating_sub(1),
+                ));
             }
             out
         }
@@ -1980,81 +2008,19 @@ fn expanded_summary_lines(
     }
 }
 
-/// Naive word-wrap: greedy line-fill at `max_width` columns, capped at
-/// `max_lines`. Words longer than `max_width` are character-truncated. If the
-/// text doesn't fully fit, the last emitted line ends in `…`.
+/// Greedy word-wrap delegating to the shared [`crate::text::wrap`]
+/// implementation. News article bodies don't carry paragraph
+/// boundaries in their RSS excerpts, so we wrap with
+/// `preserve_paragraphs = false`.
 fn wrap_text(text: &str, max_width: usize, max_lines: usize) -> Vec<String> {
-    if max_width == 0 || max_lines == 0 {
-        return Vec::new();
-    }
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut consumed = 0usize;
-    for (i, word) in words.iter().enumerate() {
-        let candidate_len = if current.is_empty() {
-            word.chars().count()
-        } else {
-            current.chars().count() + 1 + word.chars().count()
-        };
-        if candidate_len <= max_width {
-            if !current.is_empty() {
-                current.push(' ');
-            }
-            current.push_str(word);
-            consumed = i + 1;
-        } else if current.is_empty() {
-            // Word longer than max_width on its own: char-truncate.
-            let truncated: String = word.chars().take(max_width.saturating_sub(1)).collect();
-            lines.push(format!("{truncated}…"));
-            consumed = i + 1;
-            if lines.len() == max_lines {
-                return lines;
-            }
-        } else {
-            lines.push(std::mem::take(&mut current));
-            if lines.len() == max_lines {
-                break;
-            }
-            current.push_str(word);
-            consumed = i + 1;
-        }
-    }
-    if !current.is_empty() && lines.len() < max_lines {
-        lines.push(current);
-    }
-    if consumed < words.len() {
-        if let Some(last) = lines.last_mut() {
-            ellipsize_in_place(last, max_width);
-        }
-    }
-    lines
+    wrap(text, max_width, max_lines, false)
 }
 
-fn ellipsize_in_place(s: &mut String, max_width: usize) {
-    if s.chars().count() < max_width {
-        s.push('…');
-    } else if !s.ends_with('…') {
-        let mut chars: Vec<char> = s.chars().collect();
-        chars.pop();
-        chars.push('…');
-        *s = chars.into_iter().collect();
-    }
-}
-
+/// Compact "how long ago" label for the article meta row. Delegates
+/// to the shared [`crate::format::relative_time_label`] so age
+/// formatting stays consistent across widgets.
 fn age_label(now: chrono::DateTime<Utc>, published: chrono::DateTime<Utc>) -> String {
-    let secs = now.signed_duration_since(published).num_seconds().max(0);
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h", secs / 3600)
-    } else if secs < 86400 * 30 {
-        format!("{}d", secs / 86400)
-    } else {
-        format!("{}mo", secs / (86400 * 30))
-    }
+    relative_time_label(published, now)
 }
 
 pub const KIND: &str = "news";
@@ -2069,43 +2035,148 @@ pub const TOPIC_CATALOGUE: &[(&str, &[&str])] = &[
     (
         "Tech",
         &[
-            "AI", "OpenAI", "Anthropic", "LLM", "GPU", "developer", "Linux",
-            "Rust", "Apple", "Google", "Microsoft", "Meta", "chip", "software",
-            "startup", "open source", "GitHub",
+            "AI",
+            "OpenAI",
+            "Anthropic",
+            "LLM",
+            "GPU",
+            "developer",
+            "Linux",
+            "Rust",
+            "Apple",
+            "Google",
+            "Microsoft",
+            "Meta",
+            "chip",
+            "software",
+            "startup",
+            "open source",
+            "GitHub",
         ],
     ),
     (
         "Business",
         &[
-            "CEO", "merger", "acquisition", "IPO", "revenue", "earnings",
-            "quarterly", "Wall Street", "market", "Fed", "inflation",
-            "interest rate", "Bitcoin", "crypto", "yield", "treasury",
-            "stocks", "bonds", "dividend", "trader",
+            "CEO",
+            "merger",
+            "acquisition",
+            "IPO",
+            "revenue",
+            "earnings",
+            "quarterly",
+            "Wall Street",
+            "market",
+            "Fed",
+            "inflation",
+            "interest rate",
+            "Bitcoin",
+            "crypto",
+            "yield",
+            "treasury",
+            "stocks",
+            "bonds",
+            "dividend",
+            "trader",
         ],
     ),
     (
         "World",
         &[
-            "Ukraine", "Russia", "China", "EU", "UN", "climate", "war",
-            "election", "summit", "treaty", "Israel", "Gaza", "Iran", "NATO",
-            "global", "Brussels", "international",
+            "Ukraine",
+            "Russia",
+            "China",
+            "EU",
+            "UN",
+            "climate",
+            "war",
+            "election",
+            "summit",
+            "treaty",
+            "Israel",
+            "Gaza",
+            "Iran",
+            "NATO",
+            "global",
+            "Brussels",
+            "international",
+        ],
+    ),
+    (
+        "US",
+        &[
+            "United States",
+            "U.S.",
+            "America",
+            "American",
+            "Washington",
+            "Biden",
+            "Trump",
+            "Harris",
+            "Congress",
+            "Senate",
+            "GOP",
+            "Republican",
+            "Democrat",
+            "Supreme Court",
+            "SCOTUS",
+            "White House",
+            "Pentagon",
+            "FBI",
+            "CIA",
+            "DOJ",
+            "Capitol Hill",
+            "California",
+            "New York",
+            "Texas",
+            "Florida",
         ],
     ),
     (
         "Canada",
         &[
-            "Canada", "Canadian", "Ottawa", "Toronto", "Vancouver", "Montreal",
-            "Quebec", "Alberta", "B.C.", "Trudeau", "Carney", "CBC",
-            "Bank of Canada", "Loonie",
+            "Canada",
+            "Canadian",
+            "Ottawa",
+            "Toronto",
+            "Vancouver",
+            "Montreal",
+            "Quebec",
+            "Alberta",
+            "B.C.",
+            "Trudeau",
+            "Carney",
+            "CBC",
+            "Bank of Canada",
+            "Loonie",
         ],
     ),
     (
         "Entertainment",
         &[
-            "movie", "film", "actor", "actress", "Hollywood", "Netflix", "HBO",
-            "Disney", "Oscar", "Grammy", "Emmy", "show", "series", "trailer",
-            "album", "song", "single", "artist", "band", "concert", "tour",
-            "music", "EP", "soundtrack",
+            "movie",
+            "film",
+            "actor",
+            "actress",
+            "Hollywood",
+            "Netflix",
+            "HBO",
+            "Disney",
+            "Oscar",
+            "Grammy",
+            "Emmy",
+            "show",
+            "series",
+            "trailer",
+            "album",
+            "song",
+            "single",
+            "artist",
+            "band",
+            "concert",
+            "tour",
+            "music",
+            "EP",
+            "soundtrack",
         ],
     ),
 ];
@@ -2118,7 +2189,10 @@ pub const TOPIC_CATALOGUE: &[(&str, &[&str])] = &[
 pub const FEED_CATALOGUE: &[(&str, &str)] = &[
     // Tech
     ("Hacker News", "https://hnrss.org/frontpage"),
-    ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
+    (
+        "Ars Technica",
+        "https://feeds.arstechnica.com/arstechnica/index",
+    ),
     ("The Verge", "https://www.theverge.com/rss/index.xml"),
     ("Engadget", "https://www.engadget.com/rss.xml"),
     ("Phoronix", "https://www.phoronix.com/rss.php"),
@@ -2127,19 +2201,51 @@ pub const FEED_CATALOGUE: &[(&str, &str)] = &[
     ("BBC World", "http://feeds.bbci.co.uk/news/world/rss.xml"),
     ("Guardian World", "https://www.theguardian.com/world/rss"),
     ("NPR World", "https://feeds.npr.org/1004/rss.xml"),
+    // US — non-paywalled public-broadcasting / network outlets so a
+    // fresh install gets a credible US news mix without nudging users
+    // toward subscription-gated sources.
+    ("NPR Top Stories", "https://feeds.npr.org/1001/rss.xml"),
+    (
+        "PBS NewsHour",
+        "https://www.pbs.org/newshour/feeds/rss/headlines",
+    ),
+    ("CBS News", "https://www.cbsnews.com/latest/rss/main"),
+    ("The Hill", "https://thehill.com/news/feed/"),
+    ("ABC News", "https://abcnews.go.com/abcnews/topstories"),
     // Business / Markets
-    ("BBC Business", "http://feeds.bbci.co.uk/news/business/rss.xml"),
+    (
+        "BBC Business",
+        "http://feeds.bbci.co.uk/news/business/rss.xml",
+    ),
     ("Yahoo Finance", "https://finance.yahoo.com/news/rssindex"),
-    ("MarketWatch", "http://feeds.marketwatch.com/marketwatch/topstories/"),
-    ("CNBC Top", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
+    (
+        "MarketWatch",
+        "http://feeds.marketwatch.com/marketwatch/topstories/",
+    ),
+    (
+        "CNBC Top",
+        "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    ),
     // Canada
     ("CBC News", "https://www.cbc.ca/webfeed/rss/rss-topstories"),
-    ("CBC Politics", "https://www.cbc.ca/webfeed/rss/rss-politics"),
-    ("CBC Business", "https://www.cbc.ca/webfeed/rss/rss-business"),
-    ("CTV News", "https://www.ctvnews.ca/rss/ctvnews-ca-top-stories-public-rss-1.822009"),
+    (
+        "CBC Politics",
+        "https://www.cbc.ca/webfeed/rss/rss-politics",
+    ),
+    (
+        "CBC Business",
+        "https://www.cbc.ca/webfeed/rss/rss-business",
+    ),
+    (
+        "CTV News",
+        "https://www.ctvnews.ca/rss/ctvnews-ca-top-stories-public-rss-1.822009",
+    ),
     // Culture
     ("Pitchfork", "https://pitchfork.com/rss/news/"),
-    ("Hollywood Reporter", "https://www.hollywoodreporter.com/feed/"),
+    (
+        "Hollywood Reporter",
+        "https://www.hollywoodreporter.com/feed/",
+    ),
 ];
 
 /// Wizard descriptor. Surfaces a checkbox list of common feeds the user
@@ -2147,9 +2253,7 @@ pub const FEED_CATALOGUE: &[(&str, &str)] = &[
 /// here is a curated subset; custom `[[feeds]]` blocks in news.toml
 /// outside this list are preserved verbatim across `--setup` re-runs.
 pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
-    use crate::wizard::descriptor::{
-        ChoiceOption, WizardDescriptor, WizardField, WizardFieldKind,
-    };
+    use crate::wizard::descriptor::{ChoiceOption, WizardDescriptor, WizardField, WizardFieldKind};
     let feed_options: Vec<ChoiceOption> = FEED_CATALOGUE
         .iter()
         .map(|(label, url)| ChoiceOption {
@@ -2282,10 +2386,7 @@ fn load_news_from_toml(
         .get("horizontal_scroll_filters")
         .and_then(|v| v.as_bool())
     {
-        out.insert(
-            "horizontal_scroll_filters".into(),
-            WizardValue::Bool(b),
-        );
+        out.insert("horizontal_scroll_filters".into(), WizardValue::Bool(b));
     }
     if let Some(arr) = doc.get("feeds").and_then(|v| v.as_array()) {
         let catalogue_urls: std::collections::HashSet<&'static str> =
@@ -2360,19 +2461,15 @@ fn render_news_toml(
 
     // Build the new [[feeds]] list.
     let selected_urls: Vec<&str> = match values.get("feeds") {
-        Some(WizardValue::MultiChoice(items)) => {
-            items.iter().map(String::as_str).collect()
-        }
+        Some(WizardValue::MultiChoice(items)) => items.iter().map(String::as_str).collect(),
         _ => Vec::new(),
     };
     let catalogue_urls: std::collections::HashSet<&'static str> =
         FEED_CATALOGUE.iter().map(|(_, url)| *url).collect();
     let mut feed_blocks = String::new();
-    let mut emitted_urls: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut emitted_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
     for url in &selected_urls {
-        let Some((label, _)) = FEED_CATALOGUE.iter().find(|(_, u)| u == url)
-        else {
+        let Some((label, _)) = FEED_CATALOGUE.iter().find(|(_, u)| u == url) else {
             continue;
         };
         feed_blocks.push_str("\n[[feeds]]\n");
@@ -2386,18 +2483,13 @@ fn render_news_toml(
         if let Ok(doc) = toml::from_str::<toml::Value>(text) {
             if let Some(arr) = doc.get("feeds").and_then(|v| v.as_array()) {
                 for entry in arr {
-                    let Some(url) =
-                        entry.get("url").and_then(|v| v.as_str())
-                    else {
+                    let Some(url) = entry.get("url").and_then(|v| v.as_str()) else {
                         continue;
                     };
                     if catalogue_urls.contains(url) || emitted_urls.contains(url) {
                         continue;
                     }
-                    let label = entry
-                        .get("label")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(url);
+                    let label = entry.get("label").and_then(|v| v.as_str()).unwrap_or(url);
                     feed_blocks.push_str("\n[[feeds]]\n");
                     feed_blocks.push_str(&format!("label = {}\n", toml_quote(label)));
                     feed_blocks.push_str(&format!("url = {}\n", toml_quote(url)));
@@ -2412,45 +2504,38 @@ fn render_news_toml(
     // when the same label was on disk), plus any custom topics whose
     // labels aren't in the catalogue.
     let selected_topics: Vec<&str> = match values.get("topics") {
-        Some(WizardValue::MultiChoice(items)) => {
-            items.iter().map(String::as_str).collect()
-        }
+        Some(WizardValue::MultiChoice(items)) => items.iter().map(String::as_str).collect(),
         _ => Vec::new(),
     };
     let catalogue_topic_labels: std::collections::HashSet<&'static str> =
         TOPIC_CATALOGUE.iter().map(|(label, _)| *label).collect();
-    let existing_topics: std::collections::HashMap<String, Vec<String>> =
-        existing
-            .and_then(|t| toml::from_str::<toml::Value>(t).ok())
-            .and_then(|doc| {
-                doc.get("topics").and_then(|v| v.as_array()).cloned()
-            })
-            .map(|arr| {
-                arr.into_iter()
-                    .filter_map(|entry| {
-                        let label = entry.get("label")?.as_str()?.to_string();
-                        let keywords = entry
-                            .get("keywords")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        Some((label, keywords))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+    let existing_topics: std::collections::HashMap<String, Vec<String>> = existing
+        .and_then(|t| toml::from_str::<toml::Value>(t).ok())
+        .and_then(|doc| doc.get("topics").and_then(|v| v.as_array()).cloned())
+        .map(|arr| {
+            arr.into_iter()
+                .filter_map(|entry| {
+                    let label = entry.get("label")?.as_str()?.to_string();
+                    let keywords = entry
+                        .get("keywords")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some((label, keywords))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut topic_blocks = String::new();
     let mut emitted_topic_labels: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for label in &selected_topics {
-        let keywords: Vec<String> = if let Some(existing_kws) =
-            existing_topics.get(*label)
-        {
+        let keywords: Vec<String> = if let Some(existing_kws) = existing_topics.get(*label) {
             existing_kws.clone()
         } else {
             // First time we've seen this topic — use the catalogue default.
@@ -2472,9 +2557,7 @@ fn render_news_toml(
     }
     // Preserve custom topics whose labels aren't in the catalogue.
     for (label, keywords) in &existing_topics {
-        if catalogue_topic_labels.contains(label.as_str())
-            || emitted_topic_labels.contains(label)
-        {
+        if catalogue_topic_labels.contains(label.as_str()) || emitted_topic_labels.contains(label) {
             continue;
         }
         topic_blocks.push_str("\n[[topics]]\n");
@@ -2491,12 +2574,9 @@ fn render_news_toml(
         Some(text) => std::borrow::Cow::Borrowed(text),
         None => std::borrow::Cow::Borrowed(crate::config::DEFAULT_NEWS_TOML),
     };
-    let stripped =
-        crate::wizard::toml_merge::strip_array_of_tables_blocks(&base, "feeds");
-    let stripped =
-        crate::wizard::toml_merge::strip_array_of_tables_blocks(&stripped, "topics");
-    let merged =
-        crate::wizard::toml_merge::merge_top_level_scalars(&stripped, &scalars);
+    let stripped = crate::wizard::toml_merge::strip_array_of_tables_blocks(&base, "feeds");
+    let stripped = crate::wizard::toml_merge::strip_array_of_tables_blocks(&stripped, "topics");
+    let merged = crate::wizard::toml_merge::merge_top_level_scalars(&stripped, &scalars);
 
     // Append the new topics + feeds lists. Topics first (smaller; reads
     // like a config sidecar), then the larger feeds list.
@@ -2525,9 +2605,7 @@ fn toml_quote(s: &str) -> String {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32))
-            }
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
     }
@@ -2672,10 +2750,7 @@ mod tests {
         }
         #[async_trait]
         impl LlmProvider for UnusedLlm {
-            async fn complete(
-                &self,
-                _request: LlmRequest,
-            ) -> Result<crate::llm::LlmResponse> {
+            async fn complete(&self, _request: LlmRequest) -> Result<crate::llm::LlmResponse> {
                 unreachable!("LLM should not be called during this test")
             }
         }
@@ -2789,8 +2864,11 @@ mod tests {
 
     #[test]
     fn age_label_buckets() {
+        // Delegates to `format::relative_time_label`, which buckets
+        // sub-minute as "now" (minute-resolution suffices for news
+        // article timestamps — see SDK doc § Formatting).
         let now = Utc::now();
-        assert_eq!(age_label(now, now - chrono::Duration::seconds(30)), "30s");
+        assert_eq!(age_label(now, now - chrono::Duration::seconds(30)), "now");
         assert_eq!(age_label(now, now - chrono::Duration::seconds(120)), "2m");
         assert_eq!(age_label(now, now - chrono::Duration::seconds(7200)), "2h");
         assert_eq!(
@@ -2809,7 +2887,9 @@ mod tests {
     fn is_insufficient_reply_recognizes_canonical_phrasings() {
         assert!(is_insufficient_reply("Insufficient content to summarize."));
         assert!(is_insufficient_reply("insufficient content to summarize"));
-        assert!(is_insufficient_reply("  INSUFFICIENT CONTENT TO SUMMARIZE.  "));
+        assert!(is_insufficient_reply(
+            "  INSUFFICIENT CONTENT TO SUMMARIZE.  "
+        ));
         assert!(is_insufficient_reply(
             "Insufficient information to summarize this article."
         ));
@@ -2820,7 +2900,10 @@ mod tests {
     fn wrap_text_greedy_fills_within_width() {
         let out = wrap_text("the quick brown fox jumps over the lazy dog", 12, 5);
         // Expected greedy wrap: "the quick", "brown fox", "jumps over", "the lazy dog"
-        assert_eq!(out, vec!["the quick", "brown fox", "jumps over", "the lazy dog"]);
+        assert_eq!(
+            out,
+            vec!["the quick", "brown fox", "jumps over", "the lazy dog"]
+        );
     }
 
     #[test]
@@ -2828,15 +2911,27 @@ mod tests {
         let out = wrap_text("one two three four five six seven eight nine ten", 4, 3);
         assert_eq!(out.len(), 3);
         let last = out.last().unwrap();
-        assert!(last.ends_with('…'), "last line should end in ellipsis: {last:?}");
+        assert!(
+            last.ends_with('…'),
+            "last line should end in ellipsis: {last:?}"
+        );
     }
 
     #[test]
-    fn wrap_text_truncates_oversized_single_words() {
+    fn wrap_text_breaks_oversized_single_words_across_lines() {
+        // The shared `text::wrap` is lossless on oversized words: it
+        // mid-breaks rather than truncating with `…`, so the reader
+        // can see the whole word across lines. A previous local
+        // implementation truncated; the converged behaviour is
+        // strictly more informative.
         let out = wrap_text("supercalifragilistic", 10, 3);
-        assert_eq!(out.len(), 1);
-        assert!(out[0].ends_with('…'));
-        assert!(out[0].chars().count() <= 10);
+        assert!(out.len() >= 2);
+        for line in &out {
+            assert!(line.chars().count() <= 10);
+        }
+        // The full word survives (concatenation reproduces it).
+        let joined: String = out.iter().flat_map(|l| l.chars()).collect();
+        assert!(joined.contains("supercalifragilistic"));
     }
 
     /// Yahoo Finance + some Atom feeds ship items without a
@@ -2880,9 +2975,12 @@ mod tests {
         let state = Arc::new(Mutex::new(NewsState::default()));
         let lines = expanded_summary_lines(&article, &state, 80, false);
         assert_eq!(lines.len(), 1);
+        // Hint points at the `o` action — the platform convention
+        // for "open externally" (was Enter before; Enter is now the
+        // in-place expand binding).
         assert!(
-            lines[0].contains("Enter"),
-            "should point at the `Enter` action: {lines:?}"
+            lines[0].contains("`o`"),
+            "should point at the `o` action: {lines:?}"
         );
     }
 
@@ -2961,10 +3059,7 @@ mod tests {
         }
         #[async_trait]
         impl LlmProvider for PanickingLlm {
-            async fn complete(
-                &self,
-                _request: LlmRequest,
-            ) -> Result<crate::llm::LlmResponse> {
+            async fn complete(&self, _request: LlmRequest) -> Result<crate::llm::LlmResponse> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 panic!("LLM should not be called for empty content");
             }
@@ -3080,8 +3175,14 @@ mod tests {
     fn tab_index_at_maps_columns_to_tabs() {
         let cfg = NewsConfig {
             topics: vec![
-                provider::Topic { label: "Tech".into(), keywords: vec![] },
-                provider::Topic { label: "World".into(), keywords: vec![] },
+                provider::Topic {
+                    label: "Tech".into(),
+                    keywords: vec![],
+                },
+                provider::Topic {
+                    label: "World".into(),
+                    keywords: vec![],
+                },
             ],
             ..NewsConfig::default()
         };

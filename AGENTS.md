@@ -385,7 +385,21 @@ collector.
   through to widgets in registration order. `widget_id:command` for
   explicit targeting.
 - **Auth storage**: plain files with 0600 perms in `credentials/`
-  (mirroring `gcloud`, `gh`, etc.).
+  (mirroring `gcloud`, `gh`, etc.). A post-v0.2 refactor moves this
+  behind a `CredentialBackend` trait with three tiers — OS keychain
+  (`keyring` crate), host-bound AES-GCM (key from `machine-uid`), and
+  the current plaintext file as fallback — selected via
+  `credentials_backend` in `config.toml`. See `CHANGELOG.md` →
+  Deferred for the work breakdown. Pick:
+  - **Keychain**: default on macOS, Windows, Linux desktop with a
+    running Secret Service daemon.
+  - **Host-bound**: default on Linux headless / SSH-only / homelab
+    where Secret Service is unavailable. Leak-resistant (file is
+    useless if copied off-host) but does NOT defend against local
+    processes that can read the machine-ID.
+  - **Plaintext**: universal fallback. Add Windows ACL handling
+    before relying on it as the documented default there — `chmod
+    0600` is a no-op on NTFS.
 - **Calendar**: merged multi-calendar timeline with per-calendar colour
   coding.
 - **Notes**: one `.md` file per note under

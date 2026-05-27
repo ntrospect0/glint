@@ -7,22 +7,24 @@ pub mod calendar;
 pub mod clock;
 #[cfg(feature = "widget-email")]
 pub mod email;
+#[cfg(feature = "widget-forex")]
+pub mod forex;
 #[cfg(feature = "widget-gallery")]
 pub mod gallery;
 #[cfg(feature = "widget-news")]
 pub mod news;
+#[cfg(feature = "widget-notes")]
+pub mod notes;
 pub mod registry;
 #[cfg(feature = "widget-resources")]
 pub mod resources;
 pub mod stack;
-#[cfg(feature = "widget-notes")]
-pub mod notes;
 #[cfg(feature = "widget-stocks")]
 pub mod stocks;
-#[cfg(feature = "widget-forex")]
-pub mod forex;
 #[cfg(feature = "widget-weather")]
 pub mod weather;
+#[cfg(feature = "widget-wsj")]
+pub mod wsj;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -122,6 +124,23 @@ pub trait Widget: Send + Sync {
 
     async fn update(&mut self, ctx: &AppContext) -> Result<()>;
 
+    /// Returns whether the widget's displayed state has changed since the
+    /// last call, then clears the dirty bit. The main loop ORs this across
+    /// every widget on a `Tick` and skips the full `terminal.draw()` when
+    /// nothing is dirty — a 250ms tick rate otherwise forces a full layout
+    /// + render pass 4×/sec, which is the dominant idle-CPU cost.
+    ///
+    /// Default returns `true` (always redraw). Widgets opt in to clean
+    /// renders by tracking their own `dirty: bool` — set it on data
+    /// arrival inside `update()` or anywhere display-relevant state
+    /// mutates, then return-and-clear here. Non-`Tick` events (key,
+    /// mouse, paste, resize, config change) bypass this gate and always
+    /// trigger a redraw, so widgets don't need to mark themselves dirty
+    /// from their own `handle_key` / `handle_mouse` paths.
+    fn take_dirty(&mut self) -> bool {
+        true
+    }
+
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool);
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult;
@@ -129,6 +148,15 @@ pub trait Widget: Send + Sync {
     /// `area` matches the outer `Rect` passed to `render`, so the widget can
     /// reconstruct its internal layout and resolve hit-targets.
     fn handle_mouse(&mut self, _mouse: MouseEvent, _area: Rect) -> EventResult {
+        EventResult::Ignored
+    }
+
+    /// Bracketed-paste payload from the terminal. The default implementation
+    /// ignores it — widgets that own a text buffer (e.g. notes) should
+    /// override to insert the full text atomically rather than walking
+    /// `handle_key` per char, which would push one undo snapshot and one
+    /// disk write per character.
+    fn handle_paste(&mut self, _text: &str) -> EventResult {
         EventResult::Ignored
     }
 
@@ -157,6 +185,28 @@ pub trait Widget: Send + Sync {
     /// restart. Widgets that paint themed chrome rebuild their merged theme
     /// from the new app theme plus their own `[colors]` overrides.
     fn set_app_theme(&mut self, _theme: Arc<Theme>) {}
+
+    /// Optional read-only view of a widget's polling cadence.
+    /// Widgets that periodically fetch data (RSS feeds, network
+    /// quotes, weather, mail, …) return
+    /// `Some(self.poll.snapshot())` so the platform can observe —
+    /// and, eventually, schedule against — their refresh cadence.
+    /// Widgets without periodic fetches (notes, gallery, clock)
+    /// inherit the `None` default and carry zero state.
+    ///
+    /// The hook is intentionally read-only: widgets own their own
+    /// [`PollTracker`](crate::polling::PollTracker) (typically
+    /// inside their state mutex) and call `is_due` / `mark_attempted`
+    /// from their own [`update`](Self::update) implementation. The
+    /// platform just peeks at "are you currently polling, and on
+    /// what cadence?"
+    ///
+    /// See `docs/widget-sdk.md` § Polling for the recommended usage
+    /// pattern.
+    #[allow(dead_code)] // forward-looking platform surface
+    fn poll_snapshot(&self) -> Option<crate::polling::PollSnapshot> {
+        None
+    }
 
     /// Ordered preference list of `Shift+<letter>` shortcut keys. The app
     /// walks widgets in registration order and grants the first letter not
@@ -302,7 +352,10 @@ mod tests {
     #[test]
     fn parse_widget_ref_empty_suffix_falls_back_to_main() {
         assert_eq!(parse_widget_ref("clock@"), ("clock".into(), "main".into()));
-        assert_eq!(parse_widget_ref("clock@   "), ("clock".into(), "main".into()));
+        assert_eq!(
+            parse_widget_ref("clock@   "),
+            ("clock".into(), "main".into())
+        );
     }
 
     #[test]

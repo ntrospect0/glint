@@ -120,7 +120,12 @@ impl OutlookEmailProvider {
     /// (top of tree beats deeper nesting), which is the most predictable
     /// behavior for hand-typed configs.
     async fn ensure_folder_index(&self) -> Result<HashMap<String, String>> {
-        if let Some(cached) = self.folder_index.lock().expect("folder index poisoned").clone() {
+        if let Some(cached) = self
+            .folder_index
+            .lock()
+            .expect("folder index poisoned")
+            .clone()
+        {
             return Ok(cached);
         }
         let token = self.access_token().await?;
@@ -336,10 +341,7 @@ impl OutlookEmailProvider {
     /// when the cache is empty so a fresh `/me` resolution can still
     /// overwrite a stale value.
     pub fn seed_account_cache(&self, address: &str) {
-        let mut guard = self
-            .account
-            .lock()
-            .expect("email account cache poisoned");
+        let mut guard = self.account.lock().expect("email account cache poisoned");
         if guard.is_none() {
             *guard = Some(address.to_string());
         }
@@ -352,13 +354,9 @@ impl OutlookEmailProvider {
     /// folders (Inbox, Sent Items, …). Returns `(value, label)` pairs
     /// where both halves are the folder's display name (what email.toml
     /// expects).
-    pub async fn list_folders_for_picker(
-        &self,
-    ) -> Result<Vec<(String, String)>> {
+    pub async fn list_folders_for_picker(&self) -> Result<Vec<(String, String)>> {
         let token = self.access_token().await?;
-        let url = format!(
-            "{GRAPH_BASE}/me/mailFolders?$top=100&includeHiddenFolders=true"
-        );
+        let url = format!("{GRAPH_BASE}/me/mailFolders?$top=100&includeHiddenFolders=true");
         let resp = self
             .http
             .get(&url)
@@ -375,8 +373,14 @@ impl OutlookEmailProvider {
             .json()
             .await
             .context("failed to deserialize Outlook mailFolders")?;
-        let priority: &[&str] =
-            &["Inbox", "Sent Items", "Drafts", "Archive", "Junk Email", "Deleted Items"];
+        let priority: &[&str] = &[
+            "Inbox",
+            "Sent Items",
+            "Drafts",
+            "Archive",
+            "Junk Email",
+            "Deleted Items",
+        ];
         let mut folders: Vec<(String, String)> = parsed
             .value
             .into_iter()

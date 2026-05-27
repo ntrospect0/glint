@@ -40,6 +40,58 @@ where
     load_widget_toml(&stem)
 }
 
+/// Rewrite a top-level array assignment (`<key> = ["a", "b", ...]`) in a
+/// widget's TOML file, preserving comments + other settings verbatim.
+/// Missing keys are appended before the first `[table]` header.
+/// Operates atomically via a sibling `*.tmp` rename.
+///
+/// Used by runtime list mutations (stocks watchlist add/remove, forex
+/// crypto add/remove). The wizard's [`crate::wizard::toml_merge`] does
+/// the actual text munging; this is a thin wrapper that handles I/O
+/// and string-array formatting.
+pub fn rewrite_widget_top_level_string_array(
+    kind: &str,
+    instance: &str,
+    key: &str,
+    items: &[String],
+) -> Result<()> {
+    let stem = crate::widgets::widget_config_stem(kind, instance);
+    let path = config_dir()?.join(format!("{stem}.toml"));
+    let original = if path.exists() {
+        std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?
+    } else {
+        // No file yet — start from empty so the helper can append the
+        // array as a fresh first line.
+        String::new()
+    };
+    let literal = format_string_array_literal(items);
+    let updated = crate::wizard::toml_merge::merge_top_level_scalars(&original, &[(key, literal)]);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to mkdir {}", parent.display()))?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, updated).with_context(|| format!("failed to write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+/// Render a `Vec<String>` as a single-line TOML array literal:
+/// `["AAPL", "MSFT"]`. Quotes inside an entry are escaped with a
+/// backslash. Empty list renders as `[]`.
+fn format_string_array_literal(items: &[String]) -> String {
+    if items.is_empty() {
+        return "[]".to_string();
+    }
+    let parts: Vec<String> = items
+        .iter()
+        .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
+
 /// Returns `~/.config/glint/` on every platform (overridable with
 /// `$XDG_CONFIG_HOME`). The XDG Base Directory layout is what the spec
 /// promises, so we use it consistently rather than falling back to
@@ -714,6 +766,11 @@ pub const DEFAULT_CALENDAR_TOML: &str = r#"# Default view: "day", "week", or "mo
 default_view = "day"
 poll_interval_secs = 60
 
+# Which weekday starts the week in Week + Month views. Lowercase
+# chrono weekday name — sunday (US default), monday (ISO/Europe),
+# tuesday, wednesday, thursday, friday, or saturday.
+first_day_of_week = "sunday"
+
 # Calendar sources. Each [[providers]] entry pulls events from one backend;
 # add multiple entries to merge timelines (e.g. work Google + personal
 # Outlook). The default config is "local" — events listed below — which works
@@ -787,8 +844,14 @@ pub fn init_default_config() -> Result<PathBuf> {
     // Credentials live in their own subdirectory (created with 0700) so they
     // can be locked down with one chmod.
     let credentials = crate::auth::credentials_dir()?;
-    seed_credentials(&credentials.join("anthropic_key.toml"), DEFAULT_ANTHROPIC_KEY_TEMPLATE)?;
-    seed_credentials(&credentials.join("openai_key.toml"), DEFAULT_OPENAI_KEY_TEMPLATE)?;
+    seed_credentials(
+        &credentials.join("anthropic_key.toml"),
+        DEFAULT_ANTHROPIC_KEY_TEMPLATE,
+    )?;
+    seed_credentials(
+        &credentials.join("openai_key.toml"),
+        DEFAULT_OPENAI_KEY_TEMPLATE,
+    )?;
     seed_credentials(&credentials.join("caldav.toml"), DEFAULT_CALDAV_TEMPLATE)?;
     seed_credentials(
         &credentials.join("google_oauth_client.toml"),
@@ -915,10 +978,16 @@ mod tests {
             toml::from_str(DEFAULT_WEATHER_TOML).expect("weather seed should parse");
         let cal: crate::widgets::calendar::CalendarConfig =
             toml::from_str(DEFAULT_CALENDAR_TOML).expect("calendar seed should parse");
-        assert!(!cal.events.is_empty(), "calendar seed should ship example events");
+        assert!(
+            !cal.events.is_empty(),
+            "calendar seed should ship example events"
+        );
         let news: crate::widgets::news::NewsConfig =
             toml::from_str(DEFAULT_NEWS_TOML).expect("news seed should parse");
-        assert!(!news.feeds.is_empty(), "news seed should ship example feeds");
+        assert!(
+            !news.feeds.is_empty(),
+            "news seed should ship example feeds"
+        );
         let llm: crate::llm::LlmConfig =
             toml::from_str(DEFAULT_LLM_TOML).expect("llm seed should parse");
         assert!(llm.enabled);
@@ -934,5 +1003,41 @@ mod tests {
         let cfg = load(Some(Path::new("/nonexistent/glint/config.toml")))
             .expect("missing file should not error");
         assert_eq!(cfg.version, 1);
+    }
+
+    #[test]
+    fn format_string_array_literal_quotes_and_escapes() {
+        assert_eq!(format_string_array_literal(&[]), "[]");
+        assert_eq!(
+            format_string_array_literal(&["AAPL".into(), "MSFT".into()]),
+            r#"["AAPL", "MSFT"]"#
+        );
+        assert_eq!(
+            format_string_array_literal(&[r#"weird"name"#.into()]),
+            r#"["weird\"name"]"#
+        );
+    }
+
+    #[test]
+    fn array_literal_round_trips_through_merge_helper() {
+        // Sanity: an existing stocks-shaped TOML retains comments and
+        // sibling keys when the watchlist array is rewritten.
+        let original = r#"indices = ["^DJI", "^GSPC"]
+watchlist = ["AAPL", "MSFT"]
+
+# Press `j` on a selected ticker to open this URL.
+jump_url_template = "https://example.com/{ticker}"
+"#;
+        let updated = crate::wizard::toml_merge::merge_top_level_scalars(
+            original,
+            &[(
+                "watchlist",
+                format_string_array_literal(&["NVDA".into(), "TSLA".into()]),
+            )],
+        );
+        assert!(updated.contains(r#"watchlist = ["NVDA", "TSLA"]"#));
+        assert!(updated.contains(r#"indices = ["^DJI", "^GSPC"]"#));
+        assert!(updated.contains("# Press `j`"));
+        assert!(updated.contains("jump_url_template"));
     }
 }

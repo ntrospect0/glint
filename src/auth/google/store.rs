@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 ntrospect0
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::credentials_dir;
+use crate::credentials;
 
 /// Filename for the user-supplied OAuth client credentials.
 pub const CLIENT_FILE: &str = "google_oauth_client.toml";
@@ -23,17 +23,13 @@ pub struct OAuthClientConfig {
 
 impl OAuthClientConfig {
     pub fn load() -> Result<Self> {
-        let path = credentials_dir()?.join(CLIENT_FILE);
-        if !path.exists() {
+        let path = credentials::path(CLIENT_FILE)?;
+        let Some(cfg): Option<OAuthClientConfig> = credentials::load(CLIENT_FILE)? else {
             anyhow::bail!(
                 "missing {}\n\nCreate a Google Cloud OAuth desktop client and save:\n\n  client_id = \"...\"\n  client_secret = \"...\"\n",
                 path.display()
             );
-        }
-        let contents = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let cfg: OAuthClientConfig = toml::from_str(&contents)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        };
         if cfg.client_id.is_empty()
             || cfg.client_id.starts_with("REPLACE_WITH_")
             || cfg.client_secret.is_empty()
@@ -63,26 +59,12 @@ fn default_token_type() -> String {
 }
 
 impl GoogleToken {
-    pub fn path() -> Result<PathBuf> {
-        Ok(credentials_dir()?.join(TOKEN_FILE))
-    }
-
     pub fn load() -> Result<Option<Self>> {
-        let path = Self::path()?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        let contents = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let token: Self = toml::from_str(&contents)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
-        Ok(Some(token))
+        credentials::load(TOKEN_FILE)
     }
 
     pub fn save(&self) -> Result<PathBuf> {
-        let path = Self::path()?;
-        write_secret(&path, &toml::to_string_pretty(self).context("token serialize failed")?)?;
-        Ok(path)
+        credentials::save(TOKEN_FILE, self)
     }
 
     /// True if the access token is within `slack` seconds of expiring (or
@@ -92,19 +74,6 @@ impl GoogleToken {
         let cutoff = self.expires_at - chrono::Duration::seconds(slack_secs);
         now >= cutoff
     }
-}
-
-/// Write secret-bearing TOML to `path` with 0600 perms (Unix only).
-pub fn write_secret(path: &Path, contents: &str) -> Result<()> {
-    std::fs::write(path, contents)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to chmod 0600 {}", path.display()))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

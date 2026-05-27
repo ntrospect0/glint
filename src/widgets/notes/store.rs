@@ -18,8 +18,7 @@
 //! "last edited" update via the filesystem.
 
 use std::{
-    fs,
-    io,
+    fs, io,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     time::SystemTime,
@@ -144,12 +143,10 @@ pub fn load_all(instance: &str) -> Vec<Note> {
 /// can re-sort without an extra stat.
 pub fn save(instance: &str, note: &mut Note) -> Result<()> {
     let dir = notes_dir(instance)?;
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("create {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join(format!("{}.md", note.id));
     let tmp = dir.join(format!("{}.md.tmp", note.id));
-    fs::write(&tmp, &note.body)
-        .with_context(|| format!("write {}", tmp.display()))?;
+    fs::write(&tmp, &note.body).with_context(|| format!("write {}", tmp.display()))?;
     fs::rename(&tmp, &path)
         .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
     note.modified = fs::metadata(&path)
@@ -244,7 +241,10 @@ mod tests {
         )
         // Sanitize for our own rules so the assertion-target path
         // matches what notes_dir() resolves to.
-        .replace(|c: char| !matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-'), "_")
+        .replace(
+            |c: char| !matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-'),
+            "_",
+        )
     }
 
     #[test]

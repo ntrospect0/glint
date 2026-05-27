@@ -194,6 +194,29 @@ on memory, HTTP, and rendering.
 - **Dynamic widget registry** for out-of-tree widget crates (inventory
   / linkme-style runtime registration). Add when a concrete community
   widget needs it.
+- **Tiered credential storage backends.** Replace today's single
+  plaintext-with-0600 path with three pluggable backends behind one
+  trait: OS keychain (macOS Keychain / Windows Credential Manager /
+  Linux Secret Service via the `keyring` crate), host-bound encryption
+  (AES-GCM with key derived from the platform machine-ID via the
+  `machine-uid` crate, for headless / SSH-only / homelab where Secret
+  Service isn't available), and the current plaintext file as
+  universal fallback. Selected via `credentials_backend = "auto" |
+  "keychain" | "host-bound" | "plaintext"` in `config.toml`; `auto`
+  picks the strongest available tier and logs which one won.
+  PR-sized chunks: (1) extract `CredentialBackend` trait + refactor
+  existing plaintext path through it, (2) add `keychain` backend +
+  Linux-headless probe, (3) add `host-bound` backend with HKDF + a
+  per-install salt file, (4) wizard integration with explicit
+  backend-pick UI, (5) one-shot migration of existing plaintext files
+  on first read. Honest framing in docs — host-bound is
+  leak-resistant, not encrypted against local processes running as
+  your user.
+- **Upgrade `imap` dep when `3.x` stabilises** to clear the
+  `imap-proto 0.10.2` future-incompat warning (trailing-semicolon
+  macro pattern; rust-lang issue #79813). Informational today, not
+  blocking. `imap` 2.x pins `imap-proto` `^0.10` so a transitive
+  bump isn't an option without forking.
 - **`v0.2.0` cut.** The version field bumps when README + INSTRUCTIONS
   + AGENTS + LICENSE land as a final polish pass and the first GitHub
   release is tagged.

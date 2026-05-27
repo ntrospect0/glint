@@ -22,12 +22,8 @@ const SUB_COLS_PER_CHAR: usize = 2;
 
 /// Bit positions of the 8 sub-pixels inside the braille code point, indexed by
 /// `(row, col)` where row 0 is the top.
-const BIT_AT: [[u32; SUB_COLS_PER_CHAR]; SUB_ROWS_PER_CHAR] = [
-    [0x01, 0x08],
-    [0x02, 0x10],
-    [0x04, 0x20],
-    [0x40, 0x80],
-];
+const BIT_AT: [[u32; SUB_COLS_PER_CHAR]; SUB_ROWS_PER_CHAR] =
+    [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
 
 /// Plot the y-value series `points` into `rows × cols` chars (one char = 4×2
 /// sub-pixels). `(min, max)` is the visible y-range; values outside the range

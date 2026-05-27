@@ -18,9 +18,7 @@ use async_trait::async_trait;
 use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone, Timelike, Weekday,
 };
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -41,7 +39,7 @@ use provider::{CalendarProvider, Event};
 use crate::auth::google::{store::GoogleToken, OAuthClientConfig as GoogleClientConfig};
 use crate::auth::microsoft::{store::MicrosoftToken, OAuthClientConfig as MicrosoftClientConfig};
 use crate::cache::ScopedCache;
-use crate::theme::{ColorScheme, Theme};
+use crate::theme::{parse_color, ColorScheme, Theme};
 use crate::ui::{apply_title_row, big_digits, MetadataEmphasis};
 
 const VIEW_TABS: &[(CalendarView, &str)] = &[
@@ -114,6 +112,44 @@ pub struct CalendarConfig {
     /// `Shift+<letter>` focus shortcuts; falls back to `['c', 'd', 'a', 'l', 'e', 'n', 'r']`.
     #[serde(default)]
     pub shortcuts: Vec<char>,
+
+    /// Which weekday starts the week in Week + Month views. Defaults to
+    /// Sunday (US convention); ISO/Europe users typically set
+    /// `first_day_of_week = "monday"`. Any chrono-recognized lowercase
+    /// weekday name works (sunday/monday/tuesday/...). Invalid values
+    /// fall back to Sunday with a `serde` parse error logged.
+    #[serde(default)]
+    pub first_day_of_week: FirstDayOfWeek,
+}
+
+/// Configurable first-day-of-week. Defaults to Sunday. Serialized as
+/// a lowercase weekday name (`"sunday"`, `"monday"`, …) so the TOML
+/// reads naturally.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FirstDayOfWeek {
+    #[default]
+    Sunday,
+    Monday,
+    Tuesday,
+    Wednesday,
+    Thursday,
+    Friday,
+    Saturday,
+}
+
+impl FirstDayOfWeek {
+    pub fn as_weekday(self) -> Weekday {
+        match self {
+            FirstDayOfWeek::Sunday => Weekday::Sun,
+            FirstDayOfWeek::Monday => Weekday::Mon,
+            FirstDayOfWeek::Tuesday => Weekday::Tue,
+            FirstDayOfWeek::Wednesday => Weekday::Wed,
+            FirstDayOfWeek::Thursday => Weekday::Thu,
+            FirstDayOfWeek::Friday => Weekday::Fri,
+            FirstDayOfWeek::Saturday => Weekday::Sat,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -150,6 +186,7 @@ impl Default for CalendarConfig {
             gradient: big_digits::Gradient::default(),
             colors: ColorScheme::default(),
             shortcuts: Vec::new(),
+            first_day_of_week: FirstDayOfWeek::default(),
         }
     }
 }
@@ -158,7 +195,7 @@ impl Default for CalendarConfig {
 struct CalendarState {
     events: Vec<Event>,
     last_error: Option<String>,
-    last_attempt: Option<Instant>,
+    poll: crate::polling::PollTracker,
     inflight: bool,
     /// `(start, end)` of the data span the most recent successful
     /// fetch covered — the *fetch* range, which is wider than the
@@ -187,6 +224,21 @@ struct CalendarState {
     /// autoscroll pass on the next render", which matches the right
     /// behavior on first construction without a manual override.
     agenda_autoscroll_done: bool,
+    /// Per-column scroll offset for Week view — index 0 is the leftmost
+    /// day (Sunday), index 6 the rightmost (Saturday). Wheel scrolling
+    /// over a specific day in Week view drives one entry; columns are
+    /// independent so scrolling Monday doesn't shift Friday's events.
+    week_col_scroll: [u16; 7],
+    /// Last-known maximum scroll for each Week-view day column,
+    /// written by render after laying out each column's events vs the
+    /// available height. The wheel handler clamps against these so
+    /// scrolling past the end of one column doesn't accumulate state
+    /// that survives a re-render.
+    week_col_scroll_max: [u16; 7],
+    /// Display-state dirty bit drained by `take_dirty`. Set true by
+    /// every async-task / tick-time mutation site so the main loop's
+    /// dirty-flag gate triggers a redraw.
+    dirty: bool,
 }
 
 const CACHE_KEY_EVENTS: &str = "events";
@@ -211,7 +263,6 @@ pub struct CalendarWidget {
     auth_hint: Option<String>,
     colors: CalendarColors,
     state: Arc<Mutex<CalendarState>>,
-    poll_interval: Duration,
     /// App-level theme; kept so live config reloads can rebuild `theme`
     /// from updated `colors` overrides.
     app_theme: Arc<Theme>,
@@ -233,14 +284,30 @@ pub struct CalendarWidget {
     /// a quick flick into a single navigation step instead of skipping
     /// 20 days at once.
     last_horizontal_scroll: Option<Instant>,
+    /// Timestamp of the most recent vertical scroll. macOS trackpads
+    /// emit micro horizontal-scroll events alongside any vertical
+    /// gesture — without axis-locking off the recent vertical event,
+    /// those false-horizontal events would fire date navigation in the
+    /// middle of agenda scrolling and undo each row of vertical motion.
+    last_vertical_scroll: Option<Instant>,
+    /// Resolved first-day-of-week from config — drives both the Week
+    /// view's column order and the Month view's grid + header. Cached
+    /// as a chrono `Weekday` so the per-render math stays cheap.
+    first_day_of_week: Weekday,
 }
 
-/// Minimum gap between two horizontal-scroll-driven anchor jumps. Chosen
-/// so a typical trackpad flick (a ~300ms gesture of ~30 events) produces
-/// roughly one navigation step, while a deliberate slow scroll still
-/// dials through dates at a usable cadence. View-independent — applies
-/// to Day, Week, and Month equally.
+/// Minimum gap between two horizontal-scroll-driven anchor jumps. A typical
+/// trackpad flick (~300ms of ~30 events) should produce one navigation
+/// step; slow deliberate scroll still feeds steady steps.
 const HORIZONTAL_SCROLL_COOLDOWN: Duration = Duration::from_millis(200);
+
+/// Window during which horizontal-scroll events are dropped after any
+/// vertical scroll. macOS trackpads emit a few micro horizontal events
+/// per vertical gesture — those are jitter, not intent. Generous enough
+/// that the entire vertical gesture is covered, tight enough that a
+/// deliberate horizontal flick after the user clearly stops vertical
+/// scrolling still gets through.
+const VERTICAL_AXIS_LOCK_WINDOW: Duration = Duration::from_millis(700);
 
 impl CalendarWidget {
     pub fn with_config(
@@ -254,15 +321,16 @@ impl CalendarWidget {
         let poll_interval = Duration::from_secs(config.poll_interval_secs.max(15));
         let mut state = CalendarState {
             gradient: config.gradient,
+            poll: crate::polling::PollTracker::new(poll_interval),
             ..CalendarState::default()
         };
         // Seed events from cache so the first frame shows last session's
         // timeline while the provider refresh runs in the background.
         if let Some(entry) = cache.load::<Vec<Event>>(CACHE_KEY_EVENTS) {
-            let age = entry.age().min(poll_interval);
+            state.poll.seed_from_cache_age(entry.age());
             state.events = entry.value;
-            state.last_attempt = Some(Instant::now() - age);
         }
+        state.poll.apply_jitter(&format!("calendar@{instance}"));
         let colors_override = config.colors.clone();
         let theme = app_theme.with_overrides(&colors_override);
         let shortcut_prefs = if config.shortcuts.is_empty() {
@@ -291,7 +359,6 @@ impl CalendarWidget {
             auth_hint,
             colors,
             state: Arc::new(Mutex::new(state)),
-            poll_interval,
             app_theme,
             colors_override,
             theme,
@@ -299,6 +366,8 @@ impl CalendarWidget {
             shortcut_prefs,
             cache,
             last_horizontal_scroll: None,
+            last_vertical_scroll: None,
+            first_day_of_week: config.first_day_of_week.as_weekday(),
         }
     }
 
@@ -307,21 +376,18 @@ impl CalendarWidget {
         if st.inflight {
             return false;
         }
-        match st.last_attempt {
-            None => true,
-            Some(t) => t.elapsed() >= self.poll_interval,
-        }
+        st.poll.is_due()
     }
 
     /// Has the events vec settled to the current view's range? `false`
     /// while a refresh is in flight or pending (`mark_dirty` clears
-    /// `last_attempt`); render uses this to decide between showing
+    /// the tracker); render uses this to decide between showing
     /// "No events." and leaving the agenda blank during the brief
     /// window where the events vec is from the previously-fetched
     /// range and might be spuriously empty for the new anchor.
     fn agenda_data_loaded(&self) -> bool {
         let st = self.state.lock().expect("calendar state poisoned");
-        !st.inflight && st.last_attempt.is_some()
+        !st.inflight && st.poll.has_attempted()
     }
 
     /// Range we ask the provider for — `current_range` widened by a
@@ -369,7 +435,7 @@ impl CalendarWidget {
             return;
         }
         let mut st = self.state.lock().expect("calendar state poisoned");
-        st.last_attempt = None;
+        st.poll.mark_dirty();
     }
 
     fn current_range(&self) -> (DateTime<Local>, DateTime<Local>) {
@@ -379,7 +445,7 @@ impl CalendarWidget {
             // "No events" just because the next day's events weren't fetched.
             CalendarView::Day => (self.anchor, self.anchor + ChronoDuration::days(2)),
             CalendarView::Week => {
-                let s = start_of_week(self.anchor);
+                let s = start_of_week(self.anchor, self.first_day_of_week);
                 (s, s + ChronoDuration::days(7))
             }
             CalendarView::Month => {
@@ -399,7 +465,8 @@ impl CalendarWidget {
         {
             let mut st = self.state.lock().expect("calendar state poisoned");
             st.inflight = true;
-            st.last_attempt = Some(Instant::now());
+            st.poll.mark_attempted();
+            st.dirty = true;
         }
         let provider = self.provider.clone();
         let state = self.state.clone();
@@ -408,6 +475,7 @@ impl CalendarWidget {
             let result = provider.fetch_range(start, end).await;
             let mut st = state.lock().expect("calendar state poisoned");
             st.inflight = false;
+            st.dirty = true;
             match result {
                 Ok(events) => {
                     if let Err(err) = cache.store(CACHE_KEY_EVENTS, &events) {
@@ -425,7 +493,6 @@ impl CalendarWidget {
         });
     }
 
-
     /// Reset the agenda scroll offset to the top and re-arm the
     /// auto-scroll-to-now pass. Called whenever the anchor day or
     /// the view mode changes so the user doesn't land mid-list after
@@ -437,6 +504,12 @@ impl CalendarWidget {
         st.agenda_scroll = 0;
         st.agenda_scroll_max = 0;
         st.agenda_autoscroll_done = false;
+        // Per-day Week-view offsets reset alongside the shared agenda
+        // scroll — navigating to a different week means the previous
+        // week's column-by-column scroll positions are no longer
+        // meaningful for the new dates.
+        st.week_col_scroll = [0; 7];
+        st.week_col_scroll_max = [0; 7];
     }
 
     /// Does the currently-shown range cover today? Day view checks
@@ -450,7 +523,7 @@ impl CalendarWidget {
         match self.view {
             CalendarView::Day => self.anchor == today,
             CalendarView::Week => {
-                let start = start_of_week(self.anchor);
+                let start = start_of_week(self.anchor, self.first_day_of_week);
                 let end = start + ChronoDuration::days(6);
                 today >= start && today <= end
             }
@@ -460,15 +533,21 @@ impl CalendarWidget {
         }
     }
 
-    /// Accept-or-drop gate for ScrollLeft/Right. Returns `true` when
-    /// enough time has elapsed since the last accepted horizontal
-    /// scroll to take another one. Trackpad gestures emit a burst of
-    /// ~20-30 events in ~300ms; without this gate a single flick
-    /// would skip 20+ days at once. The [`HORIZONTAL_SCROLL_COOLDOWN`]
-    /// constant controls the cadence — quick flick ≈ 1 step, slow
-    /// deliberate scroll still feeds steady steps.
+    /// Accept-or-drop gate for ScrollLeft/Right. Returns `true` only when
+    /// the event represents real horizontal intent: a vertical scroll
+    /// hasn't fired recently (axis-lock filters out the micro horizontal
+    /// events macOS trackpads emit alongside any vertical gesture) AND
+    /// enough time has elapsed since the last accepted horizontal scroll
+    /// to take another step (burst-debounce — a trackpad flick emits
+    /// ~30 events in 300ms; without this gate one flick would skip 20+
+    /// days at once).
     fn consume_horizontal_scroll(&mut self) -> bool {
         let now = Instant::now();
+        if let Some(prev_vert) = self.last_vertical_scroll {
+            if now.duration_since(prev_vert) < VERTICAL_AXIS_LOCK_WINDOW {
+                return false;
+            }
+        }
         if let Some(prev) = self.last_horizontal_scroll {
             if now.duration_since(prev) < HORIZONTAL_SCROLL_COOLDOWN {
                 return false;
@@ -478,11 +557,8 @@ impl CalendarWidget {
         true
     }
 
-    /// Distance one ←/→ keystroke (or one accepted horizontal scroll-
-    /// wheel click) advances the anchor by. View-dependent: Day → 1
-    /// day, Week → 7 days, Month → ~30 days. Used by both `handle_key`
-    /// and `handle_mouse` so keyboard and trackpad navigation stay
-    /// in lockstep.
+    /// Distance one ←/→ keystroke advances the anchor by. View-
+    /// dependent: Day → 1 day, Week → 7 days, Month → ~30 days.
     fn nav_step(&self) -> ChronoDuration {
         match self.view {
             CalendarView::Day => ChronoDuration::days(1),
@@ -503,6 +579,28 @@ impl CalendarWidget {
         st.agenda_autoscroll_done = true;
     }
 
+    /// Week-view per-column scroll. Routes a wheel event over a specific
+    /// day-of-week to that column's scroll offset so scrolling Monday
+    /// doesn't shift Friday. `mouse_col` is the absolute terminal column;
+    /// `area` is the cell rect handed to `handle_mouse`. Out-of-bounds
+    /// clicks (e.g. inside the title bar) are silently dropped.
+    fn scroll_week_col(&self, mouse_col: u16, area: Rect, delta: i32) {
+        if area.width < 2 || area.height < 2 {
+            return;
+        }
+        let inner = Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2);
+        let content = content_rect_for(CalendarView::Week, inner);
+        if content.width == 0 || mouse_col < content.x || mouse_col >= content.x + content.width {
+            return;
+        }
+        let dow =
+            (((mouse_col - content.x) as u32 * 7) / content.width.max(1) as u32).min(6) as usize;
+        let mut st = self.state.lock().expect("calendar state poisoned");
+        let max = st.week_col_scroll_max[dow] as i32;
+        let next = (st.week_col_scroll[dow] as i32 + delta).clamp(0, max);
+        st.week_col_scroll[dow] = next as u16;
+    }
+
     fn snapshot_events(&self) -> Vec<Event> {
         let st = self.state.lock().expect("calendar state poisoned");
         st.events.clone()
@@ -521,7 +619,7 @@ impl CalendarWidget {
         }
         let dow = ((col - inner.x) as u32 * 7) / inner.width.max(1) as u32;
         let dow = dow.min(6) as i64;
-        Some(start_of_week(self.anchor) + ChronoDuration::days(dow))
+        Some(start_of_week(self.anchor, self.first_day_of_week) + ChronoDuration::days(dow))
     }
 
     /// Month view layout: top padding (1 row) + month name (1 row) + weekday
@@ -572,7 +670,7 @@ impl CalendarWidget {
             return None;
         }
         let first = NaiveDate::from_ymd_opt(y, m, 1)?;
-        let grid_start = start_of_week(first);
+        let grid_start = start_of_week(first, self.first_day_of_week);
         Some(grid_start + ChronoDuration::days(week * 7 + cell as i64))
     }
 }
@@ -590,18 +688,27 @@ enum BottomAction {
 /// Day and Month views get a 1-col gutter on each side of the widget's
 /// inner area so the content doesn't sit flush against the rounded border.
 /// Week view is already column-packed (7 cells + 6 separators); padding it
-/// would compress the day cells, so it stays flush. Both `render` and
-/// `handle_mouse` route through this helper so click→date mapping aligns
-/// with the rendered grid.
+/// would compress the day cells, so it stays flush. All views also reserve
+/// the bottom row for the `[Today] [Day] [Week] [Month]  ←/→ nav` hint —
+/// without that reservation, the last visible agenda row gets painted
+/// over by the hint and the user "can't scroll to the end" of a long day.
+/// Both `render` and `handle_mouse` route through this helper so
+/// click→date mapping aligns with the rendered grid.
 fn content_rect_for(view: CalendarView, inner: Rect) -> Rect {
+    let body_height = inner.height.saturating_sub(1);
     match view {
         CalendarView::Day | CalendarView::Month if inner.width >= 4 => Rect {
             x: inner.x + 1,
             y: inner.y,
             width: inner.width - 2,
-            height: inner.height,
+            height: body_height,
         },
-        _ => inner,
+        _ => Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: body_height,
+        },
     }
 }
 
@@ -629,9 +736,7 @@ fn bottom_action_at(click_col: u16, hint_x: u16) -> Option<BottomAction> {
 /// single backend (Local / Google / Outlook / CalDAV) or a CompositeProvider
 /// fanning out to multiple. `source_label` becomes the `[label]` shown in the
 /// cell title (`google`, `local`, `google+outlook`, etc.).
-fn build_provider(
-    config: &CalendarConfig,
-) -> (Arc<dyn CalendarProvider>, String, Option<String>) {
+fn build_provider(config: &CalendarConfig) -> (Arc<dyn CalendarProvider>, String, Option<String>) {
     let local_file = LocalCalendarFile {
         events: config.events.clone(),
     };
@@ -698,8 +803,8 @@ fn build_entry(
             let file = LocalCalendarFile {
                 events: config.events.clone(),
             };
-            let p = LocalCalendarProvider::from_file(file)
-                .map_err(|e| format!("local events: {e}"))?;
+            let p =
+                LocalCalendarProvider::from_file(file).map_err(|e| format!("local events: {e}"))?;
             Ok((Arc::new(p), "local"))
         }
         ProviderKind::Google => build_google_entry(&entry.calendar_ids).map(|p| (p, "google")),
@@ -716,11 +821,10 @@ fn build_entry(
 }
 
 fn build_outlook_entry(calendar_ids: &[String]) -> Result<Arc<dyn CalendarProvider>, String> {
-    let client = MicrosoftClientConfig::load()
-        .map_err(|err| {
-            tracing::warn!(error = %err, "microsoft_oauth_client.toml missing or invalid");
-            "Drop microsoft_oauth_client.toml in ~/.config/glint/credentials/".to_string()
-        })?;
+    let client = MicrosoftClientConfig::load().map_err(|err| {
+        tracing::warn!(error = %err, "microsoft_oauth_client.toml missing or invalid");
+        "Drop microsoft_oauth_client.toml in ~/.config/glint/credentials/".to_string()
+    })?;
     let token = MicrosoftToken::load()
         .map_err(|err| format!("Outlook token unreadable: {err}"))?
         .ok_or_else(|| "Run `glint --auth microsoft` to connect Microsoft Outlook".to_string())?;
@@ -750,9 +854,7 @@ fn build_caldav_entry(urls: Vec<String>) -> Result<Arc<dyn CalendarProvider>, St
     let creds = match CalDavCredentials::load() {
         Ok(Some(c)) => c,
         Ok(None) => {
-            return Err(
-                "Fill in ~/.config/glint/credentials/caldav.toml to connect CalDAV".into(),
-            );
+            return Err("Fill in ~/.config/glint/credentials/caldav.toml to connect CalDAV".into());
         }
         Err(err) => return Err(format!("CalDAV credentials unreadable: {err}")),
     };
@@ -781,10 +883,7 @@ impl CalendarProvider for CompositeProvider {
         start: DateTime<Local>,
         end: DateTime<Local>,
     ) -> Result<Vec<Event>> {
-        let futs = self
-            .inner
-            .iter()
-            .map(|p| p.fetch_range(start, end));
+        let futs = self.inner.iter().map(|p| p.fetch_range(start, end));
         let results = futures::future::join_all(futs).await;
         let mut all = Vec::new();
         for r in results {
@@ -821,11 +920,12 @@ fn render_month_grid(
     selected: NaiveDate,
     events: &[Event],
     theme: &Theme,
+    first_day_of_week: Weekday,
 ) {
     let Some(first) = NaiveDate::from_ymd_opt(year, month, 1) else {
         return;
     };
-    let grid_start = start_of_week(first);
+    let grid_start = start_of_week(first, first_day_of_week);
     let today = Local::now().date_naive();
 
     let month_header_style = if is_anchor {
@@ -833,8 +933,11 @@ fn render_month_grid(
     } else {
         theme.text_dim
     };
+    // Rotate the Sun-anchored weekday label list so the configured
+    // first-day-of-week appears in the leftmost column.
+    let weekday_labels = rotated_weekday_labels(first_day_of_week);
     let weekday_header = Line::from(
-        ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        weekday_labels
             .iter()
             .map(|s| {
                 Span::styled(
@@ -886,10 +989,7 @@ fn render_month_grid(
         lines.push(Line::from(spans));
     }
 
-    frame.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Center),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
 }
 
 fn local_midnight(date: NaiveDate) -> Option<DateTime<Local>> {
@@ -898,9 +998,28 @@ fn local_midnight(date: NaiveDate) -> Option<DateTime<Local>> {
         .single()
 }
 
-fn start_of_week(d: NaiveDate) -> NaiveDate {
-    let from_sunday = d.weekday().num_days_from_sunday();
-    d - ChronoDuration::days(i64::from(from_sunday))
+/// Roll `d` back to the start of the week, where the week starts on
+/// `first_day_of_week`. `from_sun = (today_dow - first_dow) mod 7` —
+/// that's how many days to subtract regardless of which weekday the
+/// caller chose to anchor on.
+fn start_of_week(d: NaiveDate, first_day_of_week: Weekday) -> NaiveDate {
+    let today_idx = d.weekday().num_days_from_sunday();
+    let first_idx = first_day_of_week.num_days_from_sunday();
+    let offset = (today_idx + 7 - first_idx) % 7;
+    d - ChronoDuration::days(i64::from(offset))
+}
+
+/// The seven weekday-short labels in column order, starting from
+/// `first_day_of_week`. Used by Week- and Month-view headers so the
+/// label row matches the grid's day ordering.
+fn rotated_weekday_labels(first_day_of_week: Weekday) -> [&'static str; 7] {
+    const SUN_ANCHORED: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let shift = first_day_of_week.num_days_from_sunday() as usize;
+    let mut out = [""; 7];
+    for i in 0..7 {
+        out[i] = SUN_ANCHORED[(i + shift) % 7];
+    }
+    out
 }
 
 fn start_of_month(d: NaiveDate) -> NaiveDate {
@@ -1028,7 +1147,11 @@ impl CalendarColors {
         // Unknown calendar — hash the composite key into the palette so at
         // least same-name events stay one color across renders.
         let mut hash: u32 = 5381;
-        for b in source.bytes().chain(b":".iter().copied()).chain(calendar.bytes()) {
+        for b in source
+            .bytes()
+            .chain(b":".iter().copied())
+            .chain(calendar.bytes())
+        {
             hash = hash.wrapping_mul(33).wrapping_add(u32::from(b));
         }
         self.palette[(hash as usize) % self.palette.len()]
@@ -1046,27 +1169,6 @@ fn provider_kind_label(kind: ProviderKind) -> &'static str {
 
 /// Maps a color name (case-insensitive, hyphens or underscores) to a
 /// Ratatui `Color`. ANSI 16-color names plus a few common aliases.
-fn parse_color(s: &str) -> Option<Color> {
-    let norm = s.trim().to_ascii_lowercase().replace('-', "_");
-    Some(match norm.as_str() {
-        "black" => Color::Black,
-        "red" => Color::Red,
-        "green" => Color::Green,
-        "yellow" => Color::Yellow,
-        "blue" => Color::Blue,
-        "magenta" | "purple" => Color::Magenta,
-        "cyan" => Color::Cyan,
-        "white" => Color::White,
-        "gray" | "grey" | "dark_gray" | "dark_grey" => Color::DarkGray,
-        "light_red" | "bright_red" => Color::LightRed,
-        "light_green" | "bright_green" => Color::LightGreen,
-        "light_yellow" | "bright_yellow" => Color::LightYellow,
-        "light_blue" | "bright_blue" => Color::LightBlue,
-        "light_magenta" | "bright_magenta" | "light_purple" => Color::LightMagenta,
-        "light_cyan" | "bright_cyan" => Color::LightCyan,
-        _ => return None,
-    })
-}
 
 fn weekday_short(w: Weekday) -> &'static str {
     match w {
@@ -1124,7 +1226,7 @@ impl CalendarWidget {
                 self.anchor.year()
             ),
             CalendarView::Week => {
-                let s = start_of_week(self.anchor);
+                let s = start_of_week(self.anchor, self.first_day_of_week);
                 let e = s + ChronoDuration::days(6);
                 format!(
                     "[{source}] week of {} {}–{}",
@@ -1175,12 +1277,7 @@ impl CalendarWidget {
                     height: sep_height,
                 };
                 let sep_lines: Vec<Line<'_>> = (0..sep_height)
-                    .map(|_| {
-                        Line::from(Span::styled(
-                            "│",
-                            self.theme.text_dim,
-                        ))
-                    })
+                    .map(|_| Line::from(Span::styled("│", self.theme.text_dim)))
                     .collect();
                 frame.render_widget(Paragraph::new(sep_lines), sep_area);
             }
@@ -1245,21 +1342,14 @@ impl CalendarWidget {
         };
         let mut header_lines: Vec<Line<'_>> = vec![
             Line::from(""),
-            Line::from(Span::styled(
-                header_text,
-                self.theme.text_dim,
-            )),
+            Line::from(Span::styled(header_text, self.theme.text_dim)),
         ];
         // For today's date we hand the big-digit numeral to `render_styled`
         // so the user's gradient choice applies. Anchor and preview days keep
         // their dim single-color render — putting a vibrant gradient on a
         // non-today date would defeat the visual hierarchy.
         if is_today {
-            let gradient = self
-                .state
-                .lock()
-                .expect("calendar state poisoned")
-                .gradient;
+            let gradient = self.state.lock().expect("calendar state poisoned").gradient;
             let lines = big_digits::render_styled(
                 &date.day().to_string(),
                 gradient,
@@ -1313,9 +1403,7 @@ impl CalendarWidget {
             // the natural top-of-list position; days that fit fully
             // never need scrolling at all.
             let today = Local::now().date_naive();
-            let do_autoscroll = needs_autoscroll
-                && date == today
-                && max_scroll > 0;
+            let do_autoscroll = needs_autoscroll && date == today && max_scroll > 0;
             if do_autoscroll {
                 let now = Local::now();
                 if let Some(rel_line) =
@@ -1373,10 +1461,7 @@ impl CalendarWidget {
             // data; before that, return an empty Vec so the agenda body
             // is blank rather than flashing the misleading message.
             return if self.agenda_data_loaded() {
-                vec![Line::from(Span::styled(
-                    "No events.",
-                    self.theme.text_dim,
-                ))]
+                vec![Line::from(Span::styled("No events.", self.theme.text_dim))]
             } else {
                 Vec::new()
             };
@@ -1412,10 +1497,7 @@ impl CalendarWidget {
                         title_span,
                     ]));
                 } else {
-                    lines.push(Line::from(vec![
-                        Span::raw(cont_indent.clone()),
-                        title_span,
-                    ]));
+                    lines.push(Line::from(vec![Span::raw(cont_indent.clone()), title_span]));
                 }
             }
             if let Some(loc) = &e.location {
@@ -1474,8 +1556,7 @@ impl CalendarWidget {
         if area.height == 0 || area.width == 0 {
             return;
         }
-        let day_events: Vec<&Event> =
-            events.iter().filter(|e| e.on_date(self.anchor)).collect();
+        let day_events: Vec<&Event> = events.iter().filter(|e| e.on_date(self.anchor)).collect();
         let today = Local::now().date_naive();
         let header_text = format!(
             "{}, {} {}",
@@ -1533,8 +1614,8 @@ impl CalendarWidget {
         frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
     }
 
-    fn render_week(&self, frame: &mut Frame, area: Rect, events: &[Event]) {
-        let s = start_of_week(self.anchor);
+    fn render_week(&self, frame: &mut Frame, area: Rect, events: &[Event], focused: bool) {
+        let s = start_of_week(self.anchor, self.first_day_of_week);
         // 7 day columns interleaved with 6 single-char separator columns.
         let constraints: Vec<Constraint> = (0..13)
             .map(|i| {
@@ -1551,20 +1632,89 @@ impl CalendarWidget {
             .split(area);
         let today = Local::now().date_naive();
 
-        // Draw vertical separators between day columns. Skip the bottom hint
-        // row so the separator doesn't collide with the view-tab buttons.
-        let separator_height = area.height.saturating_sub(1);
-        for i in 0..6 {
-            let sep_area = cols[i * 2 + 1];
-            let sep_lines: Vec<Line<'_>> = (0..separator_height)
-                .map(|_| {
-                    Line::from(Span::styled(
-                        "│",
-                        self.theme.text_dim,
-                    ))
-                })
-                .collect();
-            frame.render_widget(Paragraph::new(sep_lines), sep_area);
+        // Layout per column:
+        //   row 0:                empty top pad (vertical separators
+        //                         skip this row so they don't kiss the
+        //                         block's top border)
+        //   row 1:                weekday short label (Sun/Mon/…)
+        //   row 2:                date number (or [date] for today)
+        //   row 3:                horizontal divider (─ across the full
+        //                         row, with ┼ at every column separator
+        //                         and ├ ┤ overpainted on the block's
+        //                         left/right borders for clean connection)
+        //   rows 4..bottom:       per-column scrollable events
+        const WEEK_TOP_PAD: u16 = 1;
+        const WEEK_LABEL_ROWS: u16 = 2;
+        const WEEK_DIVIDER_ROW_OFFSET: u16 = WEEK_TOP_PAD + WEEK_LABEL_ROWS; // 3
+        const WEEK_HEADER_TOTAL: u16 = WEEK_DIVIDER_ROW_OFFSET + 1; // 4
+
+        // Horizontal divider — drawn first so the separators below can
+        // overwrite this row at their column with `┼`. Block borders at
+        // x = area.x - 1 (left) and x = area.x + area.width (right)
+        // get repainted with `├` / `┤` so the divider bridges the box
+        // cleanly instead of leaving a gap on each side.
+        if WEEK_HEADER_TOTAL <= area.height {
+            let divider_y = area.y + WEEK_DIVIDER_ROW_OFFSET;
+            let hr_str: String = std::iter::repeat('─').take(area.width as usize).collect();
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(hr_str, self.theme.text_dim))),
+                Rect {
+                    x: area.x,
+                    y: divider_y,
+                    width: area.width,
+                    height: 1,
+                },
+            );
+            let border_style = self.theme.border_style(focused);
+            if area.x >= 1 {
+                frame.render_widget(
+                    Paragraph::new(Span::styled("├", border_style)),
+                    Rect {
+                        x: area.x - 1,
+                        y: divider_y,
+                        width: 1,
+                        height: 1,
+                    },
+                );
+            }
+            frame.render_widget(
+                Paragraph::new(Span::styled("┤", border_style)),
+                Rect {
+                    x: area.x + area.width,
+                    y: divider_y,
+                    width: 1,
+                    height: 1,
+                },
+            );
+        }
+
+        // Vertical separators between day columns. Start at row 1 (skip
+        // the empty top pad) so they don't run up to the block border;
+        // use `┼` at the divider intersection so the cross looks clean
+        // instead of dashed-out where the lines meet.
+        if area.height > WEEK_TOP_PAD {
+            let sep_height = area.height - WEEK_TOP_PAD;
+            for i in 0..6 {
+                let sep_col = cols[i * 2 + 1];
+                let mut sep_lines: Vec<Line<'_>> = Vec::with_capacity(sep_height as usize);
+                for row_off in 0..sep_height {
+                    let ch = if row_off == WEEK_LABEL_ROWS {
+                        "┼"
+                    } else {
+                        "│"
+                    };
+                    sep_lines.push(Line::from(Span::styled(ch, self.theme.text_dim)));
+                }
+                frame.render_widget(
+                    Paragraph::new(sep_lines),
+                    Rect {
+                        x: sep_col.x,
+                        y: area.y + WEEK_TOP_PAD,
+                        width: 1,
+                        height: sep_height,
+                    },
+                );
+            }
         }
 
         for i in 0..7 {
@@ -1584,18 +1734,39 @@ impl CalendarWidget {
             } else {
                 Style::default().add_modifier(Modifier::BOLD)
             };
-            let mut lines: Vec<Line<'_>> = vec![
+            // 3 header rows: blank top pad, weekday, date. The 4th row
+            // (the horizontal divider) is drawn cell-wide above, not
+            // per-column.
+            let header_lines: Vec<Line<'_>> = vec![
                 Line::from(""),
                 Line::from(Span::styled(weekday_label, header_style)),
                 Line::from(Span::styled(date_label, header_style)),
-                Line::from(""),
             ];
+
+            let header_h = (WEEK_TOP_PAD + WEEK_LABEL_ROWS).min(col_area.height);
+            let header_rect = Rect {
+                x: col_area.x,
+                y: col_area.y,
+                width: col_area.width,
+                height: header_h,
+            };
+            let events_y_offset = WEEK_HEADER_TOTAL.min(col_area.height);
+            let events_rect = Rect {
+                x: col_area.x,
+                y: col_area.y + events_y_offset,
+                width: col_area.width,
+                height: col_area.height.saturating_sub(events_y_offset),
+            };
+
+            frame.render_widget(
+                Paragraph::new(header_lines).alignment(Alignment::Left),
+                header_rect,
+            );
+
             let day_events: Vec<&Event> = events.iter().filter(|e| e.on_date(day)).collect();
+            let mut event_lines: Vec<Line<'_>> = Vec::new();
             if day_events.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "·",
-                    self.theme.text_dim,
-                )));
+                event_lines.push(Line::from(Span::styled("·", self.theme.text_dim)));
             } else {
                 let wrap_width = col_area.width.saturating_sub(1) as usize;
                 for e in day_events {
@@ -1607,26 +1778,36 @@ impl CalendarWidget {
                     };
                     // Combine the prefix and title so the wrap function
                     // accounts for the prefix's column cost on line 1.
-                    // The previous version wrapped the bare title at
-                    // wrap_width and then glued the prefix onto line 1
-                    // — which pushed line 1 past the column edge so
-                    // ratatui silently truncated those characters,
-                    // making it look like the title had "lost" its
-                    // middle when really the wrap function had already
-                    // moved on past them on line 2.
+                    // Wrapping the bare title and then prepending the
+                    // prefix pushed line 1 past the column edge, which
+                    // ratatui silently truncated.
                     let combined = format!("{prefix} {}", e.title);
                     let title_lines = wrap_event_title(&combined, wrap_width, 3);
                     for line in title_lines {
-                        lines.push(Line::from(Span::styled(
-                            line,
-                            Style::default().fg(color),
-                        )));
+                        event_lines
+                            .push(Line::from(Span::styled(line, Style::default().fg(color))));
                     }
                 }
             }
+
+            // Publish the per-column max scroll so the wheel handler
+            // can clamp without re-running the layout, then clamp the
+            // last-saved offset against it (window resize can shrink
+            // the events area between renders).
+            let max_scroll = (event_lines.len() as u16).saturating_sub(events_rect.height);
+            let scroll = {
+                let mut st = self.state.lock().expect("calendar state poisoned");
+                st.week_col_scroll_max[i] = max_scroll;
+                let clamped = st.week_col_scroll[i].min(max_scroll);
+                st.week_col_scroll[i] = clamped;
+                clamped
+            };
+
             frame.render_widget(
-                Paragraph::new(lines).alignment(Alignment::Left),
-                col_area,
+                Paragraph::new(event_lines)
+                    .alignment(Alignment::Left)
+                    .scroll((scroll, 0)),
+                events_rect,
             );
         }
     }
@@ -1662,11 +1843,16 @@ impl CalendarWidget {
             x: area.x,
             y: area.y,
             width: area.width,
-            height: if show_agenda { GRID_HEIGHT } else { area.height },
+            height: if show_agenda {
+                GRID_HEIGHT
+            } else {
+                area.height
+            },
         };
 
-        let constraints: Vec<Constraint> =
-            (0..months.len()).map(|_| Constraint::Ratio(1, months.len() as u32)).collect();
+        let constraints: Vec<Constraint> = (0..months.len())
+            .map(|_| Constraint::Ratio(1, months.len() as u32))
+            .collect();
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(constraints)
@@ -1683,6 +1869,7 @@ impl CalendarWidget {
                 self.anchor,
                 events,
                 &self.theme,
+                self.first_day_of_week,
             );
         }
 
@@ -1778,6 +1965,11 @@ impl Widget for CalendarWidget {
         Ok(())
     }
 
+    fn take_dirty(&mut self) -> bool {
+        let mut st = self.state.lock().expect("calendar state poisoned");
+        std::mem::replace(&mut st.dirty, false)
+    }
+
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
         let metadata = self.title_metadata_string();
         let block = apply_title_row(
@@ -1800,7 +1992,7 @@ impl Widget for CalendarWidget {
         let content = content_rect_for(self.view, inner);
         match self.view {
             CalendarView::Day => self.render_day(frame, content, &events),
-            CalendarView::Week => self.render_week(frame, content, &events),
+            CalendarView::Week => self.render_week(frame, content, &events, focused),
             CalendarView::Month => self.render_month(frame, content, &events),
         }
 
@@ -1919,17 +2111,28 @@ impl Widget for CalendarWidget {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> EventResult {
-        // Vertical scroll walks the selected day's agenda; horizontal
-        // scroll walks time by the same unit ←/→ does (1 day in Day
-        // view, 1 week in Week view, ~1 month in Month view). Click
-        // navigation on the day grid stays untouched.
+        // Vertical scroll walks the selected day's agenda. Horizontal
+        // scroll walks the anchor by the same view-stride ←/→ does,
+        // gated through `consume_horizontal_scroll`: axis-locked off
+        // recent vertical events (so trackpad jitter during a vertical
+        // gesture doesn't accidentally navigate days) and burst-
+        // debounced (so a single horizontal flick is one step, not
+        // twenty). Click navigation on the day grid stays untouched.
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                self.scroll_agenda(-1);
+                self.last_vertical_scroll = Some(Instant::now());
+                match self.view {
+                    CalendarView::Week => self.scroll_week_col(mouse.column, area, -1),
+                    _ => self.scroll_agenda(-1),
+                }
                 return EventResult::Handled;
             }
             MouseEventKind::ScrollDown => {
-                self.scroll_agenda(1);
+                self.last_vertical_scroll = Some(Instant::now());
+                match self.view {
+                    CalendarView::Week => self.scroll_week_col(mouse.column, area, 1),
+                    _ => self.scroll_agenda(1),
+                }
                 return EventResult::Handled;
             }
             MouseEventKind::ScrollLeft => {
@@ -2031,7 +2234,10 @@ impl Widget for CalendarWidget {
             ("wheel", "scroll the day's agenda"),
             ("t", "jump to today"),
             ("g", "cycle digit gradient style (today's date)"),
-            ("click day", "week: open in day view; month: select for agenda"),
+            (
+                "click day",
+                "week: open in day view; month: select for agenda",
+            ),
             ("click tab", "switch view / today"),
         ]
     }
@@ -2039,7 +2245,13 @@ impl Widget for CalendarWidget {
     fn config(&self) -> serde_json::Value {
         serde_json::json!({
             "default_view": self.view,
-            "poll_interval_secs": self.poll_interval.as_secs(),
+            "poll_interval_secs": self
+                .state
+                .lock()
+                .expect("calendar state poisoned")
+                .poll
+                .interval()
+                .as_secs(),
             "provider": self.source_label,
         })
     }
@@ -2057,6 +2269,16 @@ impl Widget for CalendarWidget {
     fn set_app_theme(&mut self, theme: Arc<Theme>) {
         self.theme = theme.with_overrides(&self.colors_override);
         self.app_theme = theme;
+    }
+
+    fn poll_snapshot(&self) -> Option<crate::polling::PollSnapshot> {
+        Some(
+            self.state
+                .lock()
+                .expect("calendar state poisoned")
+                .poll
+                .snapshot(),
+        )
     }
 
     fn shortcut_preferences(&self) -> &[char] {
@@ -2083,9 +2305,7 @@ pub const KIND: &str = "calendar";
 /// [[providers]] / [[events]] / `[calendar_colors]` lives in
 /// calendar.toml and is preserved across `--setup` re-runs.
 pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
-    use crate::wizard::descriptor::{
-        ChoiceOption, WizardDescriptor, WizardField, WizardFieldKind,
-    };
+    use crate::wizard::descriptor::{ChoiceOption, WizardDescriptor, WizardField, WizardFieldKind};
     WizardDescriptor {
         display_name: "Calendar",
         blurb: "Day / week / month agenda views across Google, Outlook, \
@@ -2164,7 +2384,9 @@ pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
                        set up an Azure app yet, see \
                        credentials/microsoft_oauth_client.toml.",
                 required: false,
-                kind: WizardFieldKind::OAuth { provider: "microsoft" },
+                kind: WizardFieldKind::OAuth {
+                    provider: "microsoft",
+                },
                 validate: None,
             },
         ],
@@ -2236,9 +2458,7 @@ fn render_calendar_toml(
             provider_blocks.push_str("\n");
             provider_blocks.push_str(block);
         } else {
-            provider_blocks.push_str(&format!(
-                "\n[[providers]]\nkind = \"{kind}\"\n"
-            ));
+            provider_blocks.push_str(&format!("\n[[providers]]\nkind = \"{kind}\"\n"));
         }
     }
 
@@ -2246,11 +2466,8 @@ fn render_calendar_toml(
         Some(text) => std::borrow::Cow::Borrowed(text),
         None => std::borrow::Cow::Borrowed(crate::config::DEFAULT_CALENDAR_TOML),
     };
-    let stripped = crate::wizard::toml_merge::strip_array_of_tables_blocks(
-        &base, "providers",
-    );
-    let merged =
-        crate::wizard::toml_merge::merge_top_level_scalars(&stripped, &scalars);
+    let stripped = crate::wizard::toml_merge::strip_array_of_tables_blocks(&base, "providers");
+    let merged = crate::wizard::toml_merge::merge_top_level_scalars(&stripped, &scalars);
 
     let mut out = merged;
     if !out.ends_with("\n\n") {
@@ -2268,11 +2485,8 @@ fn render_calendar_toml(
 /// canonicalised kind (apple/icloud → caldav, etc.) so a re-render can
 /// preserve the user's `calendar_ids` lists when they keep that
 /// source ticked.
-fn existing_provider_blocks_by_kind(
-    text: &str,
-) -> HashMap<String, String> {
-    let mut out: HashMap<String, String> =
-        HashMap::new();
+fn existing_provider_blocks_by_kind(text: &str) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
     let Ok(doc) = toml::from_str::<toml::Value>(text) else {
         return out;
     };
@@ -2302,10 +2516,7 @@ fn existing_provider_blocks_by_kind(
                 .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
                 .collect();
             if !items.is_empty() {
-                block.push_str(&format!(
-                    "calendar_ids = [{}]\n",
-                    items.join(", ")
-                ));
+                block.push_str(&format!("calendar_ids = [{}]\n", items.join(", ")));
             }
         }
         out.insert(canonical.to_string(), block);
@@ -2346,58 +2557,38 @@ mod tests {
         }
     }
 
-    /// Horizontal scroll moves the anchor by the same unit ←/→ does:
-    /// 1 day in Day view, so one accepted ScrollRight click advances
-    /// the anchor by exactly one day. Cooldown is cleared between
-    /// clicks so the test exercises the per-event stride, not the
-    /// debounce gate (covered separately below).
+    /// One horizontal-scroll click steps the anchor by the view's
+    /// `nav_step` (Day → 1, Week → 7, Month → 30). Cooldown is cleared
+    /// between calls so the test exercises the per-event stride, not
+    /// the debounce gate.
     #[test]
-    fn horizontal_scroll_in_day_view_steps_by_one_day() {
-        let mut w = build_widget(CalendarConfig::default());
-        w.view = CalendarView::Day;
-        let start = w.anchor;
-        let area = Rect::new(0, 0, 40, 20);
-        assert_eq!(
-            w.handle_mouse(mouse_scroll(MouseEventKind::ScrollRight), area),
-            EventResult::Handled
-        );
-        assert_eq!(w.anchor, start + ChronoDuration::days(1));
-        w.last_horizontal_scroll = None;
-        assert_eq!(
-            w.handle_mouse(mouse_scroll(MouseEventKind::ScrollLeft), area),
-            EventResult::Handled
-        );
-        assert_eq!(w.anchor, start);
-    }
-
-    /// Week view → 7-day step per accepted horizontal scroll click.
-    /// Keeps keyboard ←/→ and trackpad swipe in lockstep.
-    #[test]
-    fn horizontal_scroll_in_week_view_steps_by_seven_days() {
-        let mut w = build_widget(CalendarConfig::default());
-        w.view = CalendarView::Week;
-        let start = w.anchor;
-        let area = Rect::new(0, 0, 40, 20);
-        w.handle_mouse(mouse_scroll(MouseEventKind::ScrollRight), area);
-        assert_eq!(w.anchor, start + ChronoDuration::days(7));
-    }
-
-    /// Month view uses ~30-day stride. Same approximation as the ←/→
-    /// keys — keeps mouse and keyboard navigation consistent.
-    #[test]
-    fn horizontal_scroll_in_month_view_steps_by_thirty_days() {
-        let mut w = build_widget(CalendarConfig::default());
-        w.view = CalendarView::Month;
-        let start = w.anchor;
-        let area = Rect::new(0, 0, 40, 20);
-        w.handle_mouse(mouse_scroll(MouseEventKind::ScrollRight), area);
-        assert_eq!(w.anchor, start + ChronoDuration::days(30));
+    fn horizontal_scroll_steps_anchor_by_view_stride() {
+        for (view, days) in [
+            (CalendarView::Day, 1),
+            (CalendarView::Week, 7),
+            (CalendarView::Month, 30),
+        ] {
+            let mut w = build_widget(CalendarConfig::default());
+            w.view = view;
+            let start = w.anchor;
+            let area = Rect::new(0, 0, 40, 20);
+            w.handle_mouse(mouse_scroll(MouseEventKind::ScrollRight), area);
+            assert_eq!(
+                w.anchor,
+                start + ChronoDuration::days(days),
+                "view {view:?}: ScrollRight should advance by {days} day(s)"
+            );
+            // Clear the cooldown so the next click isn't dropped by the
+            // burst debounce — we're verifying per-event stride here.
+            w.last_horizontal_scroll = None;
+            w.handle_mouse(mouse_scroll(MouseEventKind::ScrollLeft), area);
+            assert_eq!(w.anchor, start, "view {view:?}: ScrollLeft should reverse");
+        }
     }
 
     /// A burst of ScrollRight events arriving within the cooldown
-    /// window must collapse to a single navigation step. Without the
-    /// debounce a trackpad flick (20-30 events in ~300ms) would jump
-    /// 20+ days at once, which is what triggered this whole change.
+    /// collapses to one navigation step. Without this, a trackpad flick
+    /// (20-30 events in ~300ms) jumps 20+ days at once.
     #[test]
     fn horizontal_scroll_burst_within_cooldown_collapses_to_one_step() {
         let mut w = build_widget(CalendarConfig::default());
@@ -2414,31 +2605,84 @@ mod tests {
         );
     }
 
-    /// Events arriving after the cooldown window each move the anchor.
-    /// Simulated by clearing `last_horizontal_scroll` between calls —
-    /// equivalent to letting 200ms+ elapse in real use.
+    /// macOS trackpads emit micro horizontal-scroll events interspersed
+    /// with vertical ones. Without axis-lock, the horizontal jitter would
+    /// fire date navigation in the middle of agenda scrolling and undo
+    /// every row of vertical motion. After a vertical scroll, any
+    /// horizontal scroll within the lock window must be dropped.
     #[test]
-    fn horizontal_scroll_after_cooldown_accepts_next_step() {
+    fn vertical_scroll_locks_out_horizontal_jitter() {
         let mut w = build_widget(CalendarConfig::default());
         w.view = CalendarView::Day;
         let start = w.anchor;
         let area = Rect::new(0, 0, 40, 20);
-        w.handle_mouse(mouse_scroll(MouseEventKind::ScrollRight), area);
+        w.handle_mouse(mouse_scroll(MouseEventKind::ScrollDown), area);
+        // Clearing the horizontal cooldown isolates the test: if the
+        // horizontal event gets through, it's the axis-lock that broke,
+        // not the burst debounce.
         w.last_horizontal_scroll = None;
+        w.handle_mouse(mouse_scroll(MouseEventKind::ScrollLeft), area);
         w.handle_mouse(mouse_scroll(MouseEventKind::ScrollRight), area);
-        assert_eq!(w.anchor, start + ChronoDuration::days(2));
+        assert_eq!(
+            w.anchor, start,
+            "horizontal jitter during a vertical gesture must not navigate"
+        );
+        // Simulate the lock expiring (user paused after vertical) — a
+        // deliberate horizontal flick should now navigate.
+        w.last_vertical_scroll = None;
+        w.handle_mouse(mouse_scroll(MouseEventKind::ScrollRight), area);
+        assert_eq!(w.anchor, start + ChronoDuration::days(1));
     }
 
-    /// Vertical scroll still walks the agenda — horizontal nav doesn't
-    /// hijack the existing ScrollUp/Down behavior.
+    /// In Week view, scrolling over a specific day-column drives that
+    /// column's offset only — neighbours stay put. Catches a regression
+    /// where one shared scroll state would shift every column together
+    /// (or where Week view dropped wheel events entirely).
+    #[test]
+    fn week_view_wheel_scrolls_targeted_column_only() {
+        let mut w = build_widget(CalendarConfig::default());
+        w.view = CalendarView::Week;
+        // 70 cols wide → ~10 cols per day, so column index 0 sits at
+        // x ∈ [1, 10] (after the 1-col border inset). Target column 2
+        // (Tuesday) at x = 22.
+        let area = Rect::new(0, 0, 70, 20);
+        // Pre-seed scroll_max so the clamp lets the offset move.
+        // Render normally writes this; in the test we set it directly.
+        {
+            let mut st = w.state.lock().unwrap();
+            st.week_col_scroll_max = [10; 7];
+        }
+        let mut evt = mouse_scroll(MouseEventKind::ScrollDown);
+        evt.column = 22;
+        w.handle_mouse(evt, area);
+        let scrolls = w.state.lock().unwrap().week_col_scroll;
+        let nonzero_count = scrolls.iter().filter(|&&v| v > 0).count();
+        assert_eq!(
+            nonzero_count, 1,
+            "exactly one column should scroll; got {scrolls:?}"
+        );
+        assert!(
+            scrolls[2] > 0,
+            "the Tuesday column (index 2) should be the one scrolled; got {scrolls:?}"
+        );
+    }
+
+    /// Vertical scroll never moves the anchor — even in Week view where
+    /// the wheel routes through a different helper.
     #[test]
     fn vertical_scroll_does_not_move_anchor() {
-        let mut w = build_widget(CalendarConfig::default());
-        let start = w.anchor;
-        let area = Rect::new(0, 0, 40, 20);
-        w.handle_mouse(mouse_scroll(MouseEventKind::ScrollUp), area);
-        w.handle_mouse(mouse_scroll(MouseEventKind::ScrollDown), area);
-        assert_eq!(w.anchor, start);
+        for view in [CalendarView::Day, CalendarView::Week, CalendarView::Month] {
+            let mut w = build_widget(CalendarConfig::default());
+            w.view = view;
+            let start = w.anchor;
+            let area = Rect::new(0, 0, 40, 20);
+            w.handle_mouse(mouse_scroll(MouseEventKind::ScrollUp), area);
+            w.handle_mouse(mouse_scroll(MouseEventKind::ScrollDown), area);
+            assert_eq!(
+                w.anchor, start,
+                "view {view:?}: vertical scroll moved anchor"
+            );
+        }
     }
 
     /// Day view: [Today] is lit only when the anchor IS today.
@@ -2463,11 +2707,11 @@ mod tests {
         let today = Local::now().date_naive();
         // Anchor on the start of the current week → should still
         // count as "today in view."
-        w.anchor = start_of_week(today);
+        w.anchor = start_of_week(today, Weekday::Sun);
         assert!(w.current_view_contains_today());
         // Jump to the start of a different week — today is no longer
         // inside the anchored Sun..=Sat range.
-        w.anchor = start_of_week(today) - ChronoDuration::days(14);
+        w.anchor = start_of_week(today, Weekday::Sun) - ChronoDuration::days(14);
         assert!(!w.current_view_contains_today());
     }
 
@@ -2487,12 +2731,38 @@ mod tests {
     }
 
     #[test]
-    fn start_of_week_lands_on_sunday() {
+    fn start_of_week_anchors_on_configured_first_day() {
         // 2026-05-20 is a Wednesday.
         let wed = NaiveDate::from_ymd_opt(2026, 5, 20).unwrap();
-        let sun = start_of_week(wed);
+        let sun = start_of_week(wed, Weekday::Sun);
         assert_eq!(sun.weekday(), Weekday::Sun);
         assert_eq!(sun, NaiveDate::from_ymd_opt(2026, 5, 17).unwrap());
+        // ISO/Europe default — Monday anchors one day later.
+        let mon = start_of_week(wed, Weekday::Mon);
+        assert_eq!(mon.weekday(), Weekday::Mon);
+        assert_eq!(mon, NaiveDate::from_ymd_opt(2026, 5, 18).unwrap());
+        // A weekday that's strictly *after* today rolls back through
+        // the prior week, not forward — Saturday-start asked on a
+        // Wednesday lands on the previous Saturday (5 days back).
+        let sat = start_of_week(wed, Weekday::Sat);
+        assert_eq!(sat.weekday(), Weekday::Sat);
+        assert_eq!(sat, NaiveDate::from_ymd_opt(2026, 5, 16).unwrap());
+    }
+
+    #[test]
+    fn rotated_weekday_labels_match_first_day() {
+        assert_eq!(
+            rotated_weekday_labels(Weekday::Sun),
+            ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        );
+        assert_eq!(
+            rotated_weekday_labels(Weekday::Mon),
+            ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        );
+        assert_eq!(
+            rotated_weekday_labels(Weekday::Sat),
+            ["Sat", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri"]
+        );
     }
 
     #[test]
@@ -2556,11 +2826,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_color_accepts_common_names() {
+    fn parse_color_accepts_common_names_and_hex() {
         assert_eq!(parse_color("red"), Some(Color::Red));
         assert_eq!(parse_color("Light-Blue"), Some(Color::LightBlue));
         assert_eq!(parse_color("BRIGHT_GREEN"), Some(Color::LightGreen));
-        assert_eq!(parse_color(" gray "), Some(Color::DarkGray));
+        // Theme parser distinguishes "gray" (bright) from "dark_gray"
+        // (the darker variant) — the calendar parser used to fold both
+        // into DarkGray; the shared parser treats them as separate
+        // ANSI slots, matching ratatui's enum.
+        assert_eq!(parse_color(" gray "), Some(Color::Gray));
+        assert_eq!(parse_color("dark_gray"), Some(Color::DarkGray));
+        assert_eq!(parse_color("#ff6480"), Some(Color::Rgb(0xff, 0x64, 0x80)));
+        assert_eq!(parse_color("#4097E4"), Some(Color::Rgb(0x40, 0x97, 0xe4)));
         assert_eq!(parse_color("nope"), None);
     }
 
@@ -2577,9 +2854,18 @@ mod tests {
         //                       1     7 9   13 15   20 22
         assert_eq!(bottom_action_at(2, 0), Some(BottomAction::Today));
         assert_eq!(bottom_action_at(7, 0), Some(BottomAction::Today)); // ']' position
-        assert_eq!(bottom_action_at(10, 0), Some(BottomAction::View(CalendarView::Day)));
-        assert_eq!(bottom_action_at(16, 0), Some(BottomAction::View(CalendarView::Week)));
-        assert_eq!(bottom_action_at(23, 0), Some(BottomAction::View(CalendarView::Month)));
+        assert_eq!(
+            bottom_action_at(10, 0),
+            Some(BottomAction::View(CalendarView::Day))
+        );
+        assert_eq!(
+            bottom_action_at(16, 0),
+            Some(BottomAction::View(CalendarView::Week))
+        );
+        assert_eq!(
+            bottom_action_at(23, 0),
+            Some(BottomAction::View(CalendarView::Month))
+        );
         assert_eq!(bottom_action_at(60, 0), None);
     }
 
@@ -2694,7 +2980,11 @@ mod tests {
         assert_eq!(lines[1], "World");
     }
 
-    fn make_event(start: chrono::DateTime<Local>, end: chrono::DateTime<Local>, title: &str) -> Event {
+    fn make_event(
+        start: chrono::DateTime<Local>,
+        end: chrono::DateTime<Local>,
+        title: &str,
+    ) -> Event {
         Event {
             title: title.into(),
             start,
@@ -2715,8 +3005,16 @@ mod tests {
         let one_hour = chrono::Duration::hours(1);
         // Three events: 09–10 (past), 12–13 (past), 15–16 (future).
         let events: Vec<Event> = vec![
-            make_event(now - chrono::Duration::hours(5), now - chrono::Duration::hours(4), "morning standup"),
-            make_event(now - chrono::Duration::hours(2), now - chrono::Duration::hours(1), "lunch chat"),
+            make_event(
+                now - chrono::Duration::hours(5),
+                now - chrono::Duration::hours(4),
+                "morning standup",
+            ),
+            make_event(
+                now - chrono::Duration::hours(2),
+                now - chrono::Duration::hours(1),
+                "lunch chat",
+            ),
             make_event(now + one_hour, now + one_hour * 2, "design review"),
         ];
         let refs: Vec<&Event> = events.iter().collect();

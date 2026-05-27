@@ -7,7 +7,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
-    layout::Rect,
+    layout::{Constraint, Direction, Layout, Rect},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
@@ -28,8 +28,29 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Confirm — review and save ");
-    let inner = block.inner(area);
+    let outer_inner = style::pad_inner(block.inner(area));
     frame.render_widget(block, area);
+
+    // Two-column split: textual summary on the left, layout preview on
+    // the right. The preview echoes each cell's assigned widget so the
+    // user sees the dashboard shape they're about to write before they
+    // press Save.
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(60),
+            Constraint::Length(2),
+            Constraint::Min(20),
+        ])
+        .split(outer_inner);
+    let inner = cols[0];
+    super::preview::render(
+        frame,
+        cols[2],
+        &app.state.layout,
+        &app.state.assignments,
+        None,
+    );
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -136,15 +157,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp) {
     lines.push(Line::from(
         "                    troubleshooting guide. Read this when re-authorizing or",
     ));
-    lines.push(Line::from(
-        "                    setting up a new mailbox.",
-    ));
+    lines.push(Line::from("                    setting up a new mailbox."));
     lines.push(Line::from(
         "  README.md       — install, keybindings, color schemes, multi-instance",
     ));
-    lines.push(Line::from(
-        "                    widgets, layout overview.",
-    ));
+    lines.push(Line::from("                    widgets, layout overview."));
     lines.push(Line::from(
         "  docs/glint-spec.md — full architecture spec + per-widget TOML reference.",
     ));
@@ -160,8 +177,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp) {
         Span::styled("[ Save & Start Glint ]", style::page_button_focused()),
     ]));
     lines.push(Line::from(Span::styled(
-        "    Enter activates · Esc to go back · Ctrl-C to bail (state is preserved)."
-            .to_string(),
+        "    Enter activates · Esc to go back · Ctrl-C to bail (state is preserved).".to_string(),
         style::help_text(),
     )));
 

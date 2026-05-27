@@ -183,6 +183,17 @@ impl Widget for StackWidget {
         Ok(())
     }
 
+    fn take_dirty(&mut self) -> bool {
+        // Only the active child's dirty bit drives a redraw — hidden
+        // children paint nothing, and we deliberately leave their bits
+        // pending so the next rotation/switch into them surfaces any
+        // queued state changes on the first draw after they appear.
+        self.children
+            .get_mut(self.active)
+            .map(|c| c.take_dirty())
+            .unwrap_or(false)
+    }
+
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
         // Let the child render its full block + content first; then
         // overlay our tab strip on the top border row, replacing the
@@ -249,7 +260,11 @@ impl Widget for StackWidget {
         // falls through to the active child so the existing per-widget
         // mouse semantics still apply.
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            let layout = self.tab_layout.lock().expect("stack tab_layout poisoned").clone();
+            let layout = self
+                .tab_layout
+                .lock()
+                .expect("stack tab_layout poisoned")
+                .clone();
             if mouse.row == layout.row {
                 for (idx, (start, end)) in layout.tab_ranges.iter().enumerate() {
                     if mouse.column >= *start && mouse.column < *end {
@@ -459,10 +474,7 @@ fn render_tab_strip(
             chosen_ranges = left_ranges;
             let filler_count = inner_width - left_w - meta_w;
             if filler_count > 0 {
-                spans.push(Span::styled(
-                    "─".repeat(filler_count),
-                    border_style,
-                ));
+                spans.push(Span::styled("─".repeat(filler_count), border_style));
             }
             spans.extend(meta_spans);
             break;
@@ -493,12 +505,7 @@ fn render_tab_strip(
     let base = strip_rect.x as usize;
     let tab_ranges = chosen_ranges
         .into_iter()
-        .map(|(s, e)| {
-            (
-                base.saturating_add(s) as u16,
-                base.saturating_add(e) as u16,
-            )
-        })
+        .map(|(s, e)| (base.saturating_add(s) as u16, base.saturating_add(e) as u16))
         .collect();
     TabStripLayout {
         row: strip_rect.y,
@@ -555,7 +562,11 @@ fn build_tab_label_spans_with_ranges(
     // the surrounding border line, matching the single-widget title.
     // When unfocused the slots are blanks. Inactive tabs get no pad.
     let (active_left, active_right) = if focused { ("┤", "├") } else { (" ", " ") };
-    let active_pad_style = if focused { theme.border_focused } else { border_style };
+    let active_pad_style = if focused {
+        theme.border_focused
+    } else {
+        border_style
+    };
 
     let mut out: Vec<Span<'static>> = Vec::with_capacity(tabs.len() * 5 + 1);
     let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(tabs.len());
@@ -564,10 +575,7 @@ fn build_tab_label_spans_with_ranges(
     // Char cursor — incremented as we push spans so we can record each
     // tab's [start, end) offsets for click hit-testing.
     let mut pos: usize = 0;
-    let push = |out: &mut Vec<Span<'static>>,
-                pos: &mut usize,
-                content: String,
-                style: Style| {
+    let push = |out: &mut Vec<Span<'static>>, pos: &mut usize, content: String, style: Style| {
         *pos += content.chars().count();
         out.push(Span::styled(content, style));
     };
@@ -585,7 +593,12 @@ fn build_tab_label_spans_with_ranges(
 
         let tab_start = pos;
         if is_active {
-            push(&mut out, &mut pos, active_left.to_string(), active_pad_style);
+            push(
+                &mut out,
+                &mut pos,
+                active_left.to_string(),
+                active_pad_style,
+            );
         }
 
         let label_chars: Vec<char> = if compact {
@@ -630,7 +643,12 @@ fn build_tab_label_spans_with_ranges(
         }
 
         if is_active {
-            push(&mut out, &mut pos, active_right.to_string(), active_pad_style);
+            push(
+                &mut out,
+                &mut pos,
+                active_right.to_string(),
+                active_pad_style,
+            );
         }
         ranges.push((tab_start, pos));
 
@@ -835,9 +853,21 @@ mod tests {
         // Hidden (b, c) update only when tick_counter % 3 == 0:
         //   tick=1: skip; tick=2: skip; tick=3: yes; tick=4: skip; tick=5: skip; tick=6: yes.
         //   → 2 updates each.
-        assert_eq!(*counters[0].lock().unwrap(), 6, "active child should update every tick");
-        assert_eq!(*counters[1].lock().unwrap(), 2, "hidden child should be throttled");
-        assert_eq!(*counters[2].lock().unwrap(), 2, "hidden child should be throttled");
+        assert_eq!(
+            *counters[0].lock().unwrap(),
+            6,
+            "active child should update every tick"
+        );
+        assert_eq!(
+            *counters[1].lock().unwrap(),
+            2,
+            "hidden child should be throttled"
+        );
+        assert_eq!(
+            *counters[2].lock().unwrap(),
+            2,
+            "hidden child should be throttled"
+        );
     }
 
     #[tokio::test]
@@ -949,7 +979,11 @@ mod tests {
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         let chars: Vec<char> = joined.chars().collect();
         let slice = |r: (usize, usize)| -> String { chars[r.0..r.1].iter().collect() };
-        assert_eq!(slice(ranges[0]), "┤News├", "active tab body includes both tees");
+        assert_eq!(
+            slice(ranges[0]),
+            "┤News├",
+            "active tab body includes both tees"
+        );
         assert_eq!(slice(ranges[1]), "Email", "inactive tab is just the label");
     }
 
@@ -1017,7 +1051,11 @@ mod tests {
         // side and the ` ─ ` inactive↔inactive separator appears in
         // the joined output.
         let spans = build_tab_label_spans(
-            &tabs(&[("Clock", Some('c')), ("Weather", Some('w')), ("Stocks", Some('s'))]),
+            &tabs(&[
+                ("Clock", Some('c')),
+                ("Weather", Some('w')),
+                ("Stocks", Some('s')),
+            ]),
             0,
             false,
             true,
@@ -1045,20 +1083,18 @@ mod tests {
         // so they connect visually to the surrounding `─` border.
         let theme = Theme::builtin_defaults();
         let spans = build_tab_label_spans(
-            &tabs(&[("Clock", Some('c')), ("Weather", Some('w')), ("News", Some('n'))]),
+            &tabs(&[
+                ("Clock", Some('c')),
+                ("Weather", Some('w')),
+                ("News", Some('n')),
+            ]),
             1, // Weather active
             false,
             true, // focused
             &theme,
         );
-        let lefts: Vec<_> = spans
-            .iter()
-            .filter(|s| s.content.as_ref() == "┤")
-            .collect();
-        let rights: Vec<_> = spans
-            .iter()
-            .filter(|s| s.content.as_ref() == "├")
-            .collect();
+        let lefts: Vec<_> = spans.iter().filter(|s| s.content.as_ref() == "┤").collect();
+        let rights: Vec<_> = spans.iter().filter(|s| s.content.as_ref() == "├").collect();
         assert_eq!(lefts.len(), 1, "exactly one ┤ for the active tab");
         assert_eq!(rights.len(), 1, "exactly one ├ for the active tab");
         assert_eq!(lefts[0].style, theme.border_focused);
@@ -1089,15 +1125,25 @@ mod tests {
         // Active in the middle → separators on each side lose their
         // inner space, leaving ` ─┤` before and `├─ ` after.
         let spans = build_tab_label_spans(
-            &tabs(&[("News", Some('n')), ("Email", Some('e')), ("Stocks", Some('s'))]),
+            &tabs(&[
+                ("News", Some('n')),
+                ("Email", Some('e')),
+                ("Stocks", Some('s')),
+            ]),
             1,
             false,
             true,
             &theme,
         );
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(joined.contains(" ─┤"), "separator before active should flush against `┤`");
-        assert!(joined.contains("├─ "), "active should flush against the separator after `├`");
+        assert!(
+            joined.contains(" ─┤"),
+            "separator before active should flush against `┤`"
+        );
+        assert!(
+            joined.contains("├─ "),
+            "active should flush against the separator after `├`"
+        );
         assert!(!joined.contains(" ┤"), "no blank gap on the outside of `┤`");
         assert!(!joined.contains("├ "), "no blank gap on the outside of `├`");
 
@@ -1111,7 +1157,11 @@ mod tests {
             &theme,
         );
         let last = spans.last().expect("non-empty");
-        assert_eq!(last.content.as_ref(), "├", "last span should be `├` with no trailing space");
+        assert_eq!(
+            last.content.as_ref(),
+            "├",
+            "last span should be `├` with no trailing space"
+        );
     }
 
     #[test]
@@ -1134,8 +1184,7 @@ mod tests {
             &theme,
         );
         assert_eq!(spans_width(&focused), spans_width(&unfocused));
-        let unfocused_text: String =
-            unfocused.iter().map(|s| s.content.as_ref()).collect();
+        let unfocused_text: String = unfocused.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             !unfocused_text.contains('┤') && !unfocused_text.contains('├'),
             "no tee glyphs in unfocused state"
@@ -1184,7 +1233,10 @@ mod tests {
             .iter()
             .find(|s| s.content == "mail")
             .expect("'mail' span should exist");
-        assert_eq!(mail.style, theme.text_dim, "inactive tab body should be dim");
+        assert_eq!(
+            mail.style, theme.text_dim,
+            "inactive tab body should be dim"
+        );
     }
 
     #[test]
@@ -1214,7 +1266,10 @@ mod tests {
             .iter()
             .find(|s| s.content == "mail")
             .expect("'mail' span should exist");
-        assert_eq!(mail.style, theme.text_dim, "inactive tab body should be dim");
+        assert_eq!(
+            mail.style, theme.text_dim,
+            "inactive tab body should be dim"
+        );
         assert_ne!(
             theme.widget_title_unfocused, theme.text_dim,
             "active-unfocused must visibly differ from inactive-dim"
@@ -1257,7 +1312,11 @@ mod tests {
     fn build_tab_label_spans_compact_mode_uses_initials() {
         let theme = Theme::builtin_defaults();
         let spans = build_tab_label_spans(
-            &tabs(&[("Clock", Some('c')), ("Weather", Some('w')), ("Stocks", Some('s'))]),
+            &tabs(&[
+                ("Clock", Some('c')),
+                ("Weather", Some('w')),
+                ("Stocks", Some('s')),
+            ]),
             0,
             true,
             true,

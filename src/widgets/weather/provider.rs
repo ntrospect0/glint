@@ -181,7 +181,6 @@ impl OpenMeteoProvider {
             daily,
         })
     }
-
 }
 
 fn parse_daily(daily: OpenMeteoDaily) -> Vec<DailyForecast> {
@@ -199,8 +198,16 @@ fn parse_daily(daily: OpenMeteoDaily) -> Vec<DailyForecast> {
                 weather_code: daily.weather_code[i],
                 temperature_high: daily.temperature_2m_max[i],
                 temperature_low: daily.temperature_2m_min[i],
-                sunrise: daily.sunrise.get(i).and_then(|s| s.as_deref()).and_then(parse_local_dt),
-                sunset: daily.sunset.get(i).and_then(|s| s.as_deref()).and_then(parse_local_dt),
+                sunrise: daily
+                    .sunrise
+                    .get(i)
+                    .and_then(|s| s.as_deref())
+                    .and_then(parse_local_dt),
+                sunset: daily
+                    .sunset
+                    .get(i)
+                    .and_then(|s| s.as_deref())
+                    .and_then(parse_local_dt),
             });
         }
     }
@@ -266,7 +273,11 @@ pub fn render_icon(icon: &WeatherIcon) -> Vec<Line<'static>> {
         let top_idx = char_row * 2;
         let bot_idx = top_idx + 1;
         let top_row = icon.pixels[top_idx];
-        let bot_row = if bot_idx < h { icon.pixels[bot_idx] } else { &[] };
+        let bot_row = if bot_idx < h {
+            icon.pixels[bot_idx]
+        } else {
+            &[]
+        };
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(w);
         for col in 0..w {
             let top = top_row
@@ -294,7 +305,6 @@ fn cell_style(top: Option<Color>, bot: Option<Color>) -> (char, Style) {
         (Some(t), Some(b)) => ('▀', Style::default().fg(t).bg(b)),
     }
 }
-
 
 /// Maps a WMO weather code (returned by Open-Meteo's `weather_code` field) to a
 /// short human label and a single-glyph icon. See
@@ -342,7 +352,11 @@ mod tests {
     #[test]
     fn parse_daily_zips_aligned_arrays() {
         let raw = OpenMeteoDaily {
-            time: vec!["2026-05-20".into(), "2026-05-21".into(), "2026-05-22".into()],
+            time: vec![
+                "2026-05-20".into(),
+                "2026-05-21".into(),
+                "2026-05-22".into(),
+            ],
             weather_code: vec![0, 3, 61],
             temperature_2m_max: vec![22.0, 19.5, 17.0],
             temperature_2m_min: vec![12.0, 11.0, 10.0],
@@ -404,8 +418,14 @@ mod tests {
         assert_eq!(dims(icon_for_code(2, false)), dims(&icons::SUN_CLOUD));
         assert_eq!(dims(icon_for_code(2, true)), dims(&icons::MOON_CLOUD));
         // Non-sun codes are unaffected by night flag.
-        assert_eq!(dims(icon_for_code(61, false)), dims(icon_for_code(61, true)));
-        assert_eq!(dims(icon_for_code(95, false)), dims(icon_for_code(95, true)));
+        assert_eq!(
+            dims(icon_for_code(61, false)),
+            dims(icon_for_code(61, true))
+        );
+        assert_eq!(
+            dims(icon_for_code(95, false)),
+            dims(icon_for_code(95, true))
+        );
     }
 
     #[test]
@@ -458,13 +478,29 @@ mod tests {
     fn max_dimensions_cover_every_icon() {
         use crate::widgets::weather::icons::*;
         let all = [
-            &CLOUD, &RAIN, &FOG, &THUNDER, &SUN, &SUN_CLOUD, &SNOW, &SHOWERS,
-            &MOON, &WET_SNOW, &TORNADO, &MOON_CLOUD, &LIGHTNING_BOLT,
-            &THUNDER_SHOWERS, &SUN_STORM, &THUNDER_RAIN,
+            &CLOUD,
+            &RAIN,
+            &FOG,
+            &THUNDER,
+            &SUN,
+            &SUN_CLOUD,
+            &SNOW,
+            &SHOWERS,
+            &MOON,
+            &WET_SNOW,
+            &TORNADO,
+            &MOON_CLOUD,
+            &LIGHTNING_BOLT,
+            &THUNDER_SHOWERS,
+            &SUN_STORM,
+            &THUNDER_RAIN,
         ];
         for icon in all {
             assert!(icon.width <= MAX_WIDTH, "icon wider than MAX_WIDTH");
-            assert!(icon.height <= MAX_HEIGHT_PX, "icon taller than MAX_HEIGHT_PX");
+            assert!(
+                icon.height <= MAX_HEIGHT_PX,
+                "icon taller than MAX_HEIGHT_PX"
+            );
         }
     }
 

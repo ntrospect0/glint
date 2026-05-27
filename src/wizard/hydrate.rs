@@ -254,10 +254,7 @@ fn widget_toml_paths(kind: &str, dir: &Path) -> Vec<(String, PathBuf)> {
             if instance.is_empty() {
                 continue;
             }
-            out.push((
-                format!("{kind}@{instance}"),
-                entry.path(),
-            ));
+            out.push((format!("{kind}@{instance}"), entry.path()));
         }
     }
     out
@@ -299,9 +296,9 @@ fn extract_field_value(field: &WizardField, doc: &toml::Value) -> Option<WizardV
                 _ => WizardValue::Text(s.to_string()),
             })
         }
-        WizardFieldKind::Choice { .. } | WizardFieldKind::Lookup { .. } => raw
-            .as_str()
-            .map(|s| WizardValue::Choice(s.to_string())),
+        WizardFieldKind::Choice { .. } | WizardFieldKind::Lookup { .. } => {
+            raw.as_str().map(|s| WizardValue::Choice(s.to_string()))
+        }
         WizardFieldKind::Number { .. } => {
             // TOML can store the number as either an int or a float; we
             // accept either and promote to f64 to match the wizard's
@@ -362,7 +359,9 @@ fn hydrate_llm_settings(state: &mut WizardState, config_dir: &Path) {
             continue;
         }
         let path = creds_dir.join(def.credentials_filename);
-        let Some(doc) = parse_toml_file(&path) else { continue };
+        let Some(doc) = parse_toml_file(&path) else {
+            continue;
+        };
         let Some(key) = doc.get("api_key").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -457,10 +456,7 @@ watchlist = ["AAPL", "MSFT"]
         assert_eq!(out.get("enabled"), Some(&WizardValue::Bool(true)));
         assert_eq!(
             out.get("watchlist"),
-            Some(&WizardValue::TextList(vec![
-                "AAPL".into(),
-                "MSFT".into()
-            ]))
+            Some(&WizardValue::TextList(vec!["AAPL".into(), "MSFT".into()]))
         );
     }
 
@@ -474,8 +470,7 @@ watchlist = ["AAPL", "MSFT"]
 
     #[test]
     fn auto_load_accepts_integer_or_float_for_number_fields() {
-        let doc: toml::Value =
-            toml::from_str("poll_interval_secs = 15.5\n").unwrap();
+        let doc: toml::Value = toml::from_str("poll_interval_secs = 15.5\n").unwrap();
         let out = auto_load_from_toml(&flat_descriptor(), &doc);
         assert_eq!(
             out.get("poll_interval_secs"),
@@ -569,10 +564,7 @@ default_period = "1d"
         };
         assert_eq!(
             out.get("indices"),
-            Some(&WizardValue::TextList(vec![
-                "^DJI".into(),
-                "^GSPC".into()
-            ]))
+            Some(&WizardValue::TextList(vec!["^DJI".into(), "^GSPC".into()]))
         );
         assert_eq!(
             out.get("watchlist"),
@@ -639,16 +631,10 @@ label = "Custom Feed"
 url = "https://example.com/rss"
 "#;
         let mut values = std::collections::HashMap::new();
-        values.insert(
-            "poll_interval_secs".into(),
-            WizardValue::Number(120.0),
-        );
+        values.insert("poll_interval_secs".into(), WizardValue::Number(120.0));
         values.insert("show_topic_labels".into(), WizardValue::Bool(false));
         values.insert("summarize_with_llm".into(), WizardValue::Bool(true));
-        values.insert(
-            "horizontal_scroll_filters".into(),
-            WizardValue::Bool(false),
-        );
+        values.insert("horizontal_scroll_filters".into(), WizardValue::Bool(false));
 
         let desc = crate::widgets::registry::find("news").unwrap();
         let wd = (desc.wizard)();
@@ -693,19 +679,14 @@ url = "https://example.com/private.xml"
             other => panic!("expected MultiChoice, got {other:?}"),
         };
         assert!(selected.contains(&"https://hnrss.org/frontpage".to_string()));
-        assert!(
-            selected.contains(&"http://feeds.bbci.co.uk/news/rss.xml".to_string())
-        );
+        assert!(selected.contains(&"http://feeds.bbci.co.uk/news/rss.xml".to_string()));
         assert!(!selected
             .iter()
             .any(|s| s.contains("example.com/private.xml")));
 
         // Render should re-emit both catalogue feeds AND the private one.
         let mut values = loaded;
-        values.insert(
-            "poll_interval_secs".into(),
-            WizardValue::Number(600.0),
-        );
+        values.insert("poll_interval_secs".into(), WizardValue::Number(600.0));
         let renderer = wd.render_toml.expect("news render_toml");
         let rendered = renderer(&values, Some(original));
         assert!(rendered.contains("https://hnrss.org/frontpage"));
@@ -776,16 +757,10 @@ keywords = ["my-key"]
         // Render: user kept Tech ticked. Their custom keywords should
         // survive; the custom topic should be re-emitted intact.
         let mut values = loaded;
-        values.insert(
-            "poll_interval_secs".into(),
-            WizardValue::Number(900.0),
-        );
+        values.insert("poll_interval_secs".into(), WizardValue::Number(900.0));
         values.insert("show_topic_labels".into(), WizardValue::Bool(true));
         values.insert("summarize_with_llm".into(), WizardValue::Bool(true));
-        values.insert(
-            "horizontal_scroll_filters".into(),
-            WizardValue::Bool(false),
-        );
+        values.insert("horizontal_scroll_filters".into(), WizardValue::Bool(false));
         values.insert("feeds".into(), WizardValue::MultiChoice(vec![]));
         let renderer = wd.render_toml.unwrap();
         let rendered = renderer(&values, Some(original));
@@ -861,10 +836,7 @@ folders = ["INBOX", "SENT", "Bills/Utilities"]
         values.insert("summarize_with_llm".into(), WizardValue::Bool(false));
         values.insert(
             "folders".into(),
-            WizardValue::MultiChoice(vec![
-                "INBOX".into(),
-                "STARRED".into(),
-            ]),
+            WizardValue::MultiChoice(vec!["INBOX".into(), "STARRED".into()]),
         );
         let desc = crate::widgets::registry::find("email").unwrap();
         let wd = (desc.wizard)();
@@ -894,9 +866,7 @@ folders = ["INBOX", "SENT", "Bills/Utilities"]
                 assert_eq!(*source, "email_folders");
                 assert!(defaults.contains(&"INBOX"));
             }
-            other => panic!(
-                "folders field should be RemoteMultiChoice; got {other:?}"
-            ),
+            other => panic!("folders field should be RemoteMultiChoice; got {other:?}"),
         }
     }
 
@@ -932,7 +902,11 @@ folders = ["INBOX", "SENT", "Bills/Utilities"]
         // from `LlmProviderDef` metadata. Anything missing here breaks
         // the wizard, so guard the contract.
         for def in crate::llm::PROVIDERS {
-            assert!(!def.display_name.is_empty(), "{} missing display_name", def.name);
+            assert!(
+                !def.display_name.is_empty(),
+                "{} missing display_name",
+                def.name
+            );
             assert!(
                 def.credentials_filename.ends_with(".toml"),
                 "{} credentials_filename must be a .toml path: {:?}",

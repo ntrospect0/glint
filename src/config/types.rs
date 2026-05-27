@@ -48,8 +48,8 @@ pub struct GlobalConfig {
     pub mouse_scroll: MouseScroll,
 
     /// Polling cadence multiplier for widgets hidden inside a stack
-    /// (see docs/stack-spec.md §2). `1` = full rate; `3` (default) =
-    /// hidden children's `update()` is called every 3rd tick; higher
+    /// (see docs/stack-spec.md §2). `1` = full rate; `10` (default) =
+    /// hidden children's `update()` is called every 10th tick; higher
     /// = even less frequent. Saves CPU + API calls for stacks the
     /// user doesn't actively switch through. Visible / non-stacked
     /// widgets are unaffected.
@@ -65,7 +65,7 @@ pub struct GlobalConfig {
 }
 
 fn default_stack_hidden_poll_ratio() -> u32 {
-    3
+    10
 }
 
 fn default_show_status_bar() -> bool {

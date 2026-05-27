@@ -1031,9 +1031,10 @@ fn seed_assignments(state: &mut WizardState, choice: &LayoutChoice) {
 }
 
 fn current_count(app: &WizardApp) -> Option<usize> {
-    app.text_buffer.parse::<usize>().ok().filter(|n| {
-        (MIN_PANES..=MAX_PANES).contains(n)
-    })
+    app.text_buffer
+        .parse::<usize>()
+        .ok()
+        .filter(|n| (MIN_PANES..=MAX_PANES).contains(n))
 }
 
 fn default_count(app: &WizardApp) -> usize {
@@ -1047,11 +1048,7 @@ fn default_count(app: &WizardApp) -> usize {
             .find(|p| p.id == name)
             .map(|p| p.cells)
             .unwrap_or(4),
-        LayoutChoice::KeepExisting => app
-            .state
-            .assignments
-            .len()
-            .clamp(MIN_PANES, MAX_PANES),
+        LayoutChoice::KeepExisting => app.state.assignments.len().clamp(MIN_PANES, MAX_PANES),
     }
 }
 
@@ -1065,7 +1062,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp) {
         LayoutPhase::PickPreset => " Layout — step 2 of 2: choose a preset ",
     };
     let block = Block::default().borders(Borders::ALL).title(title);
-    let inner = block.inner(area);
+    let inner = style::pad_inner(block.inner(area));
     frame.render_widget(block, area);
 
     match app.layout_phase {
@@ -1104,9 +1101,7 @@ fn render_count_picker(frame: &mut Frame, area: Rect, app: &WizardApp) {
     ]));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        format!(
-            "       Press 1–{MAX_PANES} or use ←/→ ↑/↓ to adjust. Enter to continue."
-        ),
+        format!("       Press 1–{MAX_PANES} or use ←/→ ↑/↓ to adjust. Enter to continue."),
         style::help_text(),
     )));
     lines.push(Line::from(""));

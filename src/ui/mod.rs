@@ -3,6 +3,8 @@
 
 pub mod big_digits;
 pub mod help;
+pub mod modal;
+pub mod status;
 pub mod status_bar;
 
 use std::{cell::Cell, sync::Arc};
@@ -100,11 +102,7 @@ pub enum MetadataEmphasis {
     Emphasized,
 }
 
-fn metadata_style_for_emphasis(
-    theme: &Theme,
-    focused: bool,
-    emphasis: MetadataEmphasis,
-) -> Style {
+fn metadata_style_for_emphasis(theme: &Theme, focused: bool, emphasis: MetadataEmphasis) -> Style {
     let base = theme.metadata_style(focused);
     match emphasis {
         MetadataEmphasis::Default => base,
@@ -217,7 +215,9 @@ pub fn apply_title_row<'a>(
     theme: &Theme,
     area_width: u16,
 ) -> Block<'a> {
-    let (title, meta) = title_row(focused, base, metadata, emphasis, shortcut, theme, area_width);
+    let (title, meta) = title_row(
+        focused, base, metadata, emphasis, shortcut, theme, area_width,
+    );
     let mut block = block.title(Title::from(title).alignment(Alignment::Left));
     if let Some(meta) = meta {
         block = block.title(Title::from(meta).alignment(Alignment::Right));
@@ -413,13 +413,17 @@ mod tests {
         assert_eq!(focused.spans.first().map(|s| s.content.as_ref()), Some("┤"));
         assert_eq!(focused.spans.last().map(|s| s.content.as_ref()), Some("├"));
         assert_eq!(focused.spans.first().unwrap().style, theme.border_focused);
-        assert_eq!(unfocused.spans.first().map(|s| s.content.as_ref()), Some(" "));
-        assert_eq!(unfocused.spans.last().map(|s| s.content.as_ref()), Some(" "));
+        assert_eq!(
+            unfocused.spans.first().map(|s| s.content.as_ref()),
+            Some(" ")
+        );
+        assert_eq!(
+            unfocused.spans.last().map(|s| s.content.as_ref()),
+            Some(" ")
+        );
         // Width invariant: pad slots stay 1 char in both states.
-        let focused_text: String =
-            focused.spans.iter().map(|s| s.content.as_ref()).collect();
-        let unfocused_text: String =
-            unfocused.spans.iter().map(|s| s.content.as_ref()).collect();
+        let focused_text: String = focused.spans.iter().map(|s| s.content.as_ref()).collect();
+        let unfocused_text: String = unfocused.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(focused_text.chars().count(), unfocused_text.chars().count());
     }
 
@@ -623,9 +627,8 @@ pub fn render(frame: &mut Frame, state: &RenderState) {
     // is suppressed entirely (handed back to the widget grid) only when
     // the status bar is hidden AND there's no command in flight or
     // recent feedback to surface.
-    let chrome_visible = state.command_buffer.is_some()
-        || state.command_feedback.is_some()
-        || state.show_status_bar;
+    let chrome_visible =
+        state.command_buffer.is_some() || state.command_feedback.is_some() || state.show_status_bar;
     let chrome_h: u16 = if chrome_visible { 1 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -732,6 +735,10 @@ fn build_help_sections(
             ),
             ("click cell".into(), "focus that widget".into()),
             (":".into(), "open command bar".into()),
+            (
+                "Ctrl+U (in :)".into(),
+                "clear the command bar (keeps the `:` prompt)".into(),
+            ),
             (
                 ":scheme <name>".into(),
                 "switch color scheme (see list below)".into(),

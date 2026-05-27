@@ -74,7 +74,10 @@ pub fn html_to_text(html: &str) -> String {
             if b == b'>' {
                 in_tag = false;
                 let lname = tag_name(&tag_buf);
-                if matches!(lname.as_str(), "br" | "/p" | "/div" | "p" | "div" | "tr" | "/tr" | "li" | "/li") {
+                if matches!(
+                    lname.as_str(),
+                    "br" | "/p" | "/div" | "p" | "div" | "tr" | "/tr" | "li" | "/li"
+                ) {
                     out.push('\n');
                 }
                 tag_buf.clear();
@@ -151,11 +154,12 @@ fn strip_block(html: &str, name: &str) -> String {
 fn decode_entity(name: &str) -> String {
     // Numeric: &#N; (decimal) or &#xNN; (hex).
     if let Some(rest) = name.strip_prefix('#') {
-        let (radix, digits) = if let Some(hex) = rest.strip_prefix('x').or_else(|| rest.strip_prefix('X')) {
-            (16, hex)
-        } else {
-            (10, rest)
-        };
+        let (radix, digits) =
+            if let Some(hex) = rest.strip_prefix('x').or_else(|| rest.strip_prefix('X')) {
+                (16, hex)
+            } else {
+                (10, rest)
+            };
         if let Ok(code) = u32::from_str_radix(digits, radix) {
             if let Some(c) = char::from_u32(code) {
                 return c.to_string();
@@ -189,10 +193,7 @@ fn collapse_whitespace(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut blank_run = 0u32;
     for line in input.lines() {
-        let trimmed = line
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let trimmed = line.split_whitespace().collect::<Vec<_>>().join(" ");
         if trimmed.is_empty() {
             blank_run += 1;
             if blank_run <= 1 {
@@ -241,7 +242,10 @@ mod tests {
         let plain = html_to_text(html);
         // <br> and <br/> both insert newlines; </p> too.
         let lines: Vec<&str> = plain.lines().collect();
-        assert_eq!(lines, vec!["line one", "line two", "line three", "line four"]);
+        assert_eq!(
+            lines,
+            vec!["line one", "line two", "line three", "line four"]
+        );
     }
 
     #[test]

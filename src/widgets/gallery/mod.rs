@@ -60,6 +60,22 @@ pub struct GalleryConfig {
     #[serde(default = "default_rescan_interval_secs")]
     pub rescan_interval_secs: u64,
 
+    /// How many slides ahead of the current one to pre-decode and keep
+    /// resident. `0` disables prefetch (decode-on-arrival, expect a
+    /// brief "Loading…" flash on each rotation). The default balances
+    /// instant rotation with a bounded memory footprint — combined
+    /// with `keep_behind`, the gallery holds at most
+    /// `1 + prefetch_ahead + keep_behind` decoded images in RAM
+    /// regardless of how many paths the globs matched.
+    #[serde(default = "default_prefetch_ahead")]
+    pub prefetch_ahead: usize,
+
+    /// How many slides behind the current one to keep resident. Lets
+    /// `n` → previous-image roundtrip skip a re-decode. `0` is fine
+    /// for forward-only viewing.
+    #[serde(default = "default_keep_behind")]
+    pub keep_behind: usize,
+
     /// Per-widget overrides layered on the app theme.
     #[serde(default)]
     pub colors: ColorScheme,
@@ -77,30 +93,61 @@ fn default_rescan_interval_secs() -> u64 {
     300
 }
 
+fn default_prefetch_ahead() -> usize {
+    3
+}
+
+fn default_keep_behind() -> usize {
+    1
+}
+
 impl Default for GalleryConfig {
     fn default() -> Self {
         Self {
             images: Vec::new(),
             rotation_secs: default_rotation_secs(),
             rescan_interval_secs: default_rescan_interval_secs(),
+            prefetch_ahead: default_prefetch_ahead(),
+            keep_behind: default_keep_behind(),
             colors: ColorScheme::default(),
             shortcuts: Vec::new(),
         }
     }
 }
 
-/// One slideshow slot. `protocol` is `None` for files that failed to decode;
-/// `label` is the user-facing path for status display.
+/// Render-time status of a slide. Computed under the slides lock so
+/// the render path can pick the right placeholder (or actual image)
+/// without re-checking each field separately.
+#[derive(Debug, Clone, Copy)]
+enum SlideStatus {
+    Ready,
+    Pending,
+    Failed,
+}
+
+/// One slideshow slot. With on-demand loading, a `Slide` exists for
+/// every matched path from the moment the loader sees it, but its
+/// decoded protocol is only present when the slot is inside the
+/// current display window (`current + prefetch_ahead + keep_behind`).
 struct Slide {
     /// Resolved on-disk path. Used as the identity key during rescan
     /// diffs so a re-discovered image isn't re-decoded.
     source_path: PathBuf,
     label: String,
     /// `Mutex` because `StatefulImage::render` needs `&mut state` but the
-    /// widget's `render` only has `&self`.
+    /// widget's `render` only has `&self`. `None` covers three cases —
+    /// never-loaded, evicted-out-of-window, and permanently-failed —
+    /// disambiguated by `pixel_size` and `failed`.
     protocol: Option<Mutex<Box<dyn StatefulProtocol>>>,
-    /// Native pixel size, used to center the render rect with the right aspect.
-    pixel_size: (u32, u32),
+    /// Native pixel size. `Some` once the slide has been successfully
+    /// decoded at least once (preserved across eviction so subsequent
+    /// renders can size the placeholder correctly). `None` for slides
+    /// that haven't been decoded yet.
+    pixel_size: Option<(u32, u32)>,
+    /// `true` after a decode attempt failed permanently — typically a
+    /// corrupt or unsupported file. Skipped by the window loader on
+    /// subsequent passes so we don't spin retrying.
+    failed: bool,
 }
 
 pub struct GalleryWidget {
@@ -136,6 +183,14 @@ pub struct GalleryWidget {
     /// Set on Drop / `apply_config` so the background loader exits its
     /// rescan loop instead of leaking after a config reload.
     loader_stop: Arc<AtomicBool>,
+    /// Signal channel into the loader thread. Sent on every event that
+    /// changes the *active window* (rotation, manual nav, focus jumps)
+    /// so the loader can re-check whether the current slide and its
+    /// `[idx - keep_behind, idx + prefetch_ahead]` neighbours are
+    /// decoded — and evict anything outside that window. Best-effort:
+    /// `try_send` swallows full-channel errors because the loader has
+    /// at most one pending wakeup queued at a time anyway.
+    loader_signal: std::sync::mpsc::SyncSender<()>,
 }
 
 impl Drop for GalleryWidget {
@@ -151,6 +206,14 @@ struct GalleryState {
     idx: usize,
     paused: bool,
     last_rotation: Instant,
+    /// Display-state dirty bit drained by `take_dirty`. Set true when
+    /// the rotation index advances, when the background loader grows
+    /// the slide count, or anywhere else tick-time state changes.
+    dirty: bool,
+    /// Slide count seen at the last `take_dirty` call. Used by `update`
+    /// to detect when the background loader has appended new images and
+    /// flip `dirty` so the "{m}/{n}" metadata advances on screen.
+    last_seen_slide_count: usize,
 }
 
 impl GalleryWidget {
@@ -202,14 +265,26 @@ impl GalleryWidget {
             idx: 0,
             paused,
             last_rotation: Instant::now(),
+            dirty: true,
+            last_seen_slide_count: 0,
         }));
         let colors_override = config.colors.clone();
+
+        // Normalize bare directory entries to `<dir>/*` so the rescan
+        // loop and the literal-vs-glob split inside `expand_pattern`
+        // both see the entry as a glob. Done once up front; reused by
+        // the loader thread below.
+        let images: Vec<String> = config
+            .images
+            .iter()
+            .map(|s| normalize_images_entry(s))
+            .collect();
 
         // Resolve every config entry once, up front. `target_count` reflects
         // the post-expansion total so "Loading m/n images…" gives an honest
         // denominator from the first frame; it's shared with the loader so
         // periodic rescans can update it.
-        let mut initial_paths = expand_all_patterns(&config.images);
+        let mut initial_paths = expand_all_patterns(&images);
         let total_matched = initial_paths.len();
         if initial_paths.len() > MAX_LOADED_SLIDES {
             tracing::info!(
@@ -228,63 +303,103 @@ impl GalleryWidget {
             Duration::from_secs(config.rescan_interval_secs.max(30))
         };
 
-        // The background loader: decode every path once on startup, then
-        // (when rescan is enabled and the config has at least one glob)
-        // re-expand patterns periodically and reconcile the slide list.
-        // Reads from the same Arc that `render` walks, so the first image
-        // appears the moment it's decoded.
-        let slides: Arc<Mutex<Vec<Slide>>> =
-            Arc::new(Mutex::new(Vec::with_capacity(initial_paths.len())));
+        // Window parameters drive how aggressively the loader decodes
+        // ahead and how much it keeps resident behind the cursor. Clamp
+        // sum to ≤ MAX_LOADED_SLIDES-1 so a misconfigured gallery doesn't
+        // end up holding every image anyway.
+        let prefetch_ahead = config
+            .prefetch_ahead
+            .min(MAX_LOADED_SLIDES.saturating_sub(1));
+        let keep_behind = config
+            .keep_behind
+            .min(MAX_LOADED_SLIDES.saturating_sub(prefetch_ahead + 1));
+
+        // Build empty Slide entries for every matched path. The window
+        // loader fills the protocol lazily — first render of any slide
+        // shows a "Loading…" placeholder until the decoder catches up.
+        let slides: Arc<Mutex<Vec<Slide>>> = Arc::new(Mutex::new(
+            initial_paths
+                .iter()
+                .map(|p| Slide {
+                    source_path: p.clone(),
+                    label: p
+                        .file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.display().to_string()),
+                    protocol: None,
+                    pixel_size: None,
+                    failed: false,
+                })
+                .collect(),
+        ));
         let loader_stop = Arc::new(AtomicBool::new(false));
 
-        if !config.images.is_empty() {
+        // Single-slot signal channel — multiple bursty wakeups coalesce
+        // into one window pass. `sync_channel(1)` + `try_send` gives us
+        // "kick the loader if it's not already kicked", which is exactly
+        // the semantics we want for rotation-driven prefetch.
+        let (loader_signal_tx, loader_signal_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        // Pre-arm so the loader runs its first window pass immediately
+        // (decodes idx 0 + prefetch_ahead) before any user event.
+        let _ = loader_signal_tx.try_send(());
+
+        if !images.is_empty() {
             let slides_for_loader = slides.clone();
             let target_for_loader = target_count.clone();
             let cache_for_loader = cache.clone();
-            let patterns = config.images.clone();
+            let patterns = images.clone();
             let stop = loader_stop.clone();
             let current_for_loader = current.clone();
-            let has_globs = config.images.iter().any(|s| s.contains('*'));
+            let has_globs = images.iter().any(|s| s.contains('*'));
+            let self_signal = loader_signal_tx.clone();
             std::thread::Builder::new()
                 .name("glint-gallery-loader".into())
                 .spawn(move || {
                     let mut picker = picker;
-
-                    // Initial pass — order matches expand_all_patterns,
-                    // which preserves the user's config order.
-                    for path in initial_paths {
+                    let mut last_rescan = Instant::now();
+                    loop {
+                        // Block until either: a window-change signal
+                        // arrives, the next rescan deadline elapses,
+                        // or the channel disconnects (widget dropped).
+                        let timeout = if rescan_interval.is_zero() || !has_globs {
+                            // No rescan deadline → block forever for
+                            // the next window signal.
+                            Duration::from_secs(60 * 60)
+                        } else {
+                            rescan_interval.saturating_sub(last_rescan.elapsed())
+                        };
+                        match loader_signal_rx.recv_timeout(timeout) {
+                            Ok(()) => {}
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                // Rescan: re-expand patterns + reconcile
+                                // the path list. Decoding stays
+                                // window-driven; the rescan only adjusts
+                                // membership and order.
+                                let mut next = expand_all_patterns(&patterns);
+                                target_for_loader.store(next.len(), Ordering::Relaxed);
+                                if next.len() > MAX_LOADED_SLIDES {
+                                    next.truncate(MAX_LOADED_SLIDES);
+                                }
+                                reconcile_paths(&slides_for_loader, &current_for_loader, &next);
+                                last_rescan = Instant::now();
+                                // Wake ourselves so the window loader
+                                // re-decodes anything new that fell
+                                // inside the current window.
+                                let _ = self_signal.try_send(());
+                                continue;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
                         if stop.load(Ordering::Relaxed) {
                             return;
                         }
-                        if let Some(slide) = build_slide(&mut picker, &cache_for_loader, &path) {
-                            if let Ok(mut guard) = slides_for_loader.lock() {
-                                guard.push(slide);
-                            }
-                        }
-                    }
-
-                    if rescan_interval.is_zero() || !has_globs {
-                        return;
-                    }
-                    // Periodic rescan loop: wake on `rescan_interval`,
-                    // re-expand patterns, add new images, drop vanished
-                    // ones. Sleep is chunked into 1s slices so a config
-                    // reload's stop flag is honoured promptly.
-                    loop {
-                        if !sleep_with_cancel(rescan_interval, &stop) {
-                            return;
-                        }
-                        let mut next = expand_all_patterns(&patterns);
-                        target_for_loader.store(next.len(), Ordering::Relaxed);
-                        if next.len() > MAX_LOADED_SLIDES {
-                            next.truncate(MAX_LOADED_SLIDES);
-                        }
-                        reconcile_slides(
+                        process_window(
                             &mut picker,
                             &cache_for_loader,
                             &slides_for_loader,
                             &current_for_loader,
-                            &next,
+                            prefetch_ahead,
+                            keep_behind,
                         );
                     }
                 })
@@ -307,14 +422,19 @@ impl GalleryWidget {
             shortcut_prefs,
             cache,
             loader_stop,
+            loader_signal: loader_signal_tx,
         }
     }
 
+    /// Wake the background loader so it re-evaluates the window. Cheap
+    /// to call after every navigation event; the channel is single-slot
+    /// so bursty calls coalesce.
+    fn notify_window_changed(&self) {
+        let _ = self.loader_signal.try_send(());
+    }
+
     fn slide_count(&self) -> usize {
-        self.slides
-            .lock()
-            .map(|g| g.len())
-            .unwrap_or(0)
+        self.slides.lock().map(|g| g.len()).unwrap_or(0)
     }
 
     fn advance(&self, forward: bool) {
@@ -322,13 +442,17 @@ impl GalleryWidget {
         if n == 0 {
             return;
         }
-        let mut st = self.current.lock().expect("gallery state poisoned");
-        st.idx = if forward {
-            (st.idx + 1) % n
-        } else {
-            (st.idx + n - 1) % n
-        };
-        st.last_rotation = Instant::now();
+        {
+            let mut st = self.current.lock().expect("gallery state poisoned");
+            st.idx = if forward {
+                (st.idx + 1) % n
+            } else {
+                (st.idx + n - 1) % n
+            };
+            st.last_rotation = Instant::now();
+            st.dirty = true;
+        }
+        self.notify_window_changed();
     }
 }
 
@@ -348,11 +472,7 @@ impl GalleryWidget {
 ///     horizontal offset needed.
 ///   - Height-bound: image fills vertically and leaves space on
 ///     either side; we split that space evenly to center the column.
-fn centered_horizontal_area(
-    area: Rect,
-    image_px: (u32, u32),
-    font_size_px: (u16, u16),
-) -> Rect {
+fn centered_horizontal_area(area: Rect, image_px: (u32, u32), font_size_px: (u16, u16)) -> Rect {
     if area.width == 0 || area.height == 0 {
         return area;
     }
@@ -421,22 +541,40 @@ impl Widget for GalleryWidget {
         // far, and when enough wall time has elapsed since the last
         // advance. `slide_count` reads through the shared loader vec, so
         // rotation kicks in incrementally as more images come online.
-        if self.rotation_interval.is_zero() {
-            return Ok(());
-        }
         let n = self.slide_count();
-        if n < 2 {
-            return Ok(());
+        let mut rotated = false;
+        {
+            let mut st = self.current.lock().expect("gallery state poisoned");
+            // The background loader can grow the slide vec between ticks —
+            // surface that via the dirty bit so the "{m}/{n} images"
+            // metadata in the title row actually advances.
+            if n != st.last_seen_slide_count {
+                st.last_seen_slide_count = n;
+                st.dirty = true;
+            }
+            if self.rotation_interval.is_zero() || n < 2 || st.paused {
+                return Ok(());
+            }
+            if st.last_rotation.elapsed() >= self.rotation_interval {
+                st.idx = (st.idx + 1) % n;
+                st.last_rotation = Instant::now();
+                st.dirty = true;
+                rotated = true;
+            }
         }
-        let mut st = self.current.lock().expect("gallery state poisoned");
-        if st.paused {
-            return Ok(());
-        }
-        if st.last_rotation.elapsed() >= self.rotation_interval {
-            st.idx = (st.idx + 1) % n;
-            st.last_rotation = Instant::now();
+        if rotated {
+            // Kick the loader so the new "current + prefetch_ahead"
+            // window decodes before the next tick — without this the
+            // first frame after rotation paints "Loading…" even though
+            // we knew about the rotation a full tick in advance.
+            self.notify_window_changed();
         }
         Ok(())
+    }
+
+    fn take_dirty(&mut self) -> bool {
+        let mut st = self.current.lock().expect("gallery state poisoned");
+        std::mem::replace(&mut st.dirty, false)
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
@@ -526,21 +664,30 @@ impl Widget for GalleryWidget {
             (st.idx, st.paused)
         };
 
-        // Hold the slides lock for as little as possible — clone what
-        // render needs (pixel_size, label) and grab a fresh handle to
-        // the protocol mutex by re-locking only when we actually render.
+        // Snapshot what the renderer needs without holding the slides
+        // lock during the StatefulImage encode below. With on-demand
+        // loading there are three states the current slide can be in:
+        //   - Ready  (protocol + pixel_size both Some)
+        //   - Pending  (no protocol; never decoded or evicted; not failed)
+        //   - Failed   (decode attempt failed permanently)
         let snapshot = {
             let guard = self.slides.lock().expect("gallery slides poisoned");
-            let loaded = guard.len();
-            let slide = guard.get(idx).map(|s| (s.label.clone(), s.pixel_size));
-            (loaded, slide)
+            let total_slides = guard.len();
+            let slide = guard.get(idx).map(|s| {
+                let status = if s.protocol.is_some() {
+                    SlideStatus::Ready
+                } else if s.failed {
+                    SlideStatus::Failed
+                } else {
+                    SlideStatus::Pending
+                };
+                (s.label.clone(), s.pixel_size, status)
+            });
+            (total_slides, slide)
         };
-        let (loaded_count, current_slide) = snapshot;
+        let (total_slides, current_slide) = snapshot;
 
-        // Still loading the first image — show a friendly placeholder so
-        // the user sees the widget is alive while the background loader
-        // catches up.
-        if loaded_count == 0 {
+        if total_slides == 0 {
             let msg = Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -553,27 +700,43 @@ impl Widget for GalleryWidget {
             return;
         }
 
-        if let Some((label, pixel_size)) = current_slide {
-            // Re-lock just to render the protocol's stateful widget,
-            // then release.
-            let centered = centered_horizontal_area(image_area, pixel_size, self.font_size);
-            {
-                let mut guard = self.slides.lock().expect("gallery slides poisoned");
-                if let Some(slide) = guard.get_mut(idx) {
-                    if let Some(proto_mutex) = slide.protocol.as_ref() {
-                        let mut proto =
-                            proto_mutex.lock().expect("gallery protocol poisoned");
-                        let widget = StatefulImage::new(None).resize(Resize::Fit(None));
-                        frame.render_stateful_widget(widget, centered, &mut *proto);
+        if let Some((label, pixel_size, status)) = current_slide {
+            match status {
+                SlideStatus::Ready => {
+                    // Re-lock just to render the protocol's stateful
+                    // widget, then release.
+                    let centered = pixel_size
+                        .map(|sz| centered_horizontal_area(image_area, sz, self.font_size))
+                        .unwrap_or(image_area);
+                    let mut guard = self.slides.lock().expect("gallery slides poisoned");
+                    if let Some(slide) = guard.get_mut(idx) {
+                        if let Some(proto_mutex) = slide.protocol.as_ref() {
+                            let mut proto = proto_mutex.lock().expect("gallery protocol poisoned");
+                            let widget = StatefulImage::new(None).resize(Resize::Fit(None));
+                            frame.render_stateful_widget(widget, centered, &mut *proto);
+                        }
                     }
+                }
+                SlideStatus::Pending => {
+                    let msg = Paragraph::new(vec![
+                        Line::from(""),
+                        Line::from(Span::styled("Loading…", self.theme.text_dim)),
+                    ])
+                    .alignment(Alignment::Center);
+                    frame.render_widget(msg, image_area);
+                }
+                SlideStatus::Failed => {
+                    let msg = Paragraph::new(vec![
+                        Line::from(""),
+                        Line::from(Span::styled("(image unavailable)", self.theme.text_dim)),
+                    ])
+                    .alignment(Alignment::Center);
+                    frame.render_widget(msg, image_area);
                 }
             }
 
             if let Some(status_area) = status_area {
                 let mut line = format!("{}/{}  ·  {}", idx + 1, target_total, label);
-                if loaded_count < target_total {
-                    line.push_str(&format!("  ·  loading {}/{}", loaded_count, target_total));
-                }
                 if paused {
                     line.push_str("  ·  paused");
                 } else if !self.rotation_interval.is_zero() {
@@ -746,6 +909,26 @@ fn expand_tilde(raw: &str) -> PathBuf {
         }
     }
     PathBuf::from(raw)
+}
+
+/// Auto-glob bare directory entries. `~/Pictures` becomes `~/Pictures/*`
+/// so the user can drop a folder path in `images` and get the
+/// "everything in here" behavior without writing the trailing `/*`.
+/// Entries that already look like globs, point at a regular file, or
+/// don't exist on disk pass through unchanged — the failure path stays
+/// where it was, and the disk config keeps the literal the user typed.
+fn normalize_images_entry(raw: &str) -> String {
+    if raw.contains('*') {
+        return raw.to_string();
+    }
+    if !expand_tilde(raw).is_dir() {
+        return raw.to_string();
+    }
+    if raw.ends_with('/') {
+        format!("{raw}*")
+    } else {
+        format!("{raw}/*")
+    }
 }
 
 /// Image-format extensions recognised by directory expansion. Match the
@@ -956,27 +1139,20 @@ fn thumb_cache_key(path: &Path) -> String {
     key
 }
 
-/// Decode `path` (cache-aware) and bundle the result into a `Slide`.
-/// Returns `None` on decode failure; the loader logs and skips.
-fn build_slide(
+/// Decode `path` (cache-aware) into a freshly-built encode protocol +
+/// the source's pixel dimensions. `None` on decode failure; the loader
+/// marks the corresponding slide as permanently failed so it's not
+/// retried on every window pass.
+fn decode_slide_payload(
     picker: &mut Picker,
     cache: &ScopedCache,
     path: &Path,
-) -> Option<Slide> {
-    let label = path
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
+) -> Option<(Mutex<Box<dyn StatefulProtocol>>, (u32, u32))> {
     match load_thumb(cache, path) {
         Ok(img) => {
             let pixel_size = (img.width(), img.height());
             let protocol = picker.new_resize_protocol(img);
-            Some(Slide {
-                source_path: path.to_path_buf(),
-                label,
-                protocol: Some(Mutex::new(protocol)),
-                pixel_size,
-            })
+            Some((Mutex::new(protocol), pixel_size))
         }
         Err(err) => {
             tracing::warn!(
@@ -989,60 +1165,154 @@ fn build_slide(
     }
 }
 
-/// Sleep for `total`, but check `stop` once per second so a cancellation
-/// signal (typically from a config reload) is honoured promptly. Returns
-/// `false` when cancelled, `true` when the full duration elapsed.
-fn sleep_with_cancel(total: Duration, stop: &AtomicBool) -> bool {
-    let tick = Duration::from_secs(1);
-    let mut remaining = total;
-    while !remaining.is_zero() {
-        if stop.load(Ordering::Relaxed) {
-            return false;
-        }
-        let step = if remaining > tick { tick } else { remaining };
-        std::thread::sleep(step);
-        remaining = remaining.saturating_sub(step);
+/// Compute the index set the loader should keep resident for a slide
+/// list of length `n` and current cursor `idx`. Wraps both directions
+/// (the slideshow itself wraps, so the window should too) and dedupes
+/// — for tiny galleries the window can fold over itself.
+fn compute_window(n: usize, idx: usize, ahead: usize, behind: usize) -> Vec<usize> {
+    if n == 0 {
+        return Vec::new();
     }
-    !stop.load(Ordering::Relaxed)
+    let capacity = (1 + ahead + behind).min(n);
+    let mut out: Vec<usize> = Vec::with_capacity(capacity);
+    // Decode order: current → ahead in walking order → behind. The
+    // current slide is what's on screen, so it gets first priority;
+    // ahead matters next because the rotation timer is about to land
+    // there; behind is least urgent (only matters if the user presses
+    // previous).
+    let push_unique = |out: &mut Vec<usize>, v: usize| {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    };
+    push_unique(&mut out, idx);
+    for step in 1..=ahead {
+        push_unique(&mut out, (idx + step) % n);
+        if out.len() == capacity {
+            return out;
+        }
+    }
+    for step in 1..=behind {
+        push_unique(&mut out, (idx + n - step) % n);
+        if out.len() == capacity {
+            return out;
+        }
+    }
+    out
 }
 
-/// Reconcile the slide list against a freshly-expanded `next` path set.
-///
-/// - Newly discovered paths are decoded (via `build_slide`, which routes
-///   through the persistent cache) and appended at the end. They appear in
-///   the slideshow without further user action.
-/// - Paths that vanished from the expansion are removed.
-/// - Ordering otherwise follows `next` so the user's pattern order stays
-///   authoritative across rescans.
-/// - The currently-visible slide's identity (by `source_path`) is preserved
-///   when possible; if it was removed, the index snaps to 0.
-fn reconcile_slides(
+/// One window-loader pass: decode any in-window slide whose protocol
+/// is missing, evict any out-of-window slide whose protocol is
+/// present. The slides Vec is locked only for the brief read/install/
+/// evict windows — the actual decode (the expensive part) happens
+/// outside any lock so render isn't stalled.
+fn process_window(
     picker: &mut Picker,
     cache: &ScopedCache,
     slides: &Arc<Mutex<Vec<Slide>>>,
     current: &Arc<Mutex<GalleryState>>,
-    next: &[PathBuf],
+    prefetch_ahead: usize,
+    keep_behind: usize,
 ) {
-    // Build new slides outside the lock so decode work doesn't stall render.
-    let existing_paths: std::collections::HashSet<PathBuf> = {
+    // Snapshot what we need without holding the slides lock during decode.
+    let (n, idx) = {
+        let st = match current.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
         let guard = match slides.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
-        guard.iter().map(|s| s.source_path.clone()).collect()
+        (guard.len(), st.idx.min(guard.len().saturating_sub(1)))
     };
-    let mut additions: Vec<Slide> = Vec::new();
-    for path in next.iter() {
-        if existing_paths.contains(path) {
-            continue;
-        }
-        if let Some(slide) = build_slide(picker, cache, path) {
-            additions.push(slide);
+    if n == 0 {
+        return;
+    }
+    let window = compute_window(n, idx, prefetch_ahead, keep_behind);
+    let window_set: std::collections::HashSet<usize> = window.iter().copied().collect();
+
+    // Eviction pass: drop protocols for slides outside the window so a
+    // long slideshow walks past them without holding their decoded
+    // bytes resident. Done first so a memory-pressured system gets
+    // the freed pages back before we allocate new ones below.
+    {
+        let mut guard = match slides.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        for (i, slide) in guard.iter_mut().enumerate() {
+            if !window_set.contains(&i) && slide.protocol.is_some() {
+                slide.protocol = None;
+            }
         }
     }
+
+    // Load pass: for each in-window slide that needs decoding, snapshot
+    // its path under the lock, decode without the lock, then install
+    // the result under the lock. Skip slides that already have a
+    // protocol (cached from a prior window) or have failed before.
+    for win_idx in window {
+        // Brief lock to read the path + skip-checks.
+        let path = {
+            let guard = match slides.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let Some(slide) = guard.get(win_idx) else {
+                continue;
+            };
+            if slide.protocol.is_some() || slide.failed {
+                continue;
+            }
+            slide.source_path.clone()
+        };
+        // Decode outside the lock — this is where the JPEG decode
+        // (cache hit, fast) or full source decode + downscale (cache
+        // miss, slow) happens.
+        let payload = decode_slide_payload(picker, cache, &path);
+        // Install under the lock. The slide could have been removed
+        // by a concurrent rescan; tolerate that and drop the result.
+        let mut guard = match slides.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let Some(slide) = guard.get_mut(win_idx) else {
+            continue;
+        };
+        // Guard against the rescan-replaced-the-path race — only
+        // install if the path still matches what we decoded.
+        if slide.source_path != path {
+            continue;
+        }
+        match payload {
+            Some((protocol, pixel_size)) => {
+                slide.protocol = Some(protocol);
+                slide.pixel_size = Some(pixel_size);
+                slide.failed = false;
+            }
+            None => {
+                slide.failed = true;
+            }
+        }
+    }
+}
+
+/// Reconcile the slide list against a freshly-expanded `next` path set.
+///
+/// Path-only — decoding is the window loader's job. New paths are
+/// appended as empty Slide entries (protocol = None, pixel_size = None);
+/// the next window pass will decode whichever ones fall inside the
+/// current window. Vanished paths drop out completely. The
+/// currently-visible slide's identity is preserved when possible; if
+/// it was removed, the index snaps to 0.
+fn reconcile_paths(
+    slides: &Arc<Mutex<Vec<Slide>>>,
+    current: &Arc<Mutex<GalleryState>>,
+    next: &[PathBuf],
+) {
     let next_set: std::collections::HashSet<&Path> = next.iter().map(|p| p.as_path()).collect();
 
-    // Apply the diff atomically: reorder + drop removed + append new.
     let visible_path = {
         let st = match current.lock() {
             Ok(s) => s,
@@ -1059,6 +1329,8 @@ fn reconcile_slides(
         Ok(g) => g,
         Err(_) => return,
     };
+    let existing_paths: std::collections::HashSet<PathBuf> =
+        guard.iter().map(|s| s.source_path.clone()).collect();
     // Drop slides whose paths are no longer matched by any pattern.
     guard.retain(|s| next_set.contains(s.source_path.as_path()));
     // Reorder retained slides to match `next`'s order.
@@ -1067,7 +1339,22 @@ fn reconcile_slides(
             .position(|p| p == &s.source_path)
             .unwrap_or(usize::MAX)
     });
-    guard.extend(additions);
+    // Append empty entries for newly-discovered paths.
+    for path in next.iter() {
+        if existing_paths.contains(path) {
+            continue;
+        }
+        guard.push(Slide {
+            source_path: path.clone(),
+            label: path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            protocol: None,
+            pixel_size: None,
+            failed: false,
+        });
+    }
     // Re-locate the previously-visible slide and snap the index back to it
     // (or 0 when it's gone).
     let new_idx = visible_path
@@ -1164,15 +1451,15 @@ mod tests {
     #[test]
     fn expand_tilde_replaces_leading_tilde() {
         let home = dirs::home_dir().expect("home dir for test");
-        assert_eq!(expand_tilde("~/Pictures/x.png"), home.join("Pictures/x.png"));
+        assert_eq!(
+            expand_tilde("~/Pictures/x.png"),
+            home.join("Pictures/x.png")
+        );
     }
 
     #[test]
     fn expand_tilde_passes_through_absolute_paths() {
-        assert_eq!(
-            expand_tilde("/tmp/x.png"),
-            PathBuf::from("/tmp/x.png")
-        );
+        assert_eq!(expand_tilde("/tmp/x.png"), PathBuf::from("/tmp/x.png"));
     }
 
     #[test]
@@ -1289,8 +1576,12 @@ mod tests {
         let png_a = dir.join("a.png");
         let png_b = dir.join("b.png");
         let txt = dir.join("readme.txt");
-        RgbImage::from_pixel(8, 8, Rgb([0, 0, 0])).save(&png_a).unwrap();
-        RgbImage::from_pixel(8, 8, Rgb([0, 0, 0])).save(&png_b).unwrap();
+        RgbImage::from_pixel(8, 8, Rgb([0, 0, 0]))
+            .save(&png_a)
+            .unwrap();
+        RgbImage::from_pixel(8, 8, Rgb([0, 0, 0]))
+            .save(&png_b)
+            .unwrap();
         std::fs::write(&txt, b"hi").unwrap();
 
         let mut out = expand_pattern(&format!("{}/*", dir.display()));
@@ -1306,6 +1597,44 @@ mod tests {
 
         // Cleanup.
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn normalize_images_entry_auto_globs_a_real_directory() {
+        // Bare directory → trailing `/*` appended so the entry behaves
+        // as "every image in this directory" without the user typing it.
+        let dir = std::env::temp_dir().join(format!(
+            "glint-gallery-normalize-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.display().to_string();
+        assert_eq!(normalize_images_entry(&raw), format!("{raw}/*"));
+        // Trailing slash is honoured (no double-slash).
+        let trailing = format!("{raw}/");
+        assert_eq!(normalize_images_entry(&trailing), format!("{raw}/*"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn normalize_images_entry_leaves_files_and_globs_untouched() {
+        // Already-glob entries pass through verbatim.
+        assert_eq!(
+            normalize_images_entry("~/Pictures/*.jpg"),
+            "~/Pictures/*.jpg"
+        );
+        assert_eq!(normalize_images_entry("/abs/dir/*"), "/abs/dir/*");
+        // Non-existent path: fall through to literal — the existing
+        // loader logs the failure rather than silently treating it as
+        // an empty glob.
+        assert_eq!(
+            normalize_images_entry("/this/path/does/not/exist"),
+            "/this/path/does/not/exist"
+        );
     }
 
     #[test]
@@ -1335,7 +1664,11 @@ mod tests {
             format!("{}/*", dir.display()),
         ];
         let out = expand_all_patterns(&patterns);
-        assert_eq!(out, vec![p.clone()], "same file matched twice should appear once");
+        assert_eq!(
+            out,
+            vec![p.clone()],
+            "same file matched twice should appear once"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1450,9 +1783,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_image_logs_warning_and_is_skipped() {
-        // Path that definitely doesn't exist. Constructor shouldn't
-        // panic; the slide just gets dropped from the rotation.
+    fn missing_image_does_not_panic_construction() {
+        // Path that definitely doesn't exist. Under on-demand loading
+        // the path still gets a slot — the background loader marks it
+        // `failed: true` on its first decode attempt and the render
+        // path shows "(image unavailable)". Constructor must not
+        // panic; that's the contract the test guards.
         let cfg = GalleryConfig {
             images: vec!["/tmp/glint-gallery-does-not-exist-12345.png".to_string()],
             rotation_secs: 0,
@@ -1464,6 +1800,6 @@ mod tests {
             Arc::new(Theme::builtin_defaults()),
             ScopedCache::ephemeral(),
         );
-        assert_eq!(widget.slide_count(), 0);
+        assert_eq!(widget.slide_count(), 1, "literal path always gets a slot");
     }
 }

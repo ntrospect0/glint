@@ -196,11 +196,9 @@ mod tests {
 
     #[test]
     fn replaces_existing_scalar_in_place() {
-        let text = "poll_interval_secs = 900\nshow_topic_labels = true\n\n[[feeds]]\nlabel = \"BBC\"\n";
-        let out = merge_top_level_scalars(
-            text,
-            &[("poll_interval_secs", "300".into())],
-        );
+        let text =
+            "poll_interval_secs = 900\nshow_topic_labels = true\n\n[[feeds]]\nlabel = \"BBC\"\n";
+        let out = merge_top_level_scalars(text, &[("poll_interval_secs", "300".into())]);
         assert!(out.contains("poll_interval_secs = 300"));
         assert!(!out.contains("poll_interval_secs = 900"));
         // Tail untouched.
@@ -211,10 +209,7 @@ mod tests {
     #[test]
     fn inserts_missing_scalar_before_first_table() {
         let text = "# leading comment\n\n[[feeds]]\nlabel = \"X\"\n";
-        let out = merge_top_level_scalars(
-            text,
-            &[("summarize_with_llm", "false".into())],
-        );
+        let out = merge_top_level_scalars(text, &[("summarize_with_llm", "false".into())]);
         let summarize_pos = out.find("summarize_with_llm").unwrap();
         let feeds_pos = out.find("[[feeds]]").unwrap();
         assert!(
@@ -248,10 +243,7 @@ mod tests {
         // A `label = ...` inside [[feeds]] must NOT be rewritten when
         // the caller asks to update a different scalar.
         let text = "poll_interval_secs = 900\n\n[[feeds]]\nlabel = \"BBC\"\n";
-        let out = merge_top_level_scalars(
-            text,
-            &[("poll_interval_secs", "300".into())],
-        );
+        let out = merge_top_level_scalars(text, &[("poll_interval_secs", "300".into())]);
         assert!(out.contains("label = \"BBC\""));
     }
 

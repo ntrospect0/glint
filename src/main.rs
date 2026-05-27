@@ -14,11 +14,15 @@ mod auth;
 mod cache;
 mod clipboard;
 mod config;
+mod credentials;
 mod event;
+mod format;
 mod geolocation;
 mod http;
 mod llm;
+mod polling;
 mod runtime_state;
+mod text;
 mod theme;
 mod ui;
 mod widgets;
@@ -106,7 +110,9 @@ fn main() -> Result<()> {
         // First-run UX: drop into the setup wizard before opening the TUI.
         // `--config <path>` opts out — the user explicitly named a file.
         if cli.config.is_none() && !looks_initialized() {
-            eprintln!("No config detected at ~/.config/glint/config.toml — launching the setup wizard.");
+            eprintln!(
+                "No config detected at ~/.config/glint/config.toml — launching the setup wizard."
+            );
             eprintln!("(You can re-run `glint --setup` later to make changes.)");
             eprintln!();
             config::init_default_config()?;
@@ -123,9 +129,7 @@ fn main() -> Result<()> {
 /// (no home dir, etc.) report `true` so an unusual environment doesn't
 /// block launch on a wizard prompt.
 fn looks_initialized() -> bool {
-    config::config_path()
-        .map(|p| p.exists())
-        .unwrap_or(true)
+    config::config_path().map(|p| p.exists()).unwrap_or(true)
 }
 
 /// Resolve a `--clear-cache <target>` argument and apply it to the on-disk
@@ -204,7 +208,10 @@ fn prompt_yes_no(question: &str) -> Result<bool> {
     if n == 0 {
         return Ok(false);
     }
-    Ok(matches!(buf.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    Ok(matches!(
+        buf.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 async fn run_auth(target: &str) -> Result<()> {

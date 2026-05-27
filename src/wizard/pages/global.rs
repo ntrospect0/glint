@@ -78,13 +78,16 @@ pub fn handle_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
         _ => {}
     }
     // The trailing [ Save & Next ] button consumes only ↑/↓/Enter.
+    // j/k mirror ↑/↓ to match the vim-style navigation used elsewhere
+    // in the wizard (and called out in feedback when this page was the
+    // outlier).
     if app.focus == FOCUS_NEXT_BUTTON {
         return match key.code {
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 app.focus = FIELD_LLM_KEY;
                 PageAction::Stay
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 app.focus = FIELD_THEME;
                 app.lookup_offset = current_value_index(app);
                 PageAction::Stay
@@ -106,13 +109,13 @@ fn handle_choice_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
     let options = options_for_focus(app, app.focus);
     let n = options.len();
     match key.code {
-        KeyCode::Down => {
+        KeyCode::Down | KeyCode::Char('j') => {
             if n > 0 {
                 app.lookup_offset = (app.lookup_offset + 1).min(n - 1);
             }
             PageAction::Stay
         }
-        KeyCode::Up => {
+        KeyCode::Up | KeyCode::Char('k') => {
             app.lookup_offset = app.lookup_offset.saturating_sub(1);
             PageAction::Stay
         }
@@ -121,7 +124,12 @@ fn handle_choice_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
                 let value = value.to_string();
                 let state_key = state_key_for_focus(app.focus);
                 app.state
-                    .global_set(state_key, WizardValue::Choice(value));
+                    .global_set(state_key, WizardValue::Choice(value.clone()));
+                // Live-apply the new color scheme so the rest of the
+                // wizard repaints in the user's chosen palette.
+                if state_key == "theme" {
+                    style::set_active_scheme(&value);
+                }
             }
             PageAction::Stay
         }
@@ -134,7 +142,10 @@ fn handle_choice_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
                 let value = value.to_string();
                 let state_key = state_key_for_focus(app.focus);
                 app.state
-                    .global_set(state_key, WizardValue::Choice(value));
+                    .global_set(state_key, WizardValue::Choice(value.clone()));
+                if state_key == "theme" {
+                    style::set_active_scheme(&value);
+                }
             }
             app.focus = (app.focus + 1) % FOCUS_TOTAL;
             app.text_buffer.clear();
@@ -227,7 +238,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Global settings ");
-    let inner = block.inner(area);
+    let inner = style::pad_inner(block.inner(area));
     frame.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -246,10 +257,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp) {
         .iter()
         .map(|(v, l)| (v.as_str(), l.as_str()))
         .collect();
-    render_choice_field(&mut lines, app, 1, FIELD_THEME, "Color scheme", &theme_options);
+    render_choice_field(
+        &mut lines,
+        app,
+        1,
+        FIELD_THEME,
+        "Color scheme",
+        &theme_options,
+    );
     lines.push(Line::from(""));
-    let mouse_options: Vec<(&str, &str)> =
-        MOUSE_SCROLLS.iter().map(|(v, l)| (*v, *l)).collect();
+    let mouse_options: Vec<(&str, &str)> = MOUSE_SCROLLS.iter().map(|(v, l)| (*v, *l)).collect();
     render_choice_field(
         &mut lines,
         app,
@@ -292,8 +309,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp) {
     ]));
     if on_button {
         lines.push(Line::from(Span::styled(
-            "    Enter advances to the next page (Tab/↑ to return to fields)."
-                .to_string(),
+            "    Enter advances to the next page (Tab/↑ to return to fields).".to_string(),
             style::help_text(),
         )));
     }
@@ -374,16 +390,29 @@ fn render_text_field(
         Span::styled(label.to_string(), label_style),
     ]));
     let state_key = llm_key_state_key(active_llm_provider(app));
-    let key_display = mask_api_key(&current_text(app, &state_key));
+    let raw_key = current_text(app, &state_key);
     let value_style = if focused {
         style::value_focused()
     } else {
         style::value_idle()
     };
-    lines.push(Line::from(vec![
-        Span::raw("      "),
-        Span::styled(key_display, value_style),
-    ]));
+    // When focused, replace the static "(not set)" placeholder with a
+    // blinking cursor so the user sees the field is typeable. The
+    // existing key is still masked so it doesn't leak to onlookers.
+    if focused {
+        let mut spans: Vec<Span> = vec![Span::raw("      ")];
+        if !raw_key.is_empty() {
+            spans.push(Span::styled(mask_api_key(&raw_key), value_style));
+        }
+        spans.push(Span::styled("█".to_string(), style::cursor()));
+        lines.push(Line::from(spans));
+    } else {
+        let key_display = mask_api_key(&raw_key);
+        lines.push(Line::from(vec![
+            Span::raw("      "),
+            Span::styled(key_display, value_style),
+        ]));
+    }
     if focused {
         let hint = match crate::llm::find_provider(active_llm_provider(app)) {
             Some(def) => format!(

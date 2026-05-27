@@ -27,8 +27,8 @@ pub use crate::widgets::stocks::provider::Period;
 /// not in this set fall through to the forex path and 404 if Yahoo
 /// doesn't actually carry them.
 pub const CRYPTO_CODES: &[&str] = &[
-    "BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "AVAX", "DOT", "LINK", "LTC",
-    "MATIC", "TRX", "BCH", "BNB", "USDT", "USDC", "TON", "SUI", "ATOM", "NEAR",
+    "BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "AVAX", "DOT", "LINK", "LTC", "MATIC", "TRX", "BCH",
+    "BNB", "USDT", "USDC", "TON", "SUI", "ATOM", "NEAR",
 ];
 
 /// `true` if `code` is in the [`CRYPTO_CODES`] table. Case-insensitive.
@@ -279,10 +279,8 @@ impl YahooForexProvider {
             self.fetch_to_usd(base, period),
             self.fetch_to_usd(quote, period),
         );
-        let base_to_usd = a_res
-            .with_context(|| format!("USD-pivot leg {base}→USD failed"))?;
-        let quote_to_usd = b_res
-            .with_context(|| format!("USD-pivot leg {quote}→USD failed"))?;
+        let base_to_usd = a_res.with_context(|| format!("USD-pivot leg {base}→USD failed"))?;
+        let quote_to_usd = b_res.with_context(|| format!("USD-pivot leg {quote}→USD failed"))?;
 
         if quote_to_usd.price <= 0.0 {
             anyhow::bail!("{quote}→USD rate is zero; cannot pivot to {quote}");
@@ -537,10 +535,7 @@ mod tests {
             match provider.fetch_quote(base, quote, Period::Day).await {
                 Ok(q) => {
                     if !q.price.is_finite() || q.price <= 0.0 {
-                        failures.push(format!(
-                            "{label}: price not finite/positive ({})",
-                            q.price
-                        ));
+                        failures.push(format!("{label}: price not finite/positive ({})", q.price));
                         eprintln!("  ✗ {label} → bad price {}", q.price);
                     } else {
                         eprintln!("  ✓ {label} → {:.6}", q.price);
@@ -634,7 +629,11 @@ mod tests {
         let inv = invert_quote(listed, "USD", "BTC");
         assert_eq!(inv.price, 0.0);
         assert_eq!(inv.previous_close, 0.0);
-        assert_eq!(inv.day_high, Some(0.0), "0 input → 0 inverted (no div-by-0)");
+        assert_eq!(
+            inv.day_high,
+            Some(0.0),
+            "0 input → 0 inverted (no div-by-0)"
+        );
         assert_eq!(inv.day_low, None, "missing input stays None");
         assert_eq!(inv.series, vec![0.0, 0.0, 1.0 / 100.0]);
     }

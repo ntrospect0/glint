@@ -41,6 +41,8 @@ widget-email = []
 widget-resources = []
 widget-gallery = []
 widget-notes = []
+# WSJ depends on news's RssProvider + sanitize_summary helper.
+widget-wsj = ["widget-news"]
 widgets-all = [
   "widget-clock",
   "widget-weather",
@@ -52,6 +54,7 @@ widgets-all = [
   "widget-resources",
   "widget-gallery",
   "widget-notes",
+  "widget-wsj",
 ]
 
 [dependencies]
@@ -106,6 +109,13 @@ readability = "0.3"
 url = "2"
 dirs = "5"
 clap = { version = "4", features = ["derive"] }
+
+# Direct OS clipboard access. We try this before falling back to OSC 52
+# in `crate::clipboard::copy` — OSC 52 depends on terminal-specific
+# config (off by default in iTerm2/Alacritty, unsupported in Terminal.app)
+# and a "yank" that never actually reaches the system clipboard makes
+# Cmd+V silently paste stale content.
+arboard = "3"
 
 # System metrics (powers the Resources widget). Cross-platform read-only
 # CPU / memory / process snapshots; no FFI of our own.

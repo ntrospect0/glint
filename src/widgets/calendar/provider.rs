@@ -47,11 +47,8 @@ impl Event {
 /// overlaps the supplied half-open range.
 #[async_trait]
 pub trait CalendarProvider: Send + Sync {
-    async fn fetch_range(
-        &self,
-        start: DateTime<Local>,
-        end: DateTime<Local>,
-    ) -> Result<Vec<Event>>;
+    async fn fetch_range(&self, start: DateTime<Local>, end: DateTime<Local>)
+        -> Result<Vec<Event>>;
 }
 
 #[cfg(test)]
@@ -84,7 +81,11 @@ mod tests {
     fn overlaps_is_half_open() {
         // Use explicit offsets everywhere so the test does not depend on the
         // host's local timezone.
-        let e = ev("2026-05-20T09:00:00+00:00", "2026-05-20T10:00:00+00:00", false);
+        let e = ev(
+            "2026-05-20T09:00:00+00:00",
+            "2026-05-20T10:00:00+00:00",
+            false,
+        );
         let before = parse("2026-05-20T08:00:00+00:00");
         let mid_plus_1 = parse("2026-05-20T09:31:00+00:00");
         let after = parse("2026-05-20T11:00:00+00:00");

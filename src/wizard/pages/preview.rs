@@ -25,6 +25,32 @@ use crate::wizard::{
     style,
 };
 
+/// Label to paint inside a cell (and echo in the caption). Falls back
+/// to `(empty)` only when both `kind` and `stack_children` are empty —
+/// a stack cell has `kind == ""` by design because the actual widgets
+/// live in `stack_children`, and the previous bare `kind.is_empty()`
+/// check made stack-assigned cells render as `(empty)`.
+fn cell_preview_label(cell: Option<&CellAssignment>) -> String {
+    let Some(a) = cell else {
+        return "(empty)".to_string();
+    };
+    if !a.stack_children.is_empty() {
+        // Stack cells: list children with `+` separators (no `stack:`
+        // prefix — the user is already looking at a stack-shaped cell
+        // and the prefix just steals horizontal space).
+        return a
+            .stack_children
+            .iter()
+            .map(|c| c.widget_id())
+            .collect::<Vec<_>>()
+            .join(" + ");
+    }
+    if a.kind.is_empty() {
+        return "(empty)".to_string();
+    }
+    a.widget_id()
+}
+
 /// Render the preview into `area`. `active_cell` is the cell index the
 /// user is currently configuring (highlight target). `None` ⇒ no cell is
 /// active (just show the grid + assignments).
@@ -102,16 +128,7 @@ fn render_grid(
             continue;
         }
         let active = active_cell == Some(i);
-        let widget_label = assignments
-            .get(i)
-            .map(|a| {
-                if a.kind.is_empty() {
-                    "(empty)".to_string()
-                } else {
-                    a.widget_id()
-                }
-            })
-            .unwrap_or_else(|| "(empty)".to_string());
+        let widget_label = cell_preview_label(assignments.get(i));
 
         let border_style = if active {
             Style::default()
@@ -158,16 +175,7 @@ fn render_caption(
 ) {
     let caption = match active_cell {
         Some(idx) => {
-            let widget = assignments
-                .get(idx)
-                .map(|a| {
-                    if a.kind.is_empty() {
-                        "(empty)".to_string()
-                    } else {
-                        a.widget_id()
-                    }
-                })
-                .unwrap_or_else(|| "(empty)".to_string());
+            let widget = cell_preview_label(assignments.get(idx));
             Line::from(vec![
                 Span::styled("Configuring ", style::blurb()),
                 Span::styled(
@@ -179,10 +187,7 @@ fn render_caption(
                 Span::styled(format!(" — {widget}"), style::value_idle()),
             ])
         }
-        None => Line::from(Span::styled(
-            "Current dashboard layout",
-            style::blurb(),
-        )),
+        None => Line::from(Span::styled("Current dashboard layout", style::blurb())),
     };
     frame.render_widget(Paragraph::new(caption), area);
 }

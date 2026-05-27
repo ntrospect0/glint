@@ -22,6 +22,7 @@ use ratatui::{
 use serde::Deserialize;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
+use crate::text::truncate;
 use crate::theme::{ColorScheme, Theme};
 use crate::ui::{apply_title_row, MetadataEmphasis};
 
@@ -138,14 +139,14 @@ pub struct ResourcesWidget {
     shortcut: Option<char>,
     /// Effective shortcut preference list (TOML override or built-in).
     shortcut_prefs: Vec<char>,
+    /// Display-state dirty flag drained by `take_dirty`. True on
+    /// construction so the first render lands; subsequently flipped
+    /// only when `refresh_if_due` actually re-samples sysinfo.
+    dirty: bool,
 }
 
 impl ResourcesWidget {
-    pub fn with_config(
-        instance: String,
-        config: ResourcesConfig,
-        app_theme: Arc<Theme>,
-    ) -> Self {
+    pub fn with_config(instance: String, config: ResourcesConfig, app_theme: Arc<Theme>) -> Self {
         let id = if instance == "main" {
             "resources".to_string()
         } else {
@@ -177,10 +178,14 @@ impl ResourcesWidget {
             theme,
             shortcut: None,
             shortcut_prefs,
+            dirty: true,
         }
     }
 
-    fn refresh_if_due(&self) {
+    /// Returns `true` when this call actually re-sampled sysinfo (i.e.
+    /// the display will change); `false` when the poll interval hadn't
+    /// elapsed yet. The boolean drives the per-widget dirty flag.
+    fn refresh_if_due(&self) -> bool {
         let mut st = self.state.lock().expect("resources state poisoned");
         let now = Instant::now();
         let due = match st.last_refresh {
@@ -188,7 +193,7 @@ impl ResourcesWidget {
             Some(t) => now.duration_since(t) >= self.poll_interval,
         };
         if !due {
-            return;
+            return false;
         }
         // Refresh just what we render. `refresh_cpu_usage` requires a
         // prior baseline call; `sysinfo` handles the bookkeeping for us
@@ -251,6 +256,7 @@ impl ResourcesWidget {
             fetched_at: Some(now),
         };
         st.last_refresh = Some(now);
+        true
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -322,16 +328,7 @@ fn compact_bytes(b: u64) -> String {
 }
 
 fn format_uptime(secs: u64) -> String {
-    let d = secs / 86_400;
-    let h = (secs % 86_400) / 3600;
-    let m = (secs % 3600) / 60;
-    if d > 0 {
-        format!("{d}d {h}h {m}m")
-    } else if h > 0 {
-        format!("{h}h {m}m")
-    } else {
-        format!("{m}m")
-    }
+    crate::format::uptime_label(secs)
 }
 
 #[async_trait]
@@ -355,8 +352,14 @@ impl Widget for ResourcesWidget {
     async fn update(&mut self, _ctx: &AppContext) -> Result<()> {
         // sysinfo work is synchronous CPU work; running it on the
         // tokio worker is fine because each refresh is short.
-        self.refresh_if_due();
+        if self.refresh_if_due() {
+            self.dirty = true;
+        }
         Ok(())
+    }
+
+    fn take_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.dirty, false)
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
@@ -409,21 +412,60 @@ impl Widget for ResourcesWidget {
             let avg = snap.cpu_per_core.iter().sum::<f32>() / snap.cpu_per_core.len() as f32;
             lines.push(Line::from(vec![
                 Span::styled("CPU", self.theme.text_focused),
-                Span::raw(format!("   {avg:>5.1}% avg across {} cores", snap.cpu_per_core.len())),
+                Span::raw(format!(
+                    "   {avg:>5.1}% avg across {} cores",
+                    snap.cpu_per_core.len()
+                )),
             ]));
-            // Bar width = inner width minus a small fixed prefix
-            // ("CPUxx 100.0% " = 14 chars) so labels never get clipped.
-            let prefix_cols: u16 = 14;
-            let bar_width = inner.width.saturating_sub(prefix_cols + 2);
-            for (i, pct) in snap.cpu_per_core.iter().enumerate() {
-                let pct = *pct;
-                let label = format!("CPU{:<2}", i);
+            // Per-core layout. `prefix_cols` is the non-bar overhead
+            // each row carries: "CPUxx  100.0% " = 5 + 2 + 6 + 1 = 14.
+            // Two-column packing halves the vertical real estate the
+            // CPU section eats — meaningful on machines with 8+ cores
+            // where the process list otherwise gets cropped. Fall
+            // back to single-column when the pane is too narrow to
+            // host two readable bars side-by-side.
+            const PREFIX_COLS: u16 = 14;
+            const COL_GUTTER: u16 = 2;
+            const TRAILING_PAD: u16 = 2;
+            const MIN_BAR_PER_COL: u16 = 5;
+            let two_col_min_width =
+                PREFIX_COLS * 2 + COL_GUTTER + TRAILING_PAD + MIN_BAR_PER_COL * 2;
+            let render_row = |idx: usize, pct: f32, bar_width: u16| -> Vec<Span<'static>> {
+                let label = format!("CPU{:<2}", idx);
                 let bar_str = bar(pct, bar_width);
-                lines.push(Line::from(vec![
+                vec![
                     Span::styled(label, self.theme.text_dim),
                     Span::raw(format!("  {pct:>5.1}% ")),
                     Span::styled(bar_str, self.theme.text_focused),
-                ]));
+                ]
+            };
+            if inner.width >= two_col_min_width {
+                // Balanced columns: left half holds cores 0..rows,
+                // right half holds cores rows..n. Odd core counts
+                // leave the last row's right cell empty rather than
+                // creating a ragged left column.
+                let bar_width = (inner.width - PREFIX_COLS * 2 - COL_GUTTER - TRAILING_PAD) / 2;
+                let n = snap.cpu_per_core.len();
+                let rows_count = n.div_ceil(2);
+                for r in 0..rows_count {
+                    let left_idx = r;
+                    let right_idx = r + rows_count;
+                    let mut spans = render_row(left_idx, snap.cpu_per_core[left_idx], bar_width);
+                    spans.push(Span::raw(" ".repeat(COL_GUTTER as usize)));
+                    if right_idx < n {
+                        spans.extend(render_row(
+                            right_idx,
+                            snap.cpu_per_core[right_idx],
+                            bar_width,
+                        ));
+                    }
+                    lines.push(Line::from(spans));
+                }
+            } else {
+                let bar_width = inner.width.saturating_sub(PREFIX_COLS + TRAILING_PAD);
+                for (i, pct) in snap.cpu_per_core.iter().enumerate() {
+                    lines.push(Line::from(render_row(i, *pct, bar_width)));
+                }
             }
             lines.push(Line::from(""));
         }
@@ -449,8 +491,7 @@ impl Widget for ResourcesWidget {
             Span::styled(bar(mem_pct, bar_width), self.theme.text_focused),
         ]));
         if snap.total_swap > 0 {
-            let swap_pct =
-                (snap.used_swap as f64 / snap.total_swap as f64 * 100.0) as f32;
+            let swap_pct = (snap.used_swap as f64 / snap.total_swap as f64 * 100.0) as f32;
             lines.push(Line::from(vec![
                 Span::styled("SWAP", self.theme.text_focused),
                 Span::raw(format!(
@@ -474,7 +515,10 @@ impl Widget for ResourcesWidget {
         } else {
             "Top processes (by CPU)"
         };
-        lines.push(Line::from(Span::styled(proc_title, self.theme.text_selected)));
+        lines.push(Line::from(Span::styled(
+            proc_title,
+            self.theme.text_selected,
+        )));
         let show_virt = inner.width >= 50;
         let header = if show_virt {
             "  PID   CPU%     RES    VIRT   COMMAND"
@@ -483,9 +527,7 @@ impl Widget for ResourcesWidget {
         };
         lines.push(Line::from(Span::styled(header, self.theme.text_dim)));
         let fixed_prefix = if show_virt { 35 } else { 27 };
-        let name_room = (inner.width as usize)
-            .saturating_sub(fixed_prefix)
-            .max(6);
+        let name_room = (inner.width as usize).saturating_sub(fixed_prefix).max(6);
         for row in &snap.top {
             let name = truncate(&row.name, name_room);
             let line = if show_virt {
@@ -610,19 +652,6 @@ impl Widget for ResourcesWidget {
 
     fn shortcut(&self) -> Option<char> {
         self.shortcut
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        s.to_string()
-    } else if max == 0 {
-        String::new()
-    } else {
-        let mut out: String = chars.into_iter().take(max.saturating_sub(1)).collect();
-        out.push('…');
-        out
     }
 }
 
@@ -769,11 +798,8 @@ mod tests {
             shortcuts: vec!['x', 'y', 'z'],
             ..ResourcesConfig::default()
         };
-        let w = ResourcesWidget::with_config(
-            "main".into(),
-            cfg,
-            Arc::new(Theme::builtin_defaults()),
-        );
+        let w =
+            ResourcesWidget::with_config("main".into(), cfg, Arc::new(Theme::builtin_defaults()));
         assert_eq!(w.shortcut_preferences(), &['x', 'y', 'z']);
     }
 }

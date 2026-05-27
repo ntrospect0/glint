@@ -246,9 +246,7 @@ impl WizardFieldKind {
             WizardFieldKind::Text { default, .. } => {
                 WizardValue::Text(default.clone().unwrap_or_default())
             }
-            WizardFieldKind::Number { default, .. } => {
-                WizardValue::Number(default.unwrap_or(0.0))
-            }
+            WizardFieldKind::Number { default, .. } => WizardValue::Number(default.unwrap_or(0.0)),
             WizardFieldKind::Bool { default } => WizardValue::Bool(*default),
             WizardFieldKind::Choice { default, .. } => {
                 WizardValue::Choice(default.map(str::to_string).unwrap_or_default())

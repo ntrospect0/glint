@@ -206,10 +206,7 @@ fn entry_to_article(
         .iter()
         .find(|l| !l.href.is_empty())
         .map(|l| l.href.clone())?;
-    let published = entry
-        .published
-        .or(entry.updated)
-        .unwrap_or_else(Utc::now);
+    let published = entry.published.or(entry.updated).unwrap_or_else(Utc::now);
     let summary = entry
         .summary
         .map(|s| s.content)
@@ -226,117 +223,12 @@ fn entry_to_article(
     })
 }
 
-/// Strip rudimentary HTML, decode common entities (`&amp;`, `&#8217;`, etc.),
-/// and collapse whitespace so RSS `<description>` blobs render readably.
-/// Public for reuse by the body-extraction fallback in `mod.rs`, which
-/// pulls `<p>` text out of `data-component="text-block"` divs when
-/// Readability undershoots on React-rendered article pages.
+/// Strip rudimentary HTML and decode common entities so RSS
+/// `<description>` blobs render readably. Thin re-export over the
+/// canonical [`crate::text::sanitize_html`] so the body-extraction
+/// path in `mod.rs` keeps the same name it's always used.
 pub(super) fn sanitize_summary(raw: &str) -> String {
-    decode_entities(&strip_tags(raw))
-}
-
-fn strip_tags(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut in_tag = false;
-    let mut prev_was_space = false;
-    for ch in raw.chars() {
-        if in_tag {
-            if ch == '>' {
-                in_tag = false;
-                if !prev_was_space {
-                    out.push(' ');
-                    prev_was_space = true;
-                }
-            }
-            continue;
-        }
-        if ch == '<' {
-            in_tag = true;
-            continue;
-        }
-        if ch.is_whitespace() {
-            if !prev_was_space {
-                out.push(' ');
-                prev_was_space = true;
-            }
-        } else {
-            out.push(ch);
-            prev_was_space = false;
-        }
-    }
-    out.trim().to_string()
-}
-
-/// Decode HTML entities: numeric (`&#NNNN;`, `&#xHHHH;`) and the common named
-/// ones. Unknown entities are left intact so we don't accidentally garble text.
-fn decode_entities(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '&' {
-            out.push(c);
-            continue;
-        }
-        let mut buf = String::new();
-        let mut closed = false;
-        // Read up to 10 chars looking for the trailing ';'.
-        for _ in 0..10 {
-            match chars.peek() {
-                Some(';') => {
-                    chars.next();
-                    closed = true;
-                    break;
-                }
-                Some(&nc) if nc.is_ascii_alphanumeric() || nc == '#' => {
-                    buf.push(nc);
-                    chars.next();
-                }
-                _ => break,
-            }
-        }
-        if !closed {
-            out.push('&');
-            out.push_str(&buf);
-            continue;
-        }
-        match lookup_entity(&buf) {
-            Some(ch) => out.push(ch),
-            None => {
-                out.push('&');
-                out.push_str(&buf);
-                out.push(';');
-            }
-        }
-    }
-    out
-}
-
-fn lookup_entity(entity: &str) -> Option<char> {
-    if let Some(rest) = entity.strip_prefix('#') {
-        let (radix, digits) = if let Some(hex) = rest.strip_prefix(['x', 'X']) {
-            (16, hex)
-        } else {
-            (10, rest)
-        };
-        let n = u32::from_str_radix(digits, radix).ok()?;
-        return char::from_u32(n);
-    }
-    Some(match entity {
-        "amp" => '&',
-        "lt" => '<',
-        "gt" => '>',
-        "quot" => '"',
-        "apos" => '\'',
-        "nbsp" => ' ',
-        "hellip" => '…',
-        "mdash" => '—',
-        "ndash" => '–',
-        "lsquo" => '\u{2018}',
-        "rsquo" => '\u{2019}',
-        "ldquo" => '\u{201C}',
-        "rdquo" => '\u{201D}',
-        _ => return None,
-    })
+    crate::text::sanitize_html(raw)
 }
 
 fn dedup_by_url(articles: &mut Vec<Article>) {

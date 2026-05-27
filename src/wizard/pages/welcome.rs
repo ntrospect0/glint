@@ -14,7 +14,21 @@ use ratatui::{
 };
 
 use super::PageAction;
-use crate::wizard::{app::WizardApp, hydrate, state::WizardState, storage, style};
+use crate::wizard::{
+    app::WizardApp, descriptor::WizardValue, hydrate, state::WizardState, storage, style,
+};
+
+/// Re-apply the wizard's color palette from whatever scheme `state`
+/// carries — used after Resume/Start-Fresh swaps `app.state` so the
+/// rest of the wizard repaints in the right palette without waiting
+/// for the user to land on the Global page.
+fn refresh_palette_from_state(state: &WizardState) {
+    let scheme = match state.global_get("theme") {
+        Some(WizardValue::Choice(s)) if !s.is_empty() => s.clone(),
+        _ => style::DEFAULT_SCHEME.to_string(),
+    };
+    style::set_active_scheme(&scheme);
+}
 
 pub fn handle_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
     match key.code {
@@ -26,6 +40,7 @@ pub fn handle_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
             match storage::load() {
                 Ok(Some(state)) => {
                     app.state = state;
+                    refresh_palette_from_state(&app.state);
                     PageAction::Advance
                 }
                 _ => PageAction::Advance,
@@ -41,6 +56,7 @@ pub fn handle_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
             let mut fresh = WizardState::default();
             hydrate::hydrate_from_disk(&mut fresh);
             app.state = fresh;
+            refresh_palette_from_state(&app.state);
             PageAction::Advance
         }
         _ => PageAction::Stay,
@@ -112,9 +128,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp) {
         style::help_text(),
     )));
 
+    let block = Block::default().borders(Borders::ALL).title(" Welcome ");
+    let inner = style::pad_inner(block.inner(area));
+    frame.render_widget(block, area);
     let body = Paragraph::new(lines)
         .alignment(Alignment::Left)
-        .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title(" Welcome "));
-    frame.render_widget(body, area);
+        .wrap(Wrap { trim: false });
+    frame.render_widget(body, inner);
 }

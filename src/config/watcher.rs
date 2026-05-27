@@ -24,23 +24,21 @@ pub fn spawn(dir: PathBuf) -> Result<mpsc::Receiver<PathBuf>> {
 
     // notify needs a blocking-thread closure. tokio's runtime is multi-thread
     // by default, so blocking_send is safe to call from this thread.
-    let mut watcher = notify::recommended_watcher(
-        move |res: notify::Result<Event>| match res {
-            Ok(event) => {
-                if matches!(
-                    event.kind,
-                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                ) {
-                    for path in event.paths {
-                        // Drop the result; if the receiver is gone the app is
-                        // exiting and there's nothing to do.
-                        let _ = tx.blocking_send(path);
-                    }
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| match res {
+        Ok(event) => {
+            if matches!(
+                event.kind,
+                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+            ) {
+                for path in event.paths {
+                    // Drop the result; if the receiver is gone the app is
+                    // exiting and there's nothing to do.
+                    let _ = tx.blocking_send(path);
                 }
             }
-            Err(err) => tracing::warn!(error = %err, "config watcher error"),
-        },
-    )
+        }
+        Err(err) => tracing::warn!(error = %err, "config watcher error"),
+    })
     .context("failed to create config watcher")?;
     watcher
         .watch(&dir, RecursiveMode::NonRecursive)

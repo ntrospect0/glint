@@ -27,6 +27,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::auth;
+use crate::cache::Cache;
 use crate::config;
 use crate::widgets::registry;
 
@@ -40,15 +41,63 @@ pub fn write_all(state: &WizardState) -> Result<()> {
 
     write_main_config(state, &dir)?;
     for assignment in &state.assignments {
-        // Empty cells survive in state across Assign→Widget→back; skip
-        // them here so we don't try to write `.toml` for them.
-        if assignment.kind.is_empty() {
-            continue;
+        if !assignment.kind.is_empty() {
+            // Single-widget cell.
+            write_widget_config(state, &assignment.widget_id(), &assignment.kind, &dir)?;
+        } else if !assignment.stack_children.is_empty() {
+            // Stack cell: write a TOML per child so the user's
+            // wizard-collected values for each stack child end up on
+            // disk. Without this every stack child would silently fall
+            // back to the seeded default TOML.
+            for child in &assignment.stack_children {
+                if child.kind.is_empty() {
+                    continue;
+                }
+                write_widget_config(state, &child.widget_id(), &child.kind, &dir)?;
+            }
         }
-        write_widget_config(state, &assignment.widget_id(), &assignment.kind, &dir)?;
+        // else: truly empty cell — nothing to write.
     }
     write_llm_settings(state, &dir)?;
+    flush_runtime_caches();
     Ok(())
+}
+
+/// Drop every cached widget payload (news bodies, calendar events, email
+/// inboxes, image thumbs, etc.) on the floor at the end of finalize. If
+/// the user just switched email provider from Outlook to Gmail, the
+/// Outlook inbox sitting in `~/.cache/glint/email/main/` would otherwise
+/// flash on the first frame before the Gmail provider replaces it. Same
+/// hazard for any provider/account swap inside a widget. Best-effort —
+/// configs are already written and the wizard has succeeded; a cache
+/// clear failure just means widgets refetch slower on next launch.
+fn flush_runtime_caches() {
+    match Cache::open_default() {
+        Ok(cache) => {
+            if let Err(err) = cache.clear_all() {
+                tracing::warn!(
+                    error = %err,
+                    "wizard: failed to flush cache after finalize"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "wizard: failed to open cache for post-finalize flush"
+            );
+        }
+    }
+    // Stack active-tab indices (runtime_state.toml) are also tied to
+    // the previous layout — clearing the file means each stack starts
+    // on its first child after a wizard run instead of restoring a
+    // potentially-stale active tab from a different layout.
+    if let Err(err) = crate::runtime_state::clear() {
+        tracing::warn!(
+            error = %err,
+            "wizard: failed to clear runtime_state.toml after finalize"
+        );
+    }
 }
 
 fn write_main_config(state: &WizardState, dir: &Path) -> Result<()> {
@@ -91,10 +140,7 @@ fn write_main_config(state: &WizardState, dir: &Path) -> Result<()> {
     out.push_str("log_level = \"info\"\n");
     out.push_str(&format!(
         "mouse_scroll = {}\n",
-        toml_string(&choice_or(
-            state.global_get("mouse_scroll"),
-            "natural",
-        ))
+        toml_string(&choice_or(state.global_get("mouse_scroll"), "natural",))
     ));
     out.push_str("show_status_bar = true\n");
     out.push('\n');
@@ -104,12 +150,7 @@ fn write_main_config(state: &WizardState, dir: &Path) -> Result<()> {
     atomic_write(&dir.join("config.toml"), &out)
 }
 
-fn write_widget_config(
-    state: &WizardState,
-    widget_id: &str,
-    kind: &str,
-    dir: &Path,
-) -> Result<()> {
+fn write_widget_config(state: &WizardState, widget_id: &str, kind: &str, dir: &Path) -> Result<()> {
     let Some(desc) = registry::find(kind) else {
         return Ok(());
     };
@@ -254,10 +295,7 @@ fn write_llm_settings(state: &WizardState, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_provider_key(
-    provider: &crate::llm::LlmProviderDef,
-    key: &str,
-) -> Result<()> {
+fn write_provider_key(provider: &crate::llm::LlmProviderDef, key: &str) -> Result<()> {
     let dir = auth::credentials_dir()?;
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join(provider.credentials_filename);
@@ -272,10 +310,7 @@ fn write_provider_key(
     atomic_write(&path, &body)
 }
 
-fn write_llm_toml(
-    provider: &crate::llm::LlmProviderDef,
-    dir: &Path,
-) -> Result<()> {
+fn write_llm_toml(provider: &crate::llm::LlmProviderDef, dir: &Path) -> Result<()> {
     let path = dir.join("llm.toml");
     let existing = fs::read_to_string(&path).ok();
     let body = render_llm_toml(provider, existing.as_deref());
@@ -287,10 +322,7 @@ fn write_llm_toml(
 /// `[provider].model` / `api_base` / `max_tokens` that already point at
 /// the *same* provider — switching providers resets those to the
 /// registry defaults (the old values referenced a different API).
-fn render_llm_toml(
-    provider: &crate::llm::LlmProviderDef,
-    existing: Option<&str>,
-) -> String {
+fn render_llm_toml(provider: &crate::llm::LlmProviderDef, existing: Option<&str>) -> String {
     let prev = existing.and_then(|s| toml::from_str::<toml::Value>(s).ok());
     let prev_block = prev.as_ref().and_then(|d| d.get("provider"));
     let prev_limits = prev.as_ref().and_then(|d| d.get("limits"));
@@ -302,11 +334,15 @@ fn render_llm_toml(
         .and_then(|v| v.as_str())
         == Some(provider.name);
     let carried_str = |key: &str| -> Option<String> {
-        if !same_provider { return None; }
+        if !same_provider {
+            return None;
+        }
         prev_block?.get(key)?.as_str().map(str::to_string)
     };
     let carried_u32 = |key: &str| -> Option<u32> {
-        if !same_provider { return None; }
+        if !same_provider {
+            return None;
+        }
         prev_block?.get(key)?.as_integer().map(|n| n as u32)
     };
     let enabled = prev
@@ -449,7 +485,10 @@ fn substitute_assignments(layout: String, state: &WizardState) -> String {
                 // logic have drifted — surface that in dev. In
                 // release fall back gracefully so the dashboard
                 // still has a working cell.
-                debug_assert!(false, "preset cell `{placeholder}` had no single-line widget form");
+                debug_assert!(
+                    false,
+                    "preset cell `{placeholder}` had no single-line widget form"
+                );
                 out = out.replace(&placeholder, &assignment.widget_id());
             }
         } else if assignment.kind.is_empty() {
@@ -545,8 +584,7 @@ fn apply_assignments_to_existing_layout(layout: &str, state: &WizardState) -> St
                     .map(|c| format!("\"{}\"", c.widget_id()))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let rewritten =
-                    rewrite_widget_line_to_widgets_array(block_text, &ids);
+                let rewritten = rewrite_widget_line_to_widgets_array(block_text, &ids);
                 out.push_str(&rewritten);
             }
             Some(a) if a.kind.is_empty() && a.stack_children.is_empty() => {
@@ -785,8 +823,7 @@ mod tests {
         // with concrete widget kinds, should emit exactly `preset.cells`
         // `[[layout.cells]]` blocks — no more, no less.
         for preset in layout_page::PRESETS {
-            let assignments: Vec<(usize, &str)> =
-                (0..preset.cells).map(|i| (i, "clock")).collect();
+            let assignments: Vec<(usize, &str)> = (0..preset.cells).map(|i| (i, "clock")).collect();
             let state = state_for(preset.id, assignments);
             let layout = substitute_assignments(render_preset_layout(preset.id), &state);
             assert_eq!(
@@ -905,10 +942,7 @@ mod tests {
     fn empty_assignments_strip_their_cell_blocks() {
         // User picks a 3-cell preset but leaves cell 1 empty. Final
         // layout must drop cell 1's block entirely.
-        let state = state_for(
-            "three_column",
-            vec![(0, "clock"), (1, ""), (2, "weather")],
-        );
+        let state = state_for("three_column", vec![(0, "clock"), (1, ""), (2, "weather")]);
         let layout = substitute_assignments(render_preset_layout("three_column"), &state);
         assert_eq!(cell_block_count(&layout), 2);
         assert!(layout.contains("widget = \"clock\""));
@@ -969,10 +1003,7 @@ mod tests {
         let openai = provider_def("openai");
         assert!(rendered.contains("name = \"openai\""));
         assert!(rendered.contains(&format!("model = \"{}\"", openai.default_model)));
-        assert!(rendered.contains(&format!(
-            "max_tokens = {}",
-            openai.default_max_tokens
-        )));
+        assert!(rendered.contains(&format!("max_tokens = {}", openai.default_max_tokens)));
         assert!(rendered.contains("max_requests_per_minute = 20"));
         assert!(rendered.contains("cache_capacity = 1024"));
     }

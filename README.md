@@ -407,6 +407,50 @@ summaries). Full list in `Cargo.toml`.
 glint never sends data to any third party that isn't named in the
 External dependencies table above. There is no telemetry.
 
+### Credential storage — what it does and doesn't protect
+
+Today every credential glint stores (IMAP / CalDAV app passwords, LLM
+API keys, OAuth tokens) lives in a TOML file under
+`~/.config/glint/credentials/` with `0600` permissions and an atomic
+write. This mirrors the convention used by `aws`, `gcloud`, `gh`,
+`docker`, `npm`, `ssh`, and similar local-first CLIs.
+
+What that covers:
+
+- ✅ Another non-root user on the same Unix host can't read the file.
+- ✅ With full-disk encryption on (FileVault / LUKS / BitLocker) a
+  lost laptop's offline disk is unreadable until unlocked.
+- ✅ OAuth tokens (Google, Microsoft) and app passwords (IMAP,
+  CalDAV) are revocable from the provider's account dashboard, and
+  app passwords don't grant master-account access.
+
+What it doesn't cover:
+
+- ❌ Anything running as **your** user (a rogue shell script, a
+  compromised npm package, anything else with read access to your
+  `$HOME`) can read the file. Same threat model as `~/.aws/credentials`
+  or `~/.ssh/`.
+- ❌ Root / sudo on the host can read the file.
+- ❌ Backups that include `~/.config/` (Time Machine, restic, borg,
+  Arq, dotfile syncers like chezmoi / yadm / GNU stow) will carry the
+  credentials along. Excluding `~/.config/glint/credentials/` is
+  recommended; on dotfile managers add it to the per-host ignore
+  list rather than syncing it across machines.
+
+Recommended posture:
+
+1. Keep full-disk encryption on.
+2. Exclude `~/.config/glint/credentials/` from your backup tool.
+3. Exclude it from any dotfile sync — credentials should stay
+   per-host.
+4. Prefer OAuth and app passwords (which glint already does) over
+   master passwords.
+
+**Coming post-v0.2**: a tiered credential backend (OS keychain →
+host-bound encryption → plaintext fallback) selected via
+`credentials_backend` in `config.toml`. See `CHANGELOG.md` →
+Deferred for the scope.
+
 ---
 
 ## Troubleshooting

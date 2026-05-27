@@ -24,11 +24,7 @@ use ratatui::{
 
 use super::PageAction;
 use crate::widgets::registry::WIDGETS;
-use crate::wizard::{
-    app::WizardApp,
-    state::StackChild,
-    style,
-};
+use crate::wizard::{app::WizardApp, state::StackChild, style};
 
 const SLOTS: usize = 3;
 const SKIP_VALUE: &str = "";
@@ -71,15 +67,12 @@ pub fn on_enter(app: &mut WizardApp, cell_index: usize) {
     if let Some(cell) = app.state.assignments.get(cell_index) {
         if !cell.stack_children.is_empty() {
             for (i, child) in cell.stack_children.iter().take(SLOTS).enumerate() {
-                if let Some(pos) =
-                    opts.iter().position(|(v, _)| *v == child.kind.as_str())
-                {
+                if let Some(pos) = opts.iter().position(|(v, _)| *v == child.kind.as_str()) {
                     slots[i] = pos;
                 }
             }
         } else if !cell.kind.is_empty() {
-            if let Some(pos) = opts.iter().position(|(v, _)| *v == cell.kind.as_str())
-            {
+            if let Some(pos) = opts.iter().position(|(v, _)| *v == cell.kind.as_str()) {
                 slots[0] = pos;
             }
         }
@@ -124,7 +117,11 @@ pub fn handle_key(key: KeyEvent, app: &mut WizardApp, cell_index: usize) -> Page
         KeyCode::Enter | KeyCode::Char(' ') => {
             if focus == save_index {
                 commit_stack(app, cell_index, &slots);
-                return PageAction::Back;
+                // AssignStackDone (vs. Back) advances focus on the
+                // Assign page to the next cell so the user isn't
+                // dropped back at Cell 1. Esc still uses Back for the
+                // "cancel, stay on this cell" path.
+                return PageAction::AssignStackDone { cell_index };
             }
             // Enter on a slot row advances to the next focus slot.
             focus = (focus + 1) % focus_total;
@@ -174,8 +171,8 @@ fn commit_stack(app: &mut WizardApp, cell_index: usize, slots: &[usize; SLOTS]) 
 pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp, cell_index: usize) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" Configure stack — cell {cell_index} "));
-    let inner = block.inner(area);
+        .title(format!(" Configure stack — cell {} ", cell_index + 1));
+    let inner = style::pad_inner(block.inner(area));
     frame.render_widget(block, area);
 
     let opts = options();
@@ -250,8 +247,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp, cell_index: usize)
     ]));
     if on_button {
         lines.push(Line::from(Span::styled(
-            "    Enter commits this stack + pops back. Esc cancels without saving."
-                .to_string(),
+            "    Enter commits this stack + pops back. Esc cancels without saving.".to_string(),
             style::help_text(),
         )));
     }

@@ -1,28 +1,63 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 ntrospect0
 
-//! Minimal OSC 52 clipboard helper.
+//! Two-tier clipboard helper.
 //!
-//! OSC 52 is a terminal escape sequence that asks the terminal emulator
-//! to set the system clipboard. It works in modern terminals (Kitty,
-//! WezTerm, iTerm2, Alacritty with `selection_clipboard: true`, recent
-//! tmux with `set -g allow-passthrough on`) and silently does nothing
-//! everywhere else — so we treat it as a best-effort hint, not a
-//! guaranteed copy.
+//! 1. Try `arboard` — talks to the OS clipboard directly (NSPasteboard on
+//!    macOS, X11/Wayland on Linux, Win32 on Windows). Reliable, works
+//!    regardless of terminal config, and makes the copied text
+//!    immediately pastable with the normal OS paste shortcut.
+//! 2. Fall back to OSC 52 — a terminal escape sequence that asks the
+//!    emulator to set the system clipboard. Needed for SSH / tmux /
+//!    headless contexts where arboard can't see a display, but
+//!    silently no-ops on terminals that don't proxy it (Terminal.app,
+//!    Alacritty without `selection.save_to_clipboard = true`, iTerm2
+//!    without "Allow apps to access clipboard").
 //!
-//! Format: `ESC ] 52 ; c ; <base64-encoded-text> ESC \\`
+//! Format of the OSC 52 escape: `ESC ] 52 ; c ; <base64-text> ESC \\`
 //!   - `c` selects the clipboard (vs `p` for X primary selection).
-//!   - The text payload must be base64; we hand-roll the encoder so we
-//!     don't pull in a crate for ~30 bytes of typical clipboard content.
+//!   - We hand-roll base64 so we don't pull in a crate for ~30 bytes
+//!     of typical payload.
 
 use std::io::{self, Write};
 
-/// Try to copy `text` to the system clipboard via OSC 52. Returns
-/// `Ok(())` if the escape sequence was written successfully — that's
-/// not the same as "the terminal honored it." Falls back silently
-/// on terminals without OSC 52 support; the caller decides whether
-/// to surface a feedback line.
+/// Copy `text` to the system clipboard. Returns `Ok(())` if either the
+/// direct OS clipboard write or the OSC 52 fallback succeeded.
+///
+/// Direct write is preferred — OSC 52 success here only means the
+/// escape sequence got onto stdout, not that the terminal forwarded it
+/// to the OS clipboard. With arboard out front the OSC 52 path mostly
+/// matters for SSH / tmux pass-through.
 pub fn copy(text: &str) -> io::Result<()> {
+    if write_os_clipboard(text) {
+        return Ok(());
+    }
+    write_osc52(text)
+}
+
+/// Direct OS-clipboard write. Returns `true` on success. arboard can
+/// fail in headless / SSH / GUI-less containers — that's why we fall
+/// back to OSC 52 in [`copy`] when this returns `false`.
+fn write_os_clipboard(text: &str) -> bool {
+    match arboard::Clipboard::new() {
+        Ok(mut cb) => cb.set_text(text.to_string()).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Read the system clipboard. Returns `None` when the clipboard is
+/// empty, contains a non-text payload, or arboard can't reach a
+/// display (headless / SSH). No OSC 52 fallback — OSC 52 *reads* are
+/// almost universally disabled (security risk), so attempting one
+/// would just hang waiting for a response that'll never come.
+/// Callers that need clipboard reads in SSH should accept the
+/// limitation and fall back to bracketed-paste.
+pub fn paste() -> Option<String> {
+    let mut cb = arboard::Clipboard::new().ok()?;
+    cb.get_text().ok()
+}
+
+fn write_osc52(text: &str) -> io::Result<()> {
     let encoded = base64_encode(text.as_bytes());
     let payload = format!("\x1b]52;c;{encoded}\x1b\\");
     let mut out = io::stdout().lock();
@@ -33,8 +68,7 @@ pub fn copy(text: &str) -> io::Result<()> {
 /// RFC 4648 base64. ~30 lines of code; pulling in a crate for a single
 /// call site felt heavier than this is worth.
 fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
     let chunks = bytes.chunks(3);
     for chunk in chunks {

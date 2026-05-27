@@ -187,7 +187,10 @@ fn build_request_body<'a>(
         // OpenAI carries the system prompt as the first message rather
         // than a separate top-level field. `cache_system` is an Anthropic
         // hint — silently ignored here.
-        messages.push(MessageBody { role: "system", content: sys });
+        messages.push(MessageBody {
+            role: "system",
+            content: sys,
+        });
     }
     for m in &request.messages {
         messages.push(MessageBody {
@@ -251,7 +254,11 @@ mod tests {
         let body = build_request_body(&r, "fallback-model", 512);
         assert_eq!(body.model, "fallback-model");
         assert_eq!(body.max_completion_tokens, 512);
-        assert_eq!(body.messages.len(), 1, "no system prompt → no system message");
+        assert_eq!(
+            body.messages.len(),
+            1,
+            "no system prompt → no system message"
+        );
         assert_eq!(body.messages[0].role, "user");
     }
 

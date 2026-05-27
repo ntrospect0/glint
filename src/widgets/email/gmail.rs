@@ -94,8 +94,7 @@ impl GmailProvider {
         match resp.json::<ProfileResponse>().await {
             Ok(p) => {
                 if let Some(addr) = p.email_address {
-                    *self.account.lock().expect("gmail account cache poisoned") =
-                        Some(addr);
+                    *self.account.lock().expect("gmail account cache poisoned") = Some(addr);
                 } else {
                     tracing::warn!("gmail profile returned without emailAddress");
                 }
@@ -165,8 +164,14 @@ impl GmailProvider {
         }
         // Stable system-label order; alphabetised user labels.
         let priority: &[&str] = &[
-            "INBOX", "STARRED", "IMPORTANT", "UNREAD", "SENT", "DRAFT",
-            "SPAM", "TRASH",
+            "INBOX",
+            "STARRED",
+            "IMPORTANT",
+            "UNREAD",
+            "SENT",
+            "DRAFT",
+            "SPAM",
+            "TRASH",
         ];
         system.sort_by_key(|(name, _)| {
             priority
@@ -300,7 +305,15 @@ impl EmailProvider for GmailProvider {
             .await
             .context("failed to deserialize Gmail labels")?;
         // System labels we surface by default + every user-created label.
-        let surface = ["INBOX", "SENT", "DRAFT", "SPAM", "TRASH", "IMPORTANT", "STARRED"];
+        let surface = [
+            "INBOX",
+            "SENT",
+            "DRAFT",
+            "SPAM",
+            "TRASH",
+            "IMPORTANT",
+            "STARRED",
+        ];
         let mut out: Vec<EmailFolder> = Vec::new();
         for l in parsed.labels {
             let is_system = l.label_type.as_deref() == Some("system");
@@ -493,7 +506,10 @@ impl RawMessage {
         // Build a web URL into Gmail. Account index defaults to 0 — same
         // assumption Gmail's own "view in Gmail" buttons use when the user
         // is single-signed-in.
-        let web_url = Some(format!("https://mail.google.com/mail/u/0/#inbox/{}", self.id));
+        let web_url = Some(format!(
+            "https://mail.google.com/mail/u/0/#inbox/{}",
+            self.id
+        ));
 
         Some(EmailMessage {
             id: self.id,
@@ -553,7 +569,11 @@ fn extract_body(payload: &RawPayload) -> Option<String> {
 }
 
 fn walk_for_mime(payload: &RawPayload, want: &str) -> Option<String> {
-    let mime = payload.mime_type.as_deref().unwrap_or("").to_ascii_lowercase();
+    let mime = payload
+        .mime_type
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     if mime == want {
         if let Some(b) = &payload.body {
             if let Some(data) = &b.data {
@@ -584,7 +604,10 @@ fn decode_base64_url(input: &str) -> anyhow::Result<String> {
             _ => None,
         }
     }
-    let cleaned: Vec<u8> = input.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=').collect();
+    let cleaned: Vec<u8> = input
+        .bytes()
+        .filter(|c| !c.is_ascii_whitespace() && *c != b'=')
+        .collect();
     let mut out: Vec<u8> = Vec::with_capacity(cleaned.len() * 3 / 4);
     let mut buf = 0u32;
     let mut bits = 0u32;

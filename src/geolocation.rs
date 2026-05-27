@@ -77,8 +77,11 @@ pub async fn by_name(name: &str) -> Result<GeoLocation> {
     // result (largest "Troy" → Troy, MI) wins anyway. When hints exist,
     // a match overrides that ordering.
     results.sort_by(|a, b| {
-        score_hit(b, admin_hint.as_deref(), country_hint.as_deref())
-            .cmp(&score_hit(a, admin_hint.as_deref(), country_hint.as_deref()))
+        score_hit(b, admin_hint.as_deref(), country_hint.as_deref()).cmp(&score_hit(
+            a,
+            admin_hint.as_deref(),
+            country_hint.as_deref(),
+        ))
     });
     let hit = results.into_iter().next().expect("non-empty checked above");
 
@@ -172,10 +175,7 @@ fn parse_freeform(raw: &str) -> (String, Option<String>, Option<String>) {
 /// Always leaves at least one token in the prefix so the caller can
 /// still produce a city. Longest-first matters for multi-token names
 /// like `United Kingdom`, `New South Wales`, `South Korea`.
-fn peel_known_tail<'a, F>(
-    tokens: &[&'a str],
-    lookup: F,
-) -> (Vec<&'a str>, Option<String>)
+fn peel_known_tail<'a, F>(tokens: &[&'a str], lookup: F) -> (Vec<&'a str>, Option<String>)
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -223,7 +223,10 @@ fn lookup_country(s: &str) -> Option<String> {
         return Some((*full).to_string());
     }
     let lower = trimmed.to_lowercase();
-    if let Some((_, full)) = COUNTRIES.iter().find(|(_, full)| full.to_lowercase() == lower) {
+    if let Some((_, full)) = COUNTRIES
+        .iter()
+        .find(|(_, full)| full.to_lowercase() == lower)
+    {
         return Some((*full).to_string());
     }
     None
@@ -757,7 +760,10 @@ mod tests {
     fn lookup_country_matches_full_names_and_abbreviations() {
         assert_eq!(lookup_country("japan").as_deref(), Some("Japan"));
         assert_eq!(lookup_country("usa").as_deref(), Some("United States"));
-        assert_eq!(lookup_country("united kingdom").as_deref(), Some("United Kingdom"));
+        assert_eq!(
+            lookup_country("united kingdom").as_deref(),
+            Some("United Kingdom")
+        );
         assert_eq!(lookup_country("nowhereistan"), None);
     }
 }

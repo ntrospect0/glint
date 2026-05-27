@@ -115,7 +115,9 @@ mod tests {
     fn cache_get_returns_the_put_value() {
         let cache = ResponseCache::with_capacity(8);
         let key = CacheKey(42);
-        let val = LlmResponse { text: "cached".into() };
+        let val = LlmResponse {
+            text: "cached".into(),
+        };
         cache.put(key, val.clone());
         let got = cache.get(key).unwrap();
         assert_eq!(got.text, "cached");
@@ -129,7 +131,9 @@ mod tests {
         let cache = ResponseCache::with_capacity(4);
         let key = CacheKey(7);
         let stale = Entry {
-            value: LlmResponse { text: "stale".into() },
+            value: LlmResponse {
+                text: "stale".into(),
+            },
             inserted_at: Instant::now() - (ENTRY_TTL + Duration::from_secs(1)),
         };
         cache.inner.lock().unwrap().put(key, stale);

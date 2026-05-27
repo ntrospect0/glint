@@ -7,7 +7,7 @@ pub mod provider;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -26,6 +26,7 @@ use serde::Deserialize;
 
 use crate::cache::ScopedCache;
 use crate::theme::{ColorScheme, Theme};
+use crate::ui::status::{live_value, TimedFeedback};
 use crate::ui::{apply_title_row, MetadataEmphasis};
 
 use super::{AppContext, EventResult, Widget};
@@ -99,12 +100,26 @@ fn default_indices() -> Vec<String> {
     vec!["^DJI".into(), "^GSPC".into(), "^IXIC".into()]
 }
 fn default_watchlist() -> Vec<String> {
+    // Magnificent Seven + the FAANG holdout (NFLX) + a small set of
+    // famous blue chips. Gives a brand-new install a recognisable
+    // cross-sector watchlist without going overboard.
     vec![
+        // MAG7
         "AAPL".into(),
         "MSFT".into(),
         "GOOGL".into(),
+        "AMZN".into(),
+        "META".into(),
         "NVDA".into(),
         "TSLA".into(),
+        // FAANG round-out
+        "NFLX".into(),
+        // Blue chips across finance / healthcare / consumer staples / retail
+        "BRK-B".into(),
+        "JPM".into(),
+        "JNJ".into(),
+        "V".into(),
+        "WMT".into(),
     ]
 }
 fn default_poll_interval() -> u64 {
@@ -159,8 +174,34 @@ struct StocksState {
     transient_ticker: Option<String>,
     /// Set while a `:stock` search is in flight so we can render "Looking up…"
     transient_searching: Option<String>,
-    last_attempt: Option<Instant>,
+    poll: crate::polling::PollTracker,
     any_inflight: bool,
+    /// Symbol pending y/N removal confirmation. When `Some`, the
+    /// widget paints a modal and the key dispatcher swallows everything
+    /// except `y` (confirm) and any-other-key (cancel).
+    confirm_remove: Option<String>,
+    /// Transient status line for "Added AAPL to watchlist" / "Can't
+    /// remove primary" feedback. Cleared once the TTL elapses.
+    status: Option<TimedFeedback<String>>,
+    /// Display-state dirty bit drained by `take_dirty`. Set true by
+    /// every async-task / tick-time mutation site so the main loop's
+    /// dirty-flag gate triggers a redraw. User-driven mutations
+    /// (handle_key / handle_mouse) don't need to set it — non-tick
+    /// events always redraw at the App level.
+    dirty: bool,
+}
+
+/// How long the status feedback line stays on screen after an
+/// add / remove action. Long enough to read, short enough to revert
+/// before the next interaction.
+const STATUS_TTL: Duration = Duration::from_millis(2500);
+
+/// Which on-disk array a symbol belongs to. Yahoo `^DJI`-style index
+/// symbols land in `indices`; everything else lands in `watchlist`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StocksListKind {
+    Indices,
+    Watchlist,
 }
 
 /// Cache key prefix; the active period is appended so each period has its
@@ -168,7 +209,10 @@ struct StocksState {
 const CACHE_KEY_QUOTES_PREFIX: &str = "quotes-";
 
 fn quotes_cache_key(period: Period) -> String {
-    format!("{CACHE_KEY_QUOTES_PREFIX}{}", period.label().to_ascii_lowercase())
+    format!(
+        "{CACHE_KEY_QUOTES_PREFIX}{}",
+        period.label().to_ascii_lowercase()
+    )
 }
 
 pub struct StocksWidget {
@@ -180,7 +224,6 @@ pub struct StocksWidget {
     config: StocksConfig,
     provider: Arc<YahooFinanceProvider>,
     state: Arc<Mutex<StocksState>>,
-    poll_interval: Duration,
     /// Display mode cycled by the `%` / `$` / `c` keys; kept in widget (not
     /// state) since it changes synchronously and never via the network.
     display_mode: DisplayMode,
@@ -241,20 +284,22 @@ impl StocksWidget {
         // prices instantly. Period switches after startup miss the cache (we
         // only persist one period's payload here) and refetch on demand.
         let mut initial_state = StocksState::default();
+        initial_state.poll = crate::polling::PollTracker::new(poll_interval);
         if let Some(entry) = cache.load::<HashMap<String, StockQuote>>(&quotes_cache_key(period)) {
-            let age = entry.age().min(poll_interval);
+            initial_state.poll.seed_from_cache_age(entry.age());
             initial_state.quotes = entry
                 .value
                 .into_iter()
                 .map(|(sym, q)| (sym, QuoteState::Ready(Box::new(q))))
                 .collect();
-            initial_state.last_attempt = Some(Instant::now() - age);
         }
+        initial_state
+            .poll
+            .apply_jitter(&format!("stocks@{instance}"));
         Self {
             id,
             instance,
             display_name_cache,
-            poll_interval,
             config,
             provider,
             state: Arc::new(Mutex::new(initial_state)),
@@ -307,7 +352,13 @@ impl StocksWidget {
             .chain(self.config.watchlist.iter())
             .cloned()
             .collect();
-        if let Some(t) = self.state.lock().expect("stocks state poisoned").transient_ticker.clone() {
+        if let Some(t) = self
+            .state
+            .lock()
+            .expect("stocks state poisoned")
+            .transient_ticker
+            .clone()
+        {
             if !out.iter().any(|s| s.eq_ignore_ascii_case(&t)) {
                 out.push(t);
             }
@@ -315,16 +366,12 @@ impl StocksWidget {
         out
     }
 
-
     fn is_due(&self) -> bool {
         let st = self.state.lock().expect("stocks state poisoned");
         if st.any_inflight {
             return false;
         }
-        match st.last_attempt {
-            None => true,
-            Some(t) => t.elapsed() >= self.poll_interval,
-        }
+        st.poll.is_due()
     }
 
     fn spawn_refresh(&self) {
@@ -335,12 +382,11 @@ impl StocksWidget {
         {
             let mut st = self.state.lock().expect("stocks state poisoned");
             st.any_inflight = true;
-            st.last_attempt = Some(Instant::now());
+            st.poll.mark_attempted();
             for sym in &symbols {
-                st.quotes
-                    .entry(sym.clone())
-                    .or_insert(QuoteState::Inflight);
+                st.quotes.entry(sym.clone()).or_insert(QuoteState::Inflight);
             }
+            st.dirty = true;
         }
         let provider = self.provider.clone();
         let state = self.state.clone();
@@ -373,6 +419,7 @@ impl StocksWidget {
                 }
             }
             st.any_inflight = false;
+            st.dirty = true;
             drop(st);
             if !snapshot.is_empty() {
                 if let Err(err) = cache.store(&quotes_cache_key(period), &snapshot) {
@@ -384,7 +431,7 @@ impl StocksWidget {
 
     fn mark_dirty(&self) {
         let mut st = self.state.lock().expect("stocks state poisoned");
-        st.last_attempt = None;
+        st.poll.mark_dirty();
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -450,6 +497,7 @@ impl StocksWidget {
             let result = provider.search(&query_trim).await;
             let mut st = state.lock().expect("stocks state poisoned");
             st.transient_searching = None;
+            st.dirty = true;
             match result {
                 Ok(symbol) => {
                     // Same idea as the fast path, applied to the
@@ -474,7 +522,7 @@ impl StocksWidget {
                     }
                     st.transient_ticker = Some(symbol);
                     st.selected = base_slot;
-                    st.last_attempt = None;
+                    st.poll.mark_dirty();
                 }
                 Err(err) => {
                     tracing::warn!(query = %query_trim, error = %err, "stock lookup failed");
@@ -505,7 +553,7 @@ impl StocksWidget {
         st.transient_ticker = Some(symbol);
         st.transient_searching = None;
         st.selected = base_slot;
-        st.last_attempt = None;
+        st.poll.mark_dirty();
     }
 
     /// Clear the transient ticker and bounce the selection back to the top
@@ -516,6 +564,199 @@ impl StocksWidget {
             st.selected = 0;
             st.list_scroll = 0;
         }
+    }
+
+    /// Classify a symbol back to its destination list. Yahoo prefixes
+    /// indices with `^` (e.g. `^DJI`); everything else goes to the
+    /// regular watchlist. Crypto on Yahoo uses `BTC-USD` form which
+    /// also lands in the watchlist — separating crypto out the way
+    /// Forex does isn't worth a second list here, since stocks chart
+    /// math doesn't care about asset class.
+    fn classify_symbol(sym: &str) -> StocksListKind {
+        if sym.starts_with('^') {
+            StocksListKind::Indices
+        } else {
+            StocksListKind::Watchlist
+        }
+    }
+
+    /// Set the transient status line. Cleared automatically once
+    /// `STATUS_TTL` elapses on the next render-time check.
+    fn set_status(&self, msg: impl Into<String>) {
+        let mut st = self.state.lock().expect("stocks state poisoned");
+        st.status = Some(TimedFeedback::new(msg.into(), STATUS_TTL));
+    }
+
+    /// Persist the current `indices` + `watchlist` arrays back to
+    /// `~/.config/glint/<stocks|stocks@instance>.toml`, preserving any
+    /// other top-level scalars / `[colors]` block / comments. Logs +
+    /// surfaces a status line on failure; never panics.
+    fn persist_lists(&self) -> bool {
+        let indices = self.config.indices.clone();
+        let watchlist = self.config.watchlist.clone();
+        let mut ok = true;
+        if let Err(err) = crate::config::rewrite_widget_top_level_string_array(
+            "stocks",
+            &self.instance,
+            "indices",
+            &indices,
+        ) {
+            tracing::warn!(error = %err, "stocks: failed to persist indices");
+            self.set_status(format!("Save failed: {err}"));
+            ok = false;
+        }
+        if let Err(err) = crate::config::rewrite_widget_top_level_string_array(
+            "stocks",
+            &self.instance,
+            "watchlist",
+            &watchlist,
+        ) {
+            tracing::warn!(error = %err, "stocks: failed to persist watchlist");
+            self.set_status(format!("Save failed: {err}"));
+            ok = false;
+        }
+        ok
+    }
+
+    /// Open the confirm-remove modal for the currently selected
+    /// symbol. No-op when the selection sits on the transient lookup
+    /// row (use `x` to clear that) or when the list is empty.
+    fn request_remove_selected(&self) {
+        let symbols = self.all_symbols();
+        if symbols.is_empty() {
+            return;
+        }
+        let base_count = self.config.indices.len() + self.config.watchlist.len();
+        let idx = self.state.lock().expect("stocks state poisoned").selected;
+        if idx >= base_count {
+            // Transient row — `x` clears it; `-` is reserved for
+            // persisted-list removal so users don't accidentally write
+            // an empty array to disk when they meant "clear the
+            // search."
+            self.set_status("Press `x` to clear the lookup row");
+            return;
+        }
+        let Some(sym) = symbols.get(idx).cloned() else {
+            return;
+        };
+        self.state
+            .lock()
+            .expect("stocks state poisoned")
+            .confirm_remove = Some(sym);
+    }
+
+    /// User answered `y` on the modal: actually remove the symbol from
+    /// its source list (indices or watchlist), persist the change,
+    /// clamp selection, drop the in-memory quote so a removed row
+    /// doesn't briefly flash if the symbol gets re-added later.
+    fn confirm_remove(&mut self) {
+        let sym = match self
+            .state
+            .lock()
+            .expect("stocks state poisoned")
+            .confirm_remove
+            .clone()
+        {
+            Some(s) => s,
+            None => return,
+        };
+        let target = Self::classify_symbol(&sym);
+        let list = match target {
+            StocksListKind::Indices => &mut self.config.indices,
+            StocksListKind::Watchlist => &mut self.config.watchlist,
+        };
+        let before = list.len();
+        list.retain(|s| !s.eq_ignore_ascii_case(&sym));
+        let removed = list.len() < before;
+        if !removed {
+            // Symbol vanished from under us (race with `:reload`).
+            // Clear the modal and bail.
+            self.state
+                .lock()
+                .expect("stocks state poisoned")
+                .confirm_remove = None;
+            return;
+        }
+        // Drop the stale quote so the row doesn't briefly flicker on
+        // re-add. The next refresh repopulates from Yahoo.
+        {
+            let mut st = self.state.lock().expect("stocks state poisoned");
+            st.quotes.remove(&sym);
+            st.confirm_remove = None;
+            // Clamp selection to the last row of the new list (or 0
+            // when everything was removed).
+            let new_total = self.config.indices.len() + self.config.watchlist.len();
+            let with_transient = if st.transient_ticker.is_some() { 1 } else { 0 };
+            let total = new_total + with_transient;
+            st.selected = st.selected.min(total.saturating_sub(1));
+        }
+        let label = match target {
+            StocksListKind::Indices => "indices",
+            StocksListKind::Watchlist => "watchlist",
+        };
+        if self.persist_lists() {
+            self.set_status(format!("Removed {sym} from {label}"));
+        }
+    }
+
+    /// User pressed any key other than `y` on the modal — back out
+    /// without touching disk.
+    fn cancel_remove(&self) {
+        self.state
+            .lock()
+            .expect("stocks state poisoned")
+            .confirm_remove = None;
+    }
+
+    /// User pressed `+` on the transient lookup row: promote it into
+    /// the appropriate persisted list (indices or watchlist) and
+    /// remove the transient marker. No-op when the selection isn't on
+    /// the transient row or no transient is pinned.
+    fn add_transient_to_list(&mut self) {
+        let sym = {
+            let st = self.state.lock().expect("stocks state poisoned");
+            st.transient_ticker.clone()
+        };
+        let Some(sym) = sym else {
+            self.set_status("No lookup row to add — run `:stock <ticker>` first");
+            return;
+        };
+        let target = Self::classify_symbol(&sym);
+        let already = self
+            .config
+            .indices
+            .iter()
+            .chain(self.config.watchlist.iter())
+            .any(|s| s.eq_ignore_ascii_case(&sym));
+        if already {
+            self.set_status(format!("{sym} is already in the list"));
+            return;
+        }
+        match target {
+            StocksListKind::Indices => self.config.indices.push(sym.clone()),
+            StocksListKind::Watchlist => self.config.watchlist.push(sym.clone()),
+        }
+        // Clear the transient slot and re-select the just-added row.
+        {
+            let mut st = self.state.lock().expect("stocks state poisoned");
+            st.transient_ticker = None;
+            st.transient_searching = None;
+            let new_idx = match target {
+                StocksListKind::Indices => self.config.indices.len() - 1,
+                StocksListKind::Watchlist => {
+                    self.config.indices.len() + self.config.watchlist.len() - 1
+                }
+            };
+            st.selected = new_idx;
+        }
+        let label = match target {
+            StocksListKind::Indices => "indices",
+            StocksListKind::Watchlist => "watchlist",
+        };
+        if self.persist_lists() {
+            self.set_status(format!("Added {sym} to {label}"));
+        }
+        self.mark_dirty();
     }
 
     /// Open the selected ticker in the user's browser via the configured
@@ -540,6 +781,31 @@ impl StocksWidget {
         st.quotes.clone()
     }
 
+    /// Return the active status string, clearing it if its TTL has
+    /// elapsed. Called from `render` so feedback messages auto-revert
+    /// without needing a separate timer task.
+    fn live_status(&self) -> Option<String> {
+        let mut st = self.state.lock().expect("stocks state poisoned");
+        live_value(&mut st.status).cloned()
+    }
+
+    /// Paint the "Remove <symbol>?" overlay. Thin call into the
+    /// shared [`crate::ui::modal`] helper so the styling stays
+    /// consistent with notes / forex / future widgets.
+    fn render_confirm_modal(&self, frame: &mut Frame, parent: Rect, symbol: &str) {
+        crate::ui::modal::render(
+            frame,
+            parent,
+            &self.theme,
+            crate::ui::modal::ConfirmModal {
+                title: " Remove ticker? ",
+                target: symbol,
+                hint: None,
+                max_width: 48,
+            },
+        );
+    }
+
     /// Compute the same panel rects `render` uses so click handlers can map
     /// coordinates back to a target panel.
     fn compute_layout(&self, inner: Rect) -> StocksPanels {
@@ -555,10 +821,8 @@ impl StocksWidget {
         let is_wide = inner.width >= WIDE_LIST_W + MIN_GRAPH_W;
         let with_stats = is_wide && inner.width >= WIDE_LIST_W + WIDE_STATS_W + MIN_GRAPH_W;
         if is_wide {
-            let mut constraints: Vec<Constraint> = vec![
-                Constraint::Length(WIDE_LIST_W),
-                Constraint::Length(1),
-            ];
+            let mut constraints: Vec<Constraint> =
+                vec![Constraint::Length(WIDE_LIST_W), Constraint::Length(1)];
             if with_stats {
                 constraints.push(Constraint::Length(WIDE_STATS_W));
                 constraints.push(Constraint::Length(1));
@@ -732,7 +996,20 @@ impl Widget for StocksWidget {
         if self.is_due() {
             self.spawn_refresh();
         }
+        // Surface tick-time status TTL expiry through the dirty bit so
+        // the render filter actually gets to drop the now-stale chrome
+        // — without this the "Added AAPL" line would linger until the
+        // next unrelated redraw.
+        let mut st = self.state.lock().expect("stocks state poisoned");
+        if crate::ui::status::drain_if_expired(&mut st.status) {
+            st.dirty = true;
+        }
         Ok(())
+    }
+
+    fn take_dirty(&mut self) -> bool {
+        let mut st = self.state.lock().expect("stocks state poisoned");
+        std::mem::replace(&mut st.dirty, false)
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
@@ -802,10 +1079,8 @@ impl Widget for StocksWidget {
 
         // 1-col gaps between panels so they don't visually run together.
         if is_wide {
-            let mut constraints: Vec<Constraint> = vec![
-                Constraint::Length(WIDE_LIST_W),
-                Constraint::Length(1),
-            ];
+            let mut constraints: Vec<Constraint> =
+                vec![Constraint::Length(WIDE_LIST_W), Constraint::Length(1)];
             if with_stats {
                 constraints.push(Constraint::Length(WIDE_STATS_W));
                 constraints.push(Constraint::Length(1));
@@ -899,7 +1174,9 @@ impl Widget for StocksWidget {
             );
         }
 
-        // Footer hint along the bottom of the cell.
+        // Footer hint along the bottom of the cell. The status line
+        // (when present and not yet TTL-expired) replaces the static
+        // hint so add/remove feedback grabs the user's eye.
         if inner.height >= 2 {
             let footer = Rect {
                 x: inner.x,
@@ -907,15 +1184,33 @@ impl Widget for StocksWidget {
                 width: inner.width,
                 height: 1,
             };
-            let hint = format!(
-                "↑/↓ select · c mode ({}) · ⏎ open · r refresh",
-                display_mode_label(self.display_mode)
-            );
+            let status = self.live_status();
+            let (text, style) = match status {
+                Some(msg) => (msg, self.theme.text_selected),
+                None => (
+                    format!(
+                        "↑/↓ select · c mode ({}) · o open · - remove · + add lookup · r refresh",
+                        display_mode_label(self.display_mode)
+                    ),
+                    self.theme.text_dim,
+                ),
+            };
             frame.render_widget(
-                Paragraph::new(Span::styled(hint, self.theme.text_dim))
-                    .alignment(Alignment::Right),
+                Paragraph::new(Span::styled(text, style)).alignment(Alignment::Right),
                 footer,
             );
+        }
+
+        // Confirm-remove modal: paints on top of everything else so
+        // the user can't miss the `y/N` prompt.
+        let pending = self
+            .state
+            .lock()
+            .expect("stocks state poisoned")
+            .confirm_remove
+            .clone();
+        if let Some(sym) = pending {
+            self.render_confirm_modal(frame, inner, &sym);
         }
     }
 
@@ -933,6 +1228,23 @@ impl Widget for StocksWidget {
                 return EventResult::Ignored;
             }
         }
+        // Confirm-remove modal: y commits, any other key cancels.
+        // Handled before the normal dispatch so the user can't
+        // accidentally move selection / cycle period while the prompt
+        // is up.
+        if self
+            .state
+            .lock()
+            .expect("stocks state poisoned")
+            .confirm_remove
+            .is_some()
+        {
+            match crate::ui::modal::dispatch_key(key) {
+                crate::ui::modal::ConfirmChoice::Confirm => self.confirm_remove(),
+                crate::ui::modal::ConfirmChoice::Cancel => self.cancel_remove(),
+            }
+            return EventResult::Handled;
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_selection(-1);
@@ -942,9 +1254,12 @@ impl Widget for StocksWidget {
                 self.move_selection(1);
                 EventResult::Handled
             }
-            // Enter opens the selected ticker in the browser — same gesture
-            // the news widget uses to open an article.
-            KeyCode::Enter => {
+            // `o` opens the selected ticker in the browser, per the
+            // platform-wide convention (Enter is reserved for the
+            // primary in-place action — and stocks has none today, so
+            // we leave Enter unbound rather than reusing it for an
+            // external jump that's too easy to mis-fire).
+            KeyCode::Char('o') => {
                 self.jump_to_external();
                 EventResult::Handled
             }
@@ -971,6 +1286,19 @@ impl Widget for StocksWidget {
             // `x` clears the :stock <query> transient selection if any.
             KeyCode::Char('x') => {
                 self.clear_transient();
+                EventResult::Handled
+            }
+            // `-` prompts to remove the selected ticker/index. The
+            // actual mutation runs after the user confirms with `y`.
+            KeyCode::Char('-') => {
+                self.request_remove_selected();
+                EventResult::Handled
+            }
+            // `+` promotes the transient `:stock` lookup row into
+            // indices (^prefix) or watchlist. No confirmation —
+            // additions are non-destructive.
+            KeyCode::Char('+') => {
+                self.add_transient_to_list();
                 EventResult::Handled
             }
             // 1..9 picks a graph period directly.
@@ -1095,9 +1423,11 @@ impl Widget for StocksWidget {
             ("c", "cycle display mode (% / $)"),
             ("% / $", "set display mode directly"),
             ("1-9", "set graph period directly"),
-            ("Enter", "open selected ticker in browser"),
+            ("o", "open selected ticker in browser"),
             ("r", "force refresh"),
             ("x", "clear :stock lookup (return to default list)"),
+            ("-", "remove the selected ticker (with confirmation)"),
+            ("+", "add the :stock lookup ticker to the watchlist"),
             ("click ticker", "select that ticker"),
             ("click toggle", "switch graph period"),
             (":stock <sym|name>", "look up a ticker and pin it"),
@@ -1108,7 +1438,7 @@ impl Widget for StocksWidget {
         serde_json::json!({
             "indices": self.config.indices,
             "watchlist": self.config.watchlist,
-            "poll_interval_secs": self.poll_interval.as_secs(),
+            "poll_interval_secs": self.config.poll_interval_secs,
             "display_mode": display_mode_label(self.display_mode),
         })
     }
@@ -1126,6 +1456,16 @@ impl Widget for StocksWidget {
     fn set_app_theme(&mut self, theme: Arc<Theme>) {
         self.theme = theme.with_overrides(&self.config.colors);
         self.app_theme = theme;
+    }
+
+    fn poll_snapshot(&self) -> Option<crate::polling::PollSnapshot> {
+        Some(
+            self.state
+                .lock()
+                .expect("stocks state poisoned")
+                .poll
+                .snapshot(),
+        )
     }
 
     fn shortcut_preferences(&self) -> &[char] {
@@ -1180,9 +1520,8 @@ fn is_tickerish(s: &str) -> bool {
     if !(1..=8).contains(&len) {
         return false;
     }
-    s.chars().all(|c| {
-        c.is_ascii_uppercase() || c.is_ascii_digit() || matches!(c, '^' | '.' | '-' | '=')
-    })
+    s.chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || matches!(c, '^' | '.' | '-' | '='))
 }
 
 fn render_graph_panel(
@@ -1221,11 +1560,8 @@ fn render_graph_panel(
             Some(s) => format!("Loading {s}…"),
             None => "Select a ticker".to_string(),
         };
-        let para = Paragraph::new(Line::from(Span::styled(
-            msg,
-            theme.text_dim,
-        )))
-        .alignment(Alignment::Center);
+        let para = Paragraph::new(Line::from(Span::styled(msg, theme.text_dim)))
+            .alignment(Alignment::Center);
         let centered = Rect {
             x: area.x,
             y: area.y + area.height / 2,
@@ -1326,13 +1662,7 @@ fn render_graph_panel(
             height: 1,
         };
         let label = format!("{:>6.2} ", v);
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                label,
-                theme.text_dim,
-            )),
-            rect,
-        );
+        frame.render_widget(Paragraph::new(Span::styled(label, theme.text_dim)), rect);
     }
 
     // For 1D in "trading-day progress" mode, render the trace at a
@@ -1350,7 +1680,11 @@ fn render_graph_panel(
     } else if matches!(period, Period::YearToDate) {
         let now = chrono::Local::now();
         let day_of_year = now.ordinal() as f64; // 1..=366
-        let days_in_year = if is_leap_year(now.year()) { 366.0 } else { 365.0 };
+        let days_in_year = if is_leap_year(now.year()) {
+            366.0
+        } else {
+            365.0
+        };
         let frac = (day_of_year / days_in_year).clamp(0.0, 1.0);
         let w = (plot_w as f64 * frac).round() as u16;
         w.clamp(2, plot_w)
@@ -1436,9 +1770,7 @@ fn render_graph_panel(
         Period::Week => str_labels(&["Mon", "Tue", "Wed", "Thu", "Fri"]),
         Period::Month => str_labels(&["wk1", "wk2", "wk3", "wk4"]),
         Period::SixMonth => str_labels(&["1mo", "2mo", "3mo", "4mo", "5mo", "6mo"]),
-        Period::YearToDate => {
-            str_labels(&["Jan", "Mar", "May", "Jul", "Sep", "Nov", "Dec"])
-        }
+        Period::YearToDate => str_labels(&["Jan", "Mar", "May", "Jul", "Sep", "Nov", "Dec"]),
         Period::Year => rolling_year_month_labels(chrono::Local::now().date_naive()),
         Period::ThreeYear => str_labels(&["-3y", "-2y", "-1y", "now"]),
         Period::FiveYear => str_labels(&["-5y", "-4y", "-3y", "-2y", "-1y", "now"]),
@@ -1449,10 +1781,7 @@ fn render_graph_panel(
     // and the last one's right edge anchors at the plot's right edge.
     let line = lay_out_x_axis_labels(&label_refs, plot_w as usize);
     frame.render_widget(
-        Paragraph::new(Span::styled(
-            line,
-            theme.text_dim,
-        )),
+        Paragraph::new(Span::styled(line, theme.text_dim)),
         xaxis_rect,
     );
 }
@@ -1802,8 +2131,7 @@ fn render_list_panel(
         if let Some(line) = cushion_line {
             frame.render_widget(Paragraph::new(line), cushion_rect);
         } else if hidden_below >= 2 {
-            let arrow = Line::from(Span::styled("↓", theme.text_dim))
-                .alignment(Alignment::Center);
+            let arrow = Line::from(Span::styled("↓", theme.text_dim)).alignment(Alignment::Center);
             frame.render_widget(Paragraph::new(arrow), cushion_rect);
         }
     }
@@ -1826,20 +2154,14 @@ fn build_list_lines<'a>(
     let mut lines: Vec<Line<'a>> = Vec::with_capacity(symbols.len() + 4);
     let mut ticker_lines: Vec<usize> = Vec::with_capacity(symbols.len());
     if indices_count > 0 {
-        lines.push(Line::from(Span::styled(
-            "── Indices ──",
-            theme.text_dim,
-        )));
+        lines.push(Line::from(Span::styled("── Indices ──", theme.text_dim)));
     }
     let mut watchlist_header_emitted = indices_count == 0;
     let mut lookup_header_emitted = false;
     for (i, sym) in symbols.iter().enumerate() {
         if !watchlist_header_emitted && i == indices_count {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "── Watchlist ──",
-                theme.text_dim,
-            )));
+            lines.push(Line::from(Span::styled("── Watchlist ──", theme.text_dim)));
             watchlist_header_emitted = true;
         }
         if let Some(start) = lookup_start {
@@ -1854,7 +2176,13 @@ fn build_list_lines<'a>(
         }
         ticker_lines.push(lines.len());
         let is_selected = i == selected;
-        lines.push(format_list_row(sym, quotes.get(sym), is_selected, mode, period));
+        lines.push(format_list_row(
+            sym,
+            quotes.get(sym),
+            is_selected,
+            mode,
+            period,
+        ));
     }
     (lines, ticker_lines)
 }
@@ -1869,7 +2197,11 @@ fn format_list_row<'a>(
     let (price_str, change_str, color) = match state {
         Some(QuoteState::Ready(q)) => {
             let (chg_abs, chg_pct) = period_change(q, period);
-            let color = if chg_abs >= 0.0 { Color::Green } else { Color::Red };
+            let color = if chg_abs >= 0.0 {
+                Color::Green
+            } else {
+                Color::Red
+            };
             let glyph = if chg_abs >= 0.0 { '▲' } else { '▼' };
             let price_str = format!("{:>10.2}", q.price);
             let change_str = match mode {
@@ -1910,21 +2242,25 @@ fn render_stats_panel(
     let q = match selected.and_then(|s| quotes.get(s)) {
         Some(QuoteState::Ready(q)) => q.as_ref(),
         _ => {
-            let para = Paragraph::new(Span::styled(
-                "(no stats)",
-                theme.text_dim,
-            ))
-            .alignment(Alignment::Center);
+            let para = Paragraph::new(Span::styled("(no stats)", theme.text_dim))
+                .alignment(Alignment::Center);
             frame.render_widget(para, area);
             return;
         }
     };
 
     let mut lines: Vec<Line<'_>> = Vec::new();
-    lines.push(Line::from(Span::styled(q.short_name.clone(), theme.text_focused)));
+    lines.push(Line::from(Span::styled(
+        q.short_name.clone(),
+        theme.text_focused,
+    )));
     lines.push(Line::from(""));
     lines.push(stat_line("Price", &format!("{:.2}", q.price), theme));
-    lines.push(stat_line("Prev Close", &format!("{:.2}", q.previous_close), theme));
+    lines.push(stat_line(
+        "Prev Close",
+        &format!("{:.2}", q.previous_close),
+        theme,
+    ));
     if let (Some(h), Some(l)) = (q.day_high, q.day_low) {
         lines.push(stat_line("Day H/L", &format!("{h:.2} / {l:.2}"), theme));
     }
@@ -2085,19 +2421,28 @@ fn is_market_holiday(date: NaiveDate) -> bool {
     }
 
     // Floating holidays — fixed weekday rules, no observation shift.
-    if m == 1 && date == nth_weekday(y, 1, Weekday::Mon, 3).unwrap_or(date.succ_opt().unwrap_or(date)) {
+    if m == 1
+        && date == nth_weekday(y, 1, Weekday::Mon, 3).unwrap_or(date.succ_opt().unwrap_or(date))
+    {
         return true; // MLK Day (3rd Mon of Jan)
     }
-    if m == 2 && date == nth_weekday(y, 2, Weekday::Mon, 3).unwrap_or(date.succ_opt().unwrap_or(date)) {
+    if m == 2
+        && date == nth_weekday(y, 2, Weekday::Mon, 3).unwrap_or(date.succ_opt().unwrap_or(date))
+    {
         return true; // Presidents Day (3rd Mon of Feb)
     }
-    if m == 5 && date == last_weekday(y, 5, Weekday::Mon).unwrap_or(date.succ_opt().unwrap_or(date)) {
+    if m == 5 && date == last_weekday(y, 5, Weekday::Mon).unwrap_or(date.succ_opt().unwrap_or(date))
+    {
         return true; // Memorial Day (last Mon of May)
     }
-    if m == 9 && date == nth_weekday(y, 9, Weekday::Mon, 1).unwrap_or(date.succ_opt().unwrap_or(date)) {
+    if m == 9
+        && date == nth_weekday(y, 9, Weekday::Mon, 1).unwrap_or(date.succ_opt().unwrap_or(date))
+    {
         return true; // Labor Day (1st Mon of Sep)
     }
-    if m == 11 && date == nth_weekday(y, 11, Weekday::Thu, 4).unwrap_or(date.succ_opt().unwrap_or(date)) {
+    if m == 11
+        && date == nth_weekday(y, 11, Weekday::Thu, 4).unwrap_or(date.succ_opt().unwrap_or(date))
+    {
         return true; // Thanksgiving (4th Thu of Nov)
     }
     if let Some(gf) = good_friday(y) {
@@ -2276,12 +2621,27 @@ pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
                        for non-US markets (e.g. SHOP.TO for Toronto).",
                 required: false,
                 kind: WizardFieldKind::TextList {
+                    // Keep this in sync with [`default_watchlist`]: MAG7 +
+                    // NFLX + a handful of blue chips. The wizard's defaults
+                    // double as the on-disk defaults when the user accepts
+                    // the form without editing.
                     default: vec![
+                        // MAG7
                         "AAPL".into(),
                         "MSFT".into(),
-                        "NVDA".into(),
                         "GOOGL".into(),
                         "AMZN".into(),
+                        "META".into(),
+                        "NVDA".into(),
+                        "TSLA".into(),
+                        // FAANG round-out
+                        "NFLX".into(),
+                        // Blue chips
+                        "BRK-B".into(),
+                        "JPM".into(),
+                        "JNJ".into(),
+                        "V".into(),
+                        "WMT".into(),
                     ],
                     separator: Separator::Comma,
                 },
@@ -2573,18 +2933,22 @@ mod tests {
             m.insert("AAPL".to_string(), QuoteState::Ready(Box::new(q)));
             m
         };
-        let line_sel = format_list_row("AAPL", qs.get("AAPL"), true, DisplayMode::Percent, Period::Day);
-        let line_un = format_list_row("AAPL", qs.get("AAPL"), false, DisplayMode::Percent, Period::Day);
-        let sel_text: String = line_sel
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        let un_text: String = line_un
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
+        let line_sel = format_list_row(
+            "AAPL",
+            qs.get("AAPL"),
+            true,
+            DisplayMode::Percent,
+            Period::Day,
+        );
+        let line_un = format_list_row(
+            "AAPL",
+            qs.get("AAPL"),
+            false,
+            DisplayMode::Percent,
+            Period::Day,
+        );
+        let sel_text: String = line_sel.spans.iter().map(|s| s.content.as_ref()).collect();
+        let un_text: String = line_un.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(sel_text.contains("▸"));
         assert!(!un_text.contains("▸"));
     }
@@ -2731,10 +3095,7 @@ mod tests {
     #[test]
     fn nth_weekday_matches_known_dates() {
         // 3rd Mon of Jan 2026 = Jan 19.
-        assert_eq!(
-            nth_weekday(2026, 1, Weekday::Mon, 3),
-            Some(d(2026, 1, 19))
-        );
+        assert_eq!(nth_weekday(2026, 1, Weekday::Mon, 3), Some(d(2026, 1, 19)));
         // 4th Thu of Nov 2026 = Nov 26.
         assert_eq!(
             nth_weekday(2026, 11, Weekday::Thu, 4),
@@ -2794,7 +3155,10 @@ mod tests {
         // 2mo = Mar 2026, 0mo = May 2026.
         let today = NaiveDate::from_ymd_opt(2026, 5, 23).unwrap();
         let labels = rolling_year_month_labels(today);
-        assert_eq!(labels, vec!["May", "Jul", "Sep", "Nov", "Jan", "Mar", "May"]);
+        assert_eq!(
+            labels,
+            vec!["May", "Jul", "Sep", "Nov", "Jan", "Mar", "May"]
+        );
     }
 
     #[test]
@@ -2803,6 +3167,9 @@ mod tests {
         // …, 0mo = Jan 2026. Walks through Mar/May/Jul/Sep/Nov.
         let today = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
         let labels = rolling_year_month_labels(today);
-        assert_eq!(labels, vec!["Jan", "Mar", "May", "Jul", "Sep", "Nov", "Jan"]);
+        assert_eq!(
+            labels,
+            vec!["Jan", "Mar", "May", "Jul", "Sep", "Nov", "Jan"]
+        );
     }
 }

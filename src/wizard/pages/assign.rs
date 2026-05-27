@@ -55,41 +55,28 @@ pub fn handle_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
     let on_next_button = app.focus == cell_count;
 
     match key.code {
-        KeyCode::Tab => {
-            app.focus = (app.focus + 1) % focus_total;
-            app.lookup_offset = current_value_index(app);
-            PageAction::Stay
-        }
-        KeyCode::BackTab => {
-            app.focus = (app.focus + focus_total - 1) % focus_total;
-            app.lookup_offset = current_value_index(app);
-            PageAction::Stay
-        }
         KeyCode::Esc => PageAction::Back,
         _ if on_next_button => {
-            // Button-focus key handling: Up returns to last cell, Down
-            // wraps to first, Enter advances (subject to gate).
+            // Button-focus key handling: Up returns to last cell, Tab
+            // wraps to first, BackTab to last cell, Enter/Space advance
+            // (subject to gate).
             match key.code {
-                KeyCode::Up => {
+                KeyCode::Up | KeyCode::BackTab => {
                     app.focus = cell_count.saturating_sub(1);
                     app.lookup_offset = current_value_index(app);
                     PageAction::Stay
                 }
-                KeyCode::Down => {
+                KeyCode::Down | KeyCode::Tab => {
                     app.focus = 0;
                     app.lookup_offset = current_value_index(app);
                     PageAction::Stay
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    if app
-                        .state
-                        .assignments
-                        .iter()
-                        .all(|a| a.kind.is_empty())
+                    if !any_cell_assigned(&app.state.assignments)
                         && matches!(app.state.layout, LayoutChoice::Preset { .. })
                     {
                         app.feedback = Some(
-                            "Assign at least one widget before continuing (Space picks; Tab/↑ returns to the cell list).".into(),
+                            "Assign at least one widget before continuing (Tab/Space/Enter picks the highlighted option).".into(),
                         );
                         return PageAction::Stay;
                     }
@@ -97,6 +84,26 @@ pub fn handle_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
                 }
                 _ => PageAction::Stay,
             }
+        }
+        // Tab / Shift-Tab cycle between cells AND commit the focused
+        // cell's highlighted option in the process. Without auto-commit
+        // here, a user who navigated to "email" with ↑/↓ and pressed
+        // Tab would leave the cell uncommitted — and the validation
+        // gate below would then refuse to advance even though the user
+        // believed they'd picked widgets. Stack is the documented
+        // exception: highlighting Stack and Tabbing past it must NOT
+        // change the cell, because a real stack needs the breakout.
+        KeyCode::Tab => {
+            commit_highlighted_unless_stack(app, &options);
+            app.focus = (app.focus + 1) % focus_total;
+            app.lookup_offset = current_value_index(app);
+            PageAction::Stay
+        }
+        KeyCode::BackTab => {
+            commit_highlighted_unless_stack(app, &options);
+            app.focus = (app.focus + focus_total - 1) % focus_total;
+            app.lookup_offset = current_value_index(app);
+            PageAction::Stay
         }
         KeyCode::Up | KeyCode::Char('k') => {
             app.lookup_offset = app.lookup_offset.saturating_sub(1);
@@ -106,30 +113,55 @@ pub fn handle_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
             app.lookup_offset = (app.lookup_offset + 1).min(options.len() - 1);
             PageAction::Stay
         }
+        // Space is the "pick this option" key, with one special role
+        // for Stack: it opens the breakout to pick (or re-pick) the
+        // stack's children. For everything else it commits the
+        // highlighted option and advances to the next cell.
         KeyCode::Char(' ') => {
-            // "Stack" doesn't commit a kind; it opens the AssignStack
-            // sub-page so the user can pick 2-3 widgets for the cell.
             if highlighted_value(&options, app) == Some(STACK_VALUE) {
                 return PageAction::OpenAssignStack(app.focus);
             }
             commit_focused(app, &options);
+            app.focus = (app.focus + 1) % focus_total;
+            app.lookup_offset = current_value_index(app);
             PageAction::Stay
         }
+        // Enter commits + advances like Space, but never opens the
+        // stack breakout — Tab/Enter on the Stack option keep the
+        // cell's existing children (if any) and move on, so a
+        // re-visiting user isn't dropped back into the stack picker
+        // every time they walk past the row.
         KeyCode::Enter => {
-            if highlighted_value(&options, app) == Some(STACK_VALUE) {
-                return PageAction::OpenAssignStack(app.focus);
-            }
-            // Enter inside a cell row commits the highlighted widget
-            // kind (so the user's cursor work isn't dropped) and moves
-            // focus forward. Page advance lives on the trailing
-            // [ Save & Next ] button.
-            commit_focused(app, &options);
+            commit_highlighted_unless_stack(app, &options);
             app.focus = (app.focus + 1) % focus_total;
             app.lookup_offset = current_value_index(app);
             PageAction::Stay
         }
         _ => PageAction::Stay,
     }
+}
+
+/// `true` when at least one cell has been assigned a real widget OR a
+/// stack. Stack cells store children in `stack_children` and leave the
+/// scalar `kind` empty, so a naive `all(|a| a.kind.is_empty())` check
+/// would falsely report a stack-only setup as "nothing assigned" and
+/// block the [Save & Next] gate.
+fn any_cell_assigned(assignments: &[crate::wizard::state::CellAssignment]) -> bool {
+    assignments
+        .iter()
+        .any(|a| !a.kind.is_empty() || a.is_stack())
+}
+
+/// Commit the focused cell's highlighted option, with one exception:
+/// the Stack sentinel never commits here. Stack edits go through the
+/// breakout (opened by Space) — Tab/Enter past the Stack row should
+/// leave the cell's current state (single widget or existing stack)
+/// untouched.
+fn commit_highlighted_unless_stack(app: &mut WizardApp, options: &[(&'static str, &'static str)]) {
+    if highlighted_value(options, app) == Some(STACK_VALUE) {
+        return;
+    }
+    commit_focused(app, options);
 }
 
 fn commit_focused(app: &mut WizardApp, options: &[(&'static str, &'static str)]) {
@@ -161,6 +193,16 @@ fn current_value_index(app: &WizardApp) -> usize {
     let Some(cell) = app.state.assignments.get(app.focus) else {
         return 0;
     };
+    // Stack cells have an empty `kind` (children live in
+    // `stack_children`); without this check `position` would fall
+    // through to EMPTY_VALUE and the picker would highlight
+    // "(empty — skip this cell)" for a cell that's actually a stack.
+    if cell.is_stack() {
+        return options
+            .iter()
+            .position(|(v, _)| *v == STACK_VALUE)
+            .unwrap_or(0);
+    }
     options
         .iter()
         .position(|(v, _)| *v == cell.kind.as_str())
@@ -188,7 +230,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Assign widgets to cells ");
-    let inner = block.inner(area);
+    let inner = style::pad_inner(block.inner(area));
     frame.render_widget(block, area);
 
     // Three-column split: form on the left, a 2-cell gap, preview on the
@@ -284,7 +326,15 @@ fn render_cell_list(frame: &mut Frame, area: Rect, app: &WizardApp) {
             // ▶ cursor inside the list moves on Up/Down; Space picks.
             let highlight = app.lookup_offset.min(options.len() - 1);
             for (j, (value, label)) in options.iter().enumerate() {
-                let is_active = *value == cell.kind.as_str();
+                // Three exclusive cases for `is_active` (the `(•)`
+                // marker): a real stack lights up Stack; an empty
+                // `kind` lights up "(empty)"; otherwise the
+                // single-widget kind matches.
+                let is_active = match *value {
+                    STACK_VALUE => cell.is_stack(),
+                    EMPTY_VALUE => !cell.is_stack() && cell.kind.is_empty(),
+                    kind => !cell.is_stack() && kind == cell.kind.as_str(),
+                };
                 let is_highlighted = j == highlight;
                 let marker = if is_active { "(•)" } else { "( )" };
                 let marker_style = if is_active {
@@ -297,11 +347,26 @@ fn render_cell_list(frame: &mut Frame, area: Rect, app: &WizardApp) {
                 } else {
                     style::option_idle()
                 };
+                // When the focused cell already has a stack assigned,
+                // inline its children in the Stack-option label so
+                // the user can see what's there without leaving the
+                // row, and remind them Space re-opens the picker.
+                let display_label: String = if *value == STACK_VALUE && cell.is_stack() {
+                    let children = cell
+                        .stack_children
+                        .iter()
+                        .map(|c| c.widget_id())
+                        .collect::<Vec<_>>()
+                        .join(" + ");
+                    format!("Stack ({children}) — Space to re-pick")
+                } else {
+                    (*label).to_string()
+                };
                 lines.push(Line::from(vec![
                     Span::raw("      "),
                     Span::styled(marker.to_string(), marker_style),
                     Span::raw(" "),
-                    Span::styled(label.to_string(), row_style),
+                    Span::styled(display_label, row_style),
                 ]));
             }
             lines.push(Line::from(""));
@@ -322,7 +387,8 @@ fn render_cell_list(frame: &mut Frame, area: Rect, app: &WizardApp) {
         ]));
         if on_button {
             lines.push(Line::from(Span::styled(
-                "    Enter advances to the per-widget pages (Tab/↑ to return to the cell list).".to_string(),
+                "    Enter advances to the per-widget pages (Tab/↑ to return to the cell list)."
+                    .to_string(),
                 style::help_text(),
             )));
         }
@@ -340,4 +406,185 @@ fn render_help(frame: &mut Frame, area: Rect) {
     ])
     .wrap(Wrap { trim: true });
     frame.render_widget(para, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wizard::state::{CellAssignment, StackChild, WizardState};
+
+    fn position_of(value: &str) -> usize {
+        options()
+            .iter()
+            .position(|(v, _)| *v == value)
+            .expect("option missing")
+    }
+
+    #[test]
+    fn current_value_index_returns_stack_for_stack_cells() {
+        // Regression: stack cells store children in `stack_children`
+        // and leave `kind` empty, so a naive `position(kind)` match
+        // would land on EMPTY_VALUE and the picker would show
+        // "(empty — skip this cell)" highlighted for a configured
+        // stack. The is_stack() short-circuit fixes it.
+        let mut state = WizardState::default();
+        state.assignments.push(CellAssignment {
+            cell_index: 0,
+            kind: String::new(),
+            instance: "main".into(),
+            stack_children: vec![
+                StackChild {
+                    kind: "clock".into(),
+                    instance: "main".into(),
+                },
+                StackChild {
+                    kind: "weather".into(),
+                    instance: "main".into(),
+                },
+            ],
+        });
+        let mut app = WizardApp::new(state);
+        app.focus = 0;
+        assert_eq!(current_value_index(&app), position_of(STACK_VALUE));
+    }
+
+    #[test]
+    fn current_value_index_returns_kind_for_single_widget_cells() {
+        let mut state = WizardState::default();
+        state.assignments.push(CellAssignment {
+            cell_index: 0,
+            kind: "stocks".into(),
+            instance: "main".into(),
+            stack_children: Vec::new(),
+        });
+        let mut app = WizardApp::new(state);
+        app.focus = 0;
+        assert_eq!(current_value_index(&app), position_of("stocks"));
+    }
+
+    fn empty_cells(n: usize) -> Vec<CellAssignment> {
+        (0..n)
+            .map(|i| CellAssignment {
+                cell_index: i,
+                kind: String::new(),
+                instance: "main".into(),
+                stack_children: Vec::new(),
+            })
+            .collect()
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    fn tab_app_with_options(highlight_value: &'static str) -> WizardApp {
+        let mut state = WizardState::default();
+        state.assignments = empty_cells(3);
+        let mut app = WizardApp::new(state);
+        app.focus = 0;
+        // Position the cursor on the requested option without touching
+        // commit semantics — mirrors what ↑/↓ navigation would do.
+        app.lookup_offset = position_of(highlight_value);
+        app
+    }
+
+    #[test]
+    fn tab_commits_highlighted_non_stack_option_and_advances() {
+        // Regression for "I picked email, news, calendar but the wizard
+        // sent me straight to Confirm." Without an auto-commit on Tab,
+        // a user who highlighted "email" with ↑/↓ and Tab'd to the
+        // next cell would leave the cell uncommitted.
+        let _ = crate::widgets::registry::WIDGETS;
+        let mut app = tab_app_with_options("calendar");
+        let r = handle_key(press(KeyCode::Tab), &mut app);
+        assert_eq!(r, PageAction::Stay);
+        assert_eq!(app.focus, 1, "Tab should advance to the next cell");
+        assert_eq!(
+            app.state.assignments[0].kind, "calendar",
+            "Tab should commit the highlighted non-stack option"
+        );
+    }
+
+    #[test]
+    fn tab_on_stack_option_does_not_commit_but_advances() {
+        // Stack edits go through the breakout (opened by Space). Tab on
+        // a Stack row must NOT clobber the cell's existing state — a
+        // user re-visiting a configured stack cell should be able to
+        // Tab past without losing the stack.
+        let mut state = WizardState::default();
+        state.assignments = empty_cells(2);
+        state.assignments[0].kind = "stocks".into();
+        let mut app = WizardApp::new(state);
+        app.focus = 0;
+        app.lookup_offset = position_of(STACK_VALUE);
+        let r = handle_key(press(KeyCode::Tab), &mut app);
+        assert_eq!(r, PageAction::Stay);
+        assert_eq!(app.focus, 1, "Tab should still advance focus");
+        assert_eq!(
+            app.state.assignments[0].kind, "stocks",
+            "highlighting Stack and tabbing past must not clobber the cell"
+        );
+    }
+
+    #[test]
+    fn enter_on_stack_option_advances_without_opening_breakout() {
+        // Same rule as Tab for Enter — Space is the dedicated key for
+        // opening the stack-config breakout. Returning Advance/Stay
+        // (not OpenAssignStack) keeps Enter as a "next cell" key.
+        let mut state = WizardState::default();
+        state.assignments = empty_cells(2);
+        let mut app = WizardApp::new(state);
+        app.focus = 0;
+        app.lookup_offset = position_of(STACK_VALUE);
+        let r = handle_key(press(KeyCode::Enter), &mut app);
+        assert_eq!(r, PageAction::Stay);
+        assert_eq!(app.focus, 1);
+    }
+
+    #[test]
+    fn space_on_stack_option_opens_stack_breakout() {
+        // The one key that DOES open the stack-config sub-page. Mirrors
+        // the assign-page comment: Space is the dedicated stack key.
+        let mut state = WizardState::default();
+        state.assignments = empty_cells(2);
+        let mut app = WizardApp::new(state);
+        app.focus = 0;
+        app.lookup_offset = position_of(STACK_VALUE);
+        let r = handle_key(press(KeyCode::Char(' ')), &mut app);
+        assert_eq!(r, PageAction::OpenAssignStack(0));
+    }
+
+    #[test]
+    fn any_cell_assigned_counts_stack_cells() {
+        // Stack-only setups have all-empty `kind` strings but a
+        // populated `stack_children`. Validation must treat that as
+        // "yes, the user assigned something" so Save & Next isn't
+        // wrongly blocked.
+        let mut assignments = empty_cells(2);
+        assignments[0].stack_children = vec![
+            StackChild {
+                kind: "clock".into(),
+                instance: "main".into(),
+            },
+            StackChild {
+                kind: "weather".into(),
+                instance: "main".into(),
+            },
+        ];
+        assert!(any_cell_assigned(&assignments));
+    }
+
+    #[test]
+    fn current_value_index_returns_empty_for_unassigned_cells() {
+        let mut state = WizardState::default();
+        state.assignments.push(CellAssignment {
+            cell_index: 0,
+            kind: String::new(),
+            instance: "main".into(),
+            stack_children: Vec::new(),
+        });
+        let mut app = WizardApp::new(state);
+        app.focus = 0;
+        assert_eq!(current_value_index(&app), position_of(EMPTY_VALUE));
+    }
 }
