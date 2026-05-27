@@ -586,19 +586,28 @@ impl NewsWidget {
             );
             return;
         }
+        // `selected` is an index into the *filtered* view the user
+        // is seeing on screen (per `active_filter_idx`) — not the
+        // full article list. Reading `st.articles[selected]` here
+        // looked up the wrong article on every non-All tab, so `s`
+        // toggled summary_view and fired a body fetch against a URL
+        // that wasn't even visible. Nothing changed in the rendered
+        // row, so the keystroke looked like a no-op. `open_selected`
+        // already routes through `filtered_articles()`; mirror it.
+        let filtered = self.filtered_articles();
         let (article_url, will_show_summary) = {
             let mut st = self.state.lock().expect("news state poisoned");
-            if st.articles.is_empty() {
-                tracing::debug!("news `s` ignored: no articles loaded yet");
+            if filtered.is_empty() {
+                tracing::debug!("news `s` ignored: no articles in current filter");
                 return;
             }
-            let url = match st.articles.get(st.selected) {
+            let url = match filtered.get(st.selected) {
                 Some(a) => a.url.clone(),
                 None => {
                     tracing::debug!(
                         selected = st.selected,
-                        len = st.articles.len(),
-                        "news `s` ignored: selected index out of range"
+                        len = filtered.len(),
+                        "news `s` ignored: selected index out of range for filter"
                     );
                     return;
                 }
@@ -1515,6 +1524,25 @@ fn spawn_summary_llm_task(
     url: String,
     content: String,
 ) {
+    // Short-circuit when we'd be summarizing nothing. The body-fetch
+    // chain lands here with `content = rss_excerpt` after a body
+    // extraction failure; for sources that ship no `<description>` in
+    // RSS (Yahoo Finance) the excerpt is empty too, and the model
+    // would just reply "Insufficient content to summarize." Spending a
+    // round-trip on that produces a "Summarizing…" flicker followed
+    // by a Failed state that the render path treats indistinguishably
+    // from "never tried." Mark Failed up-front so the render branch
+    // can show a distinct "couldn't extract" message instead.
+    if content.trim().is_empty() {
+        tracing::info!(
+            url = %url,
+            title = %title,
+            "news summary: no body or excerpt available — marking Failed without LLM call"
+        );
+        let mut st = state.lock().expect("news state poisoned");
+        st.summaries.insert(url, SummaryState::Failed);
+        return;
+    }
     // Idempotency: if we've already produced (or are producing, or
     // recently failed) a summary for this URL, don't fire again.
     {
@@ -1884,8 +1912,25 @@ fn expanded_summary_lines(
             *st.summary_view.get(&article.url).unwrap_or(&false),
         )
     };
-    let raw = article.summary.as_deref().unwrap_or("");
-    let raw_lines = || wrap_text(raw, max_width, MAX_SUMMARY_LINES);
+    let raw = article.summary.as_deref().unwrap_or("").trim();
+    // Render the body view. When the RSS feed didn't ship a
+    // `<description>` (Yahoo Finance, some Atom feeds), the wrapped
+    // excerpt is empty and the expansion would otherwise collapse to
+    // zero rows — pressing `e` looks broken. Surface a placeholder
+    // line so the user sees the toggle took effect, and point at the
+    // `s` action when an LLM is configured so they have a path
+    // forward.
+    let raw_lines = || -> Vec<String> {
+        if raw.is_empty() {
+            if llm_enabled {
+                vec!["(no excerpt — press s for an AI summary)".to_string()]
+            } else {
+                vec!["(no excerpt available — press Enter to open in browser)".to_string()]
+            }
+        } else {
+            wrap_text(raw, max_width, MAX_SUMMARY_LINES)
+        }
+    };
 
     // Default view (`e` only, or `s` after toggling back to body): raw
     // excerpt. The user has to opt in to the LLM summary.
@@ -1904,7 +1949,19 @@ fn expanded_summary_lines(
             }
             return out;
         }
-        Some(SummaryState::Failed) => return raw_lines(),
+        Some(SummaryState::Failed) => {
+            // Distinct from the "never tried" placeholder when there's
+            // no raw excerpt to fall back to — otherwise the user
+            // can't tell that `s` even ran. With a real excerpt the
+            // fallback is good content; show it as-is.
+            if raw.is_empty() {
+                return vec![
+                    "(Couldn't extract article body — press Enter to open in browser)"
+                        .to_string(),
+                ];
+            }
+            return raw_lines();
+        }
         None => {}
     }
     // No summary state yet — either the body fetch is still in flight
@@ -2595,6 +2652,78 @@ mod tests {
         assert_eq!(out, "Para one.\n\nPara two.\n\nPara three.");
     }
 
+    /// `s` on a non-All filter tab used to read `st.articles[selected]`,
+    /// but `selected` indexes into the *filtered* view — so the URL we
+    /// pinned, the body we fetched, and the summary we requested were
+    /// all for some other article (the Nth in the full list). The
+    /// visible row never updated and `s` looked dead. Verify that
+    /// after `s` fires on the Tech tab, `summary_view` carries the
+    /// URL of the *visible filtered* article, not the underlying
+    /// full-list article at the same index.
+    #[tokio::test]
+    async fn toggle_summary_uses_filtered_article_not_full_list_index() {
+        use std::sync::atomic::AtomicUsize;
+
+        // Fake LLM — must exist for `toggle_summary_view` to proceed
+        // past the `self.llm.is_none()` bail. It won't actually be
+        // called in this test because we only check sync state.
+        struct UnusedLlm {
+            _calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl LlmProvider for UnusedLlm {
+            async fn complete(
+                &self,
+                _request: LlmRequest,
+            ) -> Result<crate::llm::LlmResponse> {
+                unreachable!("LLM should not be called during this test")
+            }
+        }
+        let cfg = NewsConfig {
+            topics: vec![provider::Topic {
+                label: "Tech".into(),
+                keywords: vec!["AI".into()],
+            }],
+            ..NewsConfig::default()
+        };
+        let llm: Arc<dyn LlmProvider> = Arc::new(UnusedLlm {
+            _calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut w = NewsWidget::with_config_and_llm(
+            "main".into(),
+            cfg,
+            Some(llm),
+            Arc::new(Theme::builtin_defaults()),
+            ScopedCache::ephemeral(),
+        );
+        {
+            let mut st = w.state.lock().unwrap();
+            st.articles = vec![
+                tagged_article("https://full-0", "Non-tech 0", &[]),
+                tagged_article("https://full-1-tech", "Tech 1", &["Tech"]),
+                tagged_article("https://full-2", "Non-tech 2", &[]),
+                tagged_article("https://full-3-tech", "Tech 3", &["Tech"]),
+                tagged_article("https://full-4", "Non-tech 4", &[]),
+            ];
+            // Tech tab → filtered list is [full-1-tech, full-3-tech].
+            // selected = 0 → filtered first item = full-1-tech.
+            // The OLD bug would read st.articles[0] = full-0 (non-tech).
+            st.active_filter_idx = 1;
+            st.selected = 0;
+        }
+        w.toggle_summary_view();
+        let st = w.state.lock().unwrap();
+        assert!(
+            st.summary_view.contains_key("https://full-1-tech"),
+            "summary_view should be keyed by the filtered article's URL, got: {:?}",
+            st.summary_view.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !st.summary_view.contains_key("https://full-0"),
+            "must NOT mutate the underlying full-list article at the same index"
+        );
+    }
+
     #[test]
     fn move_selection_respects_active_filter_bounds() {
         let cfg = NewsConfig {
@@ -2708,6 +2837,187 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(out[0].ends_with('…'));
         assert!(out[0].chars().count() <= 10);
+    }
+
+    /// Yahoo Finance + some Atom feeds ship items without a
+    /// `<description>` element, so `article.summary` is `None`. Without
+    /// a placeholder, `wrap_text("", …)` returns an empty Vec and the
+    /// expanded row count drops to zero — pressing `e` looks broken.
+    /// Surface the `s` hint when an LLM is configured so the user has
+    /// a path to actual content.
+    #[test]
+    fn expanded_summary_lines_shows_llm_hint_when_excerpt_empty() {
+        let article = Article {
+            title: "no-desc".into(),
+            url: "https://example/no-desc".into(),
+            source: "TestFeed".into(),
+            published: Utc::now(),
+            summary: None,
+            topics: vec![],
+        };
+        let state = Arc::new(Mutex::new(NewsState::default()));
+        let lines = expanded_summary_lines(&article, &state, 80, true);
+        assert_eq!(lines.len(), 1, "must render exactly one placeholder line");
+        assert!(
+            lines[0].contains("press s"),
+            "should point at the `s` action: {lines:?}"
+        );
+    }
+
+    /// Same situation with no LLM configured: still show a placeholder,
+    /// but don't promise an AI summary that can't be delivered. Redirect
+    /// to Enter (browser open) as the only meaningful action.
+    #[test]
+    fn expanded_summary_lines_shows_browser_hint_when_no_llm() {
+        let article = Article {
+            title: "no-desc".into(),
+            url: "https://example/no-desc".into(),
+            source: "TestFeed".into(),
+            published: Utc::now(),
+            summary: Some("   \n  \t ".into()), // whitespace-only also counts as empty
+            topics: vec![],
+        };
+        let state = Arc::new(Mutex::new(NewsState::default()));
+        let lines = expanded_summary_lines(&article, &state, 80, false);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("Enter"),
+            "should point at the `Enter` action: {lines:?}"
+        );
+    }
+
+    /// After `s` runs the body fetch + LLM and both come up empty
+    /// (Yahoo Finance: no Readability/salvage match + no RSS excerpt),
+    /// `summary_state = Failed`. The render path used to fall back to
+    /// `raw_lines()`, which produced the SAME placeholder shown before
+    /// `s` was pressed — indistinguishable from "never tried." Now
+    /// the empty-raw + Failed combination renders a distinct
+    /// couldn't-extract message so the user knows the action ran.
+    #[test]
+    fn expanded_summary_lines_failed_with_empty_raw_shows_couldnt_extract() {
+        let article = Article {
+            title: "no-desc".into(),
+            url: "https://example/empty".into(),
+            source: "TestFeed".into(),
+            published: Utc::now(),
+            summary: None,
+            topics: vec![],
+        };
+        let state = Arc::new(Mutex::new(NewsState::default()));
+        {
+            let mut st = state.lock().unwrap();
+            st.summaries
+                .insert(article.url.clone(), SummaryState::Failed);
+            st.summary_view.insert(article.url.clone(), true);
+        }
+        let lines = expanded_summary_lines(&article, &state, 80, true);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("Couldn't extract"),
+            "should show couldn't-extract message: {lines:?}"
+        );
+    }
+
+    /// Articles with a real excerpt still surface that excerpt on
+    /// Failed — losing it would regress vs. the pre-LLM behavior.
+    #[test]
+    fn expanded_summary_lines_failed_with_real_raw_falls_back_to_excerpt() {
+        let article = Article {
+            title: "with-desc".into(),
+            url: "https://example/with-desc".into(),
+            source: "TestFeed".into(),
+            published: Utc::now(),
+            summary: Some("Real article excerpt content goes here.".into()),
+            topics: vec![],
+        };
+        let state = Arc::new(Mutex::new(NewsState::default()));
+        {
+            let mut st = state.lock().unwrap();
+            st.summaries
+                .insert(article.url.clone(), SummaryState::Failed);
+            st.summary_view.insert(article.url.clone(), true);
+        }
+        let lines = expanded_summary_lines(&article, &state, 80, true);
+        assert!(!lines.is_empty());
+        assert!(
+            lines[0].starts_with("Real"),
+            "should still show raw excerpt when present: {lines:?}"
+        );
+    }
+
+    /// Empty content must NOT hit the LLM. The body-fetch chain
+    /// passes the RSS excerpt as fallback after extraction failure;
+    /// when both are empty, spawning the LLM produces a visible
+    /// "Summarizing…" flicker and burns a request to get back
+    /// "Insufficient content to summarize." Short-circuit to Failed
+    /// instead — the render path picks up the distinct empty-Failed
+    /// rendering.
+    #[tokio::test]
+    async fn spawn_summary_llm_task_skips_llm_when_content_empty() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct PanickingLlm {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl LlmProvider for PanickingLlm {
+            async fn complete(
+                &self,
+                _request: LlmRequest,
+            ) -> Result<crate::llm::LlmResponse> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                panic!("LLM should not be called for empty content");
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmProvider> = Arc::new(PanickingLlm {
+            calls: calls.clone(),
+        });
+        let state = Arc::new(Mutex::new(NewsState::default()));
+        let cache = ScopedCache::ephemeral();
+        let url = "https://example/empty".to_string();
+        spawn_summary_llm_task(
+            llm,
+            state.clone(),
+            cache,
+            "title".into(),
+            url.clone(),
+            "   \n\t  ".into(), // whitespace-only also counts as empty
+        );
+        // Yield once so any (unexpected) tokio task gets a chance to run.
+        tokio::task::yield_now().await;
+        let st = state.lock().unwrap();
+        assert!(
+            matches!(st.summaries.get(&url), Some(SummaryState::Failed)),
+            "must mark Failed up-front, got: {:?}",
+            st.summaries.get(&url)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "LLM must not be called for empty content"
+        );
+    }
+
+    /// Articles with a real excerpt still render the wrapped text —
+    /// the empty-summary placeholder mustn't hijack the normal path.
+    #[test]
+    fn expanded_summary_lines_renders_excerpt_normally_when_present() {
+        let article = Article {
+            title: "with-desc".into(),
+            url: "https://example/with-desc".into(),
+            source: "TestFeed".into(),
+            published: Utc::now(),
+            summary: Some("This is a real article excerpt that should wrap.".into()),
+            topics: vec![],
+        };
+        let state = Arc::new(Mutex::new(NewsState::default()));
+        let lines = expanded_summary_lines(&article, &state, 80, true);
+        assert!(!lines.is_empty());
+        assert!(
+            lines[0].starts_with("This is"),
+            "should show the real excerpt, not a placeholder: {lines:?}"
+        );
     }
 
     #[test]

@@ -234,6 +234,11 @@ struct ForexState {
     /// render. handle_mouse uses these to route a click on `[1Y]` etc.
     /// straight into `set_period`.
     toggle_hits: ToggleHits,
+    /// Visual confirmation after a successful 📋 click / `y` press:
+    /// the row index that was copied + the timestamp. Render swaps the
+    /// 📋 icon on that row for ✅ for `COPY_FEEDBACK_TTL`, then
+    /// reverts. `None` means no pulse active.
+    copy_feedback: Option<(usize, Instant)>,
 }
 
 /// Screen-absolute click ranges for the period toggle bar (`[1D] [1W]
@@ -275,6 +280,11 @@ struct RowHits {
 
 // Cache key: per-period since the series shape varies. Same as Stocks.
 const CACHE_KEY_QUOTES_PREFIX: &str = "fx-quotes-";
+
+/// How long the 📋 → ✅ pulse lasts after a successful copy. Long
+/// enough to register as "yes, that worked," short enough to revert
+/// before the user wants to copy the next row.
+const COPY_FEEDBACK_TTL: Duration = Duration::from_millis(1000);
 
 fn quotes_cache_key(period: Period) -> String {
     format!("{CACHE_KEY_QUOTES_PREFIX}{}", period.label().to_ascii_lowercase())
@@ -862,8 +872,19 @@ impl ForexWidget {
             return;
         };
         let text = format!("{:.4}", v);
-        if let Err(err) = crate::clipboard::copy(&text) {
-            tracing::warn!(error = %err, "OSC 52 clipboard write failed");
+        match crate::clipboard::copy(&text) {
+            Ok(()) => {
+                // Stash the copied row's index + a fresh timestamp so
+                // render can swap that row's 📋 for ✅ until the TTL
+                // elapses. Read here (rather than from the caller) so
+                // both the `y` keystroke and the 📋 click paths land
+                // the pulse on the right row.
+                let mut st = self.state.lock().expect("forex state poisoned");
+                st.copy_feedback = Some((st.selected, Instant::now()));
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "OSC 52 clipboard write failed");
+            }
         }
     }
 
@@ -1015,9 +1036,13 @@ impl Widget for ForexWidget {
             } else {
                 (None, cols[2])
             };
-            let (sel, cur_scroll) = {
+            let (sel, cur_scroll, copy_pulse) = {
                 let st = self.state.lock().unwrap();
-                (st.selected, st.list_scroll)
+                let pulse = st
+                    .copy_feedback
+                    .filter(|(_, t)| t.elapsed() < COPY_FEEDBACK_TTL)
+                    .map(|(idx, _)| idx);
+                (st.selected, st.list_scroll, pulse)
             };
             let (new_scroll, hits) = render_list_panel(
                 frame,
@@ -1031,6 +1056,7 @@ impl Widget for ForexWidget {
                 editing.as_deref(),
                 &quotes,
                 sel,
+                copy_pulse,
                 self.transient_present(),
                 cur_scroll,
                 &self.theme,
@@ -1075,9 +1101,13 @@ impl Widget for ForexWidget {
                     Constraint::Fill(1),
                 ])
                 .split(body);
-            let (sel, cur_scroll) = {
+            let (sel, cur_scroll, copy_pulse) = {
                 let st = self.state.lock().unwrap();
-                (st.selected, st.list_scroll)
+                let pulse = st
+                    .copy_feedback
+                    .filter(|(_, t)| t.elapsed() < COPY_FEEDBACK_TTL)
+                    .map(|(idx, _)| idx);
+                (st.selected, st.list_scroll, pulse)
             };
             let (new_scroll, hits) = render_list_panel(
                 frame,
@@ -1089,6 +1119,7 @@ impl Widget for ForexWidget {
                 editing.as_deref(),
                 &quotes,
                 sel,
+                copy_pulse,
                 self.transient_present(),
                 cur_scroll,
                 &self.theme,
@@ -1452,6 +1483,11 @@ fn render_list_panel<F>(
     editing: Option<&str>,
     quotes: &HashMap<String, QuoteState>,
     selected: usize,
+    // Row index (in `rows`) whose 📋 icon should render as the
+    // post-copy ✅ pulse. Caller is responsible for expiring this
+    // against `COPY_FEEDBACK_TTL` before passing — `None` means no
+    // pulse this frame.
+    copy_pulse: Option<usize>,
     has_transient: bool,
     current_scroll: usize,
     theme: &Theme,
@@ -1521,50 +1557,144 @@ where
         } else {
             row_value(code, quotes)
         };
+        let is_copy_pulsing = copy_pulse == Some(i);
         let (line, hit) = build_list_row(
             code,
             is_primary,
             is_selected,
             value,
             editing.filter(|_| is_primary),
+            is_copy_pulsing,
             theme,
         );
         hits_by_logical.push((lines.len(), hit));
         lines.push(line);
     }
 
-    // Scroll: clamp so the selected row stays visible.
+    // Pin the top-pad blank + the primary row so the primary is always
+    // on screen. Without this, scrolling down to a watchlist row clamps
+    // scroll past line 1 (primary) and entering edit mode draws the
+    // amount cursor off-screen — the user sees nothing as they type.
+    //
+    // Layout produced by the loop above:
+    //   lines[0] = top-pad blank
+    //   lines[1] = primary row (always visible — pinned)
+    //   lines[2] = blank spacer before "── Currencies ──"
+    //   lines[3] = "── Currencies ──" header
+    //   lines[4..] = watchlist rows, optional crypto header + rows,
+    //                optional lookup header + row
+    const PINNED_LINES: usize = 2;
+    let pinned_h: usize = PINNED_LINES.min(usable_h);
+    let scrollable_h: usize = usable_h.saturating_sub(pinned_h);
+
+    // Selected row's line index, mapped to "rows beneath the pinned
+    // block." `move_selection` keeps `selected >= 1` whenever there's
+    // any watchlist, so `sel_line` is normally >= 4 (past the pinned
+    // primary + the blank + header). On a primary-only widget,
+    // `selected == 0` and the sel_line lives inside the pinned block —
+    // we skip scroll math entirely.
+    let scrollable_lines_count = lines.len().saturating_sub(PINNED_LINES);
     let sel_line = row_to_line.get(selected).copied().unwrap_or(0);
     let mut scroll = current_scroll;
-    if sel_line < scroll {
-        scroll = sel_line;
+    if sel_line >= PINNED_LINES {
+        let sel_rel = sel_line - PINNED_LINES;
+        if sel_rel < scroll {
+            scroll = sel_rel;
+        }
+        if scrollable_h > 0 && sel_rel >= scroll + scrollable_h {
+            // Cushion can host the final scrollable line — when the
+            // user selects it, don't shift the viewport up. Without
+            // this, scrolling onto the last currency pushes the
+            // first visible one out of view even though it was
+            // already on the cushion.
+            let is_last_line = sel_rel + 1 == scrollable_lines_count;
+            scroll = if is_last_line {
+                sel_rel.saturating_sub(scrollable_h)
+            } else {
+                sel_rel + 1 - scrollable_h
+            };
+        }
+    } else {
+        scroll = 0;
     }
-    if usable_h > 0 && sel_line >= scroll + usable_h {
-        scroll = sel_line + 1 - usable_h;
-    }
-    let max_scroll = lines.len().saturating_sub(usable_h.max(1));
+    let max_scroll = scrollable_lines_count.saturating_sub(scrollable_h.max(1));
     if scroll > max_scroll {
         scroll = max_scroll;
     }
 
-    let end = (scroll + usable_h).min(lines.len());
-    let visible: Vec<Line<'static>> = lines.iter().skip(scroll).take(end - scroll).cloned().collect();
-    let list_area = Rect {
+    let pinned_rect = Rect {
         x: area.x,
         y: area.y,
         width: area.width,
-        height: usable_h as u16,
+        height: pinned_h as u16,
     };
-    frame.render_widget(Paragraph::new(visible), list_area);
+    if pinned_h > 0 {
+        let pinned_visible: Vec<Line<'static>> =
+            lines.iter().take(pinned_h).cloned().collect();
+        frame.render_widget(Paragraph::new(pinned_visible), pinned_rect);
+    }
 
-    // Translate logical line indices to screen-absolute row positions,
-    // dropping rows that scrolled out of view.
-    for (line_idx, mut hit) in hits_by_logical.into_iter() {
-        if line_idx < scroll || line_idx >= scroll + usable_h {
-            row_hits.push(RowHits::default()); // placeholder, never matches
-            continue;
+    let scrollable_rect = Rect {
+        x: area.x,
+        y: area.y + pinned_h as u16,
+        width: area.width,
+        height: scrollable_h as u16,
+    };
+    if scrollable_h > 0 {
+        let start = PINNED_LINES + scroll;
+        let end = (start + scrollable_h).min(lines.len());
+        if end > start {
+            let scrollable_visible: Vec<Line<'static>> =
+                lines.iter().skip(start).take(end - start).cloned().collect();
+            frame.render_widget(Paragraph::new(scrollable_visible), scrollable_rect);
         }
-        let screen_row = list_area.y + (line_idx - scroll) as u16;
+    }
+
+    // Cushion row reserved by `usable_h = area.height - 1`:
+    //   - 0 hidden → blank.
+    //   - exactly 1 hidden → render that one line on the cushion
+    //     (saves the user a scroll for an indicator that pointed
+    //     at one item anyway).
+    //   - 2+ hidden → centered `↓` arrow.
+    let hidden_below = scrollable_lines_count.saturating_sub(scroll + scrollable_h);
+    if area.height > 0 {
+        let cushion_rect = Rect {
+            x: area.x,
+            y: area.y + area.height - 1,
+            width: area.width,
+            height: 1,
+        };
+        if hidden_below == 1 {
+            let next_idx = PINNED_LINES + scroll + scrollable_h;
+            if let Some(line) = lines.get(next_idx) {
+                frame.render_widget(Paragraph::new(line.clone()), cushion_rect);
+            }
+        } else if hidden_below >= 2 {
+            let arrow = Line::from(Span::styled("↓", theme.text_dim))
+                .alignment(Alignment::Center);
+            frame.render_widget(Paragraph::new(arrow), cushion_rect);
+        }
+    }
+
+    // Translate logical line indices to screen-absolute row positions.
+    // Pinned lines (idx 0..PINNED_LINES) map directly. Scrollable lines
+    // honor `scroll`; anything outside the visible window gets a
+    // never-matching placeholder.
+    for (line_idx, mut hit) in hits_by_logical.into_iter() {
+        let screen_row = if line_idx < PINNED_LINES {
+            if line_idx >= pinned_h {
+                row_hits.push(RowHits::default());
+                continue;
+            }
+            pinned_rect.y + line_idx as u16
+        } else {
+            let rel = line_idx - PINNED_LINES;
+            if rel < scroll || rel >= scroll + scrollable_h {
+                row_hits.push(RowHits::default());
+                continue;
+            }
+            scrollable_rect.y + (rel - scroll) as u16
+        };
         hit.row = screen_row;
         // Hit columns are written relative to area.x when built; shift
         // them into screen-absolute by adding area.x.
@@ -1602,6 +1732,7 @@ fn build_list_row(
     is_selected: bool,
     value: Option<f64>,
     editing: Option<&str>,
+    is_copy_pulsing: bool,
     theme: &Theme,
 ) -> (Line<'static>, RowHits) {
     const MARKER_W: u16 = 2;
@@ -1636,6 +1767,12 @@ fn build_list_row(
     };
     let (copy_str, copy_present) = if is_primary {
         ("] ".to_string(), false)
+    } else if is_copy_pulsing {
+        // Post-copy pulse: render ✅ in place of 📋 for the row that
+        // was just yanked. Same 2-cell footprint so the hit ranges
+        // computed below stay valid — the user can click it again
+        // mid-pulse and get another copy.
+        ("✅".to_string(), true)
     } else {
         ("📋".to_string(), true)
     };
@@ -2683,6 +2820,43 @@ const COMMON_CURRENCIES: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// After a copy, the row that was yanked should render `✅` in
+    /// place of `📋` until the pulse expires. Same glyph slot, same
+    /// hit-rect footprint — clicking the cell again mid-pulse must
+    /// still register as a copy.
+    #[test]
+    fn build_list_row_swaps_clipboard_for_check_when_pulsing() {
+        let theme = Theme::builtin_defaults();
+        let (line, hit) =
+            build_list_row("EUR", false, true, Some(1.0823), None, true, &theme);
+        let text: String = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains('✅'), "pulse should render ✅: {text:?}");
+        assert!(!text.contains('📋'), "📋 should be absent during pulse: {text:?}");
+        assert!(
+            hit.copy_present,
+            "✅ cell must remain clickable so mid-pulse re-copy works"
+        );
+    }
+
+    /// Default rendering (no pulse) keeps the `📋` clipboard glyph.
+    #[test]
+    fn build_list_row_renders_clipboard_glyph_when_not_pulsing() {
+        let theme = Theme::builtin_defaults();
+        let (line, _hit) =
+            build_list_row("EUR", false, true, Some(1.0823), None, false, &theme);
+        let text: String = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains('📋'), "default should render 📋: {text:?}");
+        assert!(!text.contains('✅'), "no pulse → no ✅: {text:?}");
+    }
 
     #[test]
     fn build_alternates_concats_lists_dedupes_filters_primary() {

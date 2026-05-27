@@ -13,8 +13,8 @@ use std::{
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
-        MouseEventKind,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -307,6 +307,22 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Append a bracketed-paste payload to the command bar buffer. Newlines
+    /// and other control chars are stripped — the command bar is a single
+    /// line and Enter is the submit key, so pasted multi-line text would
+    /// auto-execute fragments otherwise.
+    fn handle_command_bar_paste(&mut self, text: &str) {
+        self.command_feedback = None;
+        let Some(buf) = self.command_buffer.as_mut() else {
+            return;
+        };
+        for c in text.chars() {
+            if !c.is_control() {
+                buf.push(c);
+            }
         }
     }
 
@@ -922,6 +938,20 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                     }
                 }
             }
+            Event::Paste(text) => {
+                // Hand the full bracketed-paste payload to the focused
+                // widget. Most widgets ignore paste; text-buffer widgets
+                // (notes) override Widget::handle_paste to insert it
+                // atomically. The command bar swallows paste while open so
+                // pasted text doesn't smuggle commands into widgets.
+                if app.command_buffer.is_some() {
+                    app.handle_command_bar_paste(&text);
+                } else if let Some(id) = app.focused_widget().map(str::to_string) {
+                    if let Some(widget) = app.manager.get_mut(&id) {
+                        let _ = widget.handle_paste(&text);
+                    }
+                }
+            }
             Event::Resize => {
                 // Ratatui handles the re-layout on the next draw call below.
             }
@@ -957,7 +987,16 @@ type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 fn enter_tui() -> Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // EnableBracketedPaste makes the terminal wrap pastes in
+    // `\x1b[200~`/`\x1b[201~` markers, which crossterm surfaces as a
+    // single `Event::Paste(String)` instead of one KeyEvent per
+    // character. Without it, a paste containing `.`, `,`, `i`, `s`,
+    // etc. fires widget shortcuts mid-stream — the user sees the
+    // dashboard flash through stack rotations / mode toggles / etc.
+    // before the rest of the buffer arrives. The Paste handler is
+    // already wired up in the event loop (Event::Paste branch above);
+    // this just turns on the terminal-side framing.
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
@@ -968,7 +1007,12 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
     }
 }
 

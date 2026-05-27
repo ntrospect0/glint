@@ -137,22 +137,48 @@ impl YahooForexProvider {
             return Ok(invert_quote(listed, &base_u, &quote_u));
         }
 
-        // One side already USD → fetch directly. Yahoo carries every
-        // major fiat-vs-USD pair and every crypto-vs-USD pair (in
-        // the crypto-first direction handled above), so there's no
-        // pivot to add value.
+        // {fiat}USD=X is patchy for exotic currencies (Yahoo lists
+        // USDVND=X but 404s on VNDUSD=X). For any `base→USD` ask
+        // where `base` is a non-USD fiat, fetch the reliable
+        // `USD{base}=X` direction and invert. This is what makes
+        // `:fx vnd` then `JPY→VND` (cross-pair) and `VND-as-primary`
+        // (every row goes through `VND→x`) keep working.
+        if quote_u == "USD" && base_u != "USD" && !is_crypto(&base_u) {
+            return self.fetch_to_usd(&base_u, period).await;
+        }
+
+        // One side already USD (covers USD→fiat and crypto→USD):
+        // Yahoo's native direction works directly, no inversion.
         if base_u == "USD" || quote_u == "USD" {
             return self.fetch_direct(&base_u, &quote_u, period).await;
         }
 
         // Cross pair → always pivot through USD. Uniform across
         // fiat-fiat, fiat-crypto, crypto-fiat, and crypto-crypto:
-        // each leg is fetched in Yahoo's natural direction (`xUSD=X`
-        // for fiat, `x-USD` for crypto), then the cross rate is
-        // `R(base, USD) / R(quote, USD)`. Avoids the patchy coverage
-        // of direct cross-pair symbols (`BTC-EUR`, `EURJPY=X` style
-        // pairs that sometimes 404 or return empty series).
+        // each leg is fetched via `fetch_to_usd` (which already
+        // picks Yahoo's reliable direction per code type), then the
+        // cross rate is `R(base, USD) / R(quote, USD)`.
         self.fetch_via_usd_pivot(&base_u, &quote_u, period).await
+    }
+
+    /// Fetch "1 unit of `code` expressed in USD" using whichever Yahoo
+    /// direction is universally available:
+    ///
+    /// * **Fiat** (any non-USD ISO code) → fetch `USD{code}=X` and
+    ///   invert. Yahoo carries every USD-quoted fiat pair, even for
+    ///   exotic currencies like VND that don't have a reverse
+    ///   `{code}USD=X` listing.
+    /// * **Crypto** → fetch `{code}-USD` directly. Yahoo only lists
+    ///   crypto in the crypto-first direction.
+    ///
+    /// Used by [`fetch_quote`] for any `→USD` request and by
+    /// [`fetch_via_usd_pivot`] for both legs of a cross-pair.
+    async fn fetch_to_usd(&self, code: &str, period: Period) -> Result<ForexQuote> {
+        if is_crypto(code) {
+            return self.fetch_direct(code, "USD", period).await;
+        }
+        let usd_to_code = self.fetch_direct("USD", code, period).await?;
+        Ok(invert_quote(usd_to_code, code, "USD"))
     }
 
     /// Direct Yahoo `{base}{quote}=X` fetch. Errors when Yahoo doesn't
@@ -245,10 +271,13 @@ impl YahooForexProvider {
         period: Period,
     ) -> Result<ForexQuote> {
         // Fan out both legs in parallel so the pivot only costs one
-        // round-trip's worth of latency.
+        // round-trip's worth of latency. `fetch_to_usd` picks Yahoo's
+        // reliable direction per code type (USD{fiat}=X inverted,
+        // {crypto}-USD direct) so exotic-fiat pivots like JPY→VND
+        // don't fall over on the leg fetch.
         let (a_res, b_res) = tokio::join!(
-            self.fetch_direct(base, "USD", period),
-            self.fetch_direct(quote, "USD", period),
+            self.fetch_to_usd(base, period),
+            self.fetch_to_usd(quote, period),
         );
         let base_to_usd = a_res
             .with_context(|| format!("USD-pivot leg {base}→USD failed"))?;
@@ -442,6 +471,95 @@ mod tests {
     fn downsample_returns_input_when_already_under_cap() {
         let s = vec![1.0, 2.0, 3.0];
         assert_eq!(downsample_to_max(s.clone(), 10), s);
+    }
+
+    /// Live Yahoo round-trip across a representative spread of pairs,
+    /// including the exotic-fiat shapes that motivated the
+    /// `fetch_to_usd` direction fix. Marked `#[ignore]` so CI / the
+    /// default `cargo test` doesn't hit the network — run with
+    /// `cargo test --ignored fetch_quote_works_across_random_pairs --
+    /// --nocapture` for a manual sanity check.
+    ///
+    /// Covers each shape the dispatch in `fetch_quote` has a branch for:
+    /// - USD→fiat (direct USDxxx=X)
+    /// - USD→crypto (crypto-USD inverted)
+    /// - fiat→USD (USDfiat=X inverted via `fetch_to_usd`)
+    /// - crypto→USD (crypto-USD direct)
+    /// - fiat-fiat cross (USD pivot, both legs via `fetch_to_usd`)
+    /// - fiat-crypto cross (USD pivot, mixed legs)
+    /// - crypto-crypto cross (USD pivot, both legs)
+    ///
+    /// Asserts each pair returns a finite, positive price. Doesn't
+    /// pin numeric values (rates shift) — the load-bearing claim is
+    /// that no leg 404s after the fix.
+    #[tokio::test]
+    #[ignore = "hits live Yahoo Finance; run with --ignored"]
+    async fn fetch_quote_works_across_random_pairs() {
+        let provider = YahooForexProvider::new().expect("provider build");
+        let pairs: &[(&str, &str, &str)] = &[
+            // USD-on-base, common fiat (was always fine).
+            ("USD", "EUR", "USD→EUR — universal direct"),
+            ("USD", "JPY", "USD→JPY — universal direct"),
+            // USD-on-base, exotic fiat (was fine; sanity-check).
+            ("USD", "VND", "USD→VND — universal direct, exotic"),
+            ("USD", "IDR", "USD→IDR — universal direct, exotic"),
+            // fiat→USD, exotic — this is the FIX TARGET. Previously
+            // tried `{fiat}USD=X` and 404'd; now inverts USD{fiat}=X.
+            ("VND", "USD", "VND→USD — exotic, inverted via fetch_to_usd"),
+            ("IDR", "USD", "IDR→USD — exotic, inverted via fetch_to_usd"),
+            ("NGN", "USD", "NGN→USD — exotic, inverted via fetch_to_usd"),
+            ("PHP", "USD", "PHP→USD — exotic, inverted via fetch_to_usd"),
+            // fiat→USD, common (already worked via direct fiatUSD=X
+            // but should also work via the new inverted path).
+            ("EUR", "USD", "EUR→USD — common, now also via fetch_to_usd"),
+            ("JPY", "USD", "JPY→USD — common, now also via fetch_to_usd"),
+            // fiat-fiat cross — pivots through USD via fetch_to_usd
+            // on both legs. Mix of common and exotic legs.
+            ("EUR", "JPY", "EUR→JPY — cross, both legs common"),
+            ("GBP", "AUD", "GBP→AUD — cross, both legs common"),
+            ("JPY", "VND", "JPY→VND — cross, one leg exotic (BUG 1)"),
+            ("VND", "JPY", "VND→JPY — cross, primary leg exotic"),
+            ("EUR", "VND", "EUR→VND — cross, one leg exotic"),
+            ("VND", "EUR", "VND→EUR — cross, primary leg exotic (BUG 2)"),
+            ("IDR", "ZAR", "IDR→ZAR — cross, both legs exotic"),
+            ("KRW", "PHP", "KRW→PHP — cross, both legs exotic"),
+            // Crypto on one side.
+            ("BTC", "USD", "BTC→USD — native crypto direction"),
+            ("USD", "BTC", "USD→BTC — crypto inverted"),
+            ("ETH", "EUR", "ETH→EUR — crypto/fiat cross"),
+            ("EUR", "BTC", "EUR→BTC — fiat/crypto cross"),
+            // Crypto-crypto.
+            ("BTC", "ETH", "BTC→ETH — crypto/crypto cross"),
+        ];
+
+        let mut failures: Vec<String> = Vec::new();
+        for (base, quote, label) in pairs {
+            match provider.fetch_quote(base, quote, Period::Day).await {
+                Ok(q) => {
+                    if !q.price.is_finite() || q.price <= 0.0 {
+                        failures.push(format!(
+                            "{label}: price not finite/positive ({})",
+                            q.price
+                        ));
+                        eprintln!("  ✗ {label} → bad price {}", q.price);
+                    } else {
+                        eprintln!("  ✓ {label} → {:.6}", q.price);
+                    }
+                }
+                Err(err) => {
+                    failures.push(format!("{label}: {err:#}"));
+                    eprintln!("  ✗ {label} → ERROR: {err:#}");
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "{} of {} pairs failed:\n  - {}",
+            failures.len(),
+            pairs.len(),
+            failures.join("\n  - ")
+        );
     }
 
     #[test]

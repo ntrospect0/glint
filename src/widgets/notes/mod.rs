@@ -33,10 +33,11 @@ pub mod store;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -109,7 +110,7 @@ const CONTENT_HANGING_INDENT: usize = 2;
 const PANE_TOP_PAD: u16 = 1;
 
 /// Matching blank row at the bottom for visual balance with the top pad.
-const PANE_BOTTOM_PAD: u16 = 1;
+const PANE_BOTTOM_PAD: u16 = 0;
 
 /// One-cell pad on each side of the vertical separator between list
 /// and content so neither pane's text crowds the divider.
@@ -122,6 +123,30 @@ const CONTENT_RIGHT_PAD: u16 = 1;
 /// Rows reserved at the bottom of the list pane for the
 /// `+ new · - delete` footer hint (1 blank spacer row + 1 label row).
 const LIST_FOOTER_ROWS: u16 = 2;
+
+/// Rows reserved at the bottom of the content pane for the mode/help
+/// hint (1 blank spacer row + 1 label row). Same shape as the list
+/// footer so both panes have matching bottoms.
+const CONTENT_FOOTER_ROWS: u16 = 2;
+
+/// Cell width of the right-edge scroll indicator. Always reserved so
+/// text width stays stable as the note grows past the viewport — the
+/// alternative ("only reserve when scrollable") would visibly reflow
+/// the body the first time a note crosses the threshold. Track + thumb
+/// occupy this single column; click anywhere on it to jump scroll.
+const CONTENT_SCROLLBAR_WIDTH: u16 = 1;
+
+/// Blank cell between body text and the scrollbar. Reads as visual
+/// breathing room so glyphs don't crowd the bar. Applies to both the
+/// content pane and the list pane.
+const SCROLLBAR_GUTTER: u16 = 1;
+
+/// How long a transient title-bar status line ("Copied to clipboard",
+/// "Save failed: …", "Nothing to undo") stays visible before reverting
+/// to the normal `<name> · MODE · ⧉` metadata. Render checks the
+/// timestamp every frame, so the message disappears on the first
+/// render after the TTL elapses — user reads it, then it clears.
+const STATUS_TTL: Duration = Duration::from_secs(3);
 
 /// Per-note undo cap. Above this we drop the oldest entry to keep
 /// memory bounded — 100 undos cover essentially any in-session edit
@@ -192,11 +217,39 @@ struct NotesState {
     /// `Some` when a delete is awaiting y/N confirmation.
     confirm_delete: Option<String>,
     /// Transient status line in the title bar — used for feedback like
-    /// "Copied to clipboard" or "Delete this note?".
-    status: Option<String>,
+    /// "Copied to clipboard" or "Save failed: …". Carries its own
+    /// timestamp so the render path can expire it after `STATUS_TTL`
+    /// and revert to the normal metadata without the user needing
+    /// to take any action.
+    status: Option<TransientStatus>,
     /// Per-note undo / redo stacks. Keyed by note id so switching
     /// notes preserves each note's history.
     history: HashMap<String, NoteHistory>,
+}
+
+#[derive(Debug, Clone)]
+struct TransientStatus {
+    text: String,
+    set_at: Instant,
+}
+
+impl TransientStatus {
+    fn is_expired(&self) -> bool {
+        self.set_at.elapsed() >= STATUS_TTL
+    }
+}
+
+impl NotesState {
+    /// Set a transient status line. Stamped with `Instant::now()` so
+    /// render can expire it after [`STATUS_TTL`]. Always prefer this
+    /// over assigning to `self.status` directly — the timestamp is
+    /// what makes auto-revert work.
+    fn set_status(&mut self, text: impl Into<String>) {
+        self.status = Some(TransientStatus {
+            text: text.into(),
+            set_at: Instant::now(),
+        });
+    }
 }
 
 impl Default for NotesState {
@@ -260,6 +313,17 @@ pub struct NotesWidget {
     /// The key handler reads this when bumping j/k so we never scroll
     /// past the last visual row.
     last_max_content_scroll: Arc<Mutex<u16>>,
+    /// Highest valid `list_scroll` (in entry-index units) given the
+    /// currently visible entry count. Updated by `render_list`; read
+    /// by the list scrollbar's click handler so clicking the bar
+    /// jumps to a clamped scroll position rather than blowing past
+    /// the last entry.
+    last_max_list_scroll: Arc<Mutex<u16>>,
+    /// Outer widget rect (includes borders). Captured at render time
+    /// so the mouse handler can hit-test the title row — the
+    /// title-bar `⧉` icon doubles as a click-to-copy affordance and
+    /// needs to know where the title row sits in screen coords.
+    last_outer_area: Arc<Mutex<Rect>>,
 }
 
 impl NotesWidget {
@@ -302,6 +366,8 @@ impl NotesWidget {
             last_content_rect: Arc::new(Mutex::new(Rect::default())),
             last_list_rect: Arc::new(Mutex::new(Rect::default())),
             last_max_content_scroll: Arc::new(Mutex::new(0)),
+            last_max_list_scroll: Arc::new(Mutex::new(0)),
+            last_outer_area: Arc::new(Mutex::new(Rect::default())),
         }
     }
 
@@ -314,7 +380,7 @@ impl NotesWidget {
         };
         if let Err(err) = store::save(&self.instance, &mut note) {
             tracing::warn!(error = %err, "notes: save new note failed");
-            st.status = Some(format!("Save failed: {err}"));
+            st.set_status(format!("Save failed: {err}"));
             return;
         }
         // Insert at the front (most-recently-edited).
@@ -335,7 +401,7 @@ impl NotesWidget {
         let id = note.id.clone();
         if let Err(err) = store::delete(&self.instance, &id) {
             tracing::warn!(error = %err, "notes: delete failed");
-            st.status = Some(format!("Delete failed: {err}"));
+            st.set_status(format!("Delete failed: {err}"));
             return;
         }
         st.notes.remove(active);
@@ -361,7 +427,7 @@ impl NotesWidget {
         let Some(note) = st.notes.get_mut(active) else { return };
         if let Err(err) = store::save(&self.instance, note) {
             tracing::warn!(error = %err, "notes: save failed");
-            st.status = Some(format!("Save failed: {err}"));
+            st.set_status(format!("Save failed: {err}"));
             return;
         }
         // Re-sort by mtime desc; restore active to follow the note.
@@ -375,8 +441,8 @@ impl NotesWidget {
         let Some(active) = st.active else { return };
         let Some(note) = st.notes.get(active) else { return };
         match crate::clipboard::copy(&note.body) {
-            Ok(()) => st.status = Some("Copied to clipboard".into()),
-            Err(err) => st.status = Some(format!("Copy failed: {err}")),
+            Ok(()) => st.set_status("Copied to clipboard"),
+            Err(err) => st.set_status(format!("Copy failed: {err}")),
         }
     }
 
@@ -433,6 +499,63 @@ impl NotesWidget {
                 st.cursor_col = 0;
             } else {
                 st.cursor_col += 1;
+            }
+        }
+        drop(st);
+        self.save_active();
+    }
+
+    /// Insert an entire bracketed-paste payload at the cursor with a single
+    /// undo snapshot and a single save. Walking per-char through
+    /// [`insert_char`] would push thousands of undo entries and trigger
+    /// thousands of disk writes for a multi-paragraph paste. Normalizes
+    /// `\r\n` and lone `\r` to `\n` (clipboard line endings vary by OS)
+    /// and drops other ASCII control chars so a pasted form feed or bell
+    /// doesn't end up in the note body.
+    fn paste_text(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let mut normalized = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\r' => {
+                    normalized.push('\n');
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                }
+                '\n' | '\t' => normalized.push(c),
+                c if (c as u32) < 0x20 || c == '\u{7F}' => {}
+                c => normalized.push(c),
+            }
+        }
+        if normalized.is_empty() {
+            return;
+        }
+
+        let mut st = self.state.lock().expect("notes state poisoned");
+        let Some(active) = st.active else { return };
+        st.push_undo_snapshot();
+        let cursor_row = st.cursor_row;
+        let cursor_col = st.cursor_col;
+        if let Some(note) = st.notes.get_mut(active) {
+            let line_start = line_start_byte(&note.body, cursor_row);
+            let byte_offset = char_offset_to_byte(&note.body[line_start..], cursor_col);
+            let insert_at = line_start + byte_offset;
+            note.body.insert_str(insert_at, &normalized);
+
+            let added_newlines = normalized.bytes().filter(|&b| b == b'\n').count();
+            if added_newlines == 0 {
+                st.cursor_col += normalized.chars().count();
+            } else {
+                st.cursor_row += added_newlines;
+                let last_line = normalized
+                    .rsplit_once('\n')
+                    .map(|(_, last)| last)
+                    .unwrap_or("");
+                st.cursor_col = last_line.chars().count();
             }
         }
         drop(st);
@@ -543,7 +666,7 @@ impl NotesWidget {
                 self.save_active();
             }
             None => {
-                st.status = Some("Nothing to undo".into());
+                st.set_status("Nothing to undo");
             }
         }
     }
@@ -577,7 +700,7 @@ impl NotesWidget {
                 self.save_active();
             }
             None => {
-                st.status = Some("Nothing to redo".into());
+                st.set_status("Nothing to redo");
             }
         }
     }
@@ -695,6 +818,7 @@ impl Widget for NotesWidget {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
+        *self.last_outer_area.lock().unwrap() = area;
         let st = self.state.lock().expect("notes state poisoned");
         let title_metadata = self.derive_title_metadata(&st);
         let block = apply_title_row(
@@ -794,8 +918,41 @@ impl Widget for NotesWidget {
         let mode = self.state.lock().expect("notes state poisoned").mode;
         let content_rect = *self.last_content_rect.lock().unwrap();
         let list_rect = *self.last_list_rect.lock().unwrap();
+        let outer = *self.last_outer_area.lock().unwrap();
         let in_content = point_in(content_rect, mouse.column, mouse.row);
         let in_list = list_rect.width > 0 && point_in(list_rect, mouse.column, mouse.row);
+        // Title bar `⧉` icon — clickable to yank the active note in
+        // both VIEW and EDIT modes. The icon's exact column depends
+        // on framework metadata truncation we don't see; widen the
+        // hit area to the un-truncated metadata span so the user
+        // doesn't have to pixel-hunt the glyph. Only fires on a
+        // primary-button down with an active note loaded.
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && outer.width > 0
+            && mouse.row == outer.y
+        {
+            let st = self.state.lock().expect("notes state poisoned");
+            let has_active = st.active.is_some();
+            let meta = self.derive_title_metadata(&st);
+            drop(st);
+            if has_active {
+                if let Some(meta) = meta {
+                    // build_metadata_line adds 1 cell of padding on
+                    // each side; right-aligned metadata sits flush
+                    // against the right corner. Match those bounds
+                    // here so any click on the metadata cluster
+                    // (name · mode · ⧉) lands.
+                    let pad: u16 = 2;
+                    let meta_cells = meta.chars().count() as u16 + pad;
+                    let right_edge = outer.x + outer.width.saturating_sub(1);
+                    let meta_left = right_edge.saturating_sub(meta_cells);
+                    if mouse.column >= meta_left && mouse.column < right_edge {
+                        self.yank_active();
+                        return EventResult::Handled;
+                    }
+                }
+            }
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp if matches!(mode, Mode::Normal) => {
                 let mut st = self.state.lock().expect("notes state poisoned");
@@ -811,7 +968,8 @@ impl Widget for NotesWidget {
             MouseEventKind::ScrollDown if matches!(mode, Mode::Normal) => {
                 let mut st = self.state.lock().expect("notes state poisoned");
                 if in_list {
-                    st.list_scroll = st.list_scroll.saturating_add(1);
+                    let max = *self.last_max_list_scroll.lock().unwrap();
+                    st.list_scroll = st.list_scroll.saturating_add(1).min(max);
                     return EventResult::Handled;
                 } else if in_content {
                     let max = *self.last_max_content_scroll.lock().unwrap();
@@ -821,6 +979,34 @@ impl Widget for NotesWidget {
                 EventResult::Ignored
             }
             MouseEventKind::Down(_) if in_list => {
+                // Scrollbar column intercept — only present when
+                // there's something to scroll. Lives in the column
+                // one cell left of the rightmost (the rightmost is
+                // the divider). Clicks land here → proportional jump;
+                // when no scrollbar is showing (or click was on the
+                // divider itself), fall through to entry-select.
+                let max_scroll =
+                    *self.last_max_list_scroll.lock().unwrap() as usize;
+                let has_scrollbar = max_scroll > 0;
+                let footer_rows = LIST_FOOTER_ROWS.min(list_rect.height);
+                let entries_bottom = list_rect.y + list_rect.height.saturating_sub(footer_rows);
+                let scrollbar_x =
+                    list_rect.x + list_rect.width.saturating_sub(2);
+                let on_scrollbar = has_scrollbar
+                    && mouse.column == scrollbar_x
+                    && mouse.row >= list_rect.y
+                    && mouse.row < entries_bottom;
+                if on_scrollbar {
+                    let body_h = entries_bottom.saturating_sub(list_rect.y) as usize;
+                    let click_row = (mouse.row - list_rect.y) as usize;
+                    if body_h > 1 {
+                        let target = (click_row * max_scroll) / (body_h - 1);
+                        let mut st = self.state.lock().expect("notes state poisoned");
+                        st.list_scroll = target.min(max_scroll) as u16;
+                        st.focus = SubFocus::List;
+                    }
+                    return EventResult::Handled;
+                }
                 // Each list entry takes 2 rows; mouse.row within
                 // list_rect tells us which entry was clicked.
                 let st = self.state.lock().expect("notes state poisoned");
@@ -835,19 +1021,47 @@ impl Widget for NotesWidget {
             MouseEventKind::Down(_) if in_content => {
                 let mut st = self.state.lock().expect("notes state poisoned");
                 st.focus = SubFocus::Content;
+                // Scrollbar column intercept — clicking the right-edge
+                // bar jumps scroll proportionally to the click row.
+                // Body rows only; clicks on the footer rows fall
+                // through to the cursor-positioning path.
+                let scrollbar_x =
+                    content_rect.x + content_rect.width.saturating_sub(CONTENT_SCROLLBAR_WIDTH);
+                let footer_rows = CONTENT_FOOTER_ROWS.min(content_rect.height);
+                let body_bottom =
+                    content_rect.y + content_rect.height.saturating_sub(footer_rows);
+                let on_scrollbar = CONTENT_SCROLLBAR_WIDTH > 0
+                    && mouse.column == scrollbar_x
+                    && mouse.row >= content_rect.y
+                    && mouse.row < body_bottom;
+                if on_scrollbar {
+                    let body_h = body_bottom.saturating_sub(content_rect.y) as usize;
+                    let click_row = (mouse.row - content_rect.y) as usize;
+                    let max_scroll =
+                        *self.last_max_content_scroll.lock().unwrap() as usize;
+                    if max_scroll > 0 && body_h > 1 {
+                        let target = (click_row * max_scroll) / (body_h - 1);
+                        st.content_scroll = target.min(max_scroll) as u16;
+                    }
+                    return EventResult::Handled;
+                }
                 // In insert mode, clicking inside the content pane
                 // jumps the cursor to the clicked position. In normal
                 // mode the cursor is hidden, so we only do the focus
-                // shift and skip the position math.
+                // shift and skip the position math. Width subtracts
+                // the scrollbar column so click-to-cursor mapping
+                // matches the same wrap math render uses.
                 if st.mode == Mode::Insert {
                     let local_y = mouse.row.saturating_sub(content_rect.y);
                     let local_x = mouse.column.saturating_sub(content_rect.x);
-                    if let Some((row, col)) = cursor_position_for_click(
-                        &st,
-                        local_y,
-                        local_x,
-                        content_rect.width as usize,
-                    ) {
+                    let pane_w = content_rect
+                        .width
+                        .saturating_sub(CONTENT_SCROLLBAR_WIDTH)
+                        .saturating_sub(SCROLLBAR_GUTTER)
+                        as usize;
+                    if let Some((row, col)) =
+                        cursor_position_for_click(&st, local_y, local_x, pane_w)
+                    {
                         st.cursor_row = row;
                         st.cursor_col = col;
                     }
@@ -856,6 +1070,18 @@ impl Widget for NotesWidget {
             }
             _ => EventResult::Ignored,
         }
+    }
+
+    fn handle_paste(&mut self, text: &str) -> EventResult {
+        // Paste only edits the note body — in normal mode it's a no-op so
+        // pasted characters can't trigger normal-mode commands (`+`, `-`,
+        // `y`, etc.) as a stream of keystrokes would.
+        let mode = self.state.lock().expect("notes state poisoned").mode;
+        if mode != Mode::Insert {
+            return EventResult::Ignored;
+        }
+        self.paste_text(text);
+        EventResult::Handled
     }
 
     fn handle_command(&mut self, _cmd: &str, _args: &[&str]) -> Result<bool> {
@@ -884,17 +1110,18 @@ impl Widget for NotesWidget {
         vec![
             ("+", "new note"),
             ("-", "delete note (confirm)"),
-            ("i", "insert mode"),
-            ("ESC", "exit insert → normal"),
-            ("h / l", "focus list / focus content (normal mode)"),
+            ("i", "switch to EDIT mode"),
+            ("ESC", "exit EDIT → VIEW"),
+            ("h / l", "focus list / focus content (VIEW mode)"),
             ("j / k", "scroll content (or switch notes in list focus)"),
             ("gg / G", "scroll to top / bottom"),
             ("y", "yank entire note to clipboard"),
-            ("Ctrl-A / Ctrl-E", "line start / end (insert mode)"),
-            ("Ctrl-U", "delete current line (insert mode)"),
-            ("Ctrl-Z / Ctrl-Shift-Z", "undo / redo (insert mode)"),
-            ("mouse click", "position cursor (insert mode)"),
-            ("mouse wheel", "scroll list or content (normal mode)"),
+            ("Ctrl-A / Ctrl-E", "line start / end (EDIT mode)"),
+            ("Ctrl-U", "delete current line (EDIT mode)"),
+            ("Ctrl-Z / Ctrl-Shift-Z", "undo / redo (EDIT mode)"),
+            ("mouse click", "position cursor (EDIT mode)"),
+            ("mouse wheel", "scroll list or content (VIEW mode)"),
+            ("scrollbar click", "jump scroll position"),
         ]
     }
 
@@ -924,16 +1151,30 @@ impl Widget for NotesWidget {
 impl NotesWidget {
     fn derive_title_metadata(&self, st: &NotesState) -> Option<String> {
         if let Some(status) = &st.status {
-            return Some(status.clone());
+            // Honor the TTL: expired statuses fall through to the
+            // normal metadata. We don't bother clearing `st.status`
+            // here — `&NotesState` is read-only and a stale entry
+            // just sits unreferenced until the next mutation. Render
+            // is called frequently enough that the user sees the
+            // revert on the first frame after expiry.
+            if !status.is_expired() {
+                return Some(status.text.clone());
+            }
         }
         let active_label = match st.active.and_then(|i| st.notes.get(i)) {
             Some(n) => {
                 let truncated = truncate_for_meta(n.display_name(), 28);
-                let mode_tag = match st.mode {
-                    Mode::Normal => "NORMAL",
-                    Mode::Insert => "INSERT",
+                // In EDIT mode every keystroke is text input, so the
+                // `y` shortcut hint after `⧉` is misleading — `y`
+                // there would just type a letter into the note. Drop
+                // the letter; the `⧉` glyph alone signals "copy"
+                // and is wired up as a click target by `handle_mouse`
+                // so the action stays reachable.
+                let (mode_tag, copy_hint) = match st.mode {
+                    Mode::Normal => ("VIEW", "⧉ y"),
+                    Mode::Insert => ("EDIT", "⧉"),
                 };
-                format!("{truncated} · {mode_tag} · ⧉ y")
+                format!("{truncated} · {mode_tag} · {copy_hint}")
             }
             None => format!(
                 "no notes · + to create · {} total",
@@ -962,7 +1203,43 @@ impl NotesWidget {
             self.theme.border_focused
         };
 
-        let inner_w = area.width.saturating_sub(1) as usize; // reserve last col for separator
+        // The list's right edge always shows a 1-col `│` divider; the
+        // scrollbar lives in the column just to its left, with a
+        // 1-col gutter between body text and the bar. Show the
+        // scrollbar only when the entries actually overflow — when
+        // everything fits, give those two columns back to the body
+        // text. The "does it fit?" probe wraps every entry's title
+        // at the narrowest layout (with scrollbar reserved); if the
+        // total still fits, the wider layout will too.
+        let footer_rows = LIST_FOOTER_ROWS.min(area.height);
+        let entries_height = area.height.saturating_sub(footer_rows);
+        let divider_w: u16 = 1;
+        let needs_scrollbar = {
+            let narrow_reserve: u16 = divider_w + SCROLLBAR_GUTTER + CONTENT_SCROLLBAR_WIDTH;
+            let narrow_inner = area.width.saturating_sub(narrow_reserve).max(1) as usize;
+            let narrow_first = narrow_inner.saturating_sub(LIST_PREFIX_W).max(1);
+            let narrow_cont = narrow_inner.saturating_sub(LIST_CONT_W).max(1);
+            let total: usize = st
+                .notes
+                .iter()
+                .map(|n| {
+                    wrap_title_lines(
+                        n.display_name(),
+                        narrow_first,
+                        narrow_cont,
+                        LIST_WRAP_MAX_LINES,
+                    )
+                    .len()
+                })
+                .sum();
+            total > entries_height as usize
+        };
+        let reserved_w: u16 = if needs_scrollbar {
+            divider_w + SCROLLBAR_GUTTER + CONTENT_SCROLLBAR_WIDTH
+        } else {
+            divider_w
+        };
+        let inner_w = area.width.saturating_sub(reserved_w).max(1) as usize;
         // First-line text width = inner_w - first-line prefix (2 cells).
         // Continuation rows have a 3-cell hanging indent so they
         // visually offset from the next entry's first line — gets
@@ -973,19 +1250,16 @@ impl NotesWidget {
         let scroll = st.list_scroll as usize;
         let active = st.active.unwrap_or(usize::MAX);
 
-        // Reserve the bottom rows for the footer hint so wrapped
-        // entries never overlap with it. When the area is too short
-        // for both the footer and any entry, the footer wins — users
-        // can scroll to reveal entries but the footer hint is the
-        // load-bearing affordance.
-        let footer_rows = LIST_FOOTER_ROWS.min(area.height);
-        let entries_height = area.height.saturating_sub(footer_rows);
-
         // Pack entries top-down by their wrapped row count (1..=3) until
         // we run out of vertical space. Don't render a partial entry —
-        // either the whole entry fits or we stop.
+        // either the whole entry fits or we stop. `entries_rendered`
+        // is fed to the scrollbar math below so the thumb size
+        // reflects what the user can actually see (variable-row
+        // entries make a simple "entries / total" approximation
+        // close enough; the bar is for orientation, not exactness).
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(entries_height as usize);
         let mut y_used: u16 = 0;
+        let mut entries_rendered: usize = 0;
         for (real_idx, note) in st.notes.iter().enumerate().skip(scroll) {
             let is_active = real_idx == active;
             let name = note.display_name();
@@ -1003,6 +1277,7 @@ impl NotesWidget {
                 ]));
             }
             y_used += wrapped.len() as u16;
+            entries_rendered += 1;
         }
 
         if lines.is_empty() {
@@ -1014,22 +1289,23 @@ impl NotesWidget {
             )));
         }
 
-        // Render text in the left columns, then a separator column.
-        // Entries get the top portion of the area; the footer hint
-        // sits in the reserved bottom rows.
+        // Render text in the left columns. Entries get the top portion
+        // of the area; the footer hint sits in the reserved bottom
+        // rows. Both rects span `inner_w` so they never overlap the
+        // divider/scrollbar/gutter on the right.
         let text_rect = Rect {
             x: area.x,
             y: area.y,
-            width: area.width.saturating_sub(1),
+            width: inner_w as u16,
             height: entries_height,
         };
         let footer_rect = Rect {
             x: area.x,
             y: area.y + entries_height,
-            width: area.width.saturating_sub(1),
+            width: inner_w as u16,
             height: footer_rows,
         };
-        let sep_rect = Rect {
+        let divider_rect = Rect {
             x: area.x + area.width.saturating_sub(1),
             y: area.y,
             width: 1,
@@ -1050,12 +1326,65 @@ impl NotesWidget {
             )));
             frame.render_widget(Paragraph::new(footer_lines), footer_rect);
         }
-        // Paint the separator column as repeated │.
-        let sep_glyph = "│";
-        let sep_lines: Vec<Line<'static>> = (0..area.height)
-            .map(|_| Line::from(Span::styled(sep_glyph.to_string(), sep_style)))
+        // Divider column — always rendered. Pure visual separator
+        // between list and content panes; sep_style picks up the
+        // widget's focus/insert-mode tier so the whole widget
+        // visibly lights up while typing.
+        let divider_lines: Vec<Line<'_>> = (0..area.height)
+            .map(|_| Line::from(Span::styled("│".to_string(), sep_style)))
             .collect();
-        frame.render_widget(Paragraph::new(sep_lines), sep_rect);
+        frame.render_widget(Paragraph::new(divider_lines), divider_rect);
+
+        // Scrollbar — rendered only when content overflows. Sits in
+        // the column immediately left of the divider, gutter-spaced
+        // from the body text. Same track `│` / thumb `█` convention
+        // as the content pane; thumb brightens when the list sub-
+        // pane has focus.
+        let total_entries = st.notes.len();
+        let max_list_scroll = total_entries.saturating_sub(entries_rendered);
+        if needs_scrollbar && entries_height > 0 {
+            *self.last_max_list_scroll.lock().unwrap() = max_list_scroll as u16;
+            let viewport_rows = entries_height as usize;
+            let thumb_rows = if total_entries > 0 {
+                ((viewport_rows * entries_rendered) / total_entries).max(1)
+            } else {
+                viewport_rows
+            };
+            let track_span_rows = viewport_rows.saturating_sub(thumb_rows);
+            let thumb_top_rows = if max_list_scroll > 0 {
+                (track_span_rows * (st.list_scroll as usize)) / max_list_scroll
+            } else {
+                0
+            };
+            let thumb_style = if list_focused {
+                self.theme.text_plain
+            } else {
+                self.theme.text_dim
+            };
+            let track_style = self.theme.text_dim;
+            let mut bar_lines: Vec<Line<'_>> = Vec::with_capacity(viewport_rows);
+            for i in 0..viewport_rows {
+                let in_thumb = i >= thumb_top_rows && i < thumb_top_rows + thumb_rows;
+                let (glyph, style) = if in_thumb {
+                    ("█", thumb_style)
+                } else {
+                    ("│", track_style)
+                };
+                bar_lines.push(Line::from(Span::styled(glyph.to_string(), style)));
+            }
+            let scrollbar_rect = Rect {
+                x: area.x + area.width.saturating_sub(divider_w + CONTENT_SCROLLBAR_WIDTH),
+                y: area.y,
+                width: CONTENT_SCROLLBAR_WIDTH,
+                height: entries_height,
+            };
+            frame.render_widget(Paragraph::new(bar_lines), scrollbar_rect);
+        } else {
+            // No scrollbar this frame — keep last_max_list_scroll
+            // accurate so the wheel-scroll handler doesn't think
+            // there's anywhere to scroll.
+            *self.last_max_list_scroll.lock().unwrap() = max_list_scroll as u16;
+        }
     }
 
     /// Encode the focus/active matrix as `(caret, caret_style,
@@ -1095,7 +1424,10 @@ impl NotesWidget {
     }
 
     fn render_content(&self, frame: &mut Frame, area: Rect, widget_focused: bool) {
-        let st = self.state.lock().expect("notes state poisoned");
+        // `mut` so we can auto-scroll the viewport when the cursor
+        // moves outside it (typing past the visible bottom in insert
+        // mode used to leave the cursor stranded off-screen).
+        let mut st = self.state.lock().expect("notes state poisoned");
         let content_focused = widget_focused && st.focus == SubFocus::Content;
         let body = match st.active.and_then(|i| st.notes.get(i)) {
             Some(n) => n.body.clone(),
@@ -1134,14 +1466,14 @@ impl NotesWidget {
                 row("-", "delete current note (confirm)"),
                 row("y", "yank entire note to clipboard"),
                 Line::from(""),
-                header("Navigation (normal mode)"),
+                header("Navigation (VIEW mode)"),
                 row("h / l", "focus list / focus content"),
                 row("j / k", "scroll content (or switch notes in list)"),
                 row("gg / G", "scroll to top / bottom"),
-                row("i", "enter insert mode at end of note"),
+                row("i", "switch to EDIT mode at end of note"),
                 Line::from(""),
-                header("Editing (insert mode)"),
-                row("ESC", "leave insert → normal"),
+                header("Editing (EDIT mode)"),
+                row("ESC", "leave EDIT → VIEW"),
                 row("Ctrl-A / Ctrl-E", "jump to line start / end"),
                 row("Ctrl-U", "delete current line"),
                 row("Ctrl-Z", "undo"),
@@ -1167,7 +1499,18 @@ impl NotesWidget {
             body.split('\n').map(|s| s.to_string()).collect()
         };
 
-        let pane_w = area.width as usize;
+        // Reserve the rightmost column for the scrollbar plus a 1-cell
+        // gutter so body glyphs don't crowd the bar. Width math for
+        // both wrap and click-to-cursor needs to use the reduced
+        // width so visual columns match what the user sees.
+        let scrollbar_w = CONTENT_SCROLLBAR_WIDTH.min(area.width);
+        let gutter_w = if area.width > scrollbar_w {
+            SCROLLBAR_GUTTER.min(area.width - scrollbar_w)
+        } else {
+            0
+        };
+        let text_w = area.width.saturating_sub(scrollbar_w).saturating_sub(gutter_w);
+        let pane_w = text_w as usize;
         let cont_w = pane_w.saturating_sub(CONTENT_HANGING_INDENT).max(1);
 
         // Build the flattened visual-row list. Each entry carries the
@@ -1185,15 +1528,20 @@ impl NotesWidget {
         let cursor_row = st.cursor_row;
         let cursor_col = st.cursor_col;
         let mode = st.mode;
-        let max_rows = area.height as usize;
+
+        // Reserve the bottom rows for the mode/help hint, mirroring the
+        // list pane's footer. Body rows render above; the footer label
+        // sits in the reserved bottom row.
+        let footer_rows = CONTENT_FOOTER_ROWS.min(area.height);
+        let body_height = area.height.saturating_sub(footer_rows);
+        let max_rows = body_height as usize;
 
         // Publish the max valid scroll for the key handler to clamp
         // against; the user can only scroll when the note exceeds the
         // visible row count. Then clamp the rendered scroll so a
         // previously-set value doesn't paint an empty pane.
-        let max_scroll: u16 = (visual.len() as u16).saturating_sub(area.height);
+        let max_scroll: u16 = (visual.len() as u16).saturating_sub(body_height);
         *self.last_max_content_scroll.lock().unwrap() = max_scroll;
-        let scroll = (st.content_scroll.min(max_scroll)) as usize;
 
         // Three-tier body brightness so the user can tell at a glance
         // what's happening: dim when input goes elsewhere, plain when
@@ -1227,6 +1575,21 @@ impl NotesWidget {
             None
         };
 
+        // Auto-scroll: if the cursor moved outside the current
+        // viewport (e.g. typing past the last visible row in insert
+        // mode), nudge content_scroll just-enough to bring it back.
+        // We snap rather than center, matching standard editor
+        // behavior — no jarring viewport jumps from line-by-line edits.
+        if let Some(cv) = cursor_visual_idx {
+            let cv_u16 = cv as u16;
+            if cv_u16 < st.content_scroll {
+                st.content_scroll = cv_u16;
+            } else if body_height > 0 && cv_u16 >= st.content_scroll + body_height {
+                st.content_scroll = cv_u16 + 1 - body_height;
+            }
+        }
+        let scroll = (st.content_scroll.min(max_scroll)) as usize;
+
         for (rendered_idx, vi) in (scroll..visual.len().min(scroll + max_rows)).enumerate() {
             let (_, wrap, is_cont) = &visual[vi];
             let indent: &str = if *is_cont { "  " } else { "" };
@@ -1234,7 +1597,11 @@ impl NotesWidget {
                 let visual_col =
                     indent.chars().count() + (cursor_col - wrap.source_col_start);
                 let combined = format!("{indent}{}", wrap.text);
-                render_cursor_line(&combined, visual_col, mode, &self.theme)
+                // Pass body_style so the non-cursor cells on the cursor
+                // line stay at the same brightness as every other body
+                // line — otherwise the whole line flashes plain↔brilliant
+                // every 500ms as the cursor blinks.
+                render_cursor_line(&combined, visual_col, mode, body_style, &self.theme)
             } else {
                 Line::from(vec![
                     Span::styled(indent.to_string(), body_style),
@@ -1244,10 +1611,76 @@ impl NotesWidget {
             let row_rect = Rect {
                 x: area.x,
                 y: area.y + rendered_idx as u16,
-                width: area.width,
+                width: text_w,
                 height: 1,
             };
             frame.render_widget(Paragraph::new(line), row_rect);
+        }
+
+        // Right-edge scroll indicator. Always painted (even when the
+        // note fits in the pane) so the body's right column stays
+        // stable — no reflow the first time a note grows past the
+        // viewport. Thumb height is proportional to the visible
+        // fraction; thumb top moves proportionally to scroll within
+        // max_scroll. When the note fits, the bar fills the column
+        // as "you can see everything."
+        if scrollbar_w > 0 && body_height > 0 {
+            let viewport = body_height as usize;
+            let total = visual.len().max(viewport);
+            let thumb_h = if total > viewport {
+                ((viewport * viewport) / total).max(1)
+            } else {
+                viewport
+            };
+            let track_span = viewport.saturating_sub(thumb_h);
+            let thumb_top = if max_scroll > 0 {
+                (track_span * scroll) / max_scroll as usize
+            } else {
+                0
+            };
+            let thumb_style = if content_focused {
+                self.theme.text_plain
+            } else {
+                self.theme.text_dim
+            };
+            let track_style = self.theme.text_dim;
+            let mut bar_lines: Vec<Line<'_>> = Vec::with_capacity(viewport);
+            for i in 0..viewport {
+                let in_thumb = i >= thumb_top && i < thumb_top + thumb_h;
+                let (glyph, style) = if in_thumb {
+                    ("█", thumb_style)
+                } else {
+                    ("│", track_style)
+                };
+                bar_lines.push(Line::from(Span::styled(glyph.to_string(), style)));
+            }
+            let scrollbar_rect = Rect {
+                x: area.x + area.width - scrollbar_w,
+                y: area.y,
+                width: scrollbar_w,
+                height: body_height,
+            };
+            frame.render_widget(Paragraph::new(bar_lines), scrollbar_rect);
+        }
+
+        // Mode/focus hint footer. Skipped entirely when there's no room.
+        if footer_rows > 0 {
+            let hint = content_footer_hint(mode, content_focused);
+            let footer_rect = Rect {
+                x: area.x,
+                y: area.y + body_height,
+                width: area.width,
+                height: footer_rows,
+            };
+            let mut lines: Vec<Line<'static>> = Vec::with_capacity(footer_rows as usize);
+            for _ in 0..footer_rows.saturating_sub(1) {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                hint.to_string(),
+                self.theme.text_dim,
+            )));
+            frame.render_widget(Paragraph::new(lines), footer_rect);
         }
     }
 
@@ -1385,6 +1818,14 @@ impl NotesWidget {
                 EventResult::Handled
             }
             KeyCode::Char('l') | KeyCode::Right => {
+                st.focus = SubFocus::Content;
+                EventResult::Handled
+            }
+            // Enter while the list is focused: "open" the selected note
+            // by jumping focus to the content pane — same effect as `l`
+            // / →, just the keystroke a list naturally suggests.
+            // Ignored when the content pane already has focus.
+            KeyCode::Enter if st.focus == SubFocus::List => {
                 st.focus = SubFocus::Content;
                 EventResult::Handled
             }
@@ -1603,11 +2044,14 @@ fn cursor_blink_visible(mode: Mode) -> bool {
 /// Render a single source line with the cursor overlay. Splits the
 /// line into "before cursor" / "cursor cell" / "after cursor" spans;
 /// the cursor cell shows the underlying char (or a space for end-of-line)
-/// painted with reversed video.
+/// painted with reversed video. `body_style` is the brightness the rest
+/// of the body is using on this frame — must match so the cursor line
+/// doesn't flash brightness as the cursor blinks.
 fn render_cursor_line(
     line: &str,
     cursor_col: usize,
     mode: Mode,
+    body_style: Style,
     theme: &Theme,
 ) -> Line<'static> {
     let chars: Vec<char> = line.chars().collect();
@@ -1634,10 +2078,24 @@ fn render_cursor_line(
             .add_modifier(Modifier::BOLD),
     };
     Line::from(vec![
-        Span::styled(before, theme.text_plain),
+        Span::styled(before, body_style),
         Span::styled(cursor_char, cursor_style),
-        Span::styled(after, theme.text_plain),
+        Span::styled(after, body_style),
     ])
+}
+
+/// Content-pane footer hint, selected by current mode + content focus.
+/// Insert mode always shows the escape hint; Normal mode shows the
+/// view-mode hint only when the content sub-pane has focus (the list
+/// pane has its own footer when focused there).
+fn content_footer_hint(mode: Mode, content_focused: bool) -> &'static str {
+    match mode {
+        Mode::Insert => "  ESC exit EDIT mode",
+        Mode::Normal if content_focused => {
+            "  VIEW mode  ·  i switch to EDIT  ·  ↑/↓ scroll  ·  ← navigate notes"
+        }
+        Mode::Normal => "",
+    }
 }
 
 /// Word-aware wrap. Splits `text` into rows that fit `first_w` (first
@@ -1804,6 +2262,131 @@ mod tests {
             NotesConfig::default(),
             Arc::new(Theme::builtin_defaults()),
         )
+    }
+
+    /// In EDIT mode every char is text input, so `y` after `⧉` would
+    /// be misleading — the keystroke just types a letter. The icon
+    /// stays (it's a click target now), the letter is dropped.
+    #[test]
+    fn title_metadata_drops_y_letter_in_edit_mode() {
+        let w = make_widget();
+        w.create_note();
+        // create_note drops into Insert mode.
+        let st = w.state.lock().unwrap();
+        let meta = w.derive_title_metadata(&st).expect("active note → metadata");
+        assert!(meta.contains("EDIT"), "should mention EDIT mode: {meta:?}");
+        assert!(meta.contains('⧉'), "should still show the ⧉ icon: {meta:?}");
+        assert!(
+            !meta.contains("⧉ y"),
+            "should not include the y shortcut hint in EDIT: {meta:?}"
+        );
+    }
+
+    /// VIEW mode keeps the `y` hint because the shortcut works there.
+    #[test]
+    fn title_metadata_keeps_y_letter_in_view_mode() {
+        let w = make_widget();
+        w.create_note();
+        w.state.lock().unwrap().mode = Mode::Normal;
+        let st = w.state.lock().unwrap();
+        let meta = w.derive_title_metadata(&st).expect("active note → metadata");
+        assert!(meta.contains("VIEW"), "should mention VIEW mode: {meta:?}");
+        assert!(meta.contains("⧉ y"), "should show ⧉ y hint in VIEW: {meta:?}");
+    }
+
+    /// Clicking the title-row metadata area (where ⧉ sits) yanks the
+    /// active note in both VIEW and EDIT modes — yank_active sets
+    /// `status` either way (success or copy-failed), so we just
+    /// assert the side effect.
+    #[test]
+    fn title_bar_metadata_click_yanks_active_note_in_both_modes() {
+        let mut w = make_widget();
+        w.create_note();
+        let area = Rect::new(0, 0, 80, 20);
+        *w.last_outer_area.lock().unwrap() = area;
+        // Click on the title row at the rightmost interior column —
+        // metadata is right-aligned and ⧉ sits near the right corner.
+        let click_col = area.x + area.width - 3;
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: click_col,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        // EDIT mode (default after create_note).
+        w.state.lock().unwrap().status = None;
+        assert_eq!(w.handle_mouse(click, area), EventResult::Handled);
+        assert!(
+            w.state.lock().unwrap().status.is_some(),
+            "EDIT-mode click on metadata should trigger yank (status set)"
+        );
+        // VIEW mode.
+        w.state.lock().unwrap().status = None;
+        w.state.lock().unwrap().mode = Mode::Normal;
+        assert_eq!(w.handle_mouse(click, area), EventResult::Handled);
+        assert!(
+            w.state.lock().unwrap().status.is_some(),
+            "VIEW-mode click on metadata should also trigger yank"
+        );
+    }
+
+    /// Status messages auto-revert after STATUS_TTL — the title bar
+    /// goes back to the normal `<name> · MODE · ⧉` once "Copied"
+    /// expires. Backdate the timestamp to simulate elapsed time
+    /// rather than sleeping in the test.
+    #[test]
+    fn title_metadata_reverts_after_status_ttl_elapses() {
+        let w = make_widget();
+        w.create_note();
+        // Fresh status — should be displayed verbatim.
+        w.state.lock().unwrap().set_status("Copied to clipboard");
+        {
+            let st = w.state.lock().unwrap();
+            assert_eq!(
+                w.derive_title_metadata(&st).as_deref(),
+                Some("Copied to clipboard")
+            );
+        }
+        // Backdate by 2× TTL so it's definitely expired.
+        {
+            let mut st = w.state.lock().unwrap();
+            if let Some(s) = st.status.as_mut() {
+                s.set_at = Instant::now() - STATUS_TTL - Duration::from_secs(1);
+            }
+        }
+        let st = w.state.lock().unwrap();
+        let meta = w.derive_title_metadata(&st).expect("should fall through");
+        assert!(
+            !meta.contains("Copied"),
+            "expired status should not be returned: {meta:?}"
+        );
+        assert!(
+            meta.contains("EDIT") || meta.contains("VIEW"),
+            "should fall through to the normal metadata: {meta:?}"
+        );
+    }
+
+    /// Clicking elsewhere on the title row (e.g. left edge near the
+    /// title text) must NOT trigger yank — the icon-click hit region
+    /// is the metadata cluster only.
+    #[test]
+    fn title_bar_click_outside_metadata_does_not_yank() {
+        let mut w = make_widget();
+        w.create_note();
+        let area = Rect::new(0, 0, 80, 20);
+        *w.last_outer_area.lock().unwrap() = area;
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 3, // far left, over the title text
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        w.state.lock().unwrap().status = None;
+        let _ = w.handle_mouse(click, area);
+        assert!(
+            w.state.lock().unwrap().status.is_none(),
+            "click on the title text should not yank"
+        );
     }
 
     #[test]
@@ -2089,6 +2672,93 @@ mod tests {
         assert_eq!(w.state.lock().unwrap().focus, SubFocus::List);
         w.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
         assert_eq!(w.state.lock().unwrap().focus, SubFocus::Content);
+    }
+
+    #[test]
+    fn normal_enter_on_list_focuses_content_and_is_noop_on_content() {
+        // Enter on the list pane mirrors `l` / → so "open this note"
+        // works with the keystroke users naturally try first. Enter
+        // while content is already focused must not consume the event
+        // (so it can fall through to global handlers if any).
+        let _g = TempHome::set();
+        let mut w = make_widget();
+        w.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        w.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        // List-focused → Enter advances to Content.
+        w.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(w.state.lock().unwrap().focus, SubFocus::List);
+        let r = w.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(r, EventResult::Handled);
+        assert_eq!(w.state.lock().unwrap().focus, SubFocus::Content);
+        // Content-focused → Enter is ignored, focus stays put.
+        let r = w.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(r, EventResult::Ignored);
+        assert_eq!(w.state.lock().unwrap().focus, SubFocus::Content);
+    }
+
+    #[test]
+    fn paste_in_insert_mode_inserts_full_text_atomically() {
+        // Reproduces the bug where pasting prose with smart quotes and a
+        // newline kicked the user out of insert mode mid-paste — without
+        // bracketed paste the embedded escape sequences would fire Esc.
+        // Through handle_paste the whole payload arrives atomically and
+        // the user stays in Insert.
+        let _g = TempHome::set();
+        let mut w = make_widget();
+        w.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        let pasted = "\u{201C}Neque porro quisquam est\u{201D}\nThere is no one\u{2026}";
+        let r = w.handle_paste(pasted);
+        assert_eq!(r, EventResult::Handled);
+        let st = w.state.lock().unwrap();
+        assert_eq!(st.mode, Mode::Insert, "must stay in insert mode after paste");
+        assert_eq!(st.notes[0].body, pasted);
+        assert_eq!(st.cursor_row, 1);
+        assert_eq!(st.cursor_col, "There is no one\u{2026}".chars().count());
+    }
+
+    #[test]
+    fn paste_pushes_one_undo_entry_regardless_of_length() {
+        // The whole point of paste_text vs. looping insert_char: a long
+        // paste must NOT push one undo snapshot per char (would blow past
+        // UNDO_CAP and ruin per-edit undo granularity).
+        let _g = TempHome::set();
+        let mut w = make_widget();
+        w.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        let long: String = "Lorem ipsum dolor sit amet. ".repeat(200);
+        w.handle_paste(&long);
+        let st = w.state.lock().unwrap();
+        let note_id = st.notes[0].id.clone();
+        let undo_len = st.history.get(&note_id).map(|h| h.undo.len()).unwrap_or(0);
+        assert_eq!(undo_len, 1, "paste must collapse to a single undo entry");
+        assert_eq!(st.notes[0].body, long);
+    }
+
+    #[test]
+    fn paste_normalizes_crlf_and_drops_control_chars() {
+        // Clipboard line endings differ by OS and pasted text occasionally
+        // carries a stray BEL / form-feed from the source page. Normalize
+        // CR/CRLF to LF and silently drop other ASCII control chars so the
+        // rendered note doesn't include unprintables.
+        let _g = TempHome::set();
+        let mut w = make_widget();
+        w.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        w.handle_paste("alpha\r\nbeta\rgamma\x07delta");
+        let st = w.state.lock().unwrap();
+        assert_eq!(st.notes[0].body, "alpha\nbeta\ngammadelta");
+    }
+
+    #[test]
+    fn paste_in_normal_mode_is_ignored() {
+        // Paste only edits the body in insert mode. In normal mode it
+        // must not mutate state — otherwise pasted commas / letters
+        // would mascarade as commands.
+        let _g = TempHome::set();
+        let mut w = make_widget();
+        w.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        w.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let r = w.handle_paste("ignored");
+        assert_eq!(r, EventResult::Ignored);
+        assert_eq!(w.state.lock().unwrap().notes[0].body, "");
     }
 
     /// Single shared TempHome guard for tests that touch ~/.config/glint/notes.

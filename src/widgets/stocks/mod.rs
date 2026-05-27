@@ -908,7 +908,7 @@ impl Widget for StocksWidget {
                 height: 1,
             };
             let hint = format!(
-                "↑/↓ select · c mode ({}) · Enter open · r refresh",
+                "↑/↓ select · c mode ({}) · ⏎ open · r refresh",
                 display_mode_label(self.display_mode)
             );
             frame.render_widget(
@@ -1745,14 +1745,27 @@ fn render_list_panel(
         height: usable_h as u16,
     };
 
-    // Keep the selected ticker visible by adjusting scroll.
+    // Keep the selected ticker visible by adjusting scroll. The
+    // cushion row hosts the last line when exactly one is hidden,
+    // so when the user navigates to the very last ticker we don't
+    // need to shift the viewport up — the cushion already shows it.
+    // Without this carve-out, moving the cursor onto the final row
+    // pushed everything else up by one, which is jarring when the
+    // user could already see the row they're moving to.
     let sel_line = ticker_lines.get(selected).copied().unwrap_or(0);
     let mut scroll = current_scroll;
     if sel_line < scroll {
         scroll = sel_line;
     }
     if usable_h > 0 && sel_line >= scroll + usable_h {
-        scroll = sel_line + 1 - usable_h;
+        let is_last_line = sel_line + 1 == lines.len();
+        scroll = if is_last_line {
+            // Land sel_line on the cushion (one past usable_h) so the
+            // visible window stays put.
+            sel_line.saturating_sub(usable_h)
+        } else {
+            sel_line + 1 - usable_h
+        };
     }
     // Cap scroll to the last useful starting line so we don't waste space.
     let max_scroll = lines.len().saturating_sub(usable_h.max(1));
@@ -1760,9 +1773,40 @@ fn render_list_panel(
         scroll = max_scroll;
     }
 
-    let end = (scroll + usable_h).min(lines.len());
+    let total_lines = lines.len();
+    let end = (scroll + usable_h).min(total_lines);
+    let hidden_below = total_lines.saturating_sub(end);
+    // Capture the would-be-next line BEFORE consuming `lines` below
+    // — when exactly one row is hidden, the cushion row promotes
+    // itself to show that row instead of a `↓` arrow. Saves the user
+    // a scroll for an indicator that pointed at one item anyway.
+    let cushion_line: Option<Line<'_>> = if hidden_below == 1 {
+        lines.get(end).cloned()
+    } else {
+        None
+    };
     let visible: Vec<Line<'_>> = lines.into_iter().skip(scroll).take(end - scroll).collect();
     frame.render_widget(Paragraph::new(visible), list_area);
+
+    // Cushion row: show the last hidden line when only one is below
+    // the viewport; show `↓` when two or more are; leave blank when
+    // everything fits. The bottom row of `area` is the cushion we
+    // reserved with `usable_h = area.height - 1`.
+    if area.height > 0 {
+        let cushion_rect = Rect {
+            x: area.x,
+            y: area.y + area.height - 1,
+            width: area.width,
+            height: 1,
+        };
+        if let Some(line) = cushion_line {
+            frame.render_widget(Paragraph::new(line), cushion_rect);
+        } else if hidden_below >= 2 {
+            let arrow = Line::from(Span::styled("↓", theme.text_dim))
+                .alignment(Alignment::Center);
+            frame.render_widget(Paragraph::new(arrow), cushion_rect);
+        }
+    }
     scroll
 }
 
