@@ -3,7 +3,7 @@ name = "glint-tui"
 version = "0.2.0"
 edition = "2021"
 description = "A fast, extensible terminal dashboard for stocks, calendar, news, and beyond"
-license = "MIT"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/ntrospect0/glint"
 keywords = ["tui", "dashboard", "terminal", "stocks", "ratatui"]
 categories = ["command-line-interface"]
@@ -40,7 +40,7 @@ widget-forex = ["widget-stocks"]
 widget-email = []
 widget-resources = []
 widget-gallery = []
-widget-sticky = []
+widget-notes = []
 widgets-all = [
   "widget-clock",
   "widget-weather",
@@ -51,7 +51,7 @@ widgets-all = [
   "widget-email",
   "widget-resources",
   "widget-gallery",
-  "widget-sticky",
+  "widget-notes",
 ]
 
 [dependencies]
@@ -63,7 +63,12 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { version = "1", features = ["full"] }
 
 # HTTP & serialization
-reqwest = { version = "0.12", features = ["json", "cookies"] }
+# `gzip`/`brotli`/`deflate` + `http2` so the shared HTTP client can
+# accept the same Accept-Encoding set a real browser advertises and
+# negotiates HTTP/2 — Cloudflare-fronted news feeds (CTV, Barron's,
+# CBC) reject HTTP/1.1 + identity-encoding requests as automation
+# even when the User-Agent is browser-shaped.
+reqwest = { version = "0.12", features = ["json", "cookies", "gzip", "brotli", "deflate", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

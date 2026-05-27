@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -90,13 +93,19 @@ impl RssProvider {
     }
 
     async fn fetch_feed(&self, feed: &FeedConfig) -> Result<Vec<Article>> {
-        // Per-request overrides for the RSS path. Many feeds sit behind
-        // bot-detection layers (Cloudflare, Akamai) that 403 / 451 the
-        // plain `glint-tui/x.y.z` UA — Barron's (Dow Jones) and CTV are
-        // the canonical examples. Sending a browser-shaped UA + the
-        // `Accept` headers an actual feed reader sends gets us past
-        // the same gates without lying about who we are (we still keep
-        // glint-tui in the comment portion of the UA).
+        // Per-request browser-shaped headers. Cloudflare's lighter bot-
+        // detection modes look at the full request shape, not just the
+        // User-Agent — sending only UA + Accept passes some sites
+        // (Bloomberg, Reuters) but fails others that require the
+        // `Sec-Fetch-*` and Upgrade-Insecure-Requests headers a real
+        // browser sends on top-level navigations. We mirror what
+        // Firefox sends for a feed click.
+        //
+        // Note: this can't defeat *TLS fingerprinting* (Cloudflare's
+        // "Bot Fight Mode" with JA3/JA4). Sites that detect Rust's
+        // rustls handshake signature reject the request before any
+        // header is read. The reliable workaround there is to remove
+        // the feed and use an alternative source.
         let bytes = self
             .http
             .get(&feed.url)
@@ -114,6 +123,19 @@ impl RssProvider {
                  text/xml;q=0.8, application/json;q=0.7, */*;q=0.5",
             )
             .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+            // `gzip`/`br`/`deflate` are negotiated by reqwest's compression
+            // features (enabled in Cargo.toml). Without explicit
+            // Accept-Encoding some servers assume "no compression support
+            // == bot" and 4xx the request.
+            .header(reqwest::header::ACCEPT_ENCODING, "gzip, br, deflate")
+            // Real browsers always send these on top-level navigations.
+            // Cloudflare's Bot Management feature flags requests missing
+            // any of them as automation candidates.
+            .header("Sec-Fetch-Dest", "document")
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Site", "none")
+            .header("Sec-Fetch-User", "?1")
+            .header(reqwest::header::UPGRADE_INSECURE_REQUESTS, "1")
             .send()
             .await
             .with_context(|| format!("GET {} failed", feed.url))?
@@ -146,7 +168,18 @@ impl NewsProvider for RssProvider {
             match self.fetch_feed(feed).await {
                 Ok(chunk) => chunk,
                 Err(err) => {
-                    tracing::warn!(feed = %feed.label, error = %err, "news feed fetch failed");
+                    // `{:#}` prints the full anyhow Error chain — without
+                    // it the inner cause (TLS handshake failure, DNS NXDOMAIN,
+                    // connection reset, etc.) is hidden behind the top-level
+                    // `with_context` message. That's exactly the info you
+                    // need to tell "this feed is bot-blocked" apart from
+                    // "this feed's host went down."
+                    tracing::warn!(
+                        feed = %feed.label,
+                        url = %feed.url,
+                        error = format!("{err:#}"),
+                        "news feed fetch failed"
+                    );
                     Vec::new()
                 }
             }

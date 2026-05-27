@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Color scheme system.
 //!
 //! Loads `~/.config/glint/colorschemes.toml`, picks the active scheme named in

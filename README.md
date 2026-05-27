@@ -1,44 +1,68 @@
 # glint
 
-A fast, keyboard-driven terminal dashboard for stocks, calendar, weather,
-news, and more. Written in Rust with [ratatui](https://ratatui.rs).
+A fast, keyboard-driven terminal dashboard. Stocks, forex + crypto,
+calendar, weather, news, email, notes, system resources, image gallery —
+all in one grid you compose yourself. Written in Rust with
+[ratatui](https://ratatui.rs).
 
-![glint widgets at a glance: clock, calendar, weather, news, stocks](docs/glint-spec.md)
+```text
+┌─ ▶ Clock ◀ ──────────────┐ ┌─ Calendar ─ [google] Sun May 24, 2026 ─┐
+│        09:42             │ │  Mon  Tue  Wed  Thu  Fri  Sat  Sun     │
+│      Sun May 24          │ │   1    2    3    4    5    6    7      │
+└──────────────────────────┘ │   8 …                                  │
+┌─ Weather ─ Richmond, BC ─┐ └────────────────────────────────────────┘
+│  14°C  partly cloudy     │ ┌─ News ─ Email ─ Notes ── 47 articles ──┐
+│  feels 13° · wind 12 km/h│ │  ▸ Anthropic ships Sonnet 4.7 …        │
+└──────────────────────────┘ │    The Verge · 12m ago                 │
+┌─ Stocks ─ Forex ── 1Y ──┐ │  ▸ Fed minutes: rate path unchanged    │
+│  ▸ AAPL    $214.30 +1.2%│ │    Reuters · 1h ago                    │
+│    NVDA    $129.18 −0.4%│ └────────────────────────────────────────┘
+└──────────────────────────┘ ┌─ Gallery ──────────────────────────────┐
+                             │  [your inline image rotates here]      │
+                             └────────────────────────────────────────┘
+```
+
+Everything is opt-in, locally configured, and persists in plain TOML
+under `~/.config/glint/` — no accounts, no telemetry, no cloud
+component glint controls. The setup wizard generates a working
+dashboard on first launch.
 
 ---
 
-## Features
+## Highlights
 
-- **Multi-widget layout** — grid of panes, mix and match
-  (Clock · Calendar · Weather · News · Stocks · Resources · Gallery), each
-  with its own TOML config.
-- **Multi-instance** — run the same widget kind in several panes (e.g. two
-  Stocks panes for different watchlists, two Clocks for home + office).
-- **Theming** — bundled color schemes (default · chalktone · gruvbox ·
-  tokyonight · rosepine · nord · bluloco · onedark · miasma); switch
-  live with `:scheme nord`.
-- **Per-widget focus shortcuts** — `Shift+C` / `Shift+W` / `Shift+N` / …
-  jump straight to that widget. The shortcut letter is painted in the
-  title.
-- **Live config reload** — edit any widget TOML and the dashboard picks
-  up the change without restart.
-- **Inline images (Gallery)** — iTerm2, Kitty graphics, Sixel, or unicode
-  half-blocks fallback. Pre-decoded on a background thread so startup
-  isn't blocked.
-- **Setup wizard** — `glint --setup` walks you through layout + widget
-  configs interactively. First run launches it automatically.
+- **Ten widget kinds**, each independently configurable, with sensible
+  built-in defaults — see the [widget catalogue](#widget-catalogue) below.
+- **Composable layout**: a grid of cells; any cell can be a single
+  widget or a **stack** of widgets you cycle between with `.` / `,`.
+- **Multi-instance** — run the same widget kind in several panes
+  (`stocks@watchlist1` + `stocks@watchlist2`, `clock@home` + `clock@office`).
+- **Live config reload** — edit any widget's TOML and the dashboard
+  picks it up without a restart.
+- **Theming** — nine bundled colour schemes; per-widget colour overrides;
+  add your own schemes by editing one TOML file. `:scheme nord` switches
+  live.
+- **Setup wizard** — `glint --setup` (or first launch with no config)
+  walks you through layout, widget assignment, and credentials with
+  copy-pasteable instructions for each external service.
+- **Keyboard-first, mouse-friendly** — `Tab` cycles widgets,
+  `Shift+<letter>` jumps to a widget by its shortcut letter, `:` opens
+  a command bar, click anywhere to focus.
+- **No cloud component**: every credential lives on disk under
+  `~/.config/glint/credentials/` (0600 perms). API calls go directly
+  from your machine to the upstream service.
 
 ---
 
 ## Install
 
-### From source (recommended for now)
+### From source (only option for now)
 
-Requires a recent Rust toolchain (1.81+). Install via
+You need a recent Rust toolchain (1.81+). Install via
 [`rustup`](https://rustup.rs/) if you don't have one.
 
 ```sh
-git clone <your-fork-url> glint
+git clone <repo-url> glint
 cd glint
 
 # Per-user install (no sudo, installs to ~/.local/bin):
@@ -61,7 +85,7 @@ Verify:
 glint --version
 ```
 
-### Other Makefile targets
+### Makefile targets
 
 | target | what it does |
 |---|---|
@@ -71,6 +95,20 @@ glint --version
 | `make uninstall` | remove `$(PREFIX)/bin/glint` |
 | `make test` | run the test suite |
 | `make clean` | `cargo clean` |
+
+### Slim builds
+
+Every widget compiles in only when its feature is enabled. The default
+`widgets-all` umbrella turns them all on. For a smaller binary:
+
+```sh
+cargo install --path . --no-default-features \
+  --features widget-clock,widget-weather,widget-stocks
+```
+
+Available features: `widget-clock`, `widget-weather`, `widget-calendar`,
+`widget-news`, `widget-stocks`, `widget-forex`, `widget-email`,
+`widget-resources`, `widget-gallery`, `widget-notes`.
 
 ### Updating
 
@@ -83,8 +121,7 @@ make install PREFIX=~/.local   # or sudo make install
 
 ## Quickstart
 
-Launch with no config and glint drops you into the setup wizard
-automatically:
+Launch with no existing config and you land in the setup wizard:
 
 ```sh
 glint
@@ -93,46 +130,114 @@ glint
 
 The wizard walks you through:
 
-1. **Layout** — 1 to 8 panes with 1–3 recommended layouts each.
-2. **Widget assignment** — pick which widget kind goes in each pane.
-   Same kind can occupy multiple panes when you give each instance a
-   distinct name (e.g. `home`, `office`).
-3. **Per-widget configs** — timezone, location, RSS feeds, watchlist
-   tickers, calendar providers, system-info refresh interval, gallery
-   image paths.
-4. **LLM key** (optional) — Anthropic API key for news summaries and
-   stock disambiguation.
+1. **Global settings** — colour scheme, mouse-scroll direction, optional
+   LLM provider and API key.
+2. **Layout** — pick 1 to 8 panes and a layout preset.
+3. **Widget assignment** — pick the widget kind that fills each pane,
+   including the option to stack multiple widgets in a single cell.
+4. **Per-widget setup** — timezone, location, RSS feeds, watchlist
+   tickers, calendar providers, mailbox folders, gallery image paths.
+5. **OAuth flows** (where needed) — Gmail, Outlook, Google Calendar all
+   captured inline through the wizard with copy-paste instructions.
 
-Re-run the wizard anytime with `glint --setup`. Each section has an
-**Edit / Skip** gate; skipping leaves that TOML untouched (preserving
-any hand-edited comments).
+Re-run any time with `glint --setup`. Every section has an
+**Edit / Skip** gate; skipping leaves that TOML untouched, so hand-edits
+and comments survive.
+
+After the wizard, the dashboard launches with your layout. Press `?` for
+the live keybinding overlay.
+
+---
+
+## Widget catalogue
+
+| widget | what it does | external services |
+|---|---|---|
+| **Clock** | big block-digit local time, optional secondary world clocks, configurable gradient | none |
+| **Weather** | current conditions + N-day forecast, IP geolocation fallback | [Open-Meteo](https://open-meteo.com) (free, key-less) |
+| **Calendar** | day / week / month views with event agenda | Google Calendar (OAuth), Microsoft Outlook (OAuth), CalDAV (iCloud / Fastmail / Nextcloud), local TOML events |
+| **News** | RSS / Atom aggregator with topic filters, keyword search (`:news <terms>`), optional per-article LLM summaries | any RSS/Atom feed; LLM provider for summaries |
+| **Stocks** | watchlist with price + change %, intraday + multi-year graphs, period toggle | [Yahoo Finance](https://finance.yahoo.com) (free, key-less) |
+| **Forex** | fiat + crypto pairs with auto-grouped Currencies / Crypto sections, primary-swap with `s`, USD-pivot triangulation | Yahoo Finance |
+| **Email** | unified inbox preview with optional per-message LLM summaries | Gmail (OAuth), Outlook (OAuth), any IMAP server (app password) |
+| **Resources** | htop-style CPU / memory / top-process view | local `sysinfo` (no FFI) |
+| **Gallery** | rotating inline image slideshow (any image glob you point it at) | none — uses iTerm2 / Kitty / Sixel inline image protocol, falls back to unicode half-blocks |
+| **Notes** | vim-flavoured multi-note pad with undo/redo, mouse cursor positioning, per-note files | none — plain `.md` files under `~/.config/glint/notes/` |
+
+Every widget is independently optional. The wizard surfaces only what
+you turn on; missing credentials route gracefully into the inline
+capture flow.
 
 ---
 
 ## Configuration
 
-All config lives under `~/.config/glint/`:
+All files live under `~/.config/glint/`:
 
 | file | what it controls |
 |---|---|
-| `config.toml` | active color scheme, grid layout, widget cell placements |
-| `colorschemes.toml` | named theme palettes (`default`, `nord`, `gruvbox`, …) |
+| `config.toml` | active colour scheme, mouse-scroll direction, status bar, grid layout, widget cell placements |
+| `colorschemes.toml` | named theme palettes (`default`, `chalktone`, `gruvbox`, `tokyonight`, `rosepine`, `nord`, `bluloco`, `onedark`, `miasma`) |
 | `clock.toml` | primary timezone, world clocks, big-digit gradient |
-| `weather.toml` | location, units, IP geolocation fallback |
-| `news.toml` | RSS feeds, topic filters, show-categorization toggle |
-| `stocks.toml` | watchlist, indices, default period, jump URL |
-| `calendar.toml` | Google / Outlook / CalDAV / Local providers |
-| `resources.toml` | refresh interval, top-N processes, sort key |
-| `gallery.toml` | image paths, rotation cadence |
-| `llm.toml` | per-feature LLM toggles |
-| `credentials/` | OAuth tokens + API keys (0600 perms) |
+| `weather.toml` | location, units (metric/imperial), forecast days, IP geolocation fallback |
+| `news.toml` | RSS / Atom feeds, topic filters, LLM summary toggle, fetch-body strategy |
+| `stocks.toml` | watchlist, indices, default period, jump URL template |
+| `forex.toml` | primary currency, fiat watchlist, **separate crypto watchlist**, default period |
+| `calendar.toml` | Google / Outlook / CalDAV / Local providers + per-provider calendar IDs |
+| `email.toml` | folders / labels to follow, polling cadence, LLM-summary opt-in |
+| `resources.toml` | refresh interval, top-N processes, sort key (CPU vs memory) |
+| `gallery.toml` | image paths or globs, rotation cadence, rescan interval |
+| `notes.toml` | per-widget shortcut + colour overrides (notes themselves live under `notes/`) |
+| `llm.toml` | active LLM provider (`anthropic` or `openai`), model, rate limit, cache size |
+| `credentials/` | OAuth tokens + API keys (`*_oauth_client.toml`, `*_oauth_token.toml`, `anthropic_key.toml`, `openai_key.toml`, `caldav.toml`, `imap.toml`) — 0600 perms |
+| `notes/<instance>/` | one `.md` file per note, `mtime` sorts the list |
 
-Most fields have sensible defaults; you only have to set the ones you
-care about. Edit any file by hand or re-run the wizard.
+Most fields have sensible defaults; you only have to set what you care
+about. Re-run the wizard any time, or hand-edit and `:reload`.
+
+### Layout example
+
+```toml
+# config.toml
+version = 1
+
+[global]
+theme = "nord"
+mouse_scroll = "natural"
+show_status_bar = true
+
+[layout]
+columns = [28, 36, 36]    # three columns at 28% / 36% / 36% of width
+rows = [30, 35, 35]       # three rows at 30% / 35% / 35% of height
+
+[[layout.cells]]
+widget = "clock"
+col = 0
+row = 0
+
+[[layout.cells]]
+widget = "calendar"
+col = 1
+row = 0
+col_span = 2              # span two columns
+
+# Stack pane: three widgets share row 1, cols 1–2; rotate with . / ,
+[[layout.cells]]
+widgets = ["news", "email", "notes"]
+col = 1
+row = 1
+col_span = 2
+
+[[layout.cells]]
+widgets = ["stocks", "forex"]
+col = 0
+row = 2
+col_span = 2
+```
 
 ### Multi-instance widgets
 
-Cells in `config.toml` can reference widgets as `kind@instance`:
+Cells can reference a widget as `kind@instance`:
 
 ```toml
 [[layout.cells]]
@@ -146,8 +251,50 @@ col = 1
 row = 2
 ```
 
-The first one reads `stocks.toml` (the implicit "main" instance), the
-others read `stocks@watchlist1.toml` and `stocks@watchlist2.toml`.
+The first uses `stocks.toml` (the implicit `main` instance), the others
+read `stocks@watchlist1.toml` and `stocks@watchlist2.toml`. Same trick
+works for clocks (home + office), calendars (work + personal), email
+(two accounts), etc.
+
+### Per-widget colour overrides
+
+Any widget's TOML can carry a `[colors]` block that overrides the
+active theme just for that widget:
+
+```toml
+# weather.toml
+location = "Vancouver, BC"
+
+[colors]
+border.focused = { fg = "#e07b00", modifiers = ["bold"] }
+widget_title.focused = { fg = "#fff", bg = "#e07b00", modifiers = ["bold"] }
+```
+
+Same field shape as `colorschemes.toml`.
+
+### Adding a custom colour scheme
+
+```toml
+# colorschemes.toml
+[schemes.my_scheme]
+border.focused           = { fg = "#88c0d0", modifiers = ["bold"] }
+border.unfocused         = "#3b4252"
+widget_title.focused     = { fg = "#000", bg = "#88c0d0", modifiers = ["bold"] }
+widget_title.unfocused   = { fg = "#eceff4", modifiers = ["bold"] }
+metadata.focused         = { fg = "#d8dee9" }
+metadata.unfocused       = { fg = "#616e88", modifiers = ["dim"] }
+text.plain               = { fg = "#d8dee9" }
+text.brilliant           = { fg = "#eceff4", modifiers = ["bold"] }
+text.dim                 = { fg = "#616e88" }
+text.selected            = { fg = "#ebcb8b", modifiers = ["bold"] }
+text.focused             = { fg = "#88c0d0", modifiers = ["bold"] }
+text.shortcut            = { fg = "#bf616a", modifiers = ["bold"] }
+```
+
+Then `:scheme my_scheme` (persisted to `[global] theme`).
+
+> ⚠️ Dotted keys must be **unquoted** (`border.focused`, not
+> `"border.focused"`). Quoted dotted keys silently fail to deserialize.
 
 ---
 
@@ -158,84 +305,107 @@ others read `stocks@watchlist1.toml` and `stocks@watchlist2.toml`.
 | key | action |
 |---|---|
 | `Tab` / `Shift+Tab` | cycle focused widget |
-| `Shift+<letter>` | jump focus directly (red letter in title) |
+| `Shift+<letter>` | jump focus to a widget by its shortcut letter (lit in title) |
 | `click cell` | focus that widget |
+| `.` / `,` | rotate the active widget in a stack pane |
 | `:` | open the command bar |
-| `:scheme <name>` | switch color scheme (persisted to `config.toml`) |
-| `:news <terms>` | filter news by keyword |
-| `:weather <city>` | retarget the weather widget |
-| `:time <city>` | retarget the clock widget |
-| `:stock <symbol>` | jump-lookup a ticker |
 | `?` | toggle help overlay (scrollable) |
 | `q` / `Ctrl+C` | quit |
+
+### Command bar (`:`)
+
+| command | what it does |
+|---|---|
+| `:scheme <name>` | switch colour scheme (persists to `config.toml`) |
+| `:reload` | re-read every widget's TOML without restarting |
+| `:news <terms>` | filter News by keyword |
+| `:weather <city>` | retarget Weather to a one-off city |
+| `:time <city>` | retarget Clock |
+| `:stock <symbol>` | jump-lookup a ticker in Stocks |
+| `:fx <code>` | swap primary currency in Forex |
 
 ### Common per-widget keys
 
 | widget | keys |
 |---|---|
-| **Stocks** | `↑/↓` select ticker · `←/→` cycle graph period · `c` % ↔ $ · `Enter` open in browser · `1-9` jump period |
-| **Calendar** | `d` / `w` / `m` day/week/month · `←/→` navigate · `t` today · `g` cycle digit gradient |
+| **Stocks** | `↑/↓` select ticker · `←/→` cycle graph period · `c` % ↔ $ · `Enter` open in browser · `1–9` jump period · `y` yank value |
+| **Forex** | `↑/↓` select pair · `←/→` cycle period · `s` / `Enter` make selected primary (crypto seeds amount=1) · `c` edit amount · `y` yank |
+| **Calendar** | `d` / `w` / `m` day/week/month · `←/→` navigate · `t` today |
 | **Weather** | `:weather <city>` retarget · `x` revert to default |
-| **Clock** | `:time <city>` retarget · `x` revert to local · `g` cycle gradient |
-| **News** | `↑/↓` select · `←/→` filter tabs · `e` expand · `Enter` open · `x` clear `:news` search |
+| **Clock** | `:time <city>` retarget · `x` revert to local |
+| **News** | `↑/↓` select · `←/→` filter tabs · `e` expand · `s` LLM summary · `Enter` open · `x` clear search |
+| **Email** | `↑/↓` select · `Enter` open in mail client · `e` expand · `s` LLM summary |
 | **Resources** | `m` toggle sort (CPU ↔ memory) · `r` force refresh |
-| **Gallery** | `p` pause/resume · `n`/`N` step · `↑/↓` rotation interval ±1s |
+| **Gallery** | `p` pause/resume · `n` / `N` step · `↑/↓` rotation interval ±1s |
+| **Notes** | `+` new · `-` delete (confirm) · `i` insert · `ESC` normal · `h`/`l` focus list / content · `j`/`k` scroll · `gg`/`G` top/bottom · `y` yank note · `Ctrl-A`/`Ctrl-E` line start/end · `Ctrl-U` delete line · `Ctrl-Z` / `Ctrl-Shift-Z` undo / redo |
 
-Hit `?` while running for the full overlay with scheme list and current
-shortcut assignments.
-
----
-
-## Color schemes
-
-Switch live:
-
-```
-:scheme nord
-:scheme gruvbox
-:scheme miasma
-```
-
-The choice persists to `[global] theme` in `config.toml`. Add your own
-scheme by editing `~/.config/glint/colorschemes.toml`:
-
-```toml
-[schemes.my_scheme]
-border.focused   = { fg = "#88c0d0", modifiers = ["bold"] }
-border.unfocused = "#3b4252"
-widget_title     = { fg = "#eceff4", modifiers = ["bold"] }
-text.plain       = { fg = "#d8dee9" }
-text.brilliant   = { fg = "#eceff4", modifiers = ["bold"] }
-text.dim         = { fg = "#616e88" }
-text.selected    = { fg = "#ebcb8b", modifiers = ["bold"] }
-text.focused     = { fg = "#88c0d0", modifiers = ["bold"] }
-text.shortcut    = { fg = "#bf616a", modifiers = ["bold"] }
-```
-
-Then `:scheme my_scheme`.
-
-**Important**: dotted keys must be unquoted (`border.focused`, not
-`"border.focused"`). Quoted dotted keys are literal flat keys and
-silently fail to deserialize into the nested struct.
+Hit `?` while running for the full overlay with the current shortcut
+assignments and active scheme.
 
 ---
 
-## Calendar providers
+## CLI reference
 
-Out of the box `calendar.toml` shows the bundled example events. To
-hook into real calendars:
+```sh
+glint                    # launch the dashboard (or wizard on first run)
+glint --setup            # launch the wizard
+glint --init             # create ~/.config/glint/ with default seed files
+glint --auth <provider>  # run an auth flow (google, microsoft, imap, anthropic, openai)
+glint --clear-cache [TARGET]
+                         # wipe ~/.cache/glint/ entirely, or scope to
+                         # a widget kind (news) or instance (news@home)
+glint --config <FILE>    # override the default XDG location
+glint --version
+```
 
-- **Google**: `glint --auth google` opens a browser to grant access.
-  List calendar IDs in `[[providers]]` under `kind = "google"`.
-- **Outlook / Microsoft 365**: register an Azure app, write the client
-  ID into `credentials/microsoft_oauth_client.toml`, run
-  `glint --auth outlook`.
-- **CalDAV (Apple iCloud, Fastmail, Nextcloud, …)**: generate an
-  app-specific password, fill `credentials/caldav.toml`, set
-  `kind = "caldav"`.
+---
 
-The setup wizard walks you through each of these with copy-pasteable
-instructions.
+## External dependencies
+
+glint pulls every piece of remote data directly from the upstream
+service; nothing routes through a glint-owned backend.
+
+| service | used by | auth |
+|---|---|---|
+| [Open-Meteo](https://open-meteo.com) | Weather (forecast), Weather (geocoding fallback via `ipapi.co`) | none |
+| [Yahoo Finance](https://finance.yahoo.com) | Stocks, Forex (fiat + crypto) | none |
+| [Google Calendar API](https://developers.google.com/calendar) | Calendar (Google provider) | OAuth, you create the OAuth app |
+| [Gmail API](https://developers.google.com/gmail) | Email (Gmail provider) | OAuth, same app as Calendar |
+| [Microsoft Graph](https://learn.microsoft.com/en-us/graph/) | Calendar (Outlook), Email (Outlook) | OAuth, you register an Azure app |
+| any CalDAV server | Calendar (iCloud, Fastmail, Nextcloud, …) | app password |
+| any IMAP server | Email (IMAP provider) | app password |
+| [Anthropic](https://www.anthropic.com/) / [OpenAI](https://openai.com/) | News + Email LLM summaries | API key, optional |
+| any RSS / Atom feed | News | none |
+
+The setup wizard walks you through the OAuth flows for Google, Outlook,
+and the LLM providers. For CalDAV and IMAP the wizard captures host +
+username + app-password inline. `INSTRUCTIONS.md` in the repo has the
+full step-by-step for each provider, including screenshots of the
+Google Cloud / Azure portals.
+
+### Rust crate dependencies
+
+Notable runtime crates: `ratatui` (TUI), `crossterm` (terminal I/O),
+`tokio` (async runtime), `reqwest` (HTTP), `serde` + `toml` (config),
+`chrono` + `chrono-tz` (time / timezones), `feed-rs` (RSS / Atom),
+`image` + `ratatui-image` (Gallery), `imap` + `mail-parser` (Email),
+`sysinfo` (Resources), `readability` (article extraction for LLM
+summaries). Full list in `Cargo.toml`.
+
+---
+
+## Data, privacy, and where things live
+
+| where | what |
+|---|---|
+| `~/.config/glint/*.toml` | your config — fully owned and editable by you |
+| `~/.config/glint/credentials/` (0600) | OAuth tokens, API keys, IMAP passwords |
+| `~/.config/glint/notes/` | notes as plain `.md` files |
+| `~/.cache/glint/` | per-widget on-disk caches (news articles, calendar events, email messages, etc.) — regenerable; a startup sweep drops anything > 30 days old |
+| `~/.config/glint/glint.log` | runtime log; `tail -f` it to debug |
+
+glint never sends data to any third party that isn't named in the
+External dependencies table above. There is no telemetry.
 
 ---
 
@@ -245,33 +415,53 @@ instructions.
   your `$PATH`. The Makefile prints the right export line at the end of
   `make install`.
 - **Gallery shows chunky pixelated images** — your terminal doesn't
-  support iTerm2 / Kitty / Sixel inline protocols, so glint fell back
-  to unicode half-blocks. Switch to iTerm2 (macOS), WezTerm, Kitty, or
+  speak iTerm2 / Kitty / Sixel inline protocols, so glint fell back to
+  unicode half-blocks. Switch to iTerm2 (macOS), WezTerm, Kitty, or
   enable sixel mode in your terminal.
-- **Logs**: anything that goes wrong at runtime is written to
-  `~/.config/glint/glint.log` — the TUI's alternate-screen mode means
-  stderr/stdout would corrupt the display, so warnings/errors land in
-  the log instead. `tail -f ~/.config/glint/glint.log` while debugging.
-- **Reset to defaults**: delete (or move aside) the files in
-  `~/.config/glint/` and re-run `glint --setup`.
+- **OAuth flow won't open a browser** — the auth flow prints the URL
+  too; copy-paste it into any browser, complete the consent, and the
+  flow's localhost listener picks up the redirect.
+- **Forex shows blank rates after closing on a non-USD primary** —
+  fixed; the disk cache now only persists when the live primary
+  matches the configured one. Earlier versions could seed the next
+  launch with the wrong symbol set.
+- **Logs**: runtime alt-screen mode means stderr/stdout would corrupt
+  the display, so warnings/errors land in
+  `~/.config/glint/glint.log`. `tail -f ~/.config/glint/glint.log`
+  while debugging.
+- **Reset to defaults**: move aside `~/.config/glint/` and re-run
+  `glint --setup`.
 
 ---
 
-## Development
+## Contributing
 
-```sh
-cargo run                  # debug build, dashboard mode
-cargo run -- --setup       # wizard
-cargo test --quiet         # full test suite (~190 tests)
-cargo clippy               # lints
-cargo fmt                  # format
-```
+glint is pre-launch v0.2; the architecture is settling but the surface
+is largely stable. If you want to dig in:
 
-See `docs/glint-spec.md` for the original design spec and `AGENTS.md`
-for the architecture overview targeted at contributors and AI assistants.
+1. `make test` — runs the full suite (~460 tests). Should pass clean
+   on `main` at all times.
+2. `make build` for a debug binary, `make` for release.
+3. `cargo clippy --features widgets-all` for lints; CI gates on this.
+4. **Adding a widget** is purely additive: implement the `Widget`
+   trait under `src/widgets/<name>/`, declare a `widget-<name>` Cargo
+   feature, and append a `WidgetDescriptor` to
+   `src/widgets/registry.rs`. The registry is the single registration
+   point — no edits to `app.rs`, `main.rs`, or the wizard are needed.
+5. `AGENTS.md` carries the architecture overview (read it before
+   non-trivial PRs). A dedicated developer guide is in flight.
+
+Issues and PRs welcome.
 
 ---
 
 ## License
 
-MIT.
+glint is licensed under **GNU GPL v3 or later** — see
+[LICENSE](LICENSE) for the full text. In short: you're free to use,
+modify, and redistribute glint, but any modified version you
+distribute must also be GPL-licensed and must keep glint's
+copyright notices intact. The author retains the right to offer
+the project under additional licenses (see
+[CONTRIBUTING.md](CONTRIBUTING.md) for the contributor sign-off +
+relicensing grant).

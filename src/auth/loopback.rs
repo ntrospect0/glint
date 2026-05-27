@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Provider-agnostic helpers for OAuth authorization-code flows that use a
 //! loopback redirect URI. Both `auth/google` and `auth/microsoft` build on
 //! this — the per-provider modules supply the URL templates, scopes, and

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Platform-level persistent cache.
 //!
 //! Widgets store fetched data here so the dashboard can paint cached results

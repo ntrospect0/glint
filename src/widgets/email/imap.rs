@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! IMAP-backed email provider. Sits alongside [`gmail::GmailProvider`]
 //! and [`outlook::OutlookEmailProvider`]; users who don't want to deal
 //! with OAuth (or whose provider isn't Google/Microsoft) point glint

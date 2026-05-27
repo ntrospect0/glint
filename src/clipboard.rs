@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Minimal OSC 52 clipboard helper.
 //!
 //! OSC 52 is a terminal escape sequence that asks the terminal emulator

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Pre-seed a fresh [`WizardState`] from the user's existing on-disk
 //! configs. Runs once at wizard start when there's no `.wizard_state.toml`
 //! resume buffer — re-running `--setup` with prior configs should surface

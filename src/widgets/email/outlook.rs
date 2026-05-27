@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Microsoft Graph (Outlook / Microsoft 365) email provider. Mirrors the
 //! calendar Outlook provider's HTTP+OAuth shape — same token refresh path,
 //! same Prefer header for UTC normalization.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Braille-dot graph renderer.
 //!
 //! Each U+2800–U+28FF braille char represents an 8-pixel cell laid out as

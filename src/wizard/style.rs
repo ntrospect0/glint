@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Shared style palette for the wizard. Centralising the colour + modifier
 //! choices here keeps the page renderers visually consistent and saves
 //! every page from inventing its own ad-hoc `Style::default()` rules.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Persistence for in-flight wizard state.
 //!
 //! The wizard buffers everything in [`WizardState`] until the user confirms

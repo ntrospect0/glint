@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Minimal HTML → plain text converter for email bodies. Hand-rolled rather
 //! than pulling in `scraper` / `html2text` because real-world emails are wildly
 //! malformed (Outlook ships angle brackets unescaped, marketing emails

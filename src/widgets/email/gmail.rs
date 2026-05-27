@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Gmail (Google Mail API v1) email provider. Uses the existing Google OAuth
 //! token (extended with the `gmail.readonly` scope) to list and read messages.
 //!

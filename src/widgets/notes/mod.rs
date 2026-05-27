@@ -1,4 +1,7 @@
-//! Sticky Note widget — a vim-flavoured notepad with multi-note
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
+//! Notes widget — a vim-flavoured notepad with multi-note
 //! navigation. Notes live as one `.md` file per note under
 //! `~/.config/glint/notes/<instance>/`; the filesystem is the source of
 //! truth, and the widget reloads from disk on startup.
@@ -50,13 +53,13 @@ use self::store::Note;
 
 use super::{AppContext, EventResult, Widget, WidgetCtx};
 
-pub const KIND: &str = "sticky";
+pub const KIND: &str = "notes";
 
-/// User-facing config under `~/.config/glint/sticky.toml` (or
-/// `sticky@<instance>.toml`). All fields optional; the widget is
+/// User-facing config under `~/.config/glint/notes.toml` (or
+/// `notes@<instance>.toml`). All fields optional; the widget is
 /// usable with an empty file.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct StickyConfig {
+pub struct NotesConfig {
     /// Per-widget `Shift+<letter>` shortcut preferences. Empty falls
     /// through to a built-in default list.
     #[serde(default)]
@@ -160,7 +163,7 @@ struct HistoryEntry {
     cursor_col: usize,
 }
 
-/// Per-note undo / redo state held in `StickyState` keyed by note id.
+/// Per-note undo / redo state held in `NotesState` keyed by note id.
 /// Preserved across note switches so undoing a typo in note A still
 /// works after you've navigated to note B and back. Dropped when a
 /// note is deleted.
@@ -170,7 +173,7 @@ struct NoteHistory {
     redo: Vec<HistoryEntry>,
 }
 
-struct StickyState {
+struct NotesState {
     notes: Vec<Note>,
     /// Index into `notes` of the currently-selected note. `None` when
     /// the store is empty.
@@ -196,7 +199,7 @@ struct StickyState {
     history: HashMap<String, NoteHistory>,
 }
 
-impl Default for StickyState {
+impl Default for NotesState {
     fn default() -> Self {
         Self {
             notes: Vec::new(),
@@ -215,7 +218,7 @@ impl Default for StickyState {
     }
 }
 
-impl StickyState {
+impl NotesState {
     /// Snapshot the active note's editable state into its undo stack
     /// and clear its redo stack. Called *before* every body-changing
     /// edit (insert, backspace, delete-line) so undo restores the
@@ -237,12 +240,12 @@ impl StickyState {
     }
 }
 
-pub struct StickyWidget {
+pub struct NotesWidget {
     id: String,
     instance: String,
     display_name_cache: String,
-    config: StickyConfig,
-    state: Arc<Mutex<StickyState>>,
+    config: NotesConfig,
+    state: Arc<Mutex<NotesState>>,
     app_theme: Arc<Theme>,
     theme: Theme,
     shortcut: Option<char>,
@@ -259,16 +262,16 @@ pub struct StickyWidget {
     last_max_content_scroll: Arc<Mutex<u16>>,
 }
 
-impl StickyWidget {
+impl NotesWidget {
     pub fn with_config(
         instance: String,
-        config: StickyConfig,
+        config: NotesConfig,
         app_theme: Arc<Theme>,
     ) -> Self {
         let id = if instance == "main" {
-            "sticky".to_string()
+            "notes".to_string()
         } else {
-            format!("sticky@{instance}")
+            format!("notes@{instance}")
         };
         let display_name_cache = if instance == "main" {
             "Notes".to_string()
@@ -281,7 +284,7 @@ impl StickyWidget {
         } else {
             config.shortcuts.clone()
         };
-        let mut state = StickyState::default();
+        let mut state = NotesState::default();
         state.notes = store::load_all(&instance);
         if !state.notes.is_empty() {
             state.active = Some(0);
@@ -303,14 +306,14 @@ impl StickyWidget {
     }
 
     fn create_note(&self) {
-        let mut st = self.state.lock().expect("sticky state poisoned");
+        let mut st = self.state.lock().expect("notes state poisoned");
         let mut note = Note {
             id: store::new_id(),
             body: String::new(),
             modified: std::time::SystemTime::now(),
         };
         if let Err(err) = store::save(&self.instance, &mut note) {
-            tracing::warn!(error = %err, "sticky: save new note failed");
+            tracing::warn!(error = %err, "notes: save new note failed");
             st.status = Some(format!("Save failed: {err}"));
             return;
         }
@@ -326,12 +329,12 @@ impl StickyWidget {
     }
 
     fn delete_active(&self) {
-        let mut st = self.state.lock().expect("sticky state poisoned");
+        let mut st = self.state.lock().expect("notes state poisoned");
         let Some(active) = st.active else { return };
         let Some(note) = st.notes.get(active) else { return };
         let id = note.id.clone();
         if let Err(err) = store::delete(&self.instance, &id) {
-            tracing::warn!(error = %err, "sticky: delete failed");
+            tracing::warn!(error = %err, "notes: delete failed");
             st.status = Some(format!("Delete failed: {err}"));
             return;
         }
@@ -353,11 +356,11 @@ impl StickyWidget {
     /// Persist the active note's body to disk. Bumps mtime and re-sorts
     /// the list so the just-edited note bubbles to the top.
     fn save_active(&self) {
-        let mut st = self.state.lock().expect("sticky state poisoned");
+        let mut st = self.state.lock().expect("notes state poisoned");
         let Some(active) = st.active else { return };
         let Some(note) = st.notes.get_mut(active) else { return };
         if let Err(err) = store::save(&self.instance, note) {
-            tracing::warn!(error = %err, "sticky: save failed");
+            tracing::warn!(error = %err, "notes: save failed");
             st.status = Some(format!("Save failed: {err}"));
             return;
         }
@@ -368,7 +371,7 @@ impl StickyWidget {
     }
 
     fn yank_active(&self) {
-        let mut st = self.state.lock().expect("sticky state poisoned");
+        let mut st = self.state.lock().expect("notes state poisoned");
         let Some(active) = st.active else { return };
         let Some(note) = st.notes.get(active) else { return };
         match crate::clipboard::copy(&note.body) {
@@ -377,7 +380,7 @@ impl StickyWidget {
         }
     }
 
-    fn move_cursor_h(&self, st: &mut StickyState, delta: i32) -> bool {
+    fn move_cursor_h(&self, st: &mut NotesState, delta: i32) -> bool {
         // Returns `true` if the cursor moved within the line; `false`
         // if it hit the boundary (callers can interpret false as a
         // focus-toggle trigger when desired).
@@ -400,7 +403,7 @@ impl StickyWidget {
         moved || delta < 0
     }
 
-    fn move_cursor_v(&self, st: &mut StickyState, delta: i32) {
+    fn move_cursor_v(&self, st: &mut NotesState, delta: i32) {
         let total_rows = active_line_count(st);
         if total_rows == 0 {
             st.cursor_row = 0;
@@ -416,7 +419,7 @@ impl StickyWidget {
     }
 
     fn insert_char(&self, c: char) {
-        let mut st = self.state.lock().expect("sticky state poisoned");
+        let mut st = self.state.lock().expect("notes state poisoned");
         let Some(active) = st.active else { return };
         st.push_undo_snapshot();
         let cursor_row = st.cursor_row;
@@ -437,7 +440,7 @@ impl StickyWidget {
     }
 
     fn backspace(&self) {
-        let mut st = self.state.lock().expect("sticky state poisoned");
+        let mut st = self.state.lock().expect("notes state poisoned");
         let Some(active) = st.active else { return };
         if st.cursor_col == 0 && st.cursor_row == 0 {
             return;
@@ -479,7 +482,7 @@ impl StickyWidget {
     /// Delete the line the cursor is on (Ctrl-U in insert mode).
     /// Captures an undo snapshot before mutating.
     fn delete_current_line(&self) {
-        let mut st = self.state.lock().expect("sticky state poisoned");
+        let mut st = self.state.lock().expect("notes state poisoned");
         let Some(active) = st.active else { return };
         st.push_undo_snapshot();
         let cursor_row = st.cursor_row;
@@ -510,7 +513,7 @@ impl StickyWidget {
     }
 
     fn undo(&self) {
-        let mut st = self.state.lock().expect("sticky state poisoned");
+        let mut st = self.state.lock().expect("notes state poisoned");
         let Some(active) = st.active else { return };
         let note_id = match st.notes.get(active) {
             Some(n) => n.id.clone(),
@@ -546,7 +549,7 @@ impl StickyWidget {
     }
 
     fn redo(&self) {
-        let mut st = self.state.lock().expect("sticky state poisoned");
+        let mut st = self.state.lock().expect("notes state poisoned");
         let Some(active) = st.active else { return };
         let note_id = match st.notes.get(active) {
             Some(n) => n.id.clone(),
@@ -580,7 +583,7 @@ impl StickyWidget {
     }
 
     fn select_note(&self, idx: usize) {
-        let mut st = self.state.lock().expect("sticky state poisoned");
+        let mut st = self.state.lock().expect("notes state poisoned");
         if idx < st.notes.len() {
             st.active = Some(idx);
             st.cursor_row = 0;
@@ -591,7 +594,7 @@ impl StickyWidget {
     }
 
     fn cycle_active(&self, delta: i32) {
-        let mut st = self.state.lock().expect("sticky state poisoned");
+        let mut st = self.state.lock().expect("notes state poisoned");
         if st.notes.is_empty() {
             return;
         }
@@ -606,7 +609,7 @@ impl StickyWidget {
     }
 }
 
-fn active_line_count(st: &StickyState) -> usize {
+fn active_line_count(st: &NotesState) -> usize {
     let Some(active) = st.active else { return 0 };
     let Some(note) = st.notes.get(active) else { return 0 };
     active_line_count_for(&note.body)
@@ -623,7 +626,7 @@ fn active_line_count_for(body: &str) -> usize {
     n.max(1)
 }
 
-fn active_line_len(st: &StickyState) -> usize {
+fn active_line_len(st: &NotesState) -> usize {
     let Some(active) = st.active else { return 0 };
     let Some(note) = st.notes.get(active) else { return 0 };
     line_char_len(&note.body, st.cursor_row)
@@ -670,7 +673,7 @@ fn char_offset_to_byte(s: &str, char_offset: usize) -> usize {
 }
 
 #[async_trait]
-impl Widget for StickyWidget {
+impl Widget for NotesWidget {
     fn id(&self) -> &str {
         &self.id
     }
@@ -692,7 +695,7 @@ impl Widget for StickyWidget {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
-        let st = self.state.lock().expect("sticky state poisoned");
+        let st = self.state.lock().expect("notes state poisoned");
         let title_metadata = self.derive_title_metadata(&st);
         let block = apply_title_row(
             Block::default()
@@ -755,7 +758,7 @@ impl Widget for StickyWidget {
         self.render_content(frame, content_rect_padded, focused);
 
         // Modal delete confirm last so it sits above both panes.
-        let st = self.state.lock().expect("sticky state poisoned");
+        let st = self.state.lock().expect("notes state poisoned");
         if let Some(name) = st.confirm_delete.clone() {
             drop(st);
             self.render_confirm_modal(frame, inner, &name);
@@ -768,13 +771,13 @@ impl Widget for StickyWidget {
         // line-start / line-end jumps, so we don't pre-filter modifiers
         // here — the per-mode handler decides.
         {
-            let st = self.state.lock().expect("sticky state poisoned");
+            let st = self.state.lock().expect("notes state poisoned");
             if st.confirm_delete.is_some() {
                 drop(st);
                 return self.handle_confirm_key(key);
             }
         }
-        let mode = self.state.lock().expect("sticky state poisoned").mode;
+        let mode = self.state.lock().expect("notes state poisoned").mode;
         match mode {
             Mode::Normal => {
                 if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
@@ -787,14 +790,14 @@ impl Widget for StickyWidget {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, _area: Rect) -> EventResult {
-        let mode = self.state.lock().expect("sticky state poisoned").mode;
+        let mode = self.state.lock().expect("notes state poisoned").mode;
         let content_rect = *self.last_content_rect.lock().unwrap();
         let list_rect = *self.last_list_rect.lock().unwrap();
         let in_content = point_in(content_rect, mouse.column, mouse.row);
         let in_list = list_rect.width > 0 && point_in(list_rect, mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp if matches!(mode, Mode::Normal) => {
-                let mut st = self.state.lock().expect("sticky state poisoned");
+                let mut st = self.state.lock().expect("notes state poisoned");
                 if in_list {
                     st.list_scroll = st.list_scroll.saturating_sub(1);
                     return EventResult::Handled;
@@ -805,7 +808,7 @@ impl Widget for StickyWidget {
                 EventResult::Ignored
             }
             MouseEventKind::ScrollDown if matches!(mode, Mode::Normal) => {
-                let mut st = self.state.lock().expect("sticky state poisoned");
+                let mut st = self.state.lock().expect("notes state poisoned");
                 if in_list {
                     st.list_scroll = st.list_scroll.saturating_add(1);
                     return EventResult::Handled;
@@ -819,17 +822,17 @@ impl Widget for StickyWidget {
             MouseEventKind::Down(_) if in_list => {
                 // Each list entry takes 2 rows; mouse.row within
                 // list_rect tells us which entry was clicked.
-                let st = self.state.lock().expect("sticky state poisoned");
+                let st = self.state.lock().expect("notes state poisoned");
                 let inner_y = mouse.row.saturating_sub(list_rect.y);
                 let visible_idx = (inner_y / 2) as usize + st.list_scroll as usize;
                 drop(st);
                 self.select_note(visible_idx);
-                let mut st = self.state.lock().expect("sticky state poisoned");
+                let mut st = self.state.lock().expect("notes state poisoned");
                 st.focus = SubFocus::List;
                 EventResult::Handled
             }
             MouseEventKind::Down(_) if in_content => {
-                let mut st = self.state.lock().expect("sticky state poisoned");
+                let mut st = self.state.lock().expect("notes state poisoned");
                 st.focus = SubFocus::Content;
                 // In insert mode, clicking inside the content pane
                 // jumps the cursor to the clicked position. In normal
@@ -865,7 +868,7 @@ impl Widget for StickyWidget {
     }
 
     fn apply_config(&mut self, config: serde_json::Value) -> Result<()> {
-        let new_cfg: StickyConfig = serde_json::from_value(config)?;
+        let new_cfg: NotesConfig = serde_json::from_value(config)?;
         self.theme = self.app_theme.with_overrides(&new_cfg.colors);
         self.shortcut_prefs = if new_cfg.shortcuts.is_empty() {
             vec!['s', 'n', 't', 'i', 'o']
@@ -912,13 +915,13 @@ impl Widget for StickyWidget {
     }
 
     fn title_metadata(&self) -> Option<String> {
-        let st = self.state.lock().expect("sticky state poisoned");
+        let st = self.state.lock().expect("notes state poisoned");
         self.derive_title_metadata(&st)
     }
 }
 
-impl StickyWidget {
-    fn derive_title_metadata(&self, st: &StickyState) -> Option<String> {
+impl NotesWidget {
+    fn derive_title_metadata(&self, st: &NotesState) -> Option<String> {
         if let Some(status) = &st.status {
             return Some(status.clone());
         }
@@ -940,7 +943,7 @@ impl StickyWidget {
     }
 
     fn render_list(&self, frame: &mut Frame, area: Rect, widget_focused: bool) {
-        let st = self.state.lock().expect("sticky state poisoned");
+        let st = self.state.lock().expect("notes state poisoned");
         let list_focused = widget_focused && st.focus == SubFocus::List;
         let content_focused = widget_focused && st.focus == SubFocus::Content;
 
@@ -1104,7 +1107,7 @@ impl StickyWidget {
     }
 
     fn render_content(&self, frame: &mut Frame, area: Rect, widget_focused: bool) {
-        let st = self.state.lock().expect("sticky state poisoned");
+        let st = self.state.lock().expect("notes state poisoned");
         let content_focused = widget_focused && st.focus == SubFocus::Content;
         let body = match st.active.and_then(|i| st.notes.get(i)) {
             Some(n) => n.body.clone(),
@@ -1308,7 +1311,7 @@ impl StickyWidget {
                 EventResult::Handled
             }
             _ => {
-                let mut st = self.state.lock().expect("sticky state poisoned");
+                let mut st = self.state.lock().expect("notes state poisoned");
                 st.confirm_delete = None;
                 EventResult::Handled
             }
@@ -1316,7 +1319,7 @@ impl StickyWidget {
     }
 
     fn handle_normal_key(&self, key: KeyEvent) -> EventResult {
-        let mut st = self.state.lock().expect("sticky state poisoned");
+        let mut st = self.state.lock().expect("notes state poisoned");
         st.status = None;
 
         // Two-key chord handling. `gg` jumps to top in this view-only
@@ -1439,12 +1442,12 @@ impl StickyWidget {
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             match key.code {
                 KeyCode::Char('a') | KeyCode::Char('A') => {
-                    let mut st = self.state.lock().expect("sticky state poisoned");
+                    let mut st = self.state.lock().expect("notes state poisoned");
                     st.cursor_col = 0;
                     return EventResult::Handled;
                 }
                 KeyCode::Char('e') | KeyCode::Char('E') => {
-                    let mut st = self.state.lock().expect("sticky state poisoned");
+                    let mut st = self.state.lock().expect("notes state poisoned");
                     let len = active_line_len(&st);
                     st.cursor_col = len;
                     return EventResult::Handled;
@@ -1470,7 +1473,7 @@ impl StickyWidget {
         }
         match key.code {
             KeyCode::Esc => {
-                let mut st = self.state.lock().expect("sticky state poisoned");
+                let mut st = self.state.lock().expect("notes state poisoned");
                 st.mode = Mode::Normal;
                 EventResult::Handled
             }
@@ -1487,22 +1490,22 @@ impl StickyWidget {
                 EventResult::Handled
             }
             KeyCode::Left => {
-                let mut st = self.state.lock().expect("sticky state poisoned");
+                let mut st = self.state.lock().expect("notes state poisoned");
                 let _ = self.move_cursor_h(&mut st, -1);
                 EventResult::Handled
             }
             KeyCode::Right => {
-                let mut st = self.state.lock().expect("sticky state poisoned");
+                let mut st = self.state.lock().expect("notes state poisoned");
                 let _ = self.move_cursor_h(&mut st, 1);
                 EventResult::Handled
             }
             KeyCode::Up => {
-                let mut st = self.state.lock().expect("sticky state poisoned");
+                let mut st = self.state.lock().expect("notes state poisoned");
                 self.move_cursor_v(&mut st, -1);
                 EventResult::Handled
             }
             KeyCode::Down => {
-                let mut st = self.state.lock().expect("sticky state poisoned");
+                let mut st = self.state.lock().expect("notes state poisoned");
                 self.move_cursor_v(&mut st, 1);
                 EventResult::Handled
             }
@@ -1518,7 +1521,7 @@ impl StickyWidget {
 /// click falls past the last rendered visual row (e.g. clicked into
 /// the bottom-pad area) — caller leaves the cursor where it was.
 fn cursor_position_for_click(
-    st: &StickyState,
+    st: &NotesState,
     local_y: u16,
     local_x: u16,
     pane_w: usize,
@@ -1775,13 +1778,13 @@ fn truncate_for_meta(s: &str, max: usize) -> String {
     format!("{kept}…")
 }
 
-/// Wizard descriptor. Sticky notes have no per-instance fields the
+/// Wizard descriptor. Notes have no per-instance fields the
 /// wizard manages — the on-disk note files are the data. Surfaces a
 /// short blurb so the wizard's widget picker explains what it is.
 pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
     use crate::wizard::descriptor::WizardDescriptor;
     WizardDescriptor {
-        display_name: "Sticky Notes",
+        display_name: "Notes",
         blurb: "A vim-flavoured notepad. Multiple notes; the list \
                 sorts by last-edited. Notes persist as one .md file \
                 per note under ~/.config/glint/notes/<instance>/ so \
@@ -1793,9 +1796,9 @@ pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
 }
 
 pub fn build(ctx: &WidgetCtx) -> Box<dyn Widget> {
-    let cfg: StickyConfig =
+    let cfg: NotesConfig =
         crate::config::load_widget_toml_for_instance(KIND, &ctx.instance).unwrap_or_default();
-    Box::new(StickyWidget::with_config(
+    Box::new(NotesWidget::with_config(
         ctx.instance.clone(),
         cfg,
         ctx.theme.clone(),
@@ -1806,10 +1809,10 @@ pub fn build(ctx: &WidgetCtx) -> Box<dyn Widget> {
 mod tests {
     use super::*;
 
-    fn make_widget() -> StickyWidget {
-        StickyWidget::with_config(
+    fn make_widget() -> NotesWidget {
+        NotesWidget::with_config(
             "test-main".to_string(),
-            StickyConfig::default(),
+            NotesConfig::default(),
             Arc::new(Theme::builtin_defaults()),
         )
     }
@@ -2105,7 +2108,7 @@ mod tests {
     impl TempHome {
         fn set() -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "glint-sticky-widget-test-{}-{:?}",
+                "glint-notes-widget-test-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             ));

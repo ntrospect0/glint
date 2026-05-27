@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! File-system watcher that notifies the main loop when any
 //! `~/.config/glint/*.toml` file changes, so widgets can hot-reload their
 //! config without an app restart.

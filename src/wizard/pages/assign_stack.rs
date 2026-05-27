@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Wizard sub-page for composing a stack cell. See
 //! `docs/stack-spec.md` §6.
 //!

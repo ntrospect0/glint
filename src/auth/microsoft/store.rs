@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};

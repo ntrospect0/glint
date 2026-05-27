@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Resources widget — htop-style CPU / memory / process view.
 //! Backed by `sysinfo` (cross-platform; no FFI of our own).
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Shared HTTP client. Building a [`reqwest::Client`] allocates a fresh
 //! TLS session pool — separate clients can't reuse keepalive sockets or
 //! cached TLS sessions across widgets. A single process-wide client folds

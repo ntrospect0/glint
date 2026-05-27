@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! TUI shell for the wizard. Owns the event loop, page dispatch, progress
 //! header, and footer hint bar. Pages are stateless renderers driven by
 //! [`WizardState`]; transient UI state (focus index, in-flight text input)

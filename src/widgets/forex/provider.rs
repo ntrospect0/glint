@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Yahoo Finance adapter for foreign-exchange pairs.
 //!
 //! Reuses Yahoo's v8/chart endpoint via the same symbol convention as

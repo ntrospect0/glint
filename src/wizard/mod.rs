@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Interactive setup wizard for glint. Invoked by `glint --setup` and by
 //! the first-run UX in `main.rs` when no `config.toml` is present.
 //!

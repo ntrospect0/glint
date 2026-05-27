@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Forex widget — mirrors the Stocks widget's shape but for currency
 //! pairs. One configured **primary** currency (e.g. USD), an ordered
 //! list of **quote** currencies (EUR, GBP, JPY, …), and an editable

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Auth provider registry — the single source of truth for OAuth providers
 //! and IMAP-style credential-only providers.
 //!

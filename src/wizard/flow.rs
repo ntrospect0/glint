@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Page sequencing. Pure functions over `WizardState` — no I/O, no UI —
 //! so the app loop can ask "what's next?" without baking the order into
 //! the loop itself.

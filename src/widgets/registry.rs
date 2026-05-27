@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Widget registry — the single source of truth for which widgets exist.
 //!
 //! ## Adding a widget
@@ -139,13 +142,13 @@ pub const WIDGETS: &[WidgetDescriptor] = &[
         auth_requirements: &[],
         wizard: super::gallery::wizard_descriptor,
     },
-    #[cfg(feature = "widget-sticky")]
+    #[cfg(feature = "widget-notes")]
     WidgetDescriptor {
-        kind: super::sticky::KIND,
-        factory: super::sticky::build,
+        kind: super::notes::KIND,
+        factory: super::notes::build,
         default_in_first_run: false,
         auth_requirements: &[],
-        wizard: super::sticky::wizard_descriptor,
+        wizard: super::notes::wizard_descriptor,
     },
 ];
 

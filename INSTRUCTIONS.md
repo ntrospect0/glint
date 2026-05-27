@@ -184,19 +184,53 @@ Glint will connect lazily on the first fetch.
 
 ---
 
-## Anthropic API key (optional, for LLM summaries)
+## LLM provider key (optional, for summaries)
 
-The news + email widgets can summarise expanded items using Claude.
+The news + email widgets can summarise expanded items using a
+configurable LLM. Glint ships two providers out of the box:
+**Anthropic (Claude)** and **OpenAI (GPT)**. You pick one — the
+widgets call whichever is active in `llm.toml`.
+
+### Anthropic (Claude)
 
 1. https://console.anthropic.com/ → *Get API Keys* → create a key.
-2. Either paste it into the wizard's *Global → Anthropic API key* field, or edit `~/.config/glint/credentials/anthropic_key.toml`:
+2. Either pick **Anthropic (Claude)** on the wizard's
+   *Global → LLM provider* field and paste the key into the
+   *Anthropic API key* field below it, or edit
+   `~/.config/glint/credentials/anthropic_key.toml`:
 
    ```toml
    api_key = "sk-ant-..."
    ```
-3. Make sure `summarize_with_llm = true` in `news.toml` / `email.toml`.
 
-If no key is configured, the `s summarize` keyboard hint stays hidden in the email widget; the news widget renders the raw RSS excerpt instead.
+### OpenAI (GPT)
+
+1. https://platform.openai.com/api-keys → *Create new secret key*.
+2. Either pick **OpenAI (GPT)** on the wizard's *Global → LLM
+   provider* field and paste the key into the *OpenAI API key* field
+   below it, or edit `~/.config/glint/credentials/openai_key.toml`:
+
+   ```toml
+   api_key = "sk-..."
+   ```
+3. The default OpenAI model is `gpt-5-mini`. Change it in `llm.toml`
+   if you want a different model — the field is sent verbatim to the
+   OpenAI Chat Completions API, so any model name your account can
+   call (e.g. `gpt-4o-mini`, `gpt-4o`) works.
+
+### Activating LLM features
+
+After the key is on disk:
+
+- `llm.toml` carries `[provider] name = "anthropic"` or `"openai"` —
+  the wizard sets this when you pick a provider; you can flip it by
+  hand any time.
+- `summarize_with_llm = true` in `news.toml` / `email.toml` opts each
+  widget into summaries. Both default to `true` once a key is configured.
+
+If no key is configured (or `enabled = false` in `llm.toml`), the
+`s summarize` keyboard hint stays hidden in the email widget; the
+news widget renders the raw RSS excerpt instead.
 
 ---
 
@@ -260,10 +294,15 @@ This wipes everything — config, tokens, cache. The wizard seeds fresh defaults
 ├── email.toml                    # provider, folders, summarize_with_llm
 ├── news.toml                     # [[feeds]], [[topics]], summarize
 ├── stocks.toml                   # indices, watchlist
+├── forex.toml                    # primary, watchlist, crypto_watchlist
 ├── weather.toml                  # lat/lon, units
 ├── gallery.toml                  # image dirs, rotation
 ├── resources.toml                # poll cadence, top-N processes
+├── notes.toml                    # per-instance shortcuts + colors
+├── llm.toml                      # active provider, model, limits
 ├── colorschemes.toml             # named [schemes.*] palettes
+├── notes/                        # one folder per notes-widget instance
+│   └── <instance>/<id>.md        # each note as a plain markdown file
 └── credentials/                  # 0600-mode
     ├── google_oauth_client.toml
     ├── google_oauth_token.toml
@@ -271,7 +310,8 @@ This wipes everything — config, tokens, cache. The wizard seeds fresh defaults
     ├── microsoft_oauth_token.toml
     ├── caldav.toml
     ├── imap.toml
-    └── anthropic_key.toml
+    ├── anthropic_key.toml
+    └── openai_key.toml
 ```
 
 Every `.toml` is plain text — edit in your favourite editor and either restart glint or hit `:reload` from the runtime command bar. The wizard preserves keys it doesn't manage (custom feeds, topic keywords, per-widget color overrides, etc.) across `--setup` re-runs.
@@ -280,6 +320,6 @@ Every `.toml` is plain text — edit in your favourite editor and either restart
 
 ## Further reading
 
-- `README.md` — install, keybindings, color schemes, multi-instance widgets.
-- `docs/glint-spec.md` — full architecture spec + per-widget TOML reference.
+- `README.md` — install, keybindings, color schemes, multi-instance widgets, widget catalogue, external dependencies.
+- `AGENTS.md` — architecture overview for contributors and AI assistants.
 - https://github.com/ntrospect0/glint — source, issues, releases.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Cell → widget assignment. Each cell is a Choice-style picker:
 //!
 //! - Tab / Shift-Tab moves between cells.

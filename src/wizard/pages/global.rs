@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Global config page. Theme + mouse_scroll + LLM provider are rendered
 //! as vertical option lists (consistent with the per-widget Choice
 //! fields); the API key is a free-form text input that binds to the

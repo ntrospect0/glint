@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Per-instance note persistence under `~/.config/glint/notes/<instance>/`.
 //!
 //! One Markdown file per note. The on-disk layout is intentionally plain:
@@ -24,7 +27,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-/// A single sticky note as held in memory. Bodies are loaded eagerly
+/// A single note as held in memory. Bodies are loaded eagerly
 /// (notes are tiny and few — typically dozens of KB total per instance).
 #[derive(Debug, Clone)]
 pub struct Note {
@@ -90,7 +93,7 @@ pub fn load_all(instance: &str) -> Vec<Note> {
     let dir = match notes_dir(instance) {
         Ok(p) => p,
         Err(err) => {
-            tracing::warn!(error = %err, "sticky: notes dir unresolvable");
+            tracing::warn!(error = %err, "notes: dir unresolvable");
             return Vec::new();
         }
     };
@@ -100,7 +103,7 @@ pub fn load_all(instance: &str) -> Vec<Note> {
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
         Err(err) => {
-            tracing::warn!(path = %dir.display(), error = %err, "sticky: read_dir failed");
+            tracing::warn!(path = %dir.display(), error = %err, "notes: read_dir failed");
             return Vec::new();
         }
     };
@@ -120,7 +123,7 @@ pub fn load_all(instance: &str) -> Vec<Note> {
                 tracing::warn!(
                     path = %path.display(),
                     error = %err,
-                    "sticky: read failed; skipping"
+                    "notes: read failed; skipping"
                 );
                 continue;
             }
@@ -177,7 +180,7 @@ mod tests {
 
     fn tmp_home() -> tempdir::PathGuard {
         let dir = std::env::temp_dir().join(format!(
-            "glint-sticky-test-{}-{:?}",
+            "glint-notes-test-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

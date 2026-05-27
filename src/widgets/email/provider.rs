@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Common types shared by both Email providers (Gmail + Outlook). The widget
 //! talks to providers exclusively through this trait so adding a third
 //! provider (IMAP, JMAP, …) later is a strictly additive change.

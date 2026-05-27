@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Confirmation page. Summary of what's about to be written + the
 //! "Complete and Save" trigger. Points the user at the relevant TOMLs for
 //! further hand-tuning.

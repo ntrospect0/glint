@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 

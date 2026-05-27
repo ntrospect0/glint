@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Local, NaiveDate, TimeZone};

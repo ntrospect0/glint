@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Local "seen via glint" persistence. Glint never writes read-state back to
 //! the server (Gmail / Graph), so we maintain a tiny on-disk set so messages
 //! the user has expanded inside the dashboard stop showing the `●` indicator

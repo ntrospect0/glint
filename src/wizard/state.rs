@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! In-flight wizard state. Buffered across pages until the user clicks
 //! `Complete and Save` on the confirmation page, at which point we write
 //! every collected value into the real TOML files in a single transaction.

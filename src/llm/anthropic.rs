@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 use anyhow::{Context, Result};
 // rustc's `unused_imports` lint mis-fires on proc-macro attribute imports
 // when there's exactly one use site in this file. The compile fails without

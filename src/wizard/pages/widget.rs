@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Generic per-widget setup page. Drives entirely from the widget's
 //! `WizardDescriptor` so adding a new widget to the wizard is a matter of
 //! filling in fields — no per-widget code in the wizard itself.

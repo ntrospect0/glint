@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Inline OAuth credentials capture page.
 //!
 //! Triggered when the user hits Space on a widget page's OAuth field

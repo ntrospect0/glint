@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Email widget — read-only feed of recent messages across Gmail / Outlook.
 //!
 //! Closely mirrors the News widget (provider trait, expand/select/open flow,

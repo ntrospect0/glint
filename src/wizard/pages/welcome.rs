@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Welcome page. First-run users get an orientation blurb; users with a
 //! `.wizard_state.toml` from a prior run get a `[Resume]` / `[Start fresh]`
 //! choice instead.

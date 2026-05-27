@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 #[cfg(feature = "widget-calendar")]
 pub mod calendar;
 #[cfg(feature = "widget-clock")]
@@ -12,8 +15,8 @@ pub mod registry;
 #[cfg(feature = "widget-resources")]
 pub mod resources;
 pub mod stack;
-#[cfg(feature = "widget-sticky")]
-pub mod sticky;
+#[cfg(feature = "widget-notes")]
+pub mod notes;
 #[cfg(feature = "widget-stocks")]
 pub mod stocks;
 #[cfg(feature = "widget-forex")]

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Runtime state — tiny user-state file separate from config.toml.
 //!
 //! Holds things that change as the user *uses* glint (rather than

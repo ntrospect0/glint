@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! CalDAV calendar provider (RFC 4791) — talks to Apple iCloud, Fastmail,
 //! Nextcloud, Synology, or any other server that speaks the standard.
 //!

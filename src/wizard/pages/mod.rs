@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Wizard pages. Each page is a thin module with a `render` + `handle_key`
 //! function. The [`Page`] enum holds zero per-page state — transient UI
 //! state lives on [`crate::wizard::app::WizardApp`]; persistent data lives

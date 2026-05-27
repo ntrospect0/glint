@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Microsoft Graph (Outlook / Microsoft 365) calendar provider. Mirrors the
 //! Google provider's shape: takes the user's token, optionally a list of
 //! calendar IDs, and fetches events for a time range via REST.

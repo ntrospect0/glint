@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
 //! Transactional commit of wizard state to the real TOML files.
 //!
 //! Called once, after the user presses `Complete and Save` on the confirm
