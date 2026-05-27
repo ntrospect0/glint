@@ -184,12 +184,13 @@ fn parse_daily(daily: OpenMeteoDaily) -> Vec<DailyForecast> {
 /// glyph set but trimmed for narrow terminal cells (each row is 13 columns).
 pub fn ascii_art(code: u32) -> [&'static str; 4] {
     match code {
-        // Clear / mostly clear → sun
+        // Clear / mostly clear → sun with rays in 4 directions. Symmetric
+        // around the centerline so the bottom mirrors the top.
         0 | 1 => [
             "    \\   /    ",
             "     .-.     ",
             "  - (   ) -  ",
-            "    `-'      ",
+            "    /   \\    ",
         ],
         // Partly cloudy → sun + cloud
         2 => [

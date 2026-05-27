@@ -269,14 +269,21 @@ impl Widget for WeatherWidget {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let lines = build_lines(&snapshot, self.config.units);
-        // Reserve one blank line at the top so content doesn't hug the border.
-        let mut padded: Vec<Line<'_>> = Vec::with_capacity(lines.len() + 1);
-        padded.push(Line::from(""));
-        padded.extend(lines);
-
-        let body = Paragraph::new(padded).alignment(Alignment::Center);
-        frame.render_widget(body, inner);
+        // When we have weather data, the ASCII art needs its own fixed-width
+        // sub-rect so each art row lands at the same x offset. Centered
+        // Paragraph alignment treats each line independently — lines with
+        // different trimmed widths shift relative to each other, which made
+        // the symmetric sun look broken on the bottom row.
+        if let Some(data) = &snapshot.data {
+            render_with_art(frame, inner, &snapshot, data, self.config.units);
+        } else {
+            let lines = loading_lines(&snapshot);
+            let mut padded: Vec<Line<'_>> = Vec::with_capacity(lines.len() + 1);
+            padded.push(Line::from(""));
+            padded.extend(lines);
+            let body = Paragraph::new(padded).alignment(Alignment::Center);
+            frame.render_widget(body, inner);
+        }
     }
 
     fn handle_key(&mut self, _key: KeyEvent) -> EventResult {
@@ -315,27 +322,71 @@ struct Snapshot {
     attempted: bool,
 }
 
-fn build_lines<'a>(s: &'a Snapshot, units: Units) -> Vec<Line<'a>> {
-    let mut lines: Vec<Line<'a>> = Vec::new();
-    if s.location_label.is_none() {
-        return loading_lines(s);
-    }
-    let Some(data) = &s.data else {
-        return loading_lines(s);
-    };
+/// Width of every row in `ascii_art()`. Used to carve a fixed sub-rect so all
+/// art rows render at the same x offset regardless of trailing-whitespace
+/// quirks in centered Paragraph layout.
+const ASCII_ART_WIDTH: u16 = 13;
+const ASCII_ART_HEIGHT: u16 = 4;
 
+fn render_with_art(
+    frame: &mut Frame,
+    inner: Rect,
+    s: &Snapshot,
+    data: &WeatherData,
+    units: Units,
+) {
     let (label, icon) = describe_code(data.weather_code);
-    lines.push(Line::from(Span::styled(
-        format!("{icon}  {label}"),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(""));
 
-    for row in ascii_art(data.weather_code) {
-        lines.push(Line::from(row));
+    // Header: top blank + condition label + blank.
+    let header_lines: Vec<Line<'_>> = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("{icon}  {label}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    let header_height: u16 = header_lines.len() as u16;
+    let header_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: header_height.min(inner.height),
+    };
+    frame.render_widget(
+        Paragraph::new(header_lines).alignment(Alignment::Center),
+        header_area,
+    );
+
+    // Art: own fixed-width left-aligned sub-rect, horizontally centered.
+    if inner.height >= header_height + ASCII_ART_HEIGHT {
+        let art_w = ASCII_ART_WIDTH.min(inner.width);
+        let art_x = inner.x + (inner.width.saturating_sub(art_w)) / 2;
+        let art_area = Rect {
+            x: art_x,
+            y: inner.y + header_height,
+            width: art_w,
+            height: ASCII_ART_HEIGHT,
+        };
+        let art_lines: Vec<Line<'_>> = ascii_art(data.weather_code)
+            .iter()
+            .map(|s| Line::from(*s))
+            .collect();
+        frame.render_widget(Paragraph::new(art_lines), art_area);
     }
-    lines.push(Line::from(""));
 
+    // Bottom section: temp, feels-like, humidity/wind, forecast, footer.
+    let used_top = header_height + ASCII_ART_HEIGHT + 1; // +1 trailing blank
+    if inner.height <= used_top {
+        return;
+    }
+    let bottom_area = Rect {
+        x: inner.x,
+        y: inner.y + used_top,
+        width: inner.width,
+        height: inner.height - used_top,
+    };
+    let mut lines: Vec<Line<'_>> = Vec::new();
     lines.push(Line::from(Span::styled(
         format!("{:.0}{}", data.temperature, data.units.temp_symbol()),
         Style::default()
@@ -355,7 +406,6 @@ fn build_lines<'a>(s: &'a Snapshot, units: Units) -> Vec<Line<'a>> {
         data.units.wind_label()
     )));
 
-    // 3-day forecast (skip today, which is data.daily[0]).
     if data.daily.len() >= 2 {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -391,7 +441,11 @@ fn build_lines<'a>(s: &'a Snapshot, units: Units) -> Vec<Line<'a>> {
         footer,
         Style::default().add_modifier(Modifier::DIM),
     )));
-    lines
+
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        bottom_area,
+    );
 }
 
 fn loading_lines(s: &Snapshot) -> Vec<Line<'_>> {

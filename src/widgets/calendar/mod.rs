@@ -226,30 +226,61 @@ impl CalendarWidget {
         Some(start_of_week(self.anchor) + ChronoDuration::days(dow))
     }
 
-    /// Month view renders as: 1-row top padding, 1-row weekday header, 6 week
-    /// rows of 7 cells (5 chars each). Maps clicks in those week rows to a date.
+    /// Month view layout: top padding (1 row) + month name (1 row) + weekday
+    /// header (1 row) + 6 week rows. With multi-month layout, the inner area
+    /// is split into N equal columns; each column hosts a centered 35-char
+    /// grid. Maps a click to the (month, week, day-of-week) that landed under
+    /// it, returning the actual date.
     fn month_day_at(&self, col: u16, row: u16, inner: Rect) -> Option<NaiveDate> {
         let usable_height = inner.height.saturating_sub(1);
         let rel_y = row.checked_sub(inner.y)?;
-        if rel_y < 2 || rel_y >= usable_height {
+        // Padding row 0, month-name row 1, weekday header row 2, weeks 3-8.
+        if rel_y < 3 || rel_y >= usable_height {
             return None;
         }
-        let week = (rel_y - 2) as i64;
+        let week = (rel_y - 3) as i64;
         if !(0..6).contains(&week) {
             return None;
         }
-        if col < inner.x {
+
+        let (anchor_y, anchor_m) = (self.anchor.year(), self.anchor.month());
+        let months: Vec<(i32, u32)> = if inner.width >= 3 * MONTH_GRID_MIN_WIDTH {
+            vec![
+                advance_month(anchor_y, anchor_m, -1),
+                (anchor_y, anchor_m),
+                advance_month(anchor_y, anchor_m, 1),
+            ]
+        } else if inner.width >= 2 * MONTH_GRID_MIN_WIDTH {
+            vec![(anchor_y, anchor_m), advance_month(anchor_y, anchor_m, 1)]
+        } else {
+            vec![(anchor_y, anchor_m)]
+        };
+
+        let col_rel = col.checked_sub(inner.x)?;
+        let n = months.len() as u16;
+        let col_width = inner.width / n;
+        if col_width == 0 {
             return None;
         }
-        let rel_x = (col - inner.x) as usize;
-        let cell = rel_x / 5; // each rendered cell is 5 chars wide
+        let month_idx = ((col_rel / col_width) as usize).min(months.len() - 1);
+        let (y, m) = months[month_idx];
+
+        // Each month's 35-char grid is centered within its column.
+        let col_start_x = inner.x + month_idx as u16 * col_width;
+        let grid_offset = col_width.saturating_sub(MONTH_GRID_WIDTH) / 2;
+        let rel_x = col.checked_sub(col_start_x + grid_offset)?;
+        let cell = rel_x / 5;
         if cell >= 7 {
             return None;
         }
-        let grid_start = start_of_week(start_of_month(self.anchor));
+        let first = NaiveDate::from_ymd_opt(y, m, 1)?;
+        let grid_start = start_of_week(first);
         Some(grid_start + ChronoDuration::days(week * 7 + cell as i64))
     }
 }
+
+const MONTH_GRID_WIDTH: u16 = 35;
+const MONTH_GRID_MIN_WIDTH: u16 = 37;
 
 /// Distinct interactions exposed in the bottom hint row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,6 +354,88 @@ fn build_provider(
             (local, ProviderKind::Local, Some(format!("Google init failed: {err}")))
         }
     }
+}
+
+fn advance_month(year: i32, month: u32, delta: i32) -> (i32, u32) {
+    let total = year * 12 + (month as i32 - 1) + delta;
+    let new_year = total.div_euclid(12);
+    let new_month = (total.rem_euclid(12) + 1) as u32;
+    (new_year, new_month)
+}
+
+/// Renders one month's 6-week grid into `area`. `is_anchor` controls header
+/// styling so the currently-focused month stands out among neighbors.
+fn render_month_grid(
+    frame: &mut Frame,
+    area: Rect,
+    year: i32,
+    month: u32,
+    is_anchor: bool,
+    events: &[Event],
+) {
+    let Some(first) = NaiveDate::from_ymd_opt(year, month, 1) else {
+        return;
+    };
+    let grid_start = start_of_week(first);
+    let today = Local::now().date_naive();
+
+    let month_header_style = if is_anchor {
+        Style::default()
+            .fg(Color::LightYellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+    let weekday_header = Line::from(
+        ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+            .iter()
+            .map(|s| {
+                Span::styled(
+                    format!("{s:^5}"),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(9);
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("{} {}", month_long(month), year),
+        month_header_style,
+    )));
+    lines.push(weekday_header);
+
+    for week in 0..6 {
+        let mut spans: Vec<Span<'_>> = Vec::with_capacity(7);
+        for dow in 0..7 {
+            let date = grid_start + ChronoDuration::days(week * 7 + dow);
+            let in_month = date.month() == month;
+            let day_str = format!("{}", date.day());
+            let cell = if date == today {
+                format!("[{day_str:>2}]")
+            } else {
+                format!(" {day_str:>2} ")
+            };
+            let has_events = events.iter().any(|e| e.on_date(date));
+            let style = if !in_month {
+                Style::default().add_modifier(Modifier::DIM)
+            } else if has_events {
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            spans.push(Span::styled(format!("{cell:<5}"), style));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        area,
+    );
 }
 
 fn local_midnight(date: NaiveDate) -> Option<DateTime<Local>> {
@@ -429,13 +542,61 @@ impl CalendarWidget {
     }
 
     fn render_day(&self, frame: &mut Frame, area: Rect, events: &[Event]) {
-        let today_events: Vec<&Event> =
-            events.iter().filter(|e| e.on_date(self.anchor)).collect();
+        // When the cell is wide enough, preview the selected day alongside
+        // the day after. Selected day's date is highlighted; the preview's
+        // date is dim/gray so it's clear which is "today's selection".
+        // A 1-col `│` separator runs down the middle so the two days don't
+        // visually blur into one another.
+        const TWO_DAY_MIN_WIDTH: u16 = 50;
+        let show_next_day = area.width >= TWO_DAY_MIN_WIDTH;
+        if show_next_day {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Fill(1),
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                ])
+                .split(area);
+            self.render_day_column(frame, cols[0], self.anchor, true, events);
+            // Carve a sub-rect that's inset one row from the top (so the
+            // separator doesn't kiss the cell border) and one row from the
+            // bottom (so it doesn't overlap with the view-tab hint row).
+            let sep_height = cols[1].height.saturating_sub(2);
+            if sep_height > 0 {
+                let sep_area = Rect {
+                    x: cols[1].x,
+                    y: cols[1].y + 1,
+                    width: cols[1].width,
+                    height: sep_height,
+                };
+                let sep_lines: Vec<Line<'_>> = (0..sep_height)
+                    .map(|_| {
+                        Line::from(Span::styled(
+                            "│",
+                            Style::default().add_modifier(Modifier::DIM),
+                        ))
+                    })
+                    .collect();
+                frame.render_widget(Paragraph::new(sep_lines), sep_area);
+            }
+            let next = self.anchor + ChronoDuration::days(1);
+            self.render_day_column(frame, cols[2], next, false, events);
+        } else {
+            self.render_day_column(frame, area, self.anchor, true, events);
+        }
+    }
 
-        // Split the inner area: tear-off-sheet header on top (centered), the
-        // hint banner + event list below (left-aligned). 8 rows fits the
-        // padding + weekday/month line + 5 block-digit rows + bottom padding;
-        // shrink gracefully when the cell is shorter than that.
+    fn render_day_column(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        date: NaiveDate,
+        is_anchor: bool,
+        events: &[Event],
+    ) {
+        let day_events: Vec<&Event> = events.iter().filter(|e| e.on_date(date)).collect();
+
         let header_height = 8u16.min(area.height);
         let header_area = Rect {
             x: area.x,
@@ -452,9 +613,16 @@ impl CalendarWidget {
 
         let header_text = format!(
             "{} · {}",
-            weekday_short(self.anchor.weekday()),
-            month_long(self.anchor.month()),
+            weekday_short(date.weekday()),
+            month_long(date.month()),
         );
+        let date_style = if is_anchor {
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
         let mut header_lines: Vec<Line<'_>> = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -462,13 +630,8 @@ impl CalendarWidget {
                 Style::default().add_modifier(Modifier::DIM),
             )),
         ];
-        for row in big_digits::render(&self.anchor.day().to_string()) {
-            header_lines.push(Line::from(Span::styled(
-                row,
-                Style::default()
-                    .fg(Color::LightYellow)
-                    .add_modifier(Modifier::BOLD),
-            )));
+        for row in big_digits::render(&date.day().to_string()) {
+            header_lines.push(Line::from(Span::styled(row, date_style)));
         }
         frame.render_widget(
             Paragraph::new(header_lines).alignment(Alignment::Center),
@@ -476,22 +639,32 @@ impl CalendarWidget {
         );
 
         let mut lines: Vec<Line<'_>> = Vec::new();
-        if let Some(hint) = &self.auth_hint {
-            lines.push(Line::from(Span::styled(
-                format!("⚠ {hint}"),
-                Style::default().fg(Color::Yellow),
-            )));
-            lines.push(Line::from(""));
+        // Auth hint only renders alongside the anchor day so we don't double-up.
+        if is_anchor {
+            if let Some(hint) = &self.auth_hint {
+                lines.push(Line::from(Span::styled(
+                    format!("⚠ {hint}"),
+                    Style::default().fg(Color::Yellow),
+                )));
+                lines.push(Line::from(""));
+            }
         }
-        if today_events.is_empty() {
+        if day_events.is_empty() {
             lines.push(Line::from(Span::styled(
                 "No events.",
                 Style::default().add_modifier(Modifier::DIM),
             )));
         } else {
-            for e in today_events {
+            // Widest time label is "HH:MM–HH:MM" (11 chars). Pad every label
+            // (including "all day") to that width so every title starts at
+            // the same column.
+            const TIME_COL_WIDTH: usize = 11;
+            const TITLE_GAP: usize = 2;
+            let cont_indent = " ".repeat(TIME_COL_WIDTH + TITLE_GAP);
+
+            for e in &day_events {
                 let color = color_for_calendar(&e.calendar);
-                let time_label = if e.all_day {
+                let raw_time = if e.all_day {
                     "all day".to_string()
                 } else {
                     format!(
@@ -502,8 +675,12 @@ impl CalendarWidget {
                         e.end.minute()
                     )
                 };
+                let padded_time = format!("{:<width$}", raw_time, width = TIME_COL_WIDTH);
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{time_label}  "), Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{padded_time}{:gap$}", "", gap = TITLE_GAP),
+                        Style::default().fg(Color::Gray),
+                    ),
                     Span::styled(
                         e.title.clone(),
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -511,7 +688,7 @@ impl CalendarWidget {
                 ]));
                 if let Some(loc) = &e.location {
                     lines.push(Line::from(Span::styled(
-                        format!("              {loc}"),
+                        format!("{cont_indent}{loc}"),
                         Style::default().add_modifier(Modifier::DIM),
                     )));
                 }
@@ -523,16 +700,42 @@ impl CalendarWidget {
 
     fn render_week(&self, frame: &mut Frame, area: Rect, events: &[Event]) {
         let s = start_of_week(self.anchor);
+        // 7 day columns interleaved with 6 single-char separator columns.
+        let constraints: Vec<Constraint> = (0..13)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Constraint::Ratio(1, 7)
+                } else {
+                    Constraint::Length(1)
+                }
+            })
+            .collect();
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints(vec![Constraint::Ratio(1, 7); 7])
+            .constraints(constraints)
             .split(area);
         let today = Local::now().date_naive();
-        for (i, col_area) in cols.iter().enumerate() {
+
+        // Draw vertical separators between day columns. Skip the bottom hint
+        // row so the separator doesn't collide with the view-tab buttons.
+        let separator_height = area.height.saturating_sub(1);
+        for i in 0..6 {
+            let sep_area = cols[i * 2 + 1];
+            let sep_lines: Vec<Line<'_>> = (0..separator_height)
+                .map(|_| {
+                    Line::from(Span::styled(
+                        "│",
+                        Style::default().add_modifier(Modifier::DIM),
+                    ))
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(sep_lines), sep_area);
+        }
+
+        for i in 0..7 {
+            let col_area = cols[i * 2];
             let day = s + ChronoDuration::days(i as i64);
             let is_today = day == today;
-            // Stack weekday on top, date underneath — keeps both visible even
-            // in narrow columns where `Mon 18` would otherwise truncate.
             let weekday_label = weekday_short(day.weekday());
             let date_label = if is_today {
                 format!("[{}]", day.day())
@@ -546,7 +749,6 @@ impl CalendarWidget {
             } else {
                 Style::default().add_modifier(Modifier::BOLD)
             };
-            // Top padding so headers don't kiss the border.
             let mut lines: Vec<Line<'_>> = vec![
                 Line::from(""),
                 Line::from(Span::styled(weekday_label, header_style)),
@@ -560,6 +762,7 @@ impl CalendarWidget {
                     Style::default().add_modifier(Modifier::DIM),
                 )));
             } else {
+                let wrap_width = col_area.width.saturating_sub(1) as usize;
                 for e in day_events {
                     let color = color_for_calendar(&e.calendar);
                     let prefix = if e.all_day {
@@ -567,76 +770,115 @@ impl CalendarWidget {
                     } else {
                         format!("{:02}:{:02}", e.start.hour(), e.start.minute())
                     };
+                    // First line is "<prefix> <first wrapped chunk>".
+                    let title_lines = wrap_event_title(&e.title, wrap_width, 3);
+                    let (first, rest) = title_lines.split_first().map(|(f, r)| (f.clone(), r)).unwrap_or((String::new(), &[][..]));
                     lines.push(Line::from(Span::styled(
-                        format!("{prefix} {}", truncate(&e.title, 14)),
+                        format!("{prefix} {first}"),
                         Style::default().fg(color),
                     )));
+                    for cont in rest {
+                        lines.push(Line::from(Span::styled(
+                            cont.clone(),
+                            Style::default().fg(color),
+                        )));
+                    }
                 }
             }
             frame.render_widget(
-                Paragraph::new(lines).alignment(Alignment::Center),
-                *col_area,
+                Paragraph::new(lines).alignment(Alignment::Left),
+                col_area,
             );
         }
     }
 
     fn render_month(&self, frame: &mut Frame, area: Rect, events: &[Event]) {
-        let first = start_of_month(self.anchor);
-        // First displayed cell is the Sunday on/before the 1st.
-        let grid_start = start_of_week(first);
-        let today = Local::now().date_naive();
+        // Each single-month grid wants ~37 cols (5 chars × 7 cells + a bit of
+        // padding). Stack 1, 2, or 3 months side-by-side as width allows.
+        let (anchor_y, anchor_m) = (self.anchor.year(), self.anchor.month());
+        let months: Vec<(i32, u32)> = if area.width >= 3 * MONTH_GRID_MIN_WIDTH {
+            vec![
+                advance_month(anchor_y, anchor_m, -1),
+                (anchor_y, anchor_m),
+                advance_month(anchor_y, anchor_m, 1),
+            ]
+        } else if area.width >= 2 * MONTH_GRID_MIN_WIDTH {
+            vec![(anchor_y, anchor_m), advance_month(anchor_y, anchor_m, 1)]
+        } else {
+            vec![(anchor_y, anchor_m)]
+        };
 
-        // Day-of-month header row
-        let header_line = Line::from(
-            ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-                .iter()
-                .map(|s| Span::styled(format!("{s:^5}"), Style::default().add_modifier(Modifier::BOLD)))
-                .collect::<Vec<_>>(),
-        );
+        let constraints: Vec<Constraint> =
+            (0..months.len()).map(|_| Constraint::Ratio(1, months.len() as u32)).collect();
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(constraints)
+            .split(area);
 
-        let mut lines: Vec<Line<'_>> = Vec::with_capacity(9);
-        // Top padding so the weekday header doesn't kiss the border.
-        lines.push(Line::from(""));
-        lines.push(header_line);
-
-        // 6 weeks always fit any month.
-        for week in 0..6 {
-            let mut spans: Vec<Span<'_>> = Vec::with_capacity(7);
-            for dow in 0..7 {
-                let date = grid_start + ChronoDuration::days(week * 7 + dow);
-                let in_month = date.month() == self.anchor.month();
-                let day_str = format!("{}", date.day());
-                let cell = if date == today {
-                    format!("[{day_str:>2}]")
-                } else {
-                    format!(" {day_str:>2} ")
-                };
-                let has_events = events.iter().any(|e| e.on_date(date));
-                let style = if !in_month {
-                    Style::default().add_modifier(Modifier::DIM)
-                } else if has_events {
-                    Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                spans.push(Span::styled(format!("{cell:<5}"), style));
-            }
-            lines.push(Line::from(spans));
+        for ((y, m), col_area) in months.iter().zip(cols.iter()) {
+            let is_anchor = (*y, *m) == (anchor_y, anchor_m);
+            render_month_grid(frame, *col_area, *y, *m, is_anchor, events);
         }
-
-        frame.render_widget(Paragraph::new(lines), area);
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = chars.into_iter().take(max.saturating_sub(1)).collect();
-        out.push('…');
-        out
+/// Greedy word-wrap for event titles in week view. Splits on whitespace and
+/// fills each line up to `max_width` columns, returning at most `max_lines`
+/// lines. If the title doesn't fit, the last line gets an ellipsis. Oversized
+/// single words are character-truncated.
+fn wrap_event_title(text: &str, max_width: usize, max_lines: usize) -> Vec<String> {
+    if max_width == 0 || max_lines == 0 {
+        return Vec::new();
     }
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut consumed = 0usize;
+    for (i, word) in words.iter().enumerate() {
+        let needed = if current.is_empty() {
+            word.chars().count()
+        } else {
+            current.chars().count() + 1 + word.chars().count()
+        };
+        if needed <= max_width {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+            consumed = i + 1;
+        } else if current.is_empty() {
+            // word longer than the column — character-truncate with ellipsis.
+            let t: String = word.chars().take(max_width.saturating_sub(1)).collect();
+            lines.push(format!("{t}…"));
+            consumed = i + 1;
+            if lines.len() == max_lines {
+                return lines;
+            }
+        } else {
+            lines.push(std::mem::take(&mut current));
+            if lines.len() == max_lines {
+                break;
+            }
+            current.push_str(word);
+            consumed = i + 1;
+        }
+    }
+    if !current.is_empty() && lines.len() < max_lines {
+        lines.push(current);
+    }
+    if consumed < words.len() {
+        if let Some(last) = lines.last_mut() {
+            if last.chars().count() < max_width {
+                last.push('…');
+            } else if !last.ends_with('…') {
+                let mut chars: Vec<char> = last.chars().collect();
+                chars.pop();
+                chars.push('…');
+                *last = chars.into_iter().collect();
+            }
+        }
+    }
+    lines
 }
 
 #[async_trait]
@@ -820,7 +1062,15 @@ impl Widget for CalendarWidget {
                     return EventResult::Handled;
                 }
             }
-            CalendarView::Day => {}
+            CalendarView::Day => {
+                // Two-column day view: clicking the right preview column
+                // promotes that day to the new anchor.
+                if inner.width >= 50 && mouse.column >= inner.x + inner.width / 2 {
+                    self.anchor += ChronoDuration::days(1);
+                    self.mark_dirty();
+                    return EventResult::Handled;
+                }
+            }
         }
         EventResult::Ignored
     }
@@ -923,24 +1173,43 @@ mod tests {
         };
         let mut w = CalendarWidget::with_config(cfg);
         w.anchor = NaiveDate::from_ymd_opt(2026, 5, 20).unwrap();
+        // 40-wide column → 35-char grid centered → 2 cols leading padding,
+        // so cell 0 starts at col 2, cell 6 starts at col 32.
         let inner = Rect::new(0, 0, 40, 20);
-        // Grid starts at relative y=2 (after padding+header). May 2026 starts
-        // on Friday — so first row of grid = Sun Apr 26 … Sat May 2.
-        // x=0..5 = Sun, 5..10 = Mon, etc.
+        // Rows: padding=0, month name=1, weekday header=2, weeks start at 3.
+        // May 2026 starts Friday → first grid row is Sun Apr 26 … Sat May 2.
         let apr26 = NaiveDate::from_ymd_opt(2026, 4, 26).unwrap();
-        assert_eq!(w.month_day_at(2, 2, inner), Some(apr26));
+        assert_eq!(w.month_day_at(3, 3, inner), Some(apr26));
         let may2 = NaiveDate::from_ymd_opt(2026, 5, 2).unwrap();
-        assert_eq!(w.month_day_at(32, 2, inner), Some(may2));
-        // Clicks in padding/header rows → None.
-        assert_eq!(w.month_day_at(2, 0, inner), None);
-        assert_eq!(w.month_day_at(2, 1, inner), None);
-        // Clicks past the 7th cell → None.
-        assert_eq!(w.month_day_at(38, 2, inner), None);
+        assert_eq!(w.month_day_at(33, 3, inner), Some(may2));
+        // Clicks in padding / month-name / weekday-header rows → None.
+        assert_eq!(w.month_day_at(3, 0, inner), None);
+        assert_eq!(w.month_day_at(3, 1, inner), None);
+        assert_eq!(w.month_day_at(3, 2, inner), None);
+        // Beyond the 7th column of the grid → None.
+        assert_eq!(w.month_day_at(38, 3, inner), None);
     }
 
     #[test]
-    fn truncate_appends_ellipsis_when_too_long() {
-        assert_eq!(truncate("abcdef", 4), "abc…");
-        assert_eq!(truncate("abc", 4), "abc");
+    fn advance_month_wraps_year_boundaries() {
+        assert_eq!(advance_month(2026, 12, 1), (2027, 1));
+        assert_eq!(advance_month(2026, 1, -1), (2025, 12));
+        assert_eq!(advance_month(2026, 5, 0), (2026, 5));
+        assert_eq!(advance_month(2026, 5, 7), (2026, 12));
+        assert_eq!(advance_month(2026, 5, 8), (2027, 1));
+    }
+
+    #[test]
+    fn wrap_event_title_caps_lines_with_ellipsis() {
+        let lines = wrap_event_title("the quick brown fox jumps over the lazy dog", 7, 3);
+        assert_eq!(lines.len(), 3);
+        assert!(lines.last().unwrap().ends_with('…'));
+    }
+
+    #[test]
+    fn wrap_event_title_truncates_oversized_word() {
+        let lines = wrap_event_title("supercalifragilistic", 5, 3);
+        assert!(lines[0].ends_with('…'));
+        assert!(lines[0].chars().count() <= 5);
     }
 }

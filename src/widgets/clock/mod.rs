@@ -164,27 +164,56 @@ impl ClockWidget {
         }
     }
 
-    /// Returns (label, "HH:MM") pairs for the World Clocks block. Primary
-    /// timezone leads, then any configured secondaries.
+    /// Returns (label, "HH:MM Wkd Mon DD") pairs for the World Clocks block.
+    /// Primary timezone leads, then any configured secondaries. Each entry
+    /// carries its own local date so the user can tell when a clock is on a
+    /// different calendar day than local time without having to do timezone
+    /// arithmetic in their head.
     fn world_clock_entries(&self) -> Vec<(String, String)> {
         let now = chrono::Utc::now();
         let mut out: Vec<(String, String)> = Vec::with_capacity(self.secondaries.len() + 1);
-        let (primary_label, primary_hm) = match self.tz {
+        let (primary_label, primary_str) = match self.tz {
             Some(tz) => {
                 let t = now.with_timezone(&tz);
-                (city_from_tz_name(tz.name()), format!("{:02}:{:02}", t.hour(), t.minute()))
+                (city_from_tz_name(tz.name()), format_clock_entry(&t))
             }
             None => {
                 let t = now.with_timezone(&Local);
-                ("Local".to_string(), format!("{:02}:{:02}", t.hour(), t.minute()))
+                ("Local".to_string(), format_clock_entry(&t))
             }
         };
-        out.push((primary_label, primary_hm));
+        out.push((primary_label, primary_str));
         for (label, tz) in &self.secondaries {
             let t = now.with_timezone(tz);
-            out.push((label.clone(), format!("{:02}:{:02}", t.hour(), t.minute())));
+            out.push((label.clone(), format_clock_entry(&t)));
         }
         out
+    }
+}
+
+fn format_clock_entry<T: TimeZone>(t: &DateTime<T>) -> String
+where
+    T::Offset: std::fmt::Display,
+{
+    format!(
+        "{} {:02}:{:02} {} {} {}",
+        day_night_icon(t.hour()),
+        t.hour(),
+        t.minute(),
+        weekday_name(t.weekday()),
+        month_name(t.month()),
+        t.day()
+    )
+}
+
+/// Simple day/night marker keyed off local hour-of-day. Use 06:00–17:59 as
+/// "day"; outside that window is "night". Not astronomically accurate but
+/// good enough as a glance signal alongside the time.
+fn day_night_icon(hour: u32) -> &'static str {
+    if (6..=17).contains(&hour) {
+        "☀"
+    } else {
+        "☾"
     }
 }
 
@@ -444,6 +473,54 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, "Vancouver");
         assert_eq!(entries[1].0, "Tokyo");
+    }
+
+    #[test]
+    fn world_clock_entries_include_icon_time_and_date() {
+        let cfg = ClockConfig {
+            timezone: Some("America/Vancouver".into()),
+            secondary_timezones: vec![SecondaryTimezone {
+                label: "Tokyo".into(),
+                tz: "Asia/Tokyo".into(),
+            }],
+            ..ClockConfig::default()
+        };
+        let w = ClockWidget::with_config(cfg);
+        let entries = w.world_clock_entries();
+        for (_label, formatted) in &entries {
+            // Format: "<icon> HH:MM Wkd Mon DD"
+            let parts: Vec<&str> = formatted.split_whitespace().collect();
+            assert_eq!(parts.len(), 5, "unexpected format: {formatted:?}");
+            assert!(parts[0] == "☀" || parts[0] == "☾");
+            // HH:MM
+            assert_eq!(parts[1].chars().nth(2), Some(':'));
+            // Weekday abbreviation
+            assert!(
+                ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].contains(&parts[2]),
+                "unexpected weekday: {:?}",
+                parts[2]
+            );
+            // Month abbreviation
+            assert!(
+                ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+                    .contains(&parts[3]),
+                "unexpected month: {:?}",
+                parts[3]
+            );
+            // Day-of-month is a positive integer
+            assert!(parts[4].parse::<u32>().is_ok());
+        }
+    }
+
+    #[test]
+    fn day_night_icon_boundaries() {
+        assert_eq!(day_night_icon(5), "☾");
+        assert_eq!(day_night_icon(6), "☀");
+        assert_eq!(day_night_icon(12), "☀");
+        assert_eq!(day_night_icon(17), "☀");
+        assert_eq!(day_night_icon(18), "☾");
+        assert_eq!(day_night_icon(23), "☾");
+        assert_eq!(day_night_icon(0), "☾");
     }
 
     #[test]
