@@ -1,4 +1,11 @@
-use std::{cell::Cell, collections::HashMap, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    cell::Cell,
+    collections::HashMap,
+    io,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -20,6 +27,10 @@ use crate::{
     ui,
     widgets::{parse_widget_ref, registry, AppContext, EventResult, WidgetCtx, WidgetManager},
 };
+
+/// Time a `command_feedback` message stays visible in the chrome row
+/// before render replaces it with the idle status-bar content.
+const FEEDBACK_TTL: Duration = Duration::from_secs(3);
 
 pub struct App {
     config: Config,
@@ -44,8 +55,12 @@ pub struct App {
     help_scroll_max: Cell<u16>,
     /// `Some` while the user is composing after pressing `:`.
     command_buffer: Option<String>,
-    /// Transient feedback shown next to the command bar; cleared on next key.
-    command_feedback: Option<String>,
+    /// Transient feedback shown in the chrome row after a `:` command.
+    /// Carries a severity tag (drives the message color via the active
+    /// scheme) and a timestamp; render expires entries older than
+    /// `FEEDBACK_TTL` so the message disappears on its own without the
+    /// user having to dismiss it.
+    command_feedback: Option<(String, ui::FeedbackSeverity, Instant)>,
     /// Snapshot of stack active-tab indices as of the last
     /// `runtime_state.toml` write. After each input tick we recompute
     /// the current snapshot and save only if it differs from this —
@@ -156,6 +171,36 @@ impl App {
 
     fn focused_widget(&self) -> Option<&str> {
         self.focus_order.get(self.focus_idx).map(String::as_str)
+    }
+
+    /// Set the chrome-row feedback message. Caller picks the severity;
+    /// the timestamp is stamped here so render can age the entry out
+    /// after `FEEDBACK_TTL` without each call site having to think about
+    /// clock plumbing.
+    fn set_feedback(&mut self, text: impl Into<String>, severity: ui::FeedbackSeverity) {
+        self.command_feedback = Some((text.into(), severity, Instant::now()));
+    }
+
+    /// Drop the feedback if it's older than `FEEDBACK_TTL`. Called right
+    /// before each draw so the chrome row reverts to the status bar on
+    /// its own — the event loop's 250 ms tick guarantees a redraw within
+    /// the TTL window without a per-frame timer.
+    fn expire_stale_feedback(&mut self) {
+        if let Some((_, _, set_at)) = &self.command_feedback {
+            if set_at.elapsed() >= FEEDBACK_TTL {
+                self.command_feedback = None;
+            }
+        }
+    }
+
+    /// Borrow the current feedback as the ui-layer tuple, after expiring
+    /// stale entries. Used at each RenderState construction site so the
+    /// three draw paths stay in lockstep.
+    fn feedback_for_render(&self) -> Option<(&str, ui::FeedbackSeverity)> {
+        self.command_feedback
+            .as_ref()
+            .filter(|(_, _, set_at)| set_at.elapsed() < FEEDBACK_TTL)
+            .map(|(text, severity, _)| (text.as_str(), *severity))
     }
 
     fn cycle_focus(&mut self, forward: bool) {
@@ -269,7 +314,10 @@ impl App {
         let file = match theme::load_schemes_file() {
             Ok(f) => f,
             Err(err) => {
-                self.command_feedback = Some(format!("colorschemes.toml: {err}"));
+                self.set_feedback(
+                    format!("colorschemes.toml: {err}"),
+                    ui::FeedbackSeverity::Error,
+                );
                 return;
             }
         };
@@ -281,24 +329,22 @@ impl App {
         let available_csv = available.join(", ");
 
         let Some(name) = args.first() else {
-            self.command_feedback = if available.is_empty() {
-                Some("usage: :scheme <name> — (no schemes defined in colorschemes.toml)".into())
+            let msg = if available.is_empty() {
+                "usage: :scheme <name> — (no schemes defined in colorschemes.toml)".to_string()
             } else {
-                Some(format!("usage: :scheme <name>. Available: {available_csv}"))
+                format!("usage: :scheme <name>. Available: {available_csv}")
             };
+            self.set_feedback(msg, ui::FeedbackSeverity::Warning);
             return;
         };
 
         let Some(scheme) = file.schemes.get(*name) else {
-            self.command_feedback = if available.is_empty() {
-                Some(format!(
-                    "unknown scheme {name:?} — colorschemes.toml has no [schemes.*] blocks"
-                ))
+            let msg = if available.is_empty() {
+                format!("unknown scheme {name:?} — colorschemes.toml has no [schemes.*] blocks")
             } else {
-                Some(format!(
-                    "unknown scheme {name:?}. Available: {available_csv}"
-                ))
+                format!("unknown scheme {name:?}. Available: {available_csv}")
             };
+            self.set_feedback(msg, ui::FeedbackSeverity::Error);
             return;
         };
 
@@ -314,13 +360,14 @@ impl App {
         // happened; a write failure only downgrades the success line.
         match theme::persist_active_scheme(name) {
             Ok(()) => {
-                self.command_feedback = Some(format!("scheme → {name}"));
+                self.set_feedback(format!("scheme → {name}"), ui::FeedbackSeverity::Confirmation);
             }
             Err(err) => {
                 tracing::warn!(error = %err, scheme = %name, "failed to persist scheme");
-                self.command_feedback = Some(format!(
-                    "scheme → {name} (not persisted: {err})"
-                ));
+                self.set_feedback(
+                    format!("scheme → {name} (not persisted: {err})"),
+                    ui::FeedbackSeverity::Warning,
+                );
             }
         }
     }
@@ -388,12 +435,15 @@ impl App {
                 }
                 Ok(false) => continue,
                 Err(err) => {
-                    self.command_feedback = Some(format!("{id}: {err}"));
+                    self.set_feedback(format!("{id}: {err}"), ui::FeedbackSeverity::Error);
                     return;
                 }
             }
         }
-        self.command_feedback = Some(format!("unknown command: {cmd:?}"));
+        self.set_feedback(
+            format!("unknown command: {cmd:?}"),
+            ui::FeedbackSeverity::Error,
+        );
     }
 }
 
@@ -580,11 +630,9 @@ fn focus_order_from_layout(config: &Config, manager: &WidgetManager) -> Vec<Stri
 
 /// Register each unique `(kind, instance)` pair found in the layout via
 /// the widget registry. Unknown kinds log a warning and skip. Stack
-/// cells additionally register a wrapping `StackWidget` under a
-/// synthetic id (`stack:<child1>+<child2>+…`) that the render path
-/// looks up via `GridCell::render_target_id()`. The individual
-/// children are also registered so the shortcut dispatcher can find
-/// them (Phase 2 walks them; Phase 1 just needs them resolvable).
+/// cells register a wrapping `StackWidget` under a synthetic id
+/// (`stack:<child1>+<child2>+…`) that the render path looks up via
+/// `GridCell::render_target_id()`.
 fn register_widgets_from_layout(
     manager: &mut WidgetManager,
     config: &Config,
@@ -596,22 +644,10 @@ fn register_widgets_from_layout(
     let mut seen_stack: std::collections::HashSet<String> = std::collections::HashSet::new();
     for cell in &config.layout.cells {
         if cell.is_stack() {
-            // Register every child individually (so the shortcut
-            // dispatcher and any future per-child lookups still work),
-            // then assemble a StackWidget that owns clones of those
-            // children for delegation. Cache scopes are per-(kind,
-            // instance) so the stack-owned copies share the on-disk
-            // cache with the standalone registrations — that's the
-            // intended behaviour: only one effective widget per
-            // (kind, instance), the StackWidget is a transport
-            // wrapper.
-            //
-            // Implementation note: because rust widget instances
-            // aren't `Clone`, we build the stack children *as their
-            // own* fresh widgets here and register them only under
-            // the stack id. The shortcut dispatcher (Phase 2) will
-            // walk INTO the StackWidget rather than expecting the
-            // children to be top-level entries.
+            // Stack children are built as fresh widget instances owned
+            // by the StackWidget (widgets aren't `Clone`). They share
+            // the on-disk cache scope with any standalone registration
+            // of the same `(kind, instance)`.
             let stack_id = match cell.render_target_id() {
                 Some(id) => id,
                 None => continue,
@@ -754,6 +790,7 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
     let mut events = EventReader::new(Duration::from_millis(250), config_rx);
 
     // Initial draw before the first event arrives.
+    app.expire_stale_feedback();
     terminal.draw(|frame| {
         ui::render(
             frame,
@@ -763,11 +800,12 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                 focused: app.focused_widget(),
                 show_help: app.show_help,
                 command_buffer: app.command_buffer.as_deref(),
-                command_feedback: app.command_feedback.as_deref(),
+                command_feedback: app.feedback_for_render(),
                 theme: &app.theme,
                 theme_name: &app.config.global.theme,
                 help_scroll: app.help_scroll,
                 help_scroll_max: &app.help_scroll_max,
+                show_status_bar: app.config.global.show_status_bar,
             },
         );
     })?;
@@ -830,6 +868,7 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                     if app.should_quit {
                         break;
                     }
+                    app.expire_stale_feedback();
                     terminal.draw(|frame| {
                         ui::render(
                             frame,
@@ -837,13 +876,14 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                                 layout: &app.config.layout,
                                 manager: &app.manager,
                                 focused: app.focused_widget(),
-                                                show_help: app.show_help,
+                                show_help: app.show_help,
                                 command_buffer: app.command_buffer.as_deref(),
-                                command_feedback: app.command_feedback.as_deref(),
+                                command_feedback: app.feedback_for_render(),
                                 theme: &app.theme,
                                 theme_name: &app.config.global.theme,
                                 help_scroll: app.help_scroll,
                                 help_scroll_max: &app.help_scroll_max,
+                                show_status_bar: app.config.global.show_status_bar,
                             },
                         );
                     })?;
@@ -901,6 +941,7 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
             break;
         }
 
+        app.expire_stale_feedback();
         terminal.draw(|frame| {
             ui::render(
                 frame,
@@ -908,13 +949,14 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                     layout: &app.config.layout,
                     manager: &app.manager,
                     focused: app.focused_widget(),
-                        show_help: app.show_help,
+                    show_help: app.show_help,
                     command_buffer: app.command_buffer.as_deref(),
-                    command_feedback: app.command_feedback.as_deref(),
+                    command_feedback: app.feedback_for_render(),
                     theme: &app.theme,
                     theme_name: &app.config.global.theme,
                     help_scroll: app.help_scroll,
                     help_scroll_max: &app.help_scroll_max,
+                    show_status_bar: app.config.global.show_status_bar,
                 },
             );
         })?;

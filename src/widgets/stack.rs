@@ -1,44 +1,39 @@
 //! Stack widget — a layout cell that holds up to 3 widgets and shows
 //! one at a time, with a tab strip in the title bar for switching.
 //!
-//! See `docs/stack-spec.md` for the full design. This module owns the
-//! runtime side: child storage, active-tab index, key handling, tab
-//! strip rendering, and hidden-child poll throttling. Schema parsing
-//! lives in `config::layout`; wizard sub-page lives in
-//! `wizard::pages::assign_stack` (Phase 3); persistence lives in
-//! `state::runtime` (Phase 4); shortcut routing lives in `app`
-//! (Phase 2).
+//! See `docs/stack-spec.md` for the full design. Related code lives
+//! in `config::layout` (schema), `wizard::pages::assign_stack` (wizard
+//! UI), `runtime_state` (active-tab persistence), and `app`
+//! (Shift+<letter> routing walks into stacks).
 //!
 //! ## Rendering strategy
 //!
 //! Each child widget paints its own `Block::default().borders(ALL).title(...)`
-//! into the area handed to it. We let that happen, then **overlay**
-//! the tab strip on the top border row, which replaces the child's
-//! single-line title with our multi-tab strip. The border corners and
-//! sides remain the child's. Ratatui's render order (last paints win)
-//! gives us this for free without modifying any child widget.
+//! into the area handed to it. We then overlay our tab strip on the
+//! top border row, replacing the child's single-line title. Border
+//! corners and sides remain the child's. Ratatui's render order
+//! (last paints win) gives us this for free without modifying any
+//! child widget.
 //!
 //! ## Hidden-child poll throttling
 //!
-//! Per spec §2, hidden children have their `update()` calls thinned
-//! to one-per-`stack_hidden_poll_ratio` ticks. This doesn't change a
-//! child's internal poll interval — for widgets that already poll at
-//! minute-scale intervals (most of them), the saving is negligible.
-//! For widgets that fire faster than the tick rate, it matters. The
-//! configurable knob is in place for the future when per-widget
-//! interval scaling becomes a real need.
+//! Hidden children have their `update()` calls thinned to
+//! one-per-`stack_hidden_poll_ratio` ticks (configured globally).
+//! For widgets that poll at minute-scale intervals the saving is
+//! negligible; for widgets that fire faster than the tick rate it
+//! matters proportionally.
 
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget as RatatuiWidget},
     Frame,
@@ -74,6 +69,11 @@ pub struct StackWidget {
     /// Cache of the active child's display name for the `display_name`
     /// trait method. Recomputed when the active tab changes.
     active_display_name: String,
+    /// Screen-column ranges of each tab in the strip, captured during
+    /// the last render so `handle_mouse` can route clicks on a tab
+    /// title to `switch_to(child)` without re-running the fit ladder.
+    /// `Default::default()` until the first render.
+    tab_layout: Mutex<TabStripLayout>,
 }
 
 impl StackWidget {
@@ -96,6 +96,7 @@ impl StackWidget {
             tick_counter: 0,
             theme,
             active_display_name,
+            tab_layout: Mutex::new(TabStripLayout::default()),
         }
     }
 
@@ -119,9 +120,10 @@ impl StackWidget {
         self.refresh_active_name();
     }
 
-    /// Switch to a specific child by its widget id (used by Phase 2's
-    /// shortcut dispatcher). Returns `true` when the id was found and
-    /// the active index changed (or already matched).
+    /// Switch to a specific child by its widget id. Used by the
+    /// `Shift+<letter>` dispatcher when the requested letter belongs
+    /// to a child hidden inside this stack. Returns `true` when the
+    /// id matched.
     pub fn switch_to(&mut self, widget_id: &str) -> bool {
         if let Some(idx) = self.children.iter().position(|w| w.id() == widget_id) {
             self.active = idx;
@@ -179,20 +181,37 @@ impl Widget for StackWidget {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
+        // Let the child render its full block + content first; then
+        // overlay our tab strip on the top border row, replacing the
+        // child's own title text. This keeps the cell at its full
+        // vertical height — no row tax — and the active widget's
+        // metadata (article count, mailbox address, etc.) is rendered
+        // by US on the same row as part of the strip, so the user
+        // sees both the tabs and the metadata simultaneously.
         if let Some(child) = self.children.get(self.active) {
             child.render(frame, area, focused);
         }
-        // Overlay the tab strip on the active child's top border row,
-        // replacing whatever title text it painted there. Border
-        // corners (column 0 and the rightmost column) stay untouched.
-        render_tab_strip(
+        let tabs: Vec<(String, Option<char>)> = self
+            .children
+            .iter()
+            .map(|w| (w.display_name().to_string(), w.shortcut()))
+            .collect();
+        let metadata = self
+            .children
+            .get(self.active)
+            .and_then(|w| w.title_metadata());
+        let layout = render_tab_strip(
             frame.buffer_mut(),
             area,
-            self.children.iter().map(|w| w.display_name()).collect(),
+            &tabs,
             self.active,
             focused,
             &self.theme,
+            metadata.as_deref(),
         );
+        // Stash the hit-rects so the next mouse click can route a tab-strip
+        // click to switch_to(child) instead of falling through to the child.
+        *self.tab_layout.lock().expect("stack tab_layout poisoned") = layout;
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
@@ -215,6 +234,24 @@ impl Widget for StackWidget {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> EventResult {
+        // Left-click on a tab title flips the stack to that child. Any
+        // other mouse event (scroll, drag, click below the tab row, …)
+        // falls through to the active child so the existing per-widget
+        // mouse semantics still apply.
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let layout = self.tab_layout.lock().expect("stack tab_layout poisoned").clone();
+            if mouse.row == layout.row {
+                for (idx, (start, end)) in layout.tab_ranges.iter().enumerate() {
+                    if mouse.column >= *start && mouse.column < *end {
+                        if idx != self.active {
+                            self.active = idx;
+                            self.refresh_active_name();
+                        }
+                        return EventResult::Handled;
+                    }
+                }
+            }
+        }
         if let Some(child) = self.children.get_mut(self.active) {
             child.handle_mouse(mouse, area)
         } else {
@@ -252,16 +289,15 @@ impl Widget for StackWidget {
     }
 
     fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
-        let mut out = vec![
+        // Stack-only bindings. Each child's own bindings reach the help
+        // overlay via `composite_child` so the hidden tabs are visible
+        // too — merging the active child's bindings in here would mask
+        // the others and double-list the active one.
+        vec![
             (",", "rotate to previous tab"),
             (".", "rotate to next tab"),
-        ];
-        // Merge in the active child's bindings so the help overlay
-        // reflects what's actually usable right now.
-        if let Some(child) = self.children.get(self.active) {
-            out.extend(child.keybindings());
-        }
-        out
+            ("click tab title", "switch to that stack tab"),
+        ]
     }
 
     fn set_app_theme(&mut self, theme: Arc<Theme>) {
@@ -272,10 +308,9 @@ impl Widget for StackWidget {
     }
 
     fn shortcut_preferences(&self) -> &[char] {
-        // Stack itself doesn't claim a shortcut — its children do.
-        // Phase 2's dispatcher walks into stacks; until then the
-        // children's preferences are inaccessible. Returning &[] here
-        // keeps the assignment pass simple.
+        // Stack itself doesn't claim a shortcut — its children do,
+        // and the assignment dispatcher walks into composites via
+        // `composite_children` to reach them.
         &[]
     }
 
@@ -292,6 +327,13 @@ impl Widget for StackWidget {
             .iter_mut()
             .find(|w| w.id() == child_id)
             .map(|b| b.as_mut() as &mut dyn Widget)
+    }
+
+    fn composite_child(&self, child_id: &str) -> Option<&dyn Widget> {
+        self.children
+            .iter()
+            .find(|w| w.id() == child_id)
+            .map(|b| b.as_ref() as &dyn Widget)
     }
 
     fn switch_to_composite_child(&mut self, child_id: &str) -> bool {
@@ -312,91 +354,315 @@ impl Widget for StackWidget {
     }
 }
 
-/// Paint the tab strip onto the top-border row of `area`. Tries full
-/// titles first; falls back to single-letter initials when the joined
-/// width exceeds the available column count. The active tab uses
-/// `text_selected` styling; inactive tabs use `text_dim`. Border
-/// corners (col 0 and rightmost col) are not touched.
+/// Paint the tab strip onto the top border row of `area`, replacing
+/// whatever title text the active child painted there. Layout:
+///
+/// `┌─ <tab> ─ <tab> ─ <tab> ──────── <active metadata> ─┐`
+///
+/// - **Tabs on the left**, separated by ` ─ ` so the visual divider
+///   matches the surrounding border line.
+/// - **`─` filler** between the last tab and the right-aligned
+///   metadata. Filler is also what we use to fully overwrite any title
+///   text the child painted before us — without it, a long child title
+///   would bleed through past our tab labels.
+/// - **Active widget's metadata right-aligned** at the top-right
+///   corner in `metadata.focused` / `metadata.unfocused` — dim when the
+///   pane isn't focused, lit when it is. Hidden entirely when the pane
+///   is too narrow to fit `tabs + min_gap + metadata`.
+///
+/// Tab label styling:
+/// - Shortcut letter (e.g. `N` in `News`, `E` in `Email`) always painted
+///   in `theme.text_shortcut` so the `Shift+<letter>` affordance stays
+///   visible in every state.
+/// - Active tab: `widget_title.focused` when the pane is focused (the
+///   background-highlight variant), `widget_title.unfocused` when not —
+///   matches the single-widget title row.
+/// - Inactive tabs: `text.dim`. The active-vs-inactive contrast
+///   (`widget_title.unfocused` vs `text.dim`) is still legible in an
+///   unfocused stack — that's what tells the user which child is on
+///   top from across the dashboard.
+///
+/// Overflow: tries full titles + metadata first; drops metadata; falls
+/// back to single-letter labels as the final attempt.
 fn render_tab_strip(
     buf: &mut Buffer,
     area: Rect,
-    titles: Vec<&str>,
+    tabs: &[(String, Option<char>)],
     active: usize,
     focused: bool,
     theme: &Theme,
-) {
+    metadata: Option<&str>,
+) -> TabStripLayout {
     if area.width < 4 || area.height == 0 {
-        return;
+        return TabStripLayout::default();
     }
-    // The strip lives ON the top border line (y = area.y), starting
-    // one cell in from the left corner so we don't overwrite '┌' /
-    // '└'-style glyphs.
-    let strip_y = area.y;
-    let strip_x = area.x.saturating_add(1);
-    let strip_width = area.width.saturating_sub(2);
-
-    let active_style = if focused {
-        theme.text_selected
-    } else {
-        theme.text_focused
-    };
-    let idle_style = theme.text_dim;
-
-    // First try full-title spans; if they fit, paint them. Otherwise
-    // fall back to initials. Both modes include a leading space so
-    // the strip looks visually distinct from the corner glyph.
-    let full = build_tab_spans(&titles, active, false, active_style, idle_style);
-    let spans = if span_width(&full) <= strip_width as usize {
-        full
-    } else {
-        build_tab_spans(&titles, active, true, active_style, idle_style)
-    };
-
-    let para = Paragraph::new(Line::from(spans));
-    let row = Rect {
-        x: strip_x,
-        y: strip_y,
-        width: strip_width,
+    let border_style = theme.border_style(focused);
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let strip_rect = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y,
+        width: area.width.saturating_sub(2),
         height: 1,
     };
-    para.render(row, buf);
+
+    // Same fit ladder as before, just with metadata pinned to the
+    // right corner instead of glued to the last tab:
+    //   1. full tabs + right-aligned metadata
+    //   2. full tabs, no metadata
+    //   3. compact tabs + right-aligned metadata
+    //   4. compact tabs, no metadata
+    let attempts: [(bool, bool); 4] = [
+        (false, metadata.is_some()),
+        (false, false),
+        (true, metadata.is_some()),
+        (true, false),
+    ];
+
+    // Min gap chars between the last tab and the metadata so they
+    // never kiss each other (matches the single-widget title row).
+    const MIN_GAP: usize = 3;
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut chosen_ranges: Vec<(usize, usize)> = Vec::new();
+    for (compact, show_meta) in attempts.iter() {
+        let (left, left_ranges) =
+            build_tab_label_spans_with_ranges(tabs, active, *compact, focused, theme);
+        let meta_spans: Vec<Span<'static>> = if *show_meta {
+            build_metadata_spans(metadata, theme.metadata_style(focused))
+        } else {
+            Vec::new()
+        };
+        let left_w = spans_width(&left);
+        let meta_w = spans_width(&meta_spans);
+        let need = left_w
+            .saturating_add(if meta_spans.is_empty() { 0 } else { MIN_GAP })
+            .saturating_add(meta_w);
+        if need <= inner_width {
+            spans = left;
+            chosen_ranges = left_ranges;
+            let filler_count = inner_width - left_w - meta_w;
+            if filler_count > 0 {
+                spans.push(Span::styled(
+                    "─".repeat(filler_count),
+                    border_style,
+                ));
+            }
+            spans.extend(meta_spans);
+            break;
+        }
+        // Keep latest attempt as the fallback if nothing fits; the
+        // last (compact, no-meta) attempt is the most forgiving so the
+        // loop's final value is the best we have.
+        spans = left;
+        chosen_ranges = left_ranges;
+    }
+
+    // Reset the background of every cell in the strip row before we
+    // paint our spans. The active child has already painted its own
+    // block + title underneath us, and ratatui's `Cell::set_style`
+    // only overrides bg when the new span explicitly sets bg. If a
+    // colorscheme gives `widget_title.focused` a background color,
+    // those cells would stay tinted in the leftmost part of our strip
+    // (where the child's title sat) — making it look like multiple
+    // tabs are highlighted. Resetting first guarantees only the chars
+    // we paint here decide the background.
+    buf.set_style(strip_rect, Style::default().bg(Color::Reset));
+
+    Paragraph::new(Line::from(spans)).render(strip_rect, buf);
+
+    // Translate char offsets (relative to the start of the spans) into
+    // absolute screen columns by adding strip_rect.x. handle_mouse uses
+    // these to route clicks on a tab to `switch_to`.
+    let base = strip_rect.x as usize;
+    let tab_ranges = chosen_ranges
+        .into_iter()
+        .map(|(s, e)| {
+            (
+                base.saturating_add(s) as u16,
+                base.saturating_add(e) as u16,
+            )
+        })
+        .collect();
+    TabStripLayout {
+        row: strip_rect.y,
+        tab_ranges,
+    }
 }
 
-fn build_tab_spans(
-    titles: &[&str],
+/// Screen-space hit-rect data for the tab strip. `row` is the row of
+/// the strip (the cell's top border); `tab_ranges[i]` is the
+/// `[start_col, end_col)` covered by the i-th tab. Empty when the cell
+/// was too narrow to render the strip at all.
+#[derive(Debug, Default, Clone)]
+struct TabStripLayout {
+    row: u16,
+    tab_ranges: Vec<(u16, u16)>,
+}
+
+fn build_tab_label_spans(
+    tabs: &[(String, Option<char>)],
     active: usize,
     compact: bool,
-    active_style: Style,
-    idle_style: Style,
+    focused: bool,
+    theme: &Theme,
 ) -> Vec<Span<'static>> {
-    let mut out: Vec<Span<'static>> = Vec::with_capacity(titles.len() * 3);
-    out.push(Span::raw(" "));
-    for (i, title) in titles.iter().enumerate() {
-        let label = if compact {
-            title
-                .chars()
-                .find(|c| c.is_alphanumeric())
-                .map(|c| c.to_ascii_uppercase().to_string())
-                .unwrap_or_else(|| "?".into())
-        } else {
-            (*title).to_string()
-        };
-        let marker = if i == active { "• " } else { "  " };
-        let body = format!("[{marker}{label}]");
-        let style = if i == active {
-            active_style.add_modifier(Modifier::BOLD)
-        } else {
-            idle_style
-        };
-        out.push(Span::styled(body, style));
-        if i + 1 < titles.len() {
-            out.push(Span::raw(" "));
-        }
-    }
-    out
+    build_tab_label_spans_with_ranges(tabs, active, compact, focused, theme).0
 }
 
-fn span_width(spans: &[Span<'_>]) -> usize {
+/// Same span layout as [`build_tab_label_spans`] but also returns the
+/// `[start, end)` char offsets (relative to the start of the strip's
+/// spans) of each tab's body — including the active tab's tee pads.
+/// Callers translate the offsets to absolute screen columns by adding
+/// `strip_rect.x` to each bound; the result is the hit-rect for that
+/// tab when routing clicks.
+fn build_tab_label_spans_with_ranges(
+    tabs: &[(String, Option<char>)],
+    active: usize,
+    compact: bool,
+    focused: bool,
+    theme: &Theme,
+) -> (Vec<Span<'static>>, Vec<(usize, usize)>) {
+    let shortcut_style = theme.text_shortcut;
+    // Active tab uses the same focused/unfocused pair as a single
+    // widget's title; inactive tabs use text.dim. The dim vs
+    // widget_title.unfocused contrast keeps the active tab readable
+    // even when the pane has no focus.
+    let active_style = theme.widget_title_style(focused);
+    let dim_style = theme.text_dim;
+    let border_style = theme.border_style(focused);
+
+    // Reserved 1-char pad slot on each side of the *active* tab so
+    // its width stays constant between focused/unfocused. When
+    // focused the slots render as `┤` / `├` tee-junctions in the
+    // border-focused color — the active tab visually notches into
+    // the surrounding border line, matching the single-widget title.
+    // When unfocused the slots are blanks. Inactive tabs get no pad.
+    let (active_left, active_right) = if focused { ("┤", "├") } else { (" ", " ") };
+    let active_pad_style = if focused { theme.border_focused } else { border_style };
+
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(tabs.len() * 5 + 1);
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(tabs.len());
+    let last_idx = tabs.len().saturating_sub(1);
+
+    // Char cursor — incremented as we push spans so we can record each
+    // tab's [start, end) offsets for click hit-testing.
+    let mut pos: usize = 0;
+    let push = |out: &mut Vec<Span<'static>>,
+                pos: &mut usize,
+                content: String,
+                style: Style| {
+        *pos += content.chars().count();
+        out.push(Span::styled(content, style));
+    };
+
+    // Leading flows out of the `┌` corner. When the first tab is active
+    // we drop the trailing space so the active pad sits flush against
+    // the leading line — the focused tee then notches directly into
+    // the corner, matching the single-widget title row.
+    let leading = if active == 0 { "─" } else { "─ " };
+    push(&mut out, &mut pos, leading.to_string(), border_style);
+
+    for (i, (title, shortcut)) in tabs.iter().enumerate() {
+        let is_active = i == active;
+        let body_style = if is_active { active_style } else { dim_style };
+
+        let tab_start = pos;
+        if is_active {
+            push(&mut out, &mut pos, active_left.to_string(), active_pad_style);
+        }
+
+        let label_chars: Vec<char> = if compact {
+            let ch = shortcut
+                .map(|c| c.to_ascii_uppercase())
+                .or_else(|| {
+                    title
+                        .chars()
+                        .find(|c| c.is_alphanumeric())
+                        .map(|c| c.to_ascii_uppercase())
+                })
+                .unwrap_or('?');
+            vec![ch]
+        } else {
+            title.chars().collect()
+        };
+
+        let shortcut_idx = shortcut.and_then(|letter| {
+            let lower = letter.to_ascii_lowercase();
+            label_chars
+                .iter()
+                .position(|c| c.to_ascii_lowercase() == lower)
+        });
+
+        match shortcut_idx {
+            Some(idx) => {
+                if idx > 0 {
+                    let before: String = label_chars[..idx].iter().collect();
+                    push(&mut out, &mut pos, before, body_style);
+                }
+                let target = label_chars[idx].to_ascii_uppercase();
+                push(&mut out, &mut pos, target.to_string(), shortcut_style);
+                if idx + 1 < label_chars.len() {
+                    let after: String = label_chars[idx + 1..].iter().collect();
+                    push(&mut out, &mut pos, after, body_style);
+                }
+            }
+            None => {
+                let s: String = label_chars.iter().collect();
+                push(&mut out, &mut pos, s, body_style);
+            }
+        }
+
+        if is_active {
+            push(&mut out, &mut pos, active_right.to_string(), active_pad_style);
+        }
+        ranges.push((tab_start, pos));
+
+        if i + 1 < tabs.len() {
+            // Drop the space on whichever side of the separator
+            // touches an active tab: the active tab's own pad fills
+            // that slot, keeping the strip width invariant and making
+            // the focused tee notch into the border line instead of
+            // floating in a gap.
+            let next_active = (i + 1) == active;
+            let sep = match (is_active, next_active) {
+                (true, false) => "─ ",
+                (false, true) => " ─",
+                _ => " ─ ",
+            };
+            push(&mut out, &mut pos, sep.to_string(), border_style);
+        }
+    }
+
+    // Trailing space so the filler ─s don't kiss the last label.
+    // When the last tab is active the trailing pad already provides
+    // the terminal char and the filler ─s connect to it directly.
+    if active != last_idx {
+        push(&mut out, &mut pos, " ".to_string(), border_style);
+    }
+    let _ = pos;
+    (out, ranges)
+}
+
+fn build_metadata_spans(
+    metadata: Option<&str>,
+    style: ratatui::style::Style,
+) -> Vec<Span<'static>> {
+    let Some(meta) = metadata else {
+        return Vec::new();
+    };
+    if meta.is_empty() {
+        return Vec::new();
+    }
+    // Single-space padding on each side so a focused-style background
+    // color (or any future highlight) doesn't kiss the border corner.
+    vec![
+        Span::styled(" ".to_string(), style),
+        Span::styled(meta.to_string(), style),
+        Span::styled(" ".to_string(), style),
+    ]
+}
+
+fn spans_width(spans: &[Span<'_>]) -> usize {
     spans.iter().map(|s| s.content.chars().count()).sum()
 }
 
@@ -515,6 +781,70 @@ mod tests {
     }
 
     #[test]
+    fn build_tab_label_spans_with_ranges_marks_each_tab_body() {
+        // Ranges should cover the active tab including its ┤ / ├ pad
+        // (so a click on the tee still activates) and bracket the
+        // inactive labels too — but exclude the leading `─ ` and
+        // inter-tab separators so a click on the line between tabs
+        // does NOT count as either tab.
+        let theme = Theme::builtin_defaults();
+        let (spans, ranges) = build_tab_label_spans_with_ranges(
+            &tabs(&[("News", Some('n')), ("Email", Some('e'))]),
+            0,
+            false,
+            true,
+            &theme,
+        );
+        assert_eq!(ranges.len(), 2, "one range per tab");
+        // Reconstruct the joined string and read each tab's slice from
+        // its range so we don't have to hard-code offsets.
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        let chars: Vec<char> = joined.chars().collect();
+        let slice = |r: (usize, usize)| -> String { chars[r.0..r.1].iter().collect() };
+        assert_eq!(slice(ranges[0]), "┤News├", "active tab body includes both tees");
+        assert_eq!(slice(ranges[1]), "Email", "inactive tab is just the label");
+    }
+
+    #[test]
+    fn handle_mouse_click_on_inactive_tab_switches_to_it() {
+        // Simulate a render to populate `tab_layout`, then click on an
+        // inactive tab's column range and check the active index moved
+        // (and that subsequent clicks on the active tab are no-ops).
+        let (mut stack, _) = build_stack(1);
+        // Hand-populate the layout cache as render would — pretend the
+        // strip is at row 0 with three 4-wide tabs starting at col 1.
+        *stack.tab_layout.lock().unwrap() = TabStripLayout {
+            row: 0,
+            tab_ranges: vec![(1, 5), (6, 10), (11, 15)],
+        };
+        let click = |col: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert_eq!(stack.active, 0);
+        assert_eq!(
+            stack.handle_mouse(click(8), Rect::new(0, 0, 20, 10)),
+            EventResult::Handled
+        );
+        assert_eq!(stack.active, 1, "click in tab 1's range switches");
+        assert_eq!(
+            stack.handle_mouse(click(8), Rect::new(0, 0, 20, 10)),
+            EventResult::Handled,
+            "click on the now-active tab is still handled (no fall-through)"
+        );
+        assert_eq!(stack.active, 1, "active doesn't change on re-click");
+        // A click outside any tab range should fall through to the
+        // child (Ignored, since StubWidget doesn't claim mouse events).
+        assert_eq!(
+            stack.handle_mouse(click(50), Rect::new(0, 0, 60, 10)),
+            EventResult::Ignored,
+        );
+        assert_eq!(stack.active, 1, "click outside ranges leaves active alone");
+    }
+
+    #[test]
     fn switch_to_finds_child_by_id() {
         let (mut stack, _) = build_stack(1);
         assert!(stack.switch_to("b"));
@@ -525,37 +855,273 @@ mod tests {
         assert_eq!(stack.active, 0);
     }
 
-    #[test]
-    fn build_tab_spans_full_mode_contains_titles() {
-        let theme = Theme::builtin_defaults();
-        let spans = build_tab_spans(
-            &["Clock", "Weather", "Stocks"],
-            1,
-            false,
-            theme.text_selected,
-            theme.text_dim,
-        );
-        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(joined.contains("Clock"));
-        assert!(joined.contains("• Weather"));
-        assert!(joined.contains("Stocks"));
+    fn tabs(items: &[(&str, Option<char>)]) -> Vec<(String, Option<char>)> {
+        items
+            .iter()
+            .map(|(name, sc)| ((*name).to_string(), *sc))
+            .collect()
     }
 
     #[test]
-    fn build_tab_spans_compact_mode_uses_initials() {
+    fn build_tab_label_spans_full_mode_contains_titles() {
         let theme = Theme::builtin_defaults();
-        let spans = build_tab_spans(
-            &["Clock", "Weather", "Stocks"],
+        // Active=0 so that the two trailing inactive tabs sit side by
+        // side and the ` ─ ` inactive↔inactive separator appears in
+        // the joined output.
+        let spans = build_tab_label_spans(
+            &tabs(&[("Clock", Some('c')), ("Weather", Some('w')), ("Stocks", Some('s'))]),
             0,
+            false,
             true,
-            theme.text_selected,
-            theme.text_dim,
+            &theme,
         );
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        // Active tab gets the `•` marker; initials are uppercase.
-        assert!(joined.contains("• C"));
+        assert!(joined.contains("Clock"));
+        assert!(joined.contains("Weather"));
+        assert!(joined.contains("Stocks"));
+        // Tab separator between two inactive tabs is the horizontal-line
+        // glyph wrapped in spaces, never a pipe.
+        assert!(joined.contains(" ─ "));
+        assert!(!joined.contains(" | "));
+        // Arrows were removed when the title row was redesigned —
+        // focus is now conveyed by tee-junction bracket pad, not by
+        // ▶ ◀ glyphs.
+        assert!(!joined.contains('▶'));
+        assert!(!joined.contains('◀'));
+    }
+
+    #[test]
+    fn build_tab_label_spans_active_tab_wrapped_in_tees_when_focused() {
+        // Active tab gets ┤ on the left and ├ on the right when the
+        // stack is focused. The brackets are styled in border_focused
+        // so they connect visually to the surrounding `─` border.
+        let theme = Theme::builtin_defaults();
+        let spans = build_tab_label_spans(
+            &tabs(&[("Clock", Some('c')), ("Weather", Some('w')), ("News", Some('n'))]),
+            1, // Weather active
+            false,
+            true, // focused
+            &theme,
+        );
+        let lefts: Vec<_> = spans
+            .iter()
+            .filter(|s| s.content.as_ref() == "┤")
+            .collect();
+        let rights: Vec<_> = spans
+            .iter()
+            .filter(|s| s.content.as_ref() == "├")
+            .collect();
+        assert_eq!(lefts.len(), 1, "exactly one ┤ for the active tab");
+        assert_eq!(rights.len(), 1, "exactly one ├ for the active tab");
+        assert_eq!(lefts[0].style, theme.border_focused);
+        assert_eq!(rights[0].style, theme.border_focused);
+    }
+
+    #[test]
+    fn build_tab_label_spans_tee_notches_flush_against_border() {
+        // The bug this fixes: a leading space between the surrounding
+        // `─` border line and the active tab's `┤` / `├` tees, which
+        // made the focus indicator look like a break in the border
+        // rather than a notch into it. The active pad must sit
+        // directly adjacent to the surrounding line on both sides.
+        let theme = Theme::builtin_defaults();
+
+        // Active = first tab → leading collapses from `─ ` (2 chars)
+        // to `─` (1 char) so `┤` notches into the corner glyph.
+        let spans = build_tab_label_spans(
+            &tabs(&[("News", Some('n')), ("Email", Some('e'))]),
+            0,
+            false,
+            true,
+            &theme,
+        );
+        assert_eq!(spans[0].content.as_ref(), "─");
+        assert_eq!(spans[1].content.as_ref(), "┤");
+
+        // Active in the middle → separators on each side lose their
+        // inner space, leaving ` ─┤` before and `├─ ` after.
+        let spans = build_tab_label_spans(
+            &tabs(&[("News", Some('n')), ("Email", Some('e')), ("Stocks", Some('s'))]),
+            1,
+            false,
+            true,
+            &theme,
+        );
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(joined.contains(" ─┤"), "separator before active should flush against `┤`");
+        assert!(joined.contains("├─ "), "active should flush against the separator after `├`");
+        assert!(!joined.contains(" ┤"), "no blank gap on the outside of `┤`");
+        assert!(!joined.contains("├ "), "no blank gap on the outside of `├`");
+
+        // Active = last tab → trailing space is dropped so the filler
+        // `─` chars connect directly to `├`.
+        let spans = build_tab_label_spans(
+            &tabs(&[("News", Some('n')), ("Email", Some('e'))]),
+            1,
+            false,
+            true,
+            &theme,
+        );
+        let last = spans.last().expect("non-empty");
+        assert_eq!(last.content.as_ref(), "├", "last span should be `├` with no trailing space");
+    }
+
+    #[test]
+    fn build_tab_label_spans_active_pad_collapses_to_spaces_when_unfocused() {
+        // Width must stay constant across focus states — when not
+        // focused, the bracket slots fall back to plain spaces.
+        let theme = Theme::builtin_defaults();
+        let focused = build_tab_label_spans(
+            &tabs(&[("Clock", Some('c')), ("Weather", Some('w'))]),
+            1,
+            false,
+            true,
+            &theme,
+        );
+        let unfocused = build_tab_label_spans(
+            &tabs(&[("Clock", Some('c')), ("Weather", Some('w'))]),
+            1,
+            false,
+            false,
+            &theme,
+        );
+        assert_eq!(spans_width(&focused), spans_width(&unfocused));
+        let unfocused_text: String =
+            unfocused.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !unfocused_text.contains('┤') && !unfocused_text.contains('├'),
+            "no tee glyphs in unfocused state"
+        );
+    }
+
+    #[test]
+    fn build_tab_label_spans_highlights_shortcut_letter() {
+        let theme = Theme::builtin_defaults();
+        let spans = build_tab_label_spans(
+            &tabs(&[("News", Some('n')), ("Email", Some('e'))]),
+            0,
+            false,
+            true,
+            &theme,
+        );
+        let n_span = spans
+            .iter()
+            .find(|s| s.style == theme.text_shortcut && s.content == "N");
+        let e_span = spans
+            .iter()
+            .find(|s| s.style == theme.text_shortcut && s.content == "E");
+        assert!(n_span.is_some(), "N in 'News' should be shortcut-styled");
+        assert!(e_span.is_some(), "E in 'Email' should be shortcut-styled");
+    }
+
+    #[test]
+    fn build_tab_label_spans_active_uses_focused_style_when_pane_focused() {
+        let theme = Theme::builtin_defaults();
+        let spans = build_tab_label_spans(
+            &tabs(&[("News", Some('n')), ("Email", Some('e'))]),
+            0,
+            false,
+            true, // focused pane
+            &theme,
+        );
+        let ews = spans
+            .iter()
+            .find(|s| s.content == "ews")
+            .expect("'ews' span should exist");
+        assert_eq!(
+            ews.style, theme.widget_title_focused,
+            "active tab body should use widget_title.focused when pane focused"
+        );
+        let mail = spans
+            .iter()
+            .find(|s| s.content == "mail")
+            .expect("'mail' span should exist");
+        assert_eq!(mail.style, theme.text_dim, "inactive tab body should be dim");
+    }
+
+    #[test]
+    fn build_tab_label_spans_active_uses_unfocused_style_when_pane_unfocused() {
+        // The user picked highlighting over dim/bright precisely to
+        // keep the active tab distinguishable in unfocused stacks —
+        // active uses widget_title.unfocused (bold no-bg), inactive
+        // tabs use text.dim. The two are visibly different even with
+        // no focus.
+        let theme = Theme::builtin_defaults();
+        let spans = build_tab_label_spans(
+            &tabs(&[("News", Some('n')), ("Email", Some('e'))]),
+            0,
+            false,
+            false, // unfocused pane
+            &theme,
+        );
+        let ews = spans
+            .iter()
+            .find(|s| s.content == "ews")
+            .expect("'ews' span should exist");
+        assert_eq!(
+            ews.style, theme.widget_title_unfocused,
+            "active tab body should use widget_title.unfocused when pane unfocused"
+        );
+        let mail = spans
+            .iter()
+            .find(|s| s.content == "mail")
+            .expect("'mail' span should exist");
+        assert_eq!(mail.style, theme.text_dim, "inactive tab body should be dim");
+        assert_ne!(
+            theme.widget_title_unfocused, theme.text_dim,
+            "active-unfocused must visibly differ from inactive-dim"
+        );
+    }
+
+    #[test]
+    fn build_metadata_spans_uses_supplied_style() {
+        let theme = Theme::builtin_defaults();
+        let spans = build_metadata_spans(Some("47 articles"), theme.metadata_focused);
+        let meta = spans
+            .iter()
+            .find(|s| s.content == "47 articles")
+            .expect("metadata span should exist");
+        assert_eq!(
+            meta.style, theme.metadata_focused,
+            "metadata body should adopt the style we passed in"
+        );
+    }
+
+    #[test]
+    fn build_metadata_spans_pads_with_single_spaces() {
+        // No more ` ─ ` separator — metadata is right-aligned in its
+        // own corner now, and the leading/trailing space pad lets a
+        // bg color (if the scheme adds one) breathe.
+        let theme = Theme::builtin_defaults();
+        let spans = build_metadata_spans(Some("47 articles"), theme.metadata_focused);
+        assert_eq!(spans.first().map(|s| s.content.as_ref()), Some(" "));
+        assert_eq!(spans.last().map(|s| s.content.as_ref()), Some(" "));
+    }
+
+    #[test]
+    fn build_metadata_spans_none_when_absent() {
+        let theme = Theme::builtin_defaults();
+        assert!(build_metadata_spans(None, theme.metadata_focused).is_empty());
+        assert!(build_metadata_spans(Some(""), theme.metadata_focused).is_empty());
+    }
+
+    #[test]
+    fn build_tab_label_spans_compact_mode_uses_initials() {
+        let theme = Theme::builtin_defaults();
+        let spans = build_tab_label_spans(
+            &tabs(&[("Clock", Some('c')), ("Weather", Some('w')), ("Stocks", Some('s'))]),
+            0,
+            true,
+            true,
+            &theme,
+        );
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        // Initials are uppercase; no arrows surround the active one.
+        assert!(joined.contains('C'));
         assert!(joined.contains("W"));
         assert!(joined.contains("S"));
         assert!(!joined.contains("Clock"));
+        assert!(!joined.contains('▶'));
+        assert!(!joined.contains('◀'));
     }
 }

@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Datelike;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
@@ -22,7 +22,7 @@ use serde::Deserialize;
 use crate::cache::ScopedCache;
 use crate::geolocation::{self, GeoLocation};
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::decorated_title_line;
+use crate::ui::apply_title_row;
 
 use super::{AppContext, EventResult, Widget};
 
@@ -403,26 +403,25 @@ impl Widget for WeatherWidget {
                 revert_target,
             }
         };
-        let title_label = snapshot
-            .location_label
-            .clone()
-            .unwrap_or_else(|| "Locating…".into());
+        let title_label = snapshot.location_label.clone();
         let title_prefix = if self.instance == "main" {
             "Weather".to_string()
         } else {
             format!("Weather ({})", self.instance)
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(self.theme.border_style(focused))
-            .title(decorated_title_line(
-                focused,
-                &format!("{title_prefix} — {title_label}"),
-                self.shortcut,
-                self.theme.widget_title,
-                self.theme.text_shortcut,
-            ));
+        let metadata = title_label.or_else(|| Some("Locating…".to_string()));
+        let block = apply_title_row(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(self.theme.border_style(focused)),
+            focused,
+            &title_prefix,
+            metadata.as_deref(),
+            self.shortcut,
+            &self.theme,
+            area.width,
+        );
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -483,6 +482,16 @@ impl Widget for WeatherWidget {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
+            return EventResult::Ignored;
+        }
+        // Uppercase ASCII letters are reserved for the app-wide
+        // `Shift+<letter>` focus-jump dispatcher — never consume them here.
+        if let KeyCode::Char(c) = key.code {
+            if c.is_ascii_uppercase() {
+                return EventResult::Ignored;
+            }
+        }
         if matches!(key.code, KeyCode::Char('x')) {
             self.clear_transient();
             EventResult::Handled
@@ -548,6 +557,21 @@ impl Widget for WeatherWidget {
 
     fn set_shortcut(&mut self, shortcut: Option<char>) {
         self.shortcut = shortcut;
+    }
+
+    fn shortcut(&self) -> Option<char> {
+        self.shortcut
+    }
+
+    fn title_metadata(&self) -> Option<String> {
+        // Active location label — transient override wins, falling
+        // back to the configured location. `None` until the first
+        // fetch resolves a location.
+        let st = self.state.lock().ok()?;
+        st.transient_location
+            .as_ref()
+            .map(|l| l.label.clone())
+            .or_else(|| st.location.as_ref().map(|l| l.label.clone()))
     }
 }
 

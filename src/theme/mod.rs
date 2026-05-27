@@ -9,7 +9,13 @@
 //!
 //! Roles exposed today:
 //!   - `border.focused` / `border.unfocused`
-//!   - `widget_title`
+//!   - `widget_title.focused` / `widget_title.unfocused` — title text on the
+//!     pane's top border. Focused panes paint a background-highlighted
+//!     variant; unfocused stays plain. Stacks use the same pair for the
+//!     active tab while inactive tabs fall through to `text.dim`.
+//!   - `metadata.focused` / `metadata.unfocused` — right-aligned suffix on
+//!     the title row (Weather's location, Email's account, News's article
+//!     count). Dimmed when the pane isn't focused.
 //!   - `text.plain` / `text.brilliant` (default body / emphasized body)
 //!   - `text.selected` (yellow-orange — selected tab, "[Today]")
 //!   - `text.focused`  (cyan — focused entity within a widget)
@@ -106,13 +112,38 @@ pub struct ColorScheme {
     #[serde(default)]
     pub border: BorderColors,
     #[serde(default)]
-    pub widget_title: Option<StyleSpec>,
+    pub widget_title: TitleColors,
+    #[serde(default)]
+    pub metadata: MetadataColors,
     #[serde(default)]
     pub text: TextColors,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BorderColors {
+    #[serde(default)]
+    pub focused: Option<StyleSpec>,
+    #[serde(default)]
+    pub unfocused: Option<StyleSpec>,
+}
+
+/// Focused/unfocused pair for the title text painted on the top border.
+/// `focused` is the "this pane has focus" variant — typically a
+/// background-color highlight so the user can spot focus from across the
+/// dashboard without the title shifting position.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TitleColors {
+    #[serde(default)]
+    pub focused: Option<StyleSpec>,
+    #[serde(default)]
+    pub unfocused: Option<StyleSpec>,
+}
+
+/// Focused/unfocused pair for the right-aligned metadata suffix on the
+/// title row. Held separate from `widget_title` so colorschemes can pick a
+/// quieter color for the metadata (often a dim variant of the title color).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MetadataColors {
     #[serde(default)]
     pub focused: Option<StyleSpec>,
     #[serde(default)]
@@ -145,7 +176,10 @@ pub struct TextColors {
 pub struct Theme {
     pub border_focused: Style,
     pub border_unfocused: Style,
-    pub widget_title: Style,
+    pub widget_title_focused: Style,
+    pub widget_title_unfocused: Style,
+    pub metadata_focused: Style,
+    pub metadata_unfocused: Style,
     pub text_plain: Style,
     pub text_brilliant: Style,
     pub text_dim: Style,
@@ -170,7 +204,14 @@ impl Theme {
                 .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD),
             border_unfocused: Style::default(),
-            widget_title: Style::default().add_modifier(Modifier::BOLD),
+            // Focus on the title is conveyed by the `┤ ├` bracket pad
+            // (painted in border_focused) — the title text itself stays
+            // the same bold across states. Schemes can still override
+            // either side to add a fg shift if they want.
+            widget_title_focused: Style::default().add_modifier(Modifier::BOLD),
+            widget_title_unfocused: Style::default().add_modifier(Modifier::BOLD),
+            metadata_focused: Style::default(),
+            metadata_unfocused: Style::default().add_modifier(Modifier::DIM),
             text_plain: Style::default(),
             text_brilliant: Style::default().add_modifier(Modifier::BOLD),
             text_dim: Style::default().add_modifier(Modifier::DIM),
@@ -197,7 +238,16 @@ impl Theme {
         Self {
             border_focused: pick(&overrides.border.focused, self.border_focused),
             border_unfocused: pick(&overrides.border.unfocused, self.border_unfocused),
-            widget_title: pick(&overrides.widget_title, self.widget_title),
+            widget_title_focused: pick(
+                &overrides.widget_title.focused,
+                self.widget_title_focused,
+            ),
+            widget_title_unfocused: pick(
+                &overrides.widget_title.unfocused,
+                self.widget_title_unfocused,
+            ),
+            metadata_focused: pick(&overrides.metadata.focused, self.metadata_focused),
+            metadata_unfocused: pick(&overrides.metadata.unfocused, self.metadata_unfocused),
             text_plain: pick(&overrides.text.plain, self.text_plain),
             text_brilliant: pick(&overrides.text.brilliant, self.text_brilliant),
             text_dim: pick(&overrides.text.dim, self.text_dim),
@@ -216,19 +266,40 @@ impl Theme {
             self.border_unfocused
         }
     }
+
+    /// Focused/unfocused pair for the title text on the border.
+    pub fn widget_title_style(&self, focused: bool) -> Style {
+        if focused {
+            self.widget_title_focused
+        } else {
+            self.widget_title_unfocused
+        }
+    }
+
+    /// Focused/unfocused pair for the right-aligned metadata suffix.
+    pub fn metadata_style(&self, focused: bool) -> Style {
+        if focused {
+            self.metadata_focused
+        } else {
+            self.metadata_unfocused
+        }
+    }
 }
 
 /// On-disk shape of `colorschemes.toml`:
 ///
 /// ```toml
 /// [schemes.default]
-/// border.focused   = { fg = "light_cyan", modifiers = ["bold"] }
-/// border.unfocused = "default"
-/// widget_title     = { modifiers = ["bold"] }
-/// text.plain       = "default"
-/// text.brilliant   = { fg = "white",        modifiers = ["bold"] }
-/// text.selected    = { fg = "light_yellow", modifiers = ["bold"] }
-/// text.focused     = { fg = "light_cyan",   modifiers = ["bold"] }
+/// border.focused           = { fg = "light_cyan", modifiers = ["bold"] }
+/// border.unfocused         = "default"
+/// widget_title.focused     = { fg = "black", bg = "light_cyan", modifiers = ["bold"] }
+/// widget_title.unfocused   = { modifiers = ["bold"] }
+/// metadata.focused         = "default"
+/// metadata.unfocused       = { modifiers = ["dim"] }
+/// text.plain               = "default"
+/// text.brilliant           = { fg = "white",        modifiers = ["bold"] }
+/// text.selected            = { fg = "light_yellow", modifiers = ["bold"] }
+/// text.focused             = { fg = "light_cyan",   modifiers = ["bold"] }
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ColorSchemesFile {
@@ -668,5 +739,36 @@ theme = "default"
         assert_eq!(widget_theme.text_focused.fg, Some(Color::LightGreen));
         // App-level text.selected untouched.
         assert_eq!(widget_theme.text_selected.fg, Some(Color::LightYellow));
+    }
+
+    #[test]
+    fn widget_title_focused_and_unfocused_split() {
+        let scheme: ColorScheme = toml::from_str(
+            r##"
+            widget_title.focused   = { fg = "black", bg = "light_cyan", modifiers = ["bold"] }
+            widget_title.unfocused = { fg = "white", modifiers = ["bold"] }
+            "##,
+        )
+        .unwrap();
+        let theme = Theme::builtin_defaults().with_overrides(&scheme);
+        assert_eq!(theme.widget_title_focused.fg, Some(Color::Black));
+        assert_eq!(theme.widget_title_focused.bg, Some(Color::LightCyan));
+        assert_eq!(theme.widget_title_unfocused.fg, Some(Color::White));
+        assert!(theme.widget_title_unfocused.bg.is_none());
+    }
+
+    #[test]
+    fn metadata_focused_and_unfocused_split() {
+        let scheme: ColorScheme = toml::from_str(
+            r#"
+            metadata.focused   = "light_yellow"
+            metadata.unfocused = { fg = "gray", modifiers = ["dim"] }
+            "#,
+        )
+        .unwrap();
+        let theme = Theme::builtin_defaults().with_overrides(&scheme);
+        assert_eq!(theme.metadata_focused.fg, Some(Color::LightYellow));
+        assert_eq!(theme.metadata_unfocused.fg, Some(Color::Gray));
+        assert!(theme.metadata_unfocused.add_modifier.contains(Modifier::DIM));
     }
 }

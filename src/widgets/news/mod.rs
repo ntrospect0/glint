@@ -22,7 +22,7 @@ use serde::Deserialize;
 use crate::cache::ScopedCache;
 use crate::llm::{LlmMessage, LlmProvider, LlmRequest, Role};
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::decorated_title_line;
+use crate::ui::apply_title_row;
 
 use super::{AppContext, EventResult, Widget};
 
@@ -810,22 +810,23 @@ impl Widget for NewsWidget {
         } else {
             format!("News ({})", self.instance)
         };
-        let title = if articles.is_empty() {
-            base
+        let metadata = if articles.is_empty() {
+            None
         } else {
-            format!("{base} — {} articles", articles.len())
+            Some(format!("{} articles", articles.len()))
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(self.theme.border_style(focused))
-            .title(decorated_title_line(
-                focused,
-                &title,
-                self.shortcut,
-                self.theme.widget_title,
-                self.theme.text_shortcut,
-            ));
+        let block = apply_title_row(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(self.theme.border_style(focused)),
+            focused,
+            &base,
+            metadata.as_deref(),
+            self.shortcut,
+            &self.theme,
+            area.width,
+        );
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -1030,6 +1031,14 @@ impl Widget for NewsWidget {
         if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
             return EventResult::Ignored;
         }
+        // Uppercase ASCII letters are reserved for the app-wide
+        // `Shift+<letter>` focus-jump dispatcher — never consume them here.
+        // This is why jump-to-bottom is `End`, not the vim-style `G`.
+        if let KeyCode::Char(c) = key.code {
+            if c.is_ascii_uppercase() {
+                return EventResult::Ignored;
+            }
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_selection(-1);
@@ -1047,11 +1056,11 @@ impl Widget for NewsWidget {
                 self.move_selection(10);
                 EventResult::Handled
             }
-            KeyCode::Char('g') => {
+            KeyCode::Char('g') | KeyCode::Home => {
                 self.jump_to(0);
                 EventResult::Handled
             }
-            KeyCode::Char('G') => {
+            KeyCode::End => {
                 self.jump_to(usize::MAX);
                 EventResult::Handled
             }
@@ -1183,7 +1192,8 @@ impl Widget for NewsWidget {
             ("↑ / ↓ / j / k", "select article"),
             ("← / → / [ / ] / h / l", "cycle filter tab"),
             ("PgUp / PgDn", "±10 articles"),
-            ("g / G", "jump to top / bottom"),
+            ("g / Home", "jump to top"),
+            ("End", "jump to bottom"),
             ("Enter", "open article URL in browser"),
             ("e", "expand selected article"),
             ("x", "clear :news <terms> search filter"),
@@ -1222,6 +1232,23 @@ impl Widget for NewsWidget {
 
     fn set_shortcut(&mut self, shortcut: Option<char>) {
         self.shortcut = shortcut;
+    }
+
+    fn shortcut(&self) -> Option<char> {
+        self.shortcut
+    }
+
+    fn title_metadata(&self) -> Option<String> {
+        // Same suffix the standalone news title shows after the kind
+        // name (`News — 47 articles`). Returns None when there's no
+        // article count yet (fresh launch before the first poll).
+        let st = self.state.lock().expect("news state poisoned");
+        let n = st.articles.len();
+        if n == 0 {
+            None
+        } else {
+            Some(format!("{n} articles"))
+        }
     }
 }
 
@@ -1548,9 +1575,9 @@ pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
             WizardField {
                 key: "summarize_with_llm",
                 label: "Summarise expanded articles with LLM",
-                help: "Requires an Anthropic key in credentials/anthropic_key.toml \
-                       (or set via the Global step). When off, glint stays \
-                       fully offline and shows raw RSS excerpts.",
+                help: "Requires the LLM provider you picked on the Global page \
+                       to have its API key set. When off, glint stays fully \
+                       offline and shows raw RSS excerpts.",
                 required: false,
                 kind: WizardFieldKind::Bool { default: true },
                 validate: None,

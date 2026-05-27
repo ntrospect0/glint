@@ -43,16 +43,26 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp) {
         };
         lines.push(Line::from(format!("  ~/.config/glint/{stem}.toml")));
     }
-    if let crate::wizard::descriptor::WizardValue::Text(key) =
-        app.state
-            .global_get("llm_api_key")
-            .cloned()
-            .unwrap_or(crate::wizard::descriptor::WizardValue::Text(String::new()))
-    {
-        if !key.trim().is_empty() {
-            lines.push(Line::from(
-                "  ~/.config/glint/credentials/anthropic_key.toml",
-            ));
+    let picked_provider_name = match app.state.global_get("llm_provider") {
+        Some(crate::wizard::descriptor::WizardValue::Choice(s)) => s.clone(),
+        _ => crate::llm::PROVIDERS
+            .first()
+            .map(|p| p.name.to_string())
+            .unwrap_or_default(),
+    };
+    let picked_provider = crate::llm::find_provider(&picked_provider_name);
+    lines.push(Line::from("  ~/.config/glint/llm.toml"));
+    if let Some(def) = picked_provider {
+        let key_state = format!("llm_api_key__{}", def.name);
+        let typed_key = match app.state.global_get(&key_state) {
+            Some(crate::wizard::descriptor::WizardValue::Text(s)) => s.trim().to_string(),
+            _ => String::new(),
+        };
+        if !typed_key.is_empty() {
+            lines.push(Line::from(format!(
+                "  ~/.config/glint/credentials/{}",
+                def.credentials_filename
+            )));
         }
     }
     lines.push(Line::from(""));
@@ -118,7 +128,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp) {
         "  INSTRUCTIONS.md — step-by-step walkthrough for Google Cloud, Azure,",
     ));
     lines.push(Line::from(
-        "                    CalDAV (iCloud/Fastmail), Anthropic key setup, plus a",
+        "                    CalDAV (iCloud/Fastmail), LLM provider key setup, plus a",
     ));
     lines.push(Line::from(
         "                    troubleshooting guide. Read this when re-authorizing or",

@@ -20,7 +20,7 @@ use serde::Deserialize;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::decorated_title_line;
+use crate::ui::apply_title_row;
 
 use super::{AppContext, EventResult, Widget};
 
@@ -362,17 +362,18 @@ impl Widget for ResourcesWidget {
         } else {
             format!("Resources ({})", self.instance)
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(self.theme.border_style(focused))
-            .title(decorated_title_line(
-                focused,
-                &title_base,
-                self.shortcut,
-                self.theme.widget_title,
-                self.theme.text_shortcut,
-            ));
+        let block = apply_title_row(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(self.theme.border_style(focused)),
+            focused,
+            &title_base,
+            None,
+            self.shortcut,
+            &self.theme,
+            area.width,
+        );
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.width < 4 || inner.height < 4 {
@@ -525,6 +526,13 @@ impl Widget for ResourcesWidget {
         if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
             return EventResult::Ignored;
         }
+        // Uppercase ASCII letters are reserved for the app-wide
+        // `Shift+<letter>` focus-jump dispatcher — never consume them here.
+        if let KeyCode::Char(c) = key.code {
+            if c.is_ascii_uppercase() {
+                return EventResult::Ignored;
+            }
+        }
         match key.code {
             // `m` toggles between sort-by-CPU and sort-by-memory.
             KeyCode::Char('m') => {
@@ -594,6 +602,10 @@ impl Widget for ResourcesWidget {
 
     fn set_shortcut(&mut self, shortcut: Option<char>) {
         self.shortcut = shortcut;
+    }
+
+    fn shortcut(&self) -> Option<char> {
+        self.shortcut
     }
 }
 

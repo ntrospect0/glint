@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
 use chrono_tz::Tz;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Alignment, Rect},
     style::Style,
@@ -15,7 +15,7 @@ use ratatui::{
 use serde::Deserialize;
 
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::{big_digits, decorated_title_line};
+use crate::ui::{apply_title_row, big_digits};
 
 use super::{AppContext, EventResult, Widget};
 
@@ -117,6 +117,15 @@ struct ClockState {
     /// Currently active big-digit gradient. Seeded from config at startup; the
     /// user can cycle through variants by pressing `g`.
     gradient: big_digits::Gradient,
+    /// First-visible world-clock index when the cell is too short to show the
+    /// whole list. ↑/↓ and mouse-wheel adjust this; render clamps it against
+    /// `world_clock_max_scroll` so handlers don't need to know the cell size.
+    world_clock_scroll: usize,
+    /// Largest valid value for `world_clock_scroll` given the most recent
+    /// render's available height. Cached here so the key/mouse handlers can
+    /// clamp without re-deriving the layout. `0` when the full list fits (or
+    /// when the world-clocks block isn't shown at all).
+    world_clock_max_scroll: usize,
 }
 
 pub struct ClockWidget {
@@ -224,6 +233,10 @@ impl ClockWidget {
         {
             let mut st = self.state.lock().expect("clock state poisoned");
             st.transient_searching = true;
+            // Setting an override prepends Local + the override onto the
+            // world-clocks list, so any prior scroll offset no longer points
+            // at the same entry — reset to the top for predictability.
+            st.world_clock_scroll = 0;
         }
         let state = self.state.clone();
         let query = query.to_string();
@@ -256,6 +269,24 @@ impl ClockWidget {
     fn clear_transient(&self) {
         let mut st = self.state.lock().expect("clock state poisoned");
         st.transient_tz = None;
+        // Same reasoning as `lookup_location` — the list shape changes back,
+        // so reset the offset rather than leave it pointing somewhere stale.
+        st.world_clock_scroll = 0;
+    }
+
+    /// Move the world-clocks view by `delta` rows (negative = up). Returns
+    /// `Handled` only when scrolling is actually possible — when the full
+    /// list already fits, ↑/↓ and mouse-wheel fall through so the event can
+    /// reach a higher-level handler.
+    fn scroll_world_clocks(&self, delta: i32) -> EventResult {
+        let mut st = self.state.lock().expect("clock state poisoned");
+        if st.world_clock_max_scroll == 0 {
+            return EventResult::Ignored;
+        }
+        let max = st.world_clock_max_scroll;
+        let next = (st.world_clock_scroll as i32 + delta).clamp(0, max as i32);
+        st.world_clock_scroll = next as usize;
+        EventResult::Handled
     }
 
     /// Returns (HH:MM[:SS], AM/PM, date) for the effective primary timezone.
@@ -465,27 +496,25 @@ impl Widget for ClockWidget {
         } else {
             format!("Clock ({})", self.instance)
         };
-        let title_base = if let Some((label, _)) = &transient {
-            format!("{base} — {label} (lookup)")
+        let metadata = if let Some((label, _)) = &transient {
+            Some(format!("{label} (lookup)"))
         } else if searching {
-            format!("{base} — looking up…")
+            Some("looking up…".to_string())
         } else {
-            match &self.tz {
-                Some(tz) => format!("{base} — {tz}"),
-                None => base,
-            }
+            self.tz.map(|tz| tz.to_string())
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(self.theme.border_style(focused))
-            .title(decorated_title_line(
-                focused,
-                &title_base,
-                self.shortcut,
-                self.theme.widget_title,
-                self.theme.text_shortcut,
-            ));
+        let block = apply_title_row(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(self.theme.border_style(focused)),
+            focused,
+            &base,
+            metadata.as_deref(),
+            self.shortcut,
+            &self.theme,
+            area.width,
+        );
 
         let now = chrono::Utc::now();
         let (time, ampm, date) = self.render_strings(now);
@@ -541,18 +570,55 @@ impl Widget for ClockWidget {
             lines.push(Line::from(date));
         }
 
-        // World clocks block — only shown if there's room for at least the
-        // separator line + one entry. Primary timezone is listed first so the
-        // user can see the local time alongside the rest of the world.
+        // World clocks block — show as many entries as fit, scroll the rest
+        // with ↑/↓ and mouse-wheel. Primary timezone leads so the user can
+        // see local time alongside the rest of the world. The transient
+        // footer (when a `:time` override is active) eats the bottom row, so
+        // the available height for the body shrinks by 1 in that case —
+        // factor that into the fit calculation, otherwise the last clock
+        // entry would be clipped by the footer.
         let clocks = self.world_clock_entries();
+        let body_h = if transient.is_some() {
+            inner.height.saturating_sub(1)
+        } else {
+            inner.height
+        };
         if !clocks.is_empty() {
-            let extra_needed = 2 + clocks.len();
-            if (lines.len() + extra_needed) as u16 <= inner.height {
+            // Block overhead is the blank pad + the "── World Clocks ──"
+            // header. Below that, every remaining row holds one entry.
+            const HEADER_ROWS: u16 = 2;
+            let avail_rows = (body_h as i32) - (lines.len() as i32) - (HEADER_ROWS as i32);
+            let avail_clocks = avail_rows.max(0) as usize;
+            if avail_clocks >= 1 {
+                let visible_count = avail_clocks.min(clocks.len());
+                let max_scroll = clocks.len().saturating_sub(visible_count);
+                let scroll = {
+                    let mut st = self.state.lock().expect("clock state poisoned");
+                    st.world_clock_max_scroll = max_scroll;
+                    if st.world_clock_scroll > max_scroll {
+                        st.world_clock_scroll = max_scroll;
+                    }
+                    st.world_clock_scroll
+                };
+                let visible_end = scroll + visible_count;
+                let has_above = scroll > 0;
+                let has_below = visible_end < clocks.len();
+
                 lines.push(Line::from(""));
+                // Chevrons surface which directions still have hidden rows.
+                // Header is centered by the surrounding Paragraph so the
+                // width drift between states is barely perceptible.
+                let header_text = match (has_above, has_below) {
+                    (false, false) => "── World Clocks ──",
+                    (true, false) => "── World Clocks ↑ ──",
+                    (false, true) => "── World Clocks ↓ ──",
+                    (true, true) => "── World Clocks ↑↓ ──",
+                };
                 lines.push(Line::from(Span::styled(
-                    "── World Clocks ──",
+                    header_text.to_string(),
                     self.theme.text_dim,
                 )));
+
                 let max_label = clocks.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0);
                 // Local — and whichever entry the big-digit display is showing
                 // — get colored so the user can see at a glance which row
@@ -563,20 +629,22 @@ impl Widget for ClockWidget {
                 let local_highlight_style = self.theme.text_focused;
                 let override_highlight_style = self.theme.text_selected;
                 let has_override = transient.is_some();
-                for (idx, (label, time_str)) in clocks.iter().enumerate() {
+                for (idx, (label, time_str)) in clocks
+                    .iter()
+                    .enumerate()
+                    .skip(scroll)
+                    .take(visible_count)
+                {
+                    // Highlight is keyed off the *absolute* index in the full
+                    // list (not the visible window) so the colored row keeps
+                    // its identity as the user scrolls past it.
                     let style = if has_override {
-                        // idx 0 = Local (prepended in world_clock_entries),
-                        // idx 1 = the override entry, rest = secondaries.
                         match idx {
                             0 => local_highlight_style,
                             1 => override_highlight_style,
                             _ => Style::default(),
                         }
                     } else if idx == 0 {
-                        // No override — the first entry is whatever the big
-                        // digits are showing (Local by default, or the
-                        // configured `self.tz` if set), so match the focused
-                        // big-digit color from the scheme.
                         local_highlight_style
                     } else {
                         Style::default()
@@ -589,6 +657,13 @@ impl Widget for ClockWidget {
                     );
                     lines.push(Line::from(Span::styled(line, style)));
                 }
+            } else {
+                // No room — make sure stale max_scroll doesn't let ↑/↓ shift
+                // an invisible offset that re-clamps oddly when the cell
+                // grows again.
+                let mut st = self.state.lock().expect("clock state poisoned");
+                st.world_clock_max_scroll = 0;
+                st.world_clock_scroll = 0;
             }
         }
 
@@ -623,6 +698,16 @@ impl Widget for ClockWidget {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
+            return EventResult::Ignored;
+        }
+        // Uppercase ASCII letters are reserved for the app-wide
+        // `Shift+<letter>` focus-jump dispatcher — never consume them here.
+        if let KeyCode::Char(c) = key.code {
+            if c.is_ascii_uppercase() {
+                return EventResult::Ignored;
+            }
+        }
         match key.code {
             KeyCode::Char('x') => {
                 self.clear_transient();
@@ -633,6 +718,16 @@ impl Widget for ClockWidget {
                 st.gradient = st.gradient.next();
                 EventResult::Handled
             }
+            KeyCode::Up => self.scroll_world_clocks(-1),
+            KeyCode::Down => self.scroll_world_clocks(1),
+            _ => EventResult::Ignored,
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, _area: Rect) -> EventResult {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_world_clocks(-1),
+            MouseEventKind::ScrollDown => self.scroll_world_clocks(1),
             _ => EventResult::Ignored,
         }
     }
@@ -653,6 +748,7 @@ impl Widget for ClockWidget {
 
     fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
         vec![
+            ("↑ / ↓ / scroll", "scroll world clocks (when truncated)"),
             ("g", "cycle digit gradient style"),
             ("x", "clear :time lookup (return to local time)"),
             (":time <city>", "switch primary clock to that location"),
@@ -694,6 +790,21 @@ impl Widget for ClockWidget {
 
     fn set_shortcut(&mut self, shortcut: Option<char>) {
         self.shortcut = shortcut;
+    }
+
+    fn shortcut(&self) -> Option<char> {
+        self.shortcut
+    }
+
+    fn title_metadata(&self) -> Option<String> {
+        let (transient, searching) = self.snapshot_transient();
+        if let Some((label, _)) = transient {
+            return Some(format!("{label} (lookup)"));
+        }
+        if searching {
+            return Some("looking up…".to_string());
+        }
+        self.tz.map(|tz| tz.to_string())
     }
 }
 
@@ -831,9 +942,8 @@ fn render_clock_toml(
         "# Generated by `glint --setup`. Hand-edit freely; the wizard\n\
          # preserves advanced keys it doesn't manage (e.g. [colors], gradient).\n\n",
     );
-    // The timezone field is a Lookup that commits as WizardValue::Choice.
-    // Accept Text too so older state buffers (Phase A.5 Text version) keep
-    // working after this upgrade.
+    // Timezone field is a Lookup → WizardValue::Choice; accept Text
+    // as a fallback in case a custom descriptor wires it differently.
     let tz = match values.get("timezone") {
         Some(WizardValue::Choice(s)) | Some(WizardValue::Text(s)) => s.trim(),
         _ => "",
@@ -1152,6 +1262,45 @@ mod tests {
         assert_eq!(day_night_icon(18), "☾");
         assert_eq!(day_night_icon(23), "☾");
         assert_eq!(day_night_icon(0), "☾");
+    }
+
+    #[test]
+    fn scroll_world_clocks_clamps_and_passes_through_when_full_list_fits() {
+        let w = build_widget(ClockConfig::default());
+
+        // max_scroll == 0 means the whole list fits, so ↑/↓ events should
+        // fall through (Ignored) rather than silently swallow the keypress.
+        assert_eq!(w.scroll_world_clocks(-1), EventResult::Ignored);
+        assert_eq!(w.scroll_world_clocks(1), EventResult::Ignored);
+        assert_eq!(w.state.lock().unwrap().world_clock_scroll, 0);
+
+        // Simulate a render that left 3 entries hidden below the fold.
+        {
+            let mut st = w.state.lock().unwrap();
+            st.world_clock_max_scroll = 3;
+        }
+        // Scroll down advances; can't go past max_scroll.
+        assert_eq!(w.scroll_world_clocks(1), EventResult::Handled);
+        assert_eq!(w.state.lock().unwrap().world_clock_scroll, 1);
+        for _ in 0..10 {
+            w.scroll_world_clocks(1);
+        }
+        assert_eq!(
+            w.state.lock().unwrap().world_clock_scroll,
+            3,
+            "scroll must clamp at max_scroll"
+        );
+        // Scroll up walks back; can't go below 0.
+        assert_eq!(w.scroll_world_clocks(-1), EventResult::Handled);
+        assert_eq!(w.state.lock().unwrap().world_clock_scroll, 2);
+        for _ in 0..10 {
+            w.scroll_world_clocks(-1);
+        }
+        assert_eq!(
+            w.state.lock().unwrap().world_clock_scroll,
+            0,
+            "scroll must clamp at 0"
+        );
     }
 
     #[test]

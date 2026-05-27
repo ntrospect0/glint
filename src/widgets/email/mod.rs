@@ -33,7 +33,7 @@ use serde::Deserialize;
 use crate::cache::ScopedCache;
 use crate::llm::{LlmMessage, LlmProvider, LlmRequest, Role};
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::decorated_title_line;
+use crate::ui::apply_title_row;
 
 use super::{AppContext, EventResult, Widget};
 
@@ -903,32 +903,33 @@ impl Widget for EmailWidget {
             .filter(|m| m.folder.eq_ignore_ascii_case(&folder_name))
             .collect();
 
-        // Title: "Email [outlook] alice@example.com" or "(loading…)" before the
-        // account address resolves.
+        // Base title is just "Email" / "Email (instance)" — the
+        // provider + account address are metadata, rendered via the
+        // shared title-with-metadata helper for consistency with
+        // other widgets.
+        let base = if self.instance == "main" {
+            "Email".to_string()
+        } else {
+            format!("Email ({})", self.instance)
+        };
         let account_label = account
             .as_deref()
             .map(String::from)
             .unwrap_or_else(|| "(loading…)".into());
-        let base = if self.instance == "main" {
-            format!("Email [{}] {}", self.provider_label, account_label)
-        } else {
-            format!(
-                "Email ({}) [{}] {}",
-                self.instance, self.provider_label, account_label
-            )
-        };
+        let metadata = format!("[{}] {}", self.provider_label, account_label);
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(self.theme.border_style(focused))
-            .title(decorated_title_line(
-                focused,
-                &base,
-                self.shortcut,
-                self.theme.widget_title,
-                self.theme.text_shortcut,
-            ));
+        let block = apply_title_row(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(self.theme.border_style(focused)),
+            focused,
+            &base,
+            Some(metadata.as_str()),
+            self.shortcut,
+            &self.theme,
+            area.width,
+        );
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -1037,12 +1038,46 @@ impl Widget for EmailWidget {
 
         let now_local = Local::now();
         let inner_width = list_area.width as usize;
-        // Reserve fixed columns for sender (22) and date (8); the rest goes
-        // to the subject. Date width includes the leading space, sender
-        // includes the indicator + space.
-        let sender_col_w: usize = 22;
-        let date_col_w: usize = 8;
-        let subject_col_w: usize = inner_width.saturating_sub(sender_col_w + date_col_w + 2);
+        // Column-width policy:
+        //   * Date is fixed at 8 chars (matches the formats produced by
+        //     `format_received`: "Fri 14:25", "Yesterday", "Mar 03", …).
+        //   * Sender label is 20 chars by default, growing up to 25 when
+        //     a wide pane leaves surplus space — long names like
+        //     "alex.thompson@example.com" become legible on a roomy
+        //     display without crowding subjects on a narrow one.
+        //   * Subject text is capped at 95 visible chars (anything past
+        //     that scans worse than it reads). Surplus pane width past
+        //     that cap first feeds sender, then becomes trailing padding
+        //     between subject and date — which keeps the date right-
+        //     aligned no matter how wide the pane gets.
+        //   * Indicator (●/○) + space prefix = 2 chars, and there are
+        //     two single-space inter-column gaps → 4 chars of fixed
+        //     chrome on every row.
+        const SENDER_LABEL_MIN: usize = 20;
+        const SENDER_LABEL_MAX: usize = 25;
+        const SUBJECT_TEXT_MAX: usize = 95;
+        const DATE_COL_W: usize = 8;
+        const INDICATOR_PREFIX_W: usize = 2;
+        const COL_GAPS_W: usize = 2;
+
+        let mut sender_label_w = SENDER_LABEL_MIN;
+        let mut sender_col_w = sender_label_w + INDICATOR_PREFIX_W;
+        let mut subject_col_w =
+            inner_width.saturating_sub(sender_col_w + DATE_COL_W + COL_GAPS_W);
+        // When subject would overflow the 95-char cap, donate the excess
+        // to sender first (up to SENDER_LABEL_MAX). Any remaining surplus
+        // stays in the subject column as trailing padding so the date
+        // column hugs the right edge.
+        if subject_col_w > SUBJECT_TEXT_MAX {
+            let excess = subject_col_w - SUBJECT_TEXT_MAX;
+            let donate = excess.min(SENDER_LABEL_MAX - SENDER_LABEL_MIN);
+            sender_label_w += donate;
+            sender_col_w = sender_label_w + INDICATOR_PREFIX_W;
+            subject_col_w =
+                inner_width.saturating_sub(sender_col_w + DATE_COL_W + COL_GAPS_W);
+        }
+        let date_col_w = DATE_COL_W;
+        let subject_text_w = subject_col_w.min(SUBJECT_TEXT_MAX);
 
         let mut lines: Vec<Line<'_>> = Vec::with_capacity(items_visible);
         let mut rows_emitted: u16 = 0;
@@ -1062,17 +1097,21 @@ impl Widget for EmailWidget {
 
             let unread = self.is_unread(msg);
             let indicator = if unread { "●" } else { "○" };
-            let sender = normalize_sender(&msg.from_name, &msg.from_address, sender_col_w.saturating_sub(2));
+            let sender = normalize_sender(&msg.from_name, &msg.from_address, sender_label_w);
             let date = format_received(now_local, msg.received);
             let subject = if msg.subject.is_empty() {
                 "(no subject)".to_string()
             } else {
                 msg.subject.clone()
             };
-            let subject = truncate(&subject, subject_col_w);
+            // Truncate the subject text at the cap, then pad the column
+            // out to its full width so the date column stays pinned to
+            // the right edge regardless of how much surplus space the
+            // pane has past 95 chars of subject.
+            let subject_truncated = truncate(&subject, subject_text_w);
 
-            let sender_padded = pad_or_truncate(&sender, sender_col_w.saturating_sub(2));
-            let subject_padded = pad_or_truncate(&subject, subject_col_w);
+            let sender_padded = pad_or_truncate(&sender, sender_label_w);
+            let subject_padded = pad_or_truncate(&subject_truncated, subject_col_w);
             let date_padded = format!("{date:>w$}", w = date_col_w);
 
             let row = Line::from(vec![
@@ -1152,6 +1191,14 @@ impl Widget for EmailWidget {
         if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
             return EventResult::Ignored;
         }
+        // Uppercase ASCII letters are reserved for the app-wide
+        // `Shift+<letter>` focus-jump dispatcher — never consume them here.
+        // This is why jump-to-bottom is `End`, not the vim-style `G`.
+        if let KeyCode::Char(c) = key.code {
+            if c.is_ascii_uppercase() {
+                return EventResult::Ignored;
+            }
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_selection(-1);
@@ -1169,11 +1216,11 @@ impl Widget for EmailWidget {
                 self.move_selection(10);
                 EventResult::Handled
             }
-            KeyCode::Char('g') => {
+            KeyCode::Char('g') | KeyCode::Home => {
                 self.jump_to(0);
                 EventResult::Handled
             }
-            KeyCode::Char('G') => {
+            KeyCode::End => {
                 self.jump_to(usize::MAX);
                 EventResult::Handled
             }
@@ -1291,7 +1338,8 @@ impl Widget for EmailWidget {
             ("↑ / ↓ / j / k", "select message"),
             ("← / → / [ / ] / h / l", "cycle folder"),
             ("PgUp / PgDn", "±10 messages"),
-            ("g / G", "jump to top / bottom"),
+            ("g / Home", "jump to top"),
+            ("End", "jump to bottom"),
             ("e / Enter / click", "expand selected (marks seen locally)"),
             ("o", "open message in browser"),
             ("s", "request LLM summary (when enabled)"),
@@ -1332,6 +1380,29 @@ impl Widget for EmailWidget {
     fn set_shortcut(&mut self, shortcut: Option<char>) {
         self.shortcut = shortcut;
     }
+
+    fn shortcut(&self) -> Option<char> {
+        self.shortcut
+    }
+
+    fn title_metadata(&self) -> Option<String> {
+        // Match the standalone email title's suffix: `[gmail]
+        // alice@example.com` when the account has resolved; just
+        // `[gmail]` until then.
+        let label = self.provider_label.as_str();
+        if label.is_empty() {
+            return None;
+        }
+        let account = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|st| st.account.clone());
+        match account {
+            Some(addr) => Some(format!("[{label}] {addr}")),
+            None => Some(format!("[{label}]")),
+        }
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -1362,22 +1433,45 @@ fn format_received(now: DateTime<Local>, received: DateTime<Local>) -> String {
     }
 }
 
+/// Truncate `s` so it occupies at most `max` *terminal cells* (not code
+/// points). Wide glyphs (CJK, most emoji) report a width of 2 via
+/// `unicode-width`; control/zero-width chars report 0. When truncation
+/// happens, the trailing chars are replaced with `…` (1 cell) so the
+/// result still fits inside `max`.
 fn truncate(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        s.to_string()
-    } else if max == 0 {
-        String::new()
-    } else {
-        let mut out: String = chars.into_iter().take(max.saturating_sub(1)).collect();
-        out.push('…');
-        out
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if UnicodeWidthStr::width(s) <= max {
+        return s.to_string();
     }
+    if max == 0 {
+        return String::new();
+    }
+    // Reserve one cell for the ellipsis; keep adding chars until the
+    // next one wouldn't fit in the remaining budget. A wide char (2
+    // cells) that would land at `max - 1` is dropped — `…` then sits at
+    // cell `max - 1` and the result fits in `max` cells exactly.
+    let budget = max.saturating_sub(1);
+    let mut used: usize = 0;
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
 }
 
+/// Pad `s` to exactly `width` *terminal cells*, truncating if `s`
+/// already exceeds the budget. Padding is plain ASCII spaces (1 cell
+/// each) so cell-width and char-count agree on the appended slice.
 fn pad_or_truncate(s: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
     let s = truncate(s, width);
-    let visible = s.chars().count();
+    let visible = UnicodeWidthStr::width(s.as_str());
     if visible < width {
         format!("{s}{}", " ".repeat(width - visible))
     } else {
@@ -1774,6 +1868,66 @@ mod tests {
         );
         assert!(n.chars().count() <= 10);
         assert!(n.ends_with('…'));
+    }
+
+    #[test]
+    fn normalize_sender_truncates_by_cell_width_for_cjk_names() {
+        // Each CJK glyph occupies 2 terminal cells. A 10-cell budget
+        // fits 4 full glyphs + the 1-cell ellipsis (4*2 + 1 = 9 cells)
+        // — adding a 5th glyph would exceed the budget. Char count is
+        // 5 (4 glyphs + ellipsis) which differs from cell width: this
+        // is exactly the case that the old chars-based truncate got
+        // wrong, overflowing the sender column and pushing the date
+        // off the right edge of the row.
+        use unicode_width::UnicodeWidthStr;
+        let n = normalize_sender(&Some("中華航空公司歡迎您".into()), "ca@example.com", 10);
+        assert!(
+            UnicodeWidthStr::width(n.as_str()) <= 10,
+            "rendered cell width must fit budget, got {n:?} ({} cells)",
+            UnicodeWidthStr::width(n.as_str())
+        );
+        assert!(n.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_keeps_string_intact_when_under_cell_budget() {
+        // Mixed emoji + ASCII: "🌸China" — `🌸` = 2 cells, "China" = 5
+        // cells → 7 cells total, fits in 10.
+        let out = truncate("🌸China", 10);
+        assert_eq!(out, "🌸China", "no truncation needed");
+    }
+
+    #[test]
+    fn truncate_uses_cell_width_not_char_count_for_emoji() {
+        // "🌸China Airlines🌸 Fly to Ho Chi Minh City with Unbeatable Fares ✨"
+        // has 2-cell glyphs at the start, middle, and end. Truncating
+        // to 30 cells must produce a string whose terminal width is
+        // ≤ 30 — not whose char count is ≤ 30 (which would let the
+        // string overflow the column).
+        use unicode_width::UnicodeWidthStr;
+        let subject = "🌸China Airlines🌸 Fly to Ho Chi Minh City with Unbeatable Fares ✨";
+        let out = truncate(subject, 30);
+        assert!(
+            UnicodeWidthStr::width(out.as_str()) <= 30,
+            "{out:?} should fit in 30 cells (got {} cells)",
+            UnicodeWidthStr::width(out.as_str())
+        );
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn pad_or_truncate_pads_emoji_prefix_to_exact_cell_width() {
+        // The bug: emoji-prefixed subjects were padded to N *chars*
+        // not N *cells*, so the trailing date column ended up shifted
+        // off the right edge of the pane. Cell-width padding fixes
+        // this — `🌸hi` is 4 cells; padding to 10 adds 6 spaces.
+        use unicode_width::UnicodeWidthStr;
+        let out = pad_or_truncate("🌸hi", 10);
+        assert_eq!(
+            UnicodeWidthStr::width(out.as_str()),
+            10,
+            "padded output must occupy exactly the requested cell width"
+        );
     }
 
     #[test]

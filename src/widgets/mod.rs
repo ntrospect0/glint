@@ -165,6 +165,28 @@ pub trait Widget: Send + Sync {
     /// paint the highlight inside their title.
     fn set_shortcut(&mut self, _shortcut: Option<char>) {}
 
+    /// The letter actually granted (or `None` if all preferences were
+    /// taken). Default returns `None`; widgets that store their
+    /// shortcut should override to return their cached field.
+    /// Used by composite widgets (stacks) to surface each child's
+    /// shortcut in their tab strip without each child having to
+    /// expose internal fields.
+    fn shortcut(&self) -> Option<char> {
+        None
+    }
+
+    /// Dynamic suffix that the widget would normally append to its
+    /// own title (e.g. "47 articles", "[outlook] alice@example.com").
+    /// Returns `None` when the widget has no metadata to surface.
+    ///
+    /// Used by stack widgets to render `<tab> <tab> — <active metadata>`
+    /// on the top border row in place of the active child's full
+    /// title, since the stack owns that row. Should not include the
+    /// widget's display name — only the suffix after it.
+    fn title_metadata(&self) -> Option<String> {
+        None
+    }
+
     /// IDs of widgets owned by this widget (used by stack widgets only).
     /// Returns an empty vec for leaf widgets. The shortcut dispatcher
     /// walks these to assign `Shift+<letter>` to children inside a
@@ -179,6 +201,13 @@ pub trait Widget: Send + Sync {
     /// can call `set_shortcut` on the right widget and so the runtime
     /// can route Shift+letter into the right pane.
     fn composite_child_mut(&mut self, _child_id: &str) -> Option<&mut dyn Widget> {
+        None
+    }
+
+    /// Read-only sibling of [`composite_child_mut`]. Used by the help
+    /// overlay so it can list every stack child's keybindings — even
+    /// the hidden tabs — without needing mutable access to the manager.
+    fn composite_child(&self, _child_id: &str) -> Option<&dyn Widget> {
         None
     }
 

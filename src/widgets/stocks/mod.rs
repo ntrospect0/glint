@@ -23,7 +23,7 @@ use serde::Deserialize;
 
 use crate::cache::ScopedCache;
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::decorated_title_line;
+use crate::ui::apply_title_row;
 
 use super::{AppContext, EventResult, Widget};
 
@@ -684,17 +684,19 @@ impl Widget for StocksWidget {
         } else {
             format!("Stocks ({})", self.instance)
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(self.theme.border_style(focused))
-            .title(decorated_title_line(
-                focused,
-                &title,
-                self.shortcut,
-                self.theme.widget_title,
-                self.theme.text_shortcut,
-            ));
+        let metadata = self.title_metadata_string();
+        let block = apply_title_row(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(self.theme.border_style(focused)),
+            focused,
+            &title,
+            metadata.as_deref(),
+            self.shortcut,
+            &self.theme,
+            area.width,
+        );
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.width == 0 || inner.height == 0 {
@@ -849,6 +851,16 @@ impl Widget for StocksWidget {
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
             return EventResult::Ignored;
+        }
+        // Uppercase ASCII letters are reserved for the app-wide
+        // `Shift+<letter>` focus-jump dispatcher — never consume them here.
+        // SHIFT itself stays permitted above so shifted non-letter chars
+        // like `%` and `$` (the display-mode toggles below) keep working
+        // on terminals that propagate the modifier with the symbol.
+        if let KeyCode::Char(c) = key.code {
+            if c.is_ascii_uppercase() {
+                return EventResult::Ignored;
+            }
         }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1054,6 +1066,28 @@ impl Widget for StocksWidget {
 
     fn set_shortcut(&mut self, shortcut: Option<char>) {
         self.shortcut = shortcut;
+    }
+
+    fn shortcut(&self) -> Option<char> {
+        self.shortcut
+    }
+
+    fn title_metadata(&self) -> Option<String> {
+        self.title_metadata_string()
+    }
+}
+
+impl StocksWidget {
+    /// Dynamic metadata for the title bar: ticker count + active
+    /// period (e.g. `"8 tickers · 1d"`). `None` for an empty
+    /// watchlist — happens during first-launch before the user has
+    /// added any.
+    fn title_metadata_string(&self) -> Option<String> {
+        let n = self.config.indices.len() + self.config.watchlist.len();
+        if n == 0 {
+            return None;
+        }
+        Some(format!("{n} tickers"))
     }
 }
 

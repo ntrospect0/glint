@@ -40,7 +40,7 @@ pub fn hydrate_from_disk(state: &mut WizardState) {
         hydrate_assignments_from_layout(state, doc);
     }
     hydrate_widget_values(state, &dir);
-    hydrate_anthropic_key(state);
+    hydrate_llm_settings(state, &dir);
 }
 
 /// Read + parse a single TOML file. `None` on any failure (missing file,
@@ -327,31 +327,50 @@ fn extract_field_value(field: &WizardField, doc: &toml::Value) -> Option<WizardV
     }
 }
 
-/// Read the LLM API key from `credentials/anthropic_key.toml`. We
-/// ignore the placeholder string `init_default_config` writes so the
-/// wizard doesn't proudly display "REPLACE_WITH_YOUR_KEY" as the
-/// current value.
-fn hydrate_anthropic_key(state: &mut WizardState) {
-    if state.global.contains_key("llm_api_key") {
-        return;
+/// Hydrate the LLM provider choice from `llm.toml` and each registered
+/// provider's API key from its credentials file. We ignore placeholder
+/// strings `init_default_config` writes so the wizard doesn't display
+/// "REPLACE_WITH_YOUR_KEY" as the current value. Per-provider keys are
+/// stored under `llm_api_key__<provider>` so switching the wizard's
+/// picker reveals whichever key was already on disk.
+fn hydrate_llm_settings(state: &mut WizardState, config_dir: &Path) {
+    if !state.global.contains_key("llm_provider") {
+        if let Some(doc) = parse_toml_file(&config_dir.join("llm.toml")) {
+            if let Some(name) = doc
+                .get("provider")
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+            {
+                if crate::llm::find_provider(name.trim()).is_some() {
+                    state.global.insert(
+                        "llm_provider".to_string(),
+                        WizardValue::Choice(name.trim().to_string()),
+                    );
+                }
+            }
+        }
     }
-    let Ok(dir) = crate::auth::credentials_dir() else {
+    let Ok(creds_dir) = crate::auth::credentials_dir() else {
         return;
     };
-    let path = dir.join("anthropic_key.toml");
-    let Some(doc) = parse_toml_file(&path) else {
-        return;
-    };
-    let Some(key) = doc.get("api_key").and_then(|v| v.as_str()) else {
-        return;
-    };
-    let key = key.trim();
-    if key.is_empty() || key == "REPLACE_WITH_YOUR_KEY" {
-        return;
+    for def in crate::llm::PROVIDERS {
+        let state_key = format!("llm_api_key__{}", def.name);
+        if state.global.contains_key(&state_key) {
+            continue;
+        }
+        let path = creds_dir.join(def.credentials_filename);
+        let Some(doc) = parse_toml_file(&path) else { continue };
+        let Some(key) = doc.get("api_key").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || key.starts_with("REPLACE_WITH_") {
+            continue;
+        }
+        state
+            .global
+            .insert(state_key, WizardValue::Text(key.to_string()));
     }
-    state
-        .global
-        .insert("llm_api_key".to_string(), WizardValue::Text(key.to_string()));
 }
 
 #[cfg(test)]
@@ -905,19 +924,24 @@ folders = ["INBOX", "SENT", "Bills/Utilities"]
     }
 
     #[test]
-    fn anthropic_placeholder_is_ignored() {
-        // Sanity: the placeholder we write into a brand-new credentials
-        // file mustn't get treated as an actual API key.
-        let mut state = WizardState::default();
-        // Simulate the path the loader would take.
-        let key = "REPLACE_WITH_YOUR_KEY".trim();
-        assert!(key.is_empty() || key == "REPLACE_WITH_YOUR_KEY");
-        // Real check: state must remain key-free.
-        assert!(state.global.get("llm_api_key").is_none());
-        // (Touch state to satisfy mutability requirement on the binding.)
-        state.global.insert(
-            "_touched".into(),
-            WizardValue::Text(String::new()),
-        );
+    fn registered_llm_providers_carry_wizard_metadata() {
+        // The Global page builds its picker + credential-write paths
+        // from `LlmProviderDef` metadata. Anything missing here breaks
+        // the wizard, so guard the contract.
+        for def in crate::llm::PROVIDERS {
+            assert!(!def.display_name.is_empty(), "{} missing display_name", def.name);
+            assert!(
+                def.credentials_filename.ends_with(".toml"),
+                "{} credentials_filename must be a .toml path: {:?}",
+                def.name,
+                def.credentials_filename
+            );
+            assert!(
+                def.key_portal_url.starts_with("http"),
+                "{} key_portal_url must be a URL: {:?}",
+                def.name,
+                def.key_portal_url
+            );
+        }
     }
 }

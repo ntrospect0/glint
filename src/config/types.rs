@@ -52,10 +52,21 @@ pub struct GlobalConfig {
     /// widgets are unaffected.
     #[serde(default = "default_stack_hidden_poll_ratio")]
     pub stack_hidden_poll_ratio: u32,
+
+    /// Bottom-of-screen status bar (`glint vX.Y.Z │ clock │ Focus │
+    /// Scheme │ hints`). `true` (default) shows the row; `false` hides
+    /// it and gives the row back to the widget grid. Discoverability
+    /// of `?`/`q`/Tab still flows through the help overlay either way.
+    #[serde(default = "default_show_status_bar")]
+    pub show_status_bar: bool,
 }
 
 fn default_stack_hidden_poll_ratio() -> u32 {
     3
+}
+
+fn default_show_status_bar() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -92,6 +103,7 @@ impl Default for GlobalConfig {
             log_file: None,
             mouse_scroll: MouseScroll::default(),
             stack_hidden_poll_ratio: default_stack_hidden_poll_ratio(),
+            show_status_bar: default_show_status_bar(),
         }
     }
 }

@@ -1,6 +1,7 @@
-//! Global config page. Theme + mouse_scroll are rendered as vertical
-//! option lists (consistent with the per-widget Choice fields); the
-//! Anthropic API key is a free-form text input.
+//! Global config page. Theme + mouse_scroll + LLM provider are rendered
+//! as vertical option lists (consistent with the per-widget Choice
+//! fields); the API key is a free-form text input that binds to the
+//! currently picked provider.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -15,8 +16,9 @@ use crate::wizard::{app::WizardApp, descriptor::WizardValue, style};
 
 const FIELD_THEME: usize = 0;
 const FIELD_MOUSE_SCROLL: usize = 1;
-const FIELD_LLM_KEY: usize = 2;
-const FIELD_COUNT: usize = 3;
+const FIELD_LLM_PROVIDER: usize = 2;
+const FIELD_LLM_KEY: usize = 3;
+const FIELD_COUNT: usize = 4;
 /// Focus slot for the trailing [ Save & Next ] button. Tab cycles
 /// fields → button → first field; Enter on the button advances the
 /// page (matching the convention introduced in widget.rs).
@@ -29,6 +31,29 @@ const MOUSE_SCROLLS: &[(&str, &str)] = &[
     ("natural", "Natural — wheel-up scrolls up"),
     ("inverted", "Inverted — wheel-up scrolls down"),
 ];
+
+/// State key under which we cache each provider's typed API key while
+/// the wizard is open — so switching the picker doesn't lose mid-typed
+/// input. Finalize only writes the active provider's key.
+fn llm_key_state_key(provider: &str) -> String {
+    format!("llm_api_key__{provider}")
+}
+
+/// Provider whose key the API-key field currently edits — the one the
+/// user has selected in the picker, falling back to the first registered
+/// provider.
+fn active_llm_provider(app: &WizardApp) -> &'static str {
+    let configured = match app.state.global_get("llm_provider") {
+        Some(WizardValue::Choice(s)) => s.clone(),
+        _ => String::new(),
+    };
+    crate::llm::PROVIDERS
+        .iter()
+        .find(|p| p.name == configured)
+        .or_else(|| crate::llm::PROVIDERS.first())
+        .map(|p| p.name)
+        .unwrap_or("")
+}
 
 pub fn handle_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
     // Field-navigation keys + global escape hatch are handled the same
@@ -66,7 +91,10 @@ pub fn handle_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
         };
     }
     match app.focus {
-        FIELD_LLM_KEY => handle_text_key(key, app, "llm_api_key"),
+        FIELD_LLM_KEY => {
+            let state_key = llm_key_state_key(active_llm_provider(app));
+            handle_text_key(key, app, &state_key)
+        }
         _ => handle_choice_key(key, app),
     }
 }
@@ -151,6 +179,10 @@ fn options_for_focus<'a>(app: &'a WizardApp, focus: usize) -> Vec<(&'a str, &'a 
             .map(|(v, l)| (v.as_str(), l.as_str()))
             .collect(),
         FIELD_MOUSE_SCROLL => MOUSE_SCROLLS.iter().map(|(v, l)| (*v, *l)).collect(),
+        FIELD_LLM_PROVIDER => crate::llm::PROVIDERS
+            .iter()
+            .map(|p| (p.name, p.display_name))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -159,6 +191,7 @@ fn state_key_for_focus(focus: usize) -> &'static str {
     match focus {
         FIELD_THEME => "theme",
         FIELD_MOUSE_SCROLL => "mouse_scroll",
+        FIELD_LLM_PROVIDER => "llm_provider",
         _ => "",
     }
 }
@@ -223,7 +256,25 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp) {
         &mouse_options,
     );
     lines.push(Line::from(""));
-    render_text_field(&mut lines, app, 3, FIELD_LLM_KEY, "Anthropic API key");
+    let provider_options: Vec<(&str, &str)> = crate::llm::PROVIDERS
+        .iter()
+        .map(|p| (p.name, p.display_name))
+        .collect();
+    render_choice_field(
+        &mut lines,
+        app,
+        3,
+        FIELD_LLM_PROVIDER,
+        "LLM provider",
+        &provider_options,
+    );
+    lines.push(Line::from(""));
+    let active = active_llm_provider(app);
+    let key_label = match crate::llm::find_provider(active) {
+        Some(def) => format!("{} API key", def.display_name),
+        None => "LLM API key".to_string(),
+    };
+    render_text_field(&mut lines, app, 4, FIELD_LLM_KEY, &key_label);
     lines.push(Line::from(""));
 
     let on_button = app.focus == FOCUS_NEXT_BUTTON;
@@ -319,7 +370,8 @@ fn render_text_field(
         Span::styled(format!("{number}. "), label_style),
         Span::styled(label.to_string(), label_style),
     ]));
-    let key_display = mask_api_key(&current_text(app, "llm_api_key"));
+    let state_key = llm_key_state_key(active_llm_provider(app));
+    let key_display = mask_api_key(&current_text(app, &state_key));
     let value_style = if focused {
         style::value_focused()
     } else {
@@ -330,12 +382,17 @@ fn render_text_field(
         Span::styled(key_display, value_style),
     ]));
     if focused {
-        lines.push(Line::from(Span::styled(
-            "      Optional. Required for LLM-backed features (news / email \
-             summarisation). Type or backspace to edit; leave blank to skip."
+        let hint = match crate::llm::find_provider(active_llm_provider(app)) {
+            Some(def) => format!(
+                "      Optional. Required for LLM-backed features. Get a key at {}. \
+                 Type or backspace to edit; leave blank to skip.",
+                def.key_portal_url,
+            ),
+            None => "      Optional. Required for LLM-backed features. \
+                     Type or backspace to edit; leave blank to skip."
                 .to_string(),
-            style::help_text(),
-        )));
+        };
+        lines.push(Line::from(Span::styled(hint, style::help_text())));
     }
 }
 

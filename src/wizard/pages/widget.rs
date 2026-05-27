@@ -2,9 +2,8 @@
 //! `WizardDescriptor` so adding a new widget to the wizard is a matter of
 //! filling in fields — no per-widget code in the wizard itself.
 //!
-//! Phase A ships with most widgets returning `defer_to_toml_descriptor()`,
-//! which yields a `fields = []` descriptor. The page handles that case by
-//! showing an "advanced — edit TOML" message instead of a form.
+//! Widgets that opt out of the form (returning `defer_to_toml_descriptor()`
+//! → `fields = []`) get an "advanced — edit TOML" message instead of a form.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{

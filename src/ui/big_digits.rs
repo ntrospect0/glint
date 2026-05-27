@@ -143,17 +143,14 @@ pub fn render_styled(s: &str, gradient: Gradient, style: Style) -> Vec<Line<'sta
     lines
 }
 
-/// Build a 10-stop gradient palette from a single accent color. Each
-/// variant chooses the *shape* of the ramp; the input color picks the
-/// hue. Endpoints aim to roughly match the visual feel of the old
-/// hardcoded palettes when seeded with cyan/yellow/magenta.
+/// Build a 10-stop gradient palette from a single accent color. The
+/// variant chooses the *shape* of the ramp; the input color picks the hue.
 fn palette(gradient: Gradient, base: (u8, u8, u8)) -> [Color; 10] {
     let (top, bot) = match gradient {
         Gradient::Normal => unreachable!("Normal handled before palette()"),
         // Lighter top, darker bottom — same hue family.
         Gradient::Subtle => (lighten(base, 0.30), darken(base, 0.45)),
-        // Bright top, hue-rotated darker bottom. Matches the original feel:
-        // cyan→blue, yellow→orange, magenta→purple.
+        // Bright top, hue-rotated darker bottom (cyan→blue, yellow→orange, ...).
         Gradient::HueShift => (
             lighten(base, 0.25),
             darken(shift_hue(base, -30.0), 0.30),
@@ -171,11 +168,9 @@ fn palette(gradient: Gradient, base: (u8, u8, u8)) -> [Color; 10] {
     out
 }
 
-/// Best-effort ANSI/Rgb → (u8, u8, u8). ANSI colors map to terminal-ish RGB
-/// approximations chosen to be close to what the old hardcoded palettes
-/// assumed (e.g. LightCyan → 160/240/255 to match the previous Subtle top).
-/// `Color::Reset` and palette-indexed colors fall through to a neutral gray
-/// so the gradient still renders something legible.
+/// Best-effort ANSI/Rgb → (u8, u8, u8). ANSI colors map to terminal-ish
+/// RGB approximations. `Color::Reset` and palette-indexed colors fall
+/// through to a neutral gray so the gradient still renders legibly.
 fn color_to_rgb(c: Color) -> (u8, u8, u8) {
     match c {
         Color::Rgb(r, g, b) => (r, g, b),

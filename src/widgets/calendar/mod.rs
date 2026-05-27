@@ -39,7 +39,7 @@ use crate::auth::google::{store::GoogleToken, OAuthClientConfig as GoogleClientC
 use crate::auth::microsoft::{store::MicrosoftToken, OAuthClientConfig as MicrosoftClientConfig};
 use crate::cache::ScopedCache;
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::{big_digits, decorated_title_line};
+use crate::ui::{apply_title_row, big_digits};
 
 const VIEW_TABS: &[(CalendarView, &str)] = &[
     (CalendarView::Day, "Day"),
@@ -968,16 +968,25 @@ fn month_long(m: u32) -> &'static str {
 }
 
 impl CalendarWidget {
+    /// The base title — just "Calendar" or "Calendar (instance)" —
+    /// without any view-specific metadata. The metadata side of the
+    /// title bar comes from [`Self::title_metadata_string`].
     fn title_for_header(&self) -> String {
-        let source = self.source_label.as_str();
-        let base = if self.instance == "main" {
+        if self.instance == "main" {
             "Calendar".to_string()
         } else {
             format!("Calendar ({})", self.instance)
-        };
+        }
+    }
+
+    /// Dynamic metadata appended after the title (e.g. `[google+outlook]
+    /// Sat May 23, 2026`). Rendered via the shared `title_row` helper
+    /// so the styling matches every other widget's title bar.
+    fn title_metadata_string(&self) -> String {
+        let source = self.source_label.as_str();
         match self.view {
             CalendarView::Day => format!(
-                "{base} [{source}] — {} {} {}, {}",
+                "[{source}] {} {} {}, {}",
                 weekday_short(self.anchor.weekday()),
                 month_long(self.anchor.month()),
                 self.anchor.day(),
@@ -987,14 +996,14 @@ impl CalendarWidget {
                 let s = start_of_week(self.anchor);
                 let e = s + ChronoDuration::days(6);
                 format!(
-                    "{base} [{source}] — week of {} {}–{}",
+                    "[{source}] week of {} {}–{}",
                     month_long(s.month()),
                     s.day(),
                     e.day()
                 )
             }
             CalendarView::Month => format!(
-                "{base} [{source}] — {} {}",
+                "[{source}] {} {}",
                 month_long(self.anchor.month()),
                 self.anchor.year()
             ),
@@ -1627,17 +1636,19 @@ impl Widget for CalendarWidget {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(self.theme.border_style(focused))
-            .title(decorated_title_line(
-                focused,
-                &self.title_for_header(),
-                self.shortcut,
-                self.theme.widget_title,
-                self.theme.text_shortcut,
-            ));
+        let metadata = self.title_metadata_string();
+        let block = apply_title_row(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(self.theme.border_style(focused)),
+            focused,
+            &self.title_for_header(),
+            Some(metadata.as_str()),
+            self.shortcut,
+            &self.theme,
+            area.width,
+        );
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -1679,6 +1690,13 @@ impl Widget for CalendarWidget {
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
             return EventResult::Ignored;
+        }
+        // Uppercase ASCII letters are reserved for the app-wide
+        // `Shift+<letter>` focus-jump dispatcher — never consume them here.
+        if let KeyCode::Char(c) = key.code {
+            if c.is_ascii_uppercase() {
+                return EventResult::Ignored;
+            }
         }
         let step = match self.view {
             CalendarView::Day => ChronoDuration::days(1),
@@ -1879,6 +1897,14 @@ impl Widget for CalendarWidget {
 
     fn set_shortcut(&mut self, shortcut: Option<char>) {
         self.shortcut = shortcut;
+    }
+
+    fn shortcut(&self) -> Option<char> {
+        self.shortcut
+    }
+
+    fn title_metadata(&self) -> Option<String> {
+        Some(self.title_metadata_string())
     }
 }
 

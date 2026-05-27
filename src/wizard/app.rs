@@ -222,7 +222,7 @@ pub fn run_wizard() -> Result<WizardOutcome> {
                 // yet (or has only the placeholder template), route to
                 // the inline OAuthSetup page to collect them, rather
                 // than failing with a "missing file" error.
-                if needs_credential_capture(&provider_name)
+                if crate::auth::registry::needs_credential_capture(&provider_name)
                     && !matches!(app.page, Page::OAuthSetup { .. })
                 {
                     let prev = std::mem::replace(
@@ -322,15 +322,7 @@ pub fn run_wizard() -> Result<WizardOutcome> {
 /// edit the file in another terminal, and retry — without having to
 /// quit and re-run `--setup`.
 fn run_oauth_for_provider(provider_name: &str) -> Result<()> {
-    // IMAP isn't OAuth — credentials capture happens entirely inside
-    // the OAuthSetup page. By the time we reach this function for
-    // "imap", the user has already saved their credentials; no browser
-    // flow to drive, and the validation happens on the first
-    // fetch_recent. Treat as success so the app loop pops back cleanly.
-    if provider_name == "imap" {
-        return Ok(());
-    }
-    ensure_oauth_client_template(provider_name)?;
+    crate::auth::registry::ensure_credentials_template(provider_name)?;
     let provider = crate::auth::registry::find(provider_name).ok_or_else(|| {
         anyhow::anyhow!(
             "unknown auth provider {provider_name:?} (known: {})",
@@ -341,170 +333,32 @@ fn run_oauth_for_provider(provider_name: &str) -> Result<()> {
     tokio::task::block_in_place(|| handle.block_on((provider.run)()))
 }
 
-/// Pre-fetch the runtime option lists that depend on the just-completed
-/// OAuth flow (Gmail labels for `google`, Outlook folders for
-/// `microsoft`) and cache them on the app for the email widget page's
-/// `RemoteMultiChoice` field. All-or-nothing per source; partial
-/// failures log and leave the cache empty so the picker falls back to
-/// its `defaults` list.
+/// Pre-fetch any remote option lists the provider exposes via
+/// [`AuthProvider::post_auth_refresh`] (e.g. Gmail labels, Outlook
+/// folders) and cache them on the app for widget-page `RemoteMultiChoice`
+/// fields. Per-provider; failures log and leave the cache empty so the
+/// picker falls back to its `defaults` list.
 fn fetch_remote_options_for_provider(provider_name: &str, app: &mut WizardApp) {
+    let Some(provider) = crate::auth::registry::find(provider_name) else {
+        return;
+    };
+    let Some(refresh) = provider.post_auth_refresh else {
+        return;
+    };
     let handle = tokio::runtime::Handle::current();
-    match provider_name {
-        "google" => {
-            let result = tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    let client = crate::auth::google::OAuthClientConfig::load()?;
-                    let token = crate::auth::google::store::GoogleToken::load()?
-                        .ok_or_else(|| anyhow::anyhow!("no Google token on disk yet"))?;
-                    let provider = crate::widgets::email::gmail::GmailProvider::new(
-                        client,
-                        token,
-                    )?;
-                    provider.list_folders_for_picker().await
-                })
-            });
-            match result {
-                Ok(opts) => {
-                    app.remote_options
-                        .insert("email_folders".to_string(), opts);
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "wizard: failed to fetch Gmail labels for picker");
-                }
-            }
+    let result = tokio::task::block_in_place(|| handle.block_on(refresh()));
+    match result {
+        Ok((key, opts)) => {
+            app.remote_options.insert(key.to_string(), opts);
         }
-        "microsoft" => {
-            let result = tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    let client = crate::auth::microsoft::OAuthClientConfig::load()?;
-                    let token = crate::auth::microsoft::store::MicrosoftToken::load()?
-                        .ok_or_else(|| anyhow::anyhow!("no Microsoft token on disk yet"))?;
-                    let provider = crate::widgets::email::outlook::OutlookEmailProvider::new(
-                        client,
-                        token,
-                    )?;
-                    provider.list_folders_for_picker().await
-                })
-            });
-            match result {
-                Ok(opts) => {
-                    app.remote_options
-                        .insert("email_folders".to_string(), opts);
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "wizard: failed to fetch Outlook folders for picker");
-                }
-            }
-        }
-        "imap" => {
-            // IMAP has no token store — credentials live in imap.toml.
-            // Load + connect + LIST in one shot. Failures here usually
-            // mean the user typed the wrong password; surface via the
-            // wizard feedback line and skip the cache update.
-            let result = tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    let dir = crate::auth::credentials_dir()?;
-                    let path = dir.join("imap.toml");
-                    let text = std::fs::read_to_string(&path)?;
-                    let creds: crate::widgets::email::imap::ImapCredentials =
-                        toml::from_str(&text)?;
-                    let provider =
-                        crate::widgets::email::imap::ImapProvider::new(creds);
-                    provider.list_folders_for_picker().await
-                })
-            });
-            match result {
-                Ok(opts) => {
-                    app.remote_options
-                        .insert("email_folders".to_string(), opts);
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "wizard: failed to fetch IMAP folders for picker");
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// `true` when the provider's credentials file is missing OR still
-/// contains placeholder values. Used by the app loop to decide whether
-/// to route to the inline OAuthSetup page before attempting the
-/// browser flow (or, for IMAP, the connection attempt).
-fn needs_credential_capture(provider_name: &str) -> bool {
-    let filename = match provider_name {
-        "google" => "google_oauth_client.toml",
-        "microsoft" => "microsoft_oauth_client.toml",
-        "imap" => "imap.toml",
-        _ => return false,
-    };
-    let Ok(dir) = crate::auth::credentials_dir() else {
-        return true;
-    };
-    let path = dir.join(filename);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return true;
-    };
-    let Ok(doc) = toml::from_str::<toml::Value>(&text) else {
-        return true;
-    };
-    let placeholder = |key: &str| {
-        match doc.get(key).and_then(|v| v.as_str()) {
-            None => true,
-            Some(s) => s.trim().is_empty() || s.starts_with("REPLACE_WITH_"),
-        }
-    };
-    match provider_name {
-        "google" => placeholder("client_id") || placeholder("client_secret"),
-        "microsoft" => placeholder("client_id"),
-        "imap" => {
-            placeholder("host")
-                || placeholder("username")
-                || placeholder("app_password")
-        }
-        _ => false,
-    }
-}
-
-/// Write the provider's OAuth client template to `credentials/` if it
-/// doesn't already exist. Returns an `Err` whose message points the
-/// user at the seeded file — so the wizard surfaces a clear "fill in
-/// your credentials" prompt rather than the raw `OAuthClientConfig::load`
-/// missing-file bail. IMAP doesn't use this path; its credentials are
-/// captured directly via the OAuthSetup page.
-fn ensure_oauth_client_template(provider_name: &str) -> Result<()> {
-    let (filename, contents) = match provider_name {
-        "google" => (
-            "google_oauth_client.toml",
-            crate::config::DEFAULT_GOOGLE_CLIENT_TEMPLATE,
-        ),
-        "microsoft" => (
-            "microsoft_oauth_client.toml",
-            crate::config::DEFAULT_MICROSOFT_CLIENT_TEMPLATE,
-        ),
-        _ => return Ok(()),
-    };
-    let dir = crate::auth::credentials_dir()?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create {}", dir.display()))?;
-    let path = dir.join(filename);
-    if !path.exists() {
-        std::fs::write(&path, contents)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &path,
-                std::fs::Permissions::from_mode(0o600),
+        Err(err) => {
+            tracing::warn!(
+                provider = provider_name,
+                error = %err,
+                "wizard: post-auth remote-option refresh failed"
             );
         }
-        anyhow::bail!(
-            "Wrote a template at {}. Open it, paste in your OAuth credentials, save, then press Space again to authorize.",
-            path.display()
-        );
     }
-    Ok(())
 }
 
 /// Best-effort state save. Failures log + continue — losing the resume

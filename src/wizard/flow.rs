@@ -2,15 +2,12 @@
 //! so the app loop can ask "what's next?" without baking the order into
 //! the loop itself.
 //!
-//! The flow is linear today:
-//!
-//!   Welcome → Global → Layout → Assign → Widget(0..N) → Confirm
-//!
-//! Welcome appears on every run; on first-run it's an intro, on re-runs it
-//! offers `[Resume]` when a `.wizard_state.toml` is present. Per-widget
-//! pages are dynamic — one per entry in `state.assignments`.
+//! Order: Welcome → Global → Layout → Assign → Widget(0..N) → Confirm.
+//! Welcome appears on every run; on re-runs it offers `[Resume]` when a
+//! `.wizard_state.toml` is present. Per-widget pages are dynamic — one
+//! per entry in `state.assignments`.
 
-#![allow(dead_code)] // consumed by app.rs once pages module lands.
+#![allow(dead_code)]
 
 use super::pages::Page;
 use super::state::WizardState;

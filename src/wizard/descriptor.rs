@@ -7,9 +7,8 @@
 //! per-widget page reads the returned descriptor and renders one input per
 //! [`WizardField`].
 
-// The wizard driver consumes these types — it's built out incrementally
-// across the wizard refactor (descriptor → state → TUI → pages). Until the
-// driver lands, the constructors look dead to the compiler.
+// Constructors for many of these types are exercised only through the
+// wizard driver, which the compiler can't see from this module alone.
 #![allow(dead_code)]
 
 use std::collections::HashMap;

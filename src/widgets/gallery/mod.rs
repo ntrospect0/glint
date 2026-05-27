@@ -28,7 +28,7 @@ use serde::Deserialize;
 
 use crate::cache::ScopedCache;
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::decorated_title_line;
+use crate::ui::apply_title_row;
 
 use super::{AppContext, EventResult, Widget};
 
@@ -430,17 +430,30 @@ impl Widget for GalleryWidget {
         } else {
             format!("Gallery ({})", self.instance)
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(self.theme.border_style(focused))
-            .title(decorated_title_line(
-                focused,
-                &title_base,
-                self.shortcut,
-                self.theme.widget_title,
-                self.theme.text_shortcut,
-            ));
+        // Metadata snapshot — show "{m}/{n} images" while loading or
+        // just "{n} images" when fully loaded. None when there are
+        // no images configured.
+        let loaded = self.slides.lock().expect("gallery slides poisoned").len();
+        let target = self.target_count.load(Ordering::Relaxed);
+        let metadata = if target == 0 {
+            None
+        } else if loaded < target {
+            Some(format!("{loaded}/{target} images"))
+        } else {
+            Some(format!("{target} images"))
+        };
+        let block = apply_title_row(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(self.theme.border_style(focused)),
+            focused,
+            &title_base,
+            metadata.as_deref(),
+            self.shortcut,
+            &self.theme,
+            area.width,
+        );
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.width == 0 || inner.height == 0 {
@@ -563,8 +576,17 @@ impl Widget for GalleryWidget {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        // Ctrl/Alt are reserved for app-wide commands; SHIFT is allowed so
+        // shifted non-letter chars (`?`, `%`, `$`, …) remain available, but
+        // uppercase ASCII letters are off-limits because `Shift+<letter>`
+        // is the app-wide focus-jump dispatcher.
         if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
             return EventResult::Ignored;
+        }
+        if let KeyCode::Char(c) = key.code {
+            if c.is_ascii_uppercase() {
+                return EventResult::Ignored;
+            }
         }
         match key.code {
             // `p` toggles pause. When `rotation_secs = 0` was set in
@@ -584,12 +606,14 @@ impl Widget for GalleryWidget {
                 EventResult::Handled
             }
             // Manual cycling — handy when paused or when the user wants
-            // to skip ahead without waiting for the timer.
+            // to skip ahead without waiting for the timer. Previous is
+            // bound to ← / `h` only; Shift+N would collide with the
+            // global focus-jump shortcut.
             KeyCode::Char('n') | KeyCode::Right | KeyCode::Char('l') => {
                 self.advance(true);
                 EventResult::Handled
             }
-            KeyCode::Char('N') | KeyCode::Left | KeyCode::Char('h') => {
+            KeyCode::Left | KeyCode::Char('h') => {
                 self.advance(false);
                 EventResult::Handled
             }
@@ -618,7 +642,7 @@ impl Widget for GalleryWidget {
         vec![
             ("p", "pause / resume slideshow"),
             ("n / →", "next image"),
-            ("N / ←", "previous image"),
+            ("h / ←", "previous image"),
             ("↑ / ↓", "rotation interval +1s / -1s (floor 1s)"),
         ]
     }
@@ -656,6 +680,10 @@ impl Widget for GalleryWidget {
 
     fn set_shortcut(&mut self, shortcut: Option<char>) {
         self.shortcut = shortcut;
+    }
+
+    fn shortcut(&self) -> Option<char> {
+        self.shortcut
     }
 }
 
