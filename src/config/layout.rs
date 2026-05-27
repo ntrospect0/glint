@@ -29,11 +29,11 @@ fn default_span() -> usize {
 }
 
 fn default_columns() -> Vec<u16> {
-    vec![60, 40]
+    vec![45, 30, 25]
 }
 
 fn default_rows() -> Vec<u16> {
-    vec![50, 50]
+    vec![45, 55]
 }
 
 fn default_cells() -> Vec<GridCell> {
@@ -46,15 +46,29 @@ fn default_cells() -> Vec<GridCell> {
             row_span: 2,
         },
         GridCell {
-            widget: "calendar".into(),
+            widget: "clock".into(),
             col: 1,
             row: 0,
             col_span: 1,
             row_span: 1,
         },
         GridCell {
-            widget: "news".into(),
+            widget: "weather".into(),
             col: 1,
+            row: 1,
+            col_span: 1,
+            row_span: 1,
+        },
+        GridCell {
+            widget: "calendar".into(),
+            col: 2,
+            row: 0,
+            col_span: 1,
+            row_span: 1,
+        },
+        GridCell {
+            widget: "news".into(),
+            col: 2,
             row: 1,
             col_span: 1,
             row_span: 1,
@@ -142,11 +156,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_layout_has_three_cells() {
+    fn default_layout_has_five_cells() {
         let layout = LayoutConfig::default();
-        assert_eq!(layout.cells.len(), 3);
-        assert_eq!(layout.columns, vec![60, 40]);
-        assert_eq!(layout.rows, vec![50, 50]);
+        assert_eq!(layout.cells.len(), 5);
+        let widgets: Vec<&str> = layout.cells.iter().map(|c| c.widget.as_str()).collect();
+        assert_eq!(widgets, vec!["stocks", "clock", "weather", "calendar", "news"]);
     }
 
     #[test]
@@ -154,20 +168,28 @@ mod tests {
         let layout = LayoutConfig::default();
         let area = Rect::new(0, 0, 100, 40);
         let resolved = layout.resolve(area);
-        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved.len(), 5);
 
-        // First cell (stocks) spans both rows in col 0.
+        // Stocks spans both rows in col 0.
         assert_eq!(resolved[0].cell.widget, "stocks");
         assert_eq!(resolved[0].area.x, 0);
         assert_eq!(resolved[0].area.y, 0);
         assert_eq!(resolved[0].area.height, 40);
 
-        // Second + third cells stack in col 1.
-        assert_eq!(resolved[1].cell.widget, "calendar");
-        assert_eq!(resolved[2].cell.widget, "news");
+        // Clock above weather in col 1.
+        assert_eq!(resolved[1].cell.widget, "clock");
+        assert_eq!(resolved[2].cell.widget, "weather");
         assert_eq!(
             resolved[1].area.y + resolved[1].area.height,
             resolved[2].area.y
+        );
+
+        // Calendar above news in col 2.
+        assert_eq!(resolved[3].cell.widget, "calendar");
+        assert_eq!(resolved[4].cell.widget, "news");
+        assert_eq!(
+            resolved[3].area.y + resolved[3].area.height,
+            resolved[4].area.y
         );
     }
 

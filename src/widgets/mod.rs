@@ -1,4 +1,6 @@
+pub mod clock;
 pub mod stocks;
+pub mod weather;
 
 use std::collections::HashMap;
 

@@ -12,7 +12,12 @@ use crate::{
     config::{self, Config},
     event::{Event, EventReader},
     ui,
-    widgets::{stocks::StocksWidget, AppContext, EventResult, WidgetManager},
+    widgets::{
+        clock::{ClockConfig, ClockWidget},
+        stocks::StocksWidget,
+        weather::{WeatherConfig, WeatherWidget},
+        AppContext, EventResult, WidgetManager,
+    },
 };
 
 /// Top-level app state. Phase 1 keeps this intentionally tiny — it'll grow as
@@ -28,8 +33,13 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config) -> Self {
+        let clock_cfg: ClockConfig = config::load_widget_toml("clock").unwrap_or_default();
+        let weather_cfg: WeatherConfig = config::load_widget_toml("weather").unwrap_or_default();
+
         let mut manager = WidgetManager::new();
         manager.register(StocksWidget::new());
+        manager.register(ClockWidget::with_config(clock_cfg));
+        manager.register(WeatherWidget::with_config(weather_cfg));
 
         let focus_order = focus_order_from_layout(&config, &manager);
         Self {
@@ -178,10 +188,22 @@ mod tests {
     fn focus_cycles_in_layout_order() {
         let config = Config::default();
         let mut app = App::new(config);
-        // Only stocks is registered in Phase 1 — focus order has one entry.
-        assert_eq!(app.focus_order, vec!["stocks".to_string()]);
+        assert_eq!(
+            app.focus_order,
+            vec![
+                "stocks".to_string(),
+                "clock".to_string(),
+                "weather".to_string(),
+            ]
+        );
         assert_eq!(app.focused_widget(), Some("stocks"));
         app.cycle_focus(true);
+        assert_eq!(app.focused_widget(), Some("clock"));
+        app.cycle_focus(true);
+        assert_eq!(app.focused_widget(), Some("weather"));
+        app.cycle_focus(true);
         assert_eq!(app.focused_widget(), Some("stocks"));
+        app.cycle_focus(false);
+        assert_eq!(app.focused_widget(), Some("weather"));
     }
 }
