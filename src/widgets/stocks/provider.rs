@@ -302,6 +302,38 @@ impl YahooFinanceProvider {
 }
 
 impl YahooFinanceProvider {
+    /// Resolve a free-form query (company name or ticker) to a Yahoo symbol.
+    /// Uses the public `/v1/finance/search` endpoint which doesn't need a
+    /// crumb. Picks the highest-score EQUITY hit, falling back to the top
+    /// non-equity hit (so ETFs / indices work too).
+    pub async fn search(&self, query: &str) -> Result<String> {
+        let url = format!(
+            "{base}/v1/finance/search?q={q}",
+            base = self.summary_base_url.trim_end_matches('/'),
+            q = urlencoding::encode(query),
+        );
+        let resp: SearchResponse = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("search {query:?} failed"))?
+            .error_for_status()
+            .with_context(|| format!("search {query:?} returned non-2xx"))?
+            .json()
+            .await
+            .with_context(|| format!("failed to deserialize search for {query:?}"))?;
+        // Prefer equities; fall back to whatever's first.
+        let equity = resp.quotes.iter().find(|q| {
+            q.quote_type.as_deref() == Some("EQUITY") && q.symbol.is_some()
+        });
+        let pick = equity.or_else(|| resp.quotes.iter().find(|q| q.symbol.is_some()));
+        let symbol = pick
+            .and_then(|q| q.symbol.clone())
+            .with_context(|| format!("no candidates found for {query:?}"))?;
+        Ok(symbol)
+    }
+
     /// Pulls the fundamentals modules from v10/quoteSummary. On a 401 we
     /// invalidate the cached crumb so the next call re-authenticates.
     async fn fetch_summary(&self, symbol: &str) -> Result<SummaryFields> {
@@ -429,6 +461,20 @@ impl RawF64 {
     fn raw_u64(&self) -> Option<u64> {
         self.raw.filter(|v| v.is_finite() && *v >= 0.0).map(|v| v as u64)
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchResponse {
+    #[serde(default)]
+    quotes: Vec<SearchQuote>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchQuote {
+    #[serde(default)]
+    symbol: Option<String>,
+    #[serde(rename = "quoteType", default)]
+    quote_type: Option<String>,
 }
 
 /// Thin wrapper so the generic `DataProvider` trait stays useful for stocks —

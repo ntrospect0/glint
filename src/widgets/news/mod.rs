@@ -115,6 +115,7 @@ pub struct NewsWidget {
 }
 
 impl NewsWidget {
+    #[cfg(test)]
     pub fn with_config(config: NewsConfig) -> Self {
         Self::with_config_and_llm(config, None, false)
     }
@@ -811,6 +812,18 @@ impl Widget for NewsWidget {
         Ok(false)
     }
 
+    fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("↑ / ↓ / j / k", "select article"),
+            ("← / → / [ / ] / h / l", "cycle filter tab"),
+            ("PgUp / PgDn", "±10 articles"),
+            ("g / G", "jump to top / bottom"),
+            ("Enter", "open article URL in browser"),
+            ("e", "expand selected article"),
+            ("r", "force refresh"),
+        ]
+    }
+
     fn config(&self) -> serde_json::Value {
         serde_json::json!({
             "poll_interval_secs": self.poll_interval.as_secs(),
@@ -820,7 +833,11 @@ impl Widget for NewsWidget {
     fn apply_config(&mut self, config: serde_json::Value) -> Result<()> {
         let new_config: NewsConfig =
             serde_json::from_value(config).context("invalid news config payload")?;
-        *self = Self::with_config(new_config);
+        // Preserve the active LLM provider + summarize flag across reloads —
+        // those are app-level, not user-config-level.
+        let llm = self.llm.clone();
+        let summarize = self.llm_summarize_enabled;
+        *self = Self::with_config_and_llm(new_config, llm, summarize);
         Ok(())
     }
 }

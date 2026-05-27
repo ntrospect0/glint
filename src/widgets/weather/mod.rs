@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Datelike;
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
@@ -88,6 +88,11 @@ struct WeatherState {
     last_error: Option<String>,
     last_attempt: Option<Instant>,
     inflight: bool,
+    /// Set by `:weather <city>` — when Some, overrides `location` for fetches.
+    /// Cleared by `x`.
+    transient_location: Option<GeoLocation>,
+    /// True while a `:weather <city>` lookup is in flight.
+    transient_searching: bool,
 }
 
 pub struct WeatherWidget {
@@ -132,11 +137,13 @@ impl WeatherWidget {
     }
 
     /// What the widget should do on the next tick. Computed inside a single
-    /// short lock window.
+    /// short lock window. A transient location set by `:weather <city>` takes
+    /// priority over the configured (or IP-geolocated) `location`.
     fn next_action(&self) -> NextAction {
         let st = self.state.lock().expect("weather state poisoned");
-        if st.location.is_none() {
-            if st.locating {
+        let effective = st.transient_location.as_ref().or(st.location.as_ref());
+        if effective.is_none() {
+            if st.locating || st.transient_searching {
                 return NextAction::Wait;
             }
             return if self.config.auto_locate {
@@ -156,6 +163,44 @@ impl WeatherWidget {
             NextAction::Fetch
         } else {
             NextAction::Wait
+        }
+    }
+
+    /// Resolve a city / place name to lat/lon via Open-Meteo's free geocoding
+    /// API, store the result as `transient_location`, and force a refresh.
+    /// Errors are logged; the widget keeps showing the previous data.
+    fn lookup_location(&self, query: &str) {
+        {
+            let mut st = self.state.lock().expect("weather state poisoned");
+            st.transient_searching = true;
+        }
+        let state = self.state.clone();
+        let query = query.to_string();
+        tokio::spawn(async move {
+            let result = crate::geolocation::by_name(&query).await;
+            let mut st = state.lock().expect("weather state poisoned");
+            st.transient_searching = false;
+            match result {
+                Ok(loc) => {
+                    st.transient_location = Some(loc);
+                    // Clear cached weather + force refetch on the next tick.
+                    st.data = None;
+                    st.last_attempt = None;
+                }
+                Err(err) => {
+                    tracing::warn!(query = %query, error = %err, "weather geocoding failed");
+                }
+            }
+        });
+    }
+
+    /// Clear the `:weather <city>` override and re-fetch with the configured
+    /// location.
+    fn clear_transient(&self) {
+        let mut st = self.state.lock().expect("weather state poisoned");
+        if st.transient_location.take().is_some() {
+            st.data = None;
+            st.last_attempt = None;
         }
     }
 
@@ -185,7 +230,11 @@ impl WeatherWidget {
     fn spawn_refresh(&self) {
         let (lat, lon) = {
             let st = self.state.lock().expect("weather state poisoned");
-            let Some(loc) = st.location.as_ref() else {
+            let Some(loc) = st
+                .transient_location
+                .as_ref()
+                .or(st.location.as_ref())
+            else {
                 return;
             };
             (loc.latitude, loc.longitude)
@@ -245,13 +294,18 @@ impl Widget for WeatherWidget {
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
         let snapshot = {
             let st = self.state.lock().expect("weather state poisoned");
+            let label = st
+                .transient_location
+                .as_ref()
+                .map(|l| format!("{} (lookup)", l.label))
+                .or_else(|| st.location.as_ref().map(|l| l.label.clone()));
             Snapshot {
-                location_label: st.location.as_ref().map(|l| l.label.clone()),
+                location_label: label,
                 locating: st.locating,
                 geolocation_error: st.geolocation_error.clone(),
                 data: st.data.clone(),
                 last_error: st.last_error.clone(),
-                inflight: st.inflight,
+                inflight: st.inflight || st.transient_searching,
                 attempted: st.last_attempt.is_some(),
             }
         };
@@ -286,12 +340,39 @@ impl Widget for WeatherWidget {
         }
     }
 
-    fn handle_key(&mut self, _key: KeyEvent) -> EventResult {
-        EventResult::Ignored
+    fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        if matches!(key.code, KeyCode::Char('x')) {
+            self.clear_transient();
+            EventResult::Handled
+        } else {
+            EventResult::Ignored
+        }
     }
 
-    fn handle_command(&mut self, _cmd: &str, _args: &[&str]) -> Result<bool> {
-        Ok(false)
+    fn handle_command(&mut self, cmd: &str, args: &[&str]) -> Result<bool> {
+        match cmd {
+            "weather" | "w" => {
+                if args.is_empty() {
+                    anyhow::bail!("usage: :weather <city>");
+                }
+                let query = args.join(" ");
+                self.lookup_location(&query);
+                Ok(true)
+            }
+            "refresh" => {
+                let mut st = self.state.lock().expect("weather state poisoned");
+                st.last_attempt = None;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("x", "clear :weather lookup (return to default location)"),
+            (":weather <city>", "look up weather for a place"),
+        ]
     }
 
     fn config(&self) -> serde_json::Value {

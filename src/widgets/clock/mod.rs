@@ -1,8 +1,10 @@
+use std::sync::{Arc, Mutex};
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
 use chrono_tz::Tz;
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
@@ -106,6 +108,16 @@ impl Default for ClockConfig {
     }
 }
 
+#[derive(Default)]
+struct ClockState {
+    /// Override pinned by `:time <location>`. When Some, the big-digit display
+    /// renders in that timezone and is tinted purple to make the override
+    /// state unmistakable.
+    transient_tz: Option<(String, Tz)>,
+    /// True while a `:time <location>` geocoding request is in flight.
+    transient_searching: bool,
+}
+
 pub struct ClockWidget {
     id: String,
     config: ClockConfig,
@@ -113,6 +125,7 @@ pub struct ClockWidget {
     /// Parsed secondary timezones — entries with invalid IANA names get dropped
     /// at construction time and a warning logged.
     secondaries: Vec<(String, Tz)>,
+    state: Arc<Mutex<ClockState>>,
 }
 
 impl Default for ClockWidget {
@@ -141,12 +154,68 @@ impl ClockWidget {
             config,
             tz,
             secondaries,
+            state: Arc::new(Mutex::new(ClockState::default())),
         }
     }
 
-    /// Returns (HH:MM[:SS], AM/PM, date) for the primary timezone.
+    fn snapshot_transient(&self) -> (Option<(String, Tz)>, bool) {
+        let st = self.state.lock().expect("clock state poisoned");
+        (st.transient_tz.clone(), st.transient_searching)
+    }
+
+    /// Effective primary timezone — transient override beats configured tz
+    /// beats system local.
+    fn effective_tz(&self) -> Option<Tz> {
+        self.state
+            .lock()
+            .expect("clock state poisoned")
+            .transient_tz
+            .as_ref()
+            .map(|(_, tz)| *tz)
+            .or(self.tz)
+    }
+
+    fn lookup_location(&self, query: &str) {
+        {
+            let mut st = self.state.lock().expect("clock state poisoned");
+            st.transient_searching = true;
+        }
+        let state = self.state.clone();
+        let query = query.to_string();
+        tokio::spawn(async move {
+            let result = crate::geolocation::by_name(&query).await;
+            let mut st = state.lock().expect("clock state poisoned");
+            st.transient_searching = false;
+            match result {
+                Ok(loc) => {
+                    let Some(tz_name) = loc.timezone.as_deref() else {
+                        tracing::warn!(query = %query, "geocoding succeeded but returned no timezone");
+                        return;
+                    };
+                    match tz_name.parse::<Tz>() {
+                        Ok(tz) => {
+                            st.transient_tz = Some((loc.label.clone(), tz));
+                        }
+                        Err(_) => {
+                            tracing::warn!(query = %query, tz = %tz_name, "unrecognized IANA timezone");
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(query = %query, error = %err, "clock geocoding failed");
+                }
+            }
+        });
+    }
+
+    fn clear_transient(&self) {
+        let mut st = self.state.lock().expect("clock state poisoned");
+        st.transient_tz = None;
+    }
+
+    /// Returns (HH:MM[:SS], AM/PM, date) for the effective primary timezone.
     fn render_strings(&self, now_utc: DateTime<chrono::Utc>) -> (String, String, String) {
-        match self.tz {
+        match self.effective_tz() {
             Some(tz) => self.format_parts(now_utc.with_timezone(&tz)),
             None => self.format_parts(now_utc.with_timezone(&Local)),
         }
@@ -191,7 +260,7 @@ impl ClockWidget {
     }
 
     fn ticker_string(&self, now_utc: DateTime<chrono::Utc>) -> String {
-        match self.tz {
+        match self.effective_tz() {
             Some(tz) => format_ticker(now_utc.with_timezone(&tz), self.config.hour_format),
             None => format_ticker(now_utc.with_timezone(&Local), self.config.hour_format),
         }
@@ -205,15 +274,22 @@ impl ClockWidget {
     fn world_clock_entries(&self) -> Vec<(String, String)> {
         let now = chrono::Utc::now();
         let mut out: Vec<(String, String)> = Vec::with_capacity(self.secondaries.len() + 1);
-        let (primary_label, primary_str) = match self.tz {
-            Some(tz) => {
+        let transient = self.state.lock().expect("clock state poisoned").transient_tz.clone();
+        let (primary_label, primary_str) = match transient {
+            Some((label, tz)) => {
                 let t = now.with_timezone(&tz);
-                (city_from_tz_name(tz.name()), format_clock_entry(&t))
+                (label, format_clock_entry(&t))
             }
-            None => {
-                let t = now.with_timezone(&Local);
-                ("Local".to_string(), format_clock_entry(&t))
-            }
+            None => match self.tz {
+                Some(tz) => {
+                    let t = now.with_timezone(&tz);
+                    (city_from_tz_name(tz.name()), format_clock_entry(&t))
+                }
+                None => {
+                    let t = now.with_timezone(&Local);
+                    ("Local".to_string(), format_clock_entry(&t))
+                }
+            },
         };
         out.push((primary_label, primary_str));
         for (label, tz) in &self.secondaries {
@@ -320,9 +396,16 @@ impl Widget for ClockWidget {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
-        let title_base = match &self.tz {
-            Some(tz) => format!("Clock — {tz}"),
-            None => "Clock".into(),
+        let (transient, searching) = self.snapshot_transient();
+        let title_base = if let Some((label, _)) = &transient {
+            format!("Clock — {label} (lookup)")
+        } else if searching {
+            "Clock — looking up…".into()
+        } else {
+            match &self.tz {
+                Some(tz) => format!("Clock — {tz}"),
+                None => "Clock".into(),
+            }
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -339,15 +422,22 @@ impl Widget for ClockWidget {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        // Big-digit color: LightMagenta while a `:time <location>` override is
+        // active so the user can't miss that they're not on home base; cyan
+        // otherwise.
+        let big_color = if transient.is_some() {
+            Color::LightMagenta
+        } else {
+            Color::Cyan
+        };
+
         let mut lines: Vec<Line<'_>> = Vec::new();
         // Top padding so the big digits don't kiss the border.
         lines.push(Line::from(""));
         for row in big {
             lines.push(Line::from(Span::styled(
                 row,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(big_color).add_modifier(Modifier::BOLD),
             )));
         }
 
@@ -399,12 +489,34 @@ impl Widget for ClockWidget {
         frame.render_widget(body, inner);
     }
 
-    fn handle_key(&mut self, _key: KeyEvent) -> EventResult {
-        EventResult::Ignored
+    fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        if matches!(key.code, KeyCode::Char('x')) {
+            self.clear_transient();
+            EventResult::Handled
+        } else {
+            EventResult::Ignored
+        }
     }
 
-    fn handle_command(&mut self, _cmd: &str, _args: &[&str]) -> Result<bool> {
-        Ok(false)
+    fn handle_command(&mut self, cmd: &str, args: &[&str]) -> Result<bool> {
+        match cmd {
+            "time" | "t" => {
+                if args.is_empty() {
+                    anyhow::bail!("usage: :time <city or country>");
+                }
+                let query = args.join(" ");
+                self.lookup_location(&query);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("x", "clear :time lookup (return to local time)"),
+            (":time <city>", "switch primary clock to that location"),
+        ]
     }
 
     fn config(&self) -> serde_json::Value {

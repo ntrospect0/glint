@@ -41,7 +41,7 @@ pub fn render(
         sep.clone(),
         Span::styled(format!(" Last fetch: {last} "), dim),
         sep,
-        Span::styled(" Tab: switch · q: quit ", dim),
+        Span::styled(" Tab: switch · ? help · q quit ", dim),
     ])
     .alignment(Alignment::Left);
 

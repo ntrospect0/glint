@@ -22,6 +22,69 @@ struct IpApiResponse {
     timezone: Option<String>,
 }
 
+/// Resolve a free-form place name to a `GeoLocation` via Open-Meteo's free
+/// geocoding API (no key). Returns the top match — usually accurate even for
+/// short queries like "Vancouver" (defaults to the largest one by population).
+pub async fn by_name(name: &str) -> Result<GeoLocation> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .user_agent(concat!("glint-tui/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("failed to build geocoding HTTP client")?;
+    let url = format!(
+        "https://geocoding-api.open-meteo.com/v1/search?name={q}&count=1",
+        q = urlencoding::encode(name)
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .context("open-meteo geocoding request failed")?
+        .error_for_status()
+        .context("open-meteo geocoding returned non-2xx")?
+        .json::<GeocodingResponse>()
+        .await
+        .context("failed to deserialize open-meteo geocoding response")?;
+    let hit = resp
+        .results
+        .and_then(|r| r.into_iter().next())
+        .with_context(|| format!("no geocoding result for {name:?}"))?;
+    let mut label = hit.name.clone();
+    if let Some(admin1) = hit.admin1 {
+        label.push_str(", ");
+        label.push_str(&admin1);
+    }
+    if let Some(country) = hit.country {
+        label.push_str(", ");
+        label.push_str(&country);
+    }
+    Ok(GeoLocation {
+        latitude: hit.latitude,
+        longitude: hit.longitude,
+        label,
+        timezone: hit.timezone,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct GeocodingResponse {
+    #[serde(default)]
+    results: Option<Vec<GeocodingHit>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeocodingHit {
+    name: String,
+    latitude: f64,
+    longitude: f64,
+    #[serde(default)]
+    admin1: Option<String>,
+    #[serde(default)]
+    country: Option<String>,
+    #[serde(default)]
+    timezone: Option<String>,
+}
+
 /// Geolocate by the caller's egress IP via ipapi.co (free, HTTPS, no API key).
 /// Returns an error if the request fails or the response is malformed — callers
 /// are expected to fall back to a sensible default.

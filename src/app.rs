@@ -39,6 +39,14 @@ pub struct App {
     should_quit: bool,
     /// Set on every successful tick to drive the status-bar "Last fetch" field.
     last_fetch: Option<chrono::DateTime<Local>>,
+    /// True when the `?` help overlay is showing.
+    show_help: bool,
+    /// `Some` while the user is composing a command after pressing `:`.
+    /// `None` when the command bar is closed.
+    command_buffer: Option<String>,
+    /// Transient status line shown next to the command bar — used for error
+    /// feedback after a failed command. Cleared on the next keystroke.
+    command_feedback: Option<String>,
 }
 
 impl App {
@@ -79,6 +87,9 @@ impl App {
             focus_order,
             should_quit: false,
             last_fetch: None,
+            show_help: false,
+            command_buffer: None,
+            command_feedback: None,
         }
     }
 
@@ -99,6 +110,18 @@ impl App {
     }
 
     fn handle_global_key(&mut self, key: crossterm::event::KeyEvent) {
+        // Help overlay intercepts every key (Esc / ? close it; anything else
+        // is ignored). Returning early keeps q from quitting through the
+        // overlay accidentally.
+        if self.show_help {
+            if matches!(
+                key.code,
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q')
+            ) {
+                self.show_help = false;
+            }
+            return;
+        }
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Char('q')) => self.should_quit = true,
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => self.should_quit = true,
@@ -106,8 +129,151 @@ impl App {
             (KeyModifiers::SHIFT, KeyCode::BackTab) | (KeyModifiers::NONE, KeyCode::BackTab) => {
                 self.cycle_focus(false)
             }
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
+                self.show_help = true;
+            }
+            // `:` opens the command bar when no widget claimed it.
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(':')) => {
+                self.command_buffer = Some(String::new());
+                self.command_feedback = None;
+            }
             _ => {}
         }
+    }
+
+    fn handle_command_bar_key(&mut self, key: crossterm::event::KeyEvent) {
+        self.command_feedback = None;
+        let Some(buf) = self.command_buffer.as_mut() else {
+            return;
+        };
+        match (key.modifiers, key.code) {
+            (_, KeyCode::Esc) => {
+                self.command_buffer = None;
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
+                self.command_buffer = None;
+            }
+            (_, KeyCode::Backspace) if buf.pop().is_none() => {
+                self.command_buffer = None;
+            }
+            (_, KeyCode::Enter) => {
+                let line = std::mem::take(buf);
+                self.command_buffer = None;
+                self.execute_command(line.trim());
+            }
+            (mods, KeyCode::Char(c))
+                if mods == KeyModifiers::NONE || mods == KeyModifiers::SHIFT =>
+            {
+                buf.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn execute_command(&mut self, line: &str) {
+        if line.is_empty() {
+            return;
+        }
+        let mut parts = line.split_whitespace();
+        let cmd = parts.next().unwrap_or("");
+        let args: Vec<&str> = parts.collect();
+
+        // Global commands first.
+        match cmd {
+            "q" | "quit" | "exit" => {
+                self.should_quit = true;
+                return;
+            }
+            "help" | "?" => {
+                self.show_help = true;
+                return;
+            }
+            "refresh" | "r" => {
+                // Forwarded to the focused widget so each one can implement
+                // its own refresh semantics via handle_command.
+                if let Some(id) = self.focused_widget().map(str::to_string) {
+                    if let Some(widget) = self.manager.get_mut(&id) {
+                        let _ = widget.handle_command("refresh", &args);
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        // Try the focused widget first, then every other registered widget.
+        // The first one to return Ok(true) wins and gets focus.
+        let focused = self.focused_widget().map(str::to_string);
+        let ordered_ids: Vec<String> = {
+            let mut ids: Vec<String> = Vec::new();
+            if let Some(f) = focused.as_ref() {
+                ids.push(f.clone());
+            }
+            for id in self.manager.ids() {
+                if focused.as_deref() != Some(id.as_str()) {
+                    ids.push(id.clone());
+                }
+            }
+            ids
+        };
+        for id in ordered_ids {
+            let Some(widget) = self.manager.get_mut(&id) else {
+                continue;
+            };
+            match widget.handle_command(cmd, &args) {
+                Ok(true) => {
+                    if let Some(pos) = self.focus_order.iter().position(|w| w == &id) {
+                        self.focus_idx = pos;
+                    }
+                    return;
+                }
+                Ok(false) => continue,
+                Err(err) => {
+                    self.command_feedback = Some(format!("{id}: {err}"));
+                    return;
+                }
+            }
+        }
+        self.command_feedback = Some(format!("unknown command: {cmd:?}"));
+    }
+}
+
+/// Re-read a TOML file and pipe the new value into the matching widget via
+/// Widget::apply_config. Best-effort: parse errors are logged (the file may
+/// be mid-write) and the next event will retry.
+fn apply_config_change(app: &mut App, path: &std::path::Path) {
+    // We only care about *.toml files inside the config dir.
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let widget_id = match stem {
+        "clock" | "weather" | "calendar" | "news" | "stocks" => stem,
+        _ => return, // ignore credentials/, llm.toml (no live reload), etc.
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let toml_value: toml::Value = match toml::from_str(&contents) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(file = %path.display(), error = %err, "config parse failed, will retry on next event");
+            return;
+        }
+    };
+    let json: serde_json::Value = match serde_json::to_value(toml_value) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(file = %path.display(), error = %err, "toml→json conversion failed");
+            return;
+        }
+    };
+    let Some(widget) = app.manager.get_mut(widget_id) else {
+        return;
+    };
+    if let Err(err) = widget.apply_config(json) {
+        tracing::warn!(widget = %widget_id, error = %err, "apply_config failed");
+    } else {
+        tracing::info!(widget = %widget_id, "live-reloaded config");
     }
 }
 
@@ -157,16 +323,35 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
     let _guard = TerminalGuard;
 
     let mut app = App::new(config);
-    let mut events = EventReader::new(Duration::from_millis(250));
+
+    // Set up the config file watcher so edits to ~/.config/glint/*.toml hot-
+    // reload via Widget::apply_config. If the dir doesn't exist or notify
+    // can't start (e.g. permission), we just run without live reload.
+    let config_rx = match config::config_dir() {
+        Ok(dir) if dir.exists() => match config::watcher::spawn(dir) {
+            Ok(rx) => Some(rx),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to spawn config watcher");
+                None
+            }
+        },
+        _ => None,
+    };
+    let mut events = EventReader::new(Duration::from_millis(250), config_rx);
 
     // Initial draw before the first event arrives.
     terminal.draw(|frame| {
         ui::render(
             frame,
-            &app.config.layout,
-            &app.manager,
-            app.focused_widget(),
-            app.last_fetch,
+            &ui::RenderState {
+                layout: &app.config.layout,
+                manager: &app.manager,
+                focused: app.focused_widget(),
+                last_fetch: app.last_fetch,
+                show_help: app.show_help,
+                command_buffer: app.command_buffer.as_deref(),
+                command_feedback: app.command_feedback.as_deref(),
+            },
         );
     })?;
 
@@ -178,17 +363,26 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                let consumed = if let Some(id) = app.focused_widget().map(str::to_string) {
-                    if let Some(widget) = app.manager.get_mut(&id) {
-                        widget.handle_key(key) == EventResult::Handled
-                    } else {
-                        false
+                // Command bar takes precedence over both widgets and globals
+                // — typing into it routes nowhere else.
+                if app.command_buffer.is_some() {
+                    app.handle_command_bar_key(key);
+                    if app.should_quit {
+                        break;
                     }
                 } else {
-                    false
-                };
-                if !consumed {
-                    app.handle_global_key(key);
+                    let consumed = if let Some(id) = app.focused_widget().map(str::to_string) {
+                        if let Some(widget) = app.manager.get_mut(&id) {
+                            widget.handle_key(key) == EventResult::Handled
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if !consumed {
+                        app.handle_global_key(key);
+                    }
                 }
             }
             Event::Mouse(mouse) => {
@@ -226,6 +420,9 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
             Event::Resize(_, _) => {
                 // Ratatui handles the re-layout on the next draw call below.
             }
+            Event::ConfigChanged(path) => {
+                apply_config_change(&mut app, &path);
+            }
             Event::Tick => {
                 for id in app.manager.ids().to_vec() {
                     if let Some(w) = app.manager.get_mut(&id) {
@@ -245,10 +442,15 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
         terminal.draw(|frame| {
             ui::render(
                 frame,
-                &app.config.layout,
-                &app.manager,
-                app.focused_widget(),
-                app.last_fetch,
+                &ui::RenderState {
+                    layout: &app.config.layout,
+                    manager: &app.manager,
+                    focused: app.focused_widget(),
+                    last_fetch: app.last_fetch,
+                    show_help: app.show_help,
+                    command_buffer: app.command_buffer.as_deref(),
+                    command_feedback: app.command_feedback.as_deref(),
+                },
             );
         })?;
     }

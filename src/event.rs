@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use crossterm::event::{Event as CtEvent, EventStream, KeyEvent, MouseEvent};
 use futures::StreamExt;
@@ -11,20 +11,23 @@ pub enum Event {
     Mouse(MouseEvent),
     Resize(#[allow(dead_code)] u16, #[allow(dead_code)] u16),
     Tick,
+    /// One of the user's TOML config files changed — main loop will re-read
+    /// and hot-apply via Widget::apply_config.
+    ConfigChanged(PathBuf),
 }
 
-/// Background reader that fans crossterm events + periodic ticks onto a single
-/// mpsc channel consumed by the main loop.
+/// Background reader that fans crossterm events + periodic ticks + config
+/// file changes onto a single mpsc channel consumed by the main loop.
 pub struct EventReader {
     rx: mpsc::Receiver<Event>,
     _handle: tokio::task::JoinHandle<()>,
 }
 
 impl EventReader {
-    pub fn new(tick_rate: Duration) -> Self {
+    pub fn new(tick_rate: Duration, config_changes: Option<mpsc::Receiver<PathBuf>>) -> Self {
         let (tx, rx) = mpsc::channel(64);
         let handle = tokio::spawn(async move {
-            run_loop(tx, tick_rate).await;
+            run_loop(tx, tick_rate, config_changes).await;
         });
         Self {
             rx,
@@ -37,7 +40,11 @@ impl EventReader {
     }
 }
 
-async fn run_loop(tx: mpsc::Sender<Event>, tick_rate: Duration) {
+async fn run_loop(
+    tx: mpsc::Sender<Event>,
+    tick_rate: Duration,
+    mut config_changes: Option<mpsc::Receiver<PathBuf>>,
+) {
     let mut crossterm_events = EventStream::new();
     let mut ticker = tokio::time::interval(tick_rate);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -61,6 +68,16 @@ async fn run_loop(tx: mpsc::Sender<Event>, tick_rate: Duration) {
             }
             _ = ticker.tick() => {
                 if tx.send(Event::Tick).await.is_err() {
+                    break;
+                }
+            }
+            maybe_path = async { config_changes.as_mut()?.recv().await }, if config_changes.is_some() => {
+                let Some(path) = maybe_path else {
+                    // Watcher dropped — keep going without it.
+                    config_changes = None;
+                    continue;
+                };
+                if tx.send(Event::ConfigChanged(path)).await.is_err() {
                     break;
                 }
             }

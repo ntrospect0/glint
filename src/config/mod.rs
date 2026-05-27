@@ -1,5 +1,6 @@
 pub mod layout;
 pub mod types;
+pub mod watcher;
 
 use std::path::{Path, PathBuf};
 

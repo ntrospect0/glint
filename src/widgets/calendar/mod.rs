@@ -1079,6 +1079,16 @@ impl Widget for CalendarWidget {
         Ok(false)
     }
 
+    fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("d / w / m", "switch view: day / week / month"),
+            ("← / → / h / l", "previous / next (per view)"),
+            ("t", "jump to today"),
+            ("click day", "navigate to that day (week/month view)"),
+            ("click tab", "switch view / today"),
+        ]
+    }
+
     fn config(&self) -> serde_json::Value {
         serde_json::json!({
             "default_view": self.view,

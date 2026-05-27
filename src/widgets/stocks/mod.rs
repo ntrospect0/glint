@@ -118,6 +118,12 @@ struct StocksState {
     /// First-visible logical row in the list panel. Auto-adjusted on render
     /// so the selected ticker stays in view.
     list_scroll: usize,
+    /// Ticker pinned to the list by a `:stock <query>` command. Appears in
+    /// its own `── Lookup ──` section at the bottom of the list and stays
+    /// until the user presses `x` to clear it.
+    transient_ticker: Option<String>,
+    /// Set while a `:stock` search is in flight so we can render "Looking up…"
+    transient_searching: Option<String>,
     last_attempt: Option<Instant>,
     any_inflight: bool,
 }
@@ -186,14 +192,24 @@ impl StocksWidget {
     }
 
     /// Concatenated list of symbols in display order: indices first, then
-    /// watchlist. Used for selection indexing too.
-    fn all_symbols(&self) -> Vec<&String> {
-        self.config
+    /// watchlist, then the transient lookup (if any). Used for selection
+    /// indexing too.
+    fn all_symbols(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .config
             .indices
             .iter()
             .chain(self.config.watchlist.iter())
-            .collect()
+            .cloned()
+            .collect();
+        if let Some(t) = self.state.lock().expect("stocks state poisoned").transient_ticker.clone() {
+            if !out.iter().any(|s| s.eq_ignore_ascii_case(&t)) {
+                out.push(t);
+            }
+        }
+        out
     }
+
 
     fn is_due(&self) -> bool {
         let st = self.state.lock().expect("stocks state poisoned");
@@ -207,7 +223,7 @@ impl StocksWidget {
     }
 
     fn spawn_refresh(&self) {
-        let symbols: Vec<String> = self.all_symbols().iter().map(|s| s.to_string()).collect();
+        let symbols: Vec<String> = self.all_symbols();
         if symbols.is_empty() {
             return;
         }
@@ -270,7 +286,68 @@ impl StocksWidget {
     fn selected_symbol(&self) -> Option<String> {
         let symbols = self.all_symbols();
         let idx = self.state.lock().expect("stocks state poisoned").selected;
-        symbols.get(idx).map(|s| s.to_string())
+        symbols.into_iter().nth(idx)
+    }
+
+    /// Resolve `query` to a ticker (direct or via Yahoo search) and pin it as
+    /// the transient symbol, selecting it in the list. Called from
+    /// :stock <query> dispatch.
+    fn lookup_and_set_transient(&self, query: &str) {
+        let query_trim = query.trim().to_string();
+        // If it already looks like a ticker (short, ASCII-uppercase + ^ . - =)
+        // skip the search round-trip.
+        let direct = is_tickerish(&query_trim).then(|| query_trim.to_uppercase());
+        if let Some(symbol) = direct {
+            self.set_transient_now(symbol);
+            return;
+        }
+        // Mark "searching…" so the UI can show feedback while the request flies.
+        {
+            let mut st = self.state.lock().expect("stocks state poisoned");
+            st.transient_searching = Some(query_trim.clone());
+        }
+        let provider = self.provider.clone();
+        let state = self.state.clone();
+        // Total slot count (indices + watchlist) — knowing this lets us snap
+        // selection straight to the transient row (last slot) when search
+        // resolves.
+        let base_slot = self.config.indices.len() + self.config.watchlist.len();
+        tokio::spawn(async move {
+            let result = provider.search(&query_trim).await;
+            let mut st = state.lock().expect("stocks state poisoned");
+            st.transient_searching = None;
+            match result {
+                Ok(symbol) => {
+                    st.transient_ticker = Some(symbol);
+                    st.selected = base_slot;
+                    st.last_attempt = None;
+                }
+                Err(err) => {
+                    tracing::warn!(query = %query_trim, error = %err, "stock lookup failed");
+                }
+            }
+        });
+    }
+
+    /// Insert `symbol` as the transient lookup synchronously (used when the
+    /// query already looked like a ticker, no search needed).
+    fn set_transient_now(&self, symbol: String) {
+        let base_slot = self.config.indices.len() + self.config.watchlist.len();
+        let mut st = self.state.lock().expect("stocks state poisoned");
+        st.transient_ticker = Some(symbol);
+        st.transient_searching = None;
+        st.selected = base_slot;
+        st.last_attempt = None;
+    }
+
+    /// Clear the transient ticker and bounce the selection back to the top
+    /// of the configured list. No-op when there's nothing pinned.
+    fn clear_transient(&self) {
+        let mut st = self.state.lock().expect("stocks state poisoned");
+        if st.transient_ticker.take().is_some() {
+            st.selected = 0;
+            st.list_scroll = 0;
+        }
     }
 
     /// Open the selected ticker in the user's browser via the configured
@@ -355,16 +432,16 @@ struct StocksPanels {
 
 /// Maps a click row inside the list panel to the ticker index, accounting
 /// for the current scroll offset. The list lays out: optional `── Indices ──`
-/// header, N index rows, blank, `── Watchlist ──`, M watchlist rows.
+/// header + N index rows, blank + `── Watchlist ──` + M watchlist rows,
+/// optionally blank + `── Lookup ──` + 1 transient row.
 fn list_ticker_at(
     click_row: u16,
     list_area: Rect,
     indices_count: usize,
-    total: usize,
+    watchlist_count: usize,
+    has_lookup: bool,
     scroll: usize,
 ) -> Option<usize> {
-    // Translate the click into an absolute logical row index by adding the
-    // scroll offset that the list panel currently uses.
     let visible_rel = click_row.checked_sub(list_area.y)? as usize;
     let rel = visible_rel + scroll;
     let mut cursor = 0usize;
@@ -380,7 +457,6 @@ fn list_ticker_at(
             cursor += 1;
         }
     }
-    let watchlist_count = total.saturating_sub(indices_count);
     if watchlist_count > 0 {
         if indices_count > 0 {
             if rel == cursor || rel == cursor + 1 {
@@ -398,6 +474,16 @@ fn list_ticker_at(
                 return Some(indices_count + i);
             }
             cursor += 1;
+        }
+    }
+    if has_lookup {
+        // blank + header before the single transient row
+        if rel == cursor || rel == cursor + 1 {
+            return None;
+        }
+        cursor += 2;
+        if rel == cursor {
+            return Some(indices_count + watchlist_count);
         }
     }
     None
@@ -482,12 +568,14 @@ impl Widget for StocksWidget {
         }
 
         let quotes = self.snapshot_quotes();
-        let symbols: Vec<String> = self
-            .all_symbols()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let symbols: Vec<String> = self.all_symbols();
         let selected_sym = self.selected_symbol();
+        let base_count = self.config.indices.len() + self.config.watchlist.len();
+        let lookup_start = if symbols.len() > base_count {
+            Some(base_count)
+        } else {
+            None
+        };
 
         // Adaptive layout: in landscape mode (wide), list | stats | graph
         // run horizontally — list + stats get their full width first, graph
@@ -529,6 +617,7 @@ impl Widget for StocksWidget {
                 list_area,
                 &symbols,
                 self.config.indices.len(),
+                lookup_start,
                 &quotes,
                 sel,
                 self.display_mode,
@@ -566,6 +655,7 @@ impl Widget for StocksWidget {
                 rows[0],
                 &symbols,
                 self.config.indices.len(),
+                lookup_start,
                 &quotes,
                 sel,
                 self.display_mode,
@@ -644,6 +734,11 @@ impl Widget for StocksWidget {
                 self.mark_dirty();
                 EventResult::Handled
             }
+            // `x` clears the :stock <query> transient selection if any.
+            KeyCode::Char('x') => {
+                self.clear_transient();
+                EventResult::Handled
+            }
             // 1..9 picks a graph period directly.
             KeyCode::Char(d @ '1'..='9') => {
                 let idx = (d as u8 - b'1') as usize;
@@ -704,12 +799,16 @@ impl Widget for StocksWidget {
                         && mouse.column >= list_area.x
                         && mouse.column < list_area.x + list_area.width
                     {
-                        let scroll = self.state.lock().expect("stocks state poisoned").list_scroll;
+                        let (scroll, has_lookup) = {
+                            let st = self.state.lock().expect("stocks state poisoned");
+                            (st.list_scroll, st.transient_ticker.is_some())
+                        };
                         if let Some(idx) = list_ticker_at(
                             mouse.row,
                             list_area,
                             self.config.indices.len(),
-                            self.all_symbols().len(),
+                            self.config.watchlist.len(),
+                            has_lookup,
                             scroll,
                         ) {
                             let mut st = self.state.lock().expect("stocks state poisoned");
@@ -724,8 +823,37 @@ impl Widget for StocksWidget {
         }
     }
 
-    fn handle_command(&mut self, _cmd: &str, _args: &[&str]) -> Result<bool> {
-        Ok(false)
+    fn handle_command(&mut self, cmd: &str, args: &[&str]) -> Result<bool> {
+        match cmd {
+            "stock" | "stocks" | "s" => {
+                if args.is_empty() {
+                    anyhow::bail!("usage: :stock <symbol-or-name>");
+                }
+                let query = args.join(" ");
+                self.lookup_and_set_transient(&query);
+                Ok(true)
+            }
+            "refresh" => {
+                self.mark_dirty();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("↑ / ↓ / k", "select ticker (k = up)"),
+            ("c", "cycle display mode (% / $)"),
+            ("% / $", "set display mode directly"),
+            ("1-9", "set graph period directly"),
+            ("j", "Jump: open ticker URL in browser"),
+            ("r", "force refresh"),
+            ("x", "clear :stock lookup (return to default list)"),
+            ("click ticker", "select that ticker"),
+            ("click toggle", "switch graph period"),
+            (":stock <sym|name>", "look up a ticker and pin it"),
+        ]
     }
 
     fn config(&self) -> serde_json::Value {
@@ -750,6 +878,18 @@ fn display_mode_label(m: DisplayMode) -> &'static str {
         DisplayMode::Percent => "%",
         DisplayMode::Dollar => "$",
     }
+}
+
+/// Heuristic: does `s` look like a Yahoo ticker (e.g. AAPL, ^GSPC, BRK-A,
+/// CAD=X)? If so we skip the search hop. Tickers are short and use a small
+/// punctuation set; company names have lowercase letters or spaces.
+fn is_tickerish(s: &str) -> bool {
+    let len = s.chars().count();
+    if !(1..=8).contains(&len) {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '^' | '.' | '-' | '='))
 }
 
 fn render_graph_panel(
@@ -1071,20 +1211,28 @@ fn label_rows(plot_h: u16) -> Vec<u16> {
     rows
 }
 
-#[allow(clippy::too_many_arguments)] // 8 args, all distinct render inputs — no obvious bundle.
+#[allow(clippy::too_many_arguments)] // 9 args, all distinct render inputs — no obvious bundle.
 fn render_list_panel(
     frame: &mut Frame,
     area: Rect,
     symbols: &[String],
     indices_count: usize,
+    lookup_start: Option<usize>,
     quotes: &HashMap<String, QuoteState>,
     selected: usize,
     mode: DisplayMode,
     period: Period,
     current_scroll: usize,
 ) -> usize {
-    let (lines, ticker_lines) =
-        build_list_lines(symbols, indices_count, quotes, selected, mode, period);
+    let (lines, ticker_lines) = build_list_lines(
+        symbols,
+        indices_count,
+        lookup_start,
+        quotes,
+        selected,
+        mode,
+        period,
+    );
 
     // Reserve the bottom row for the footer hint rendered in `render`.
     let usable_h = area.height.saturating_sub(1) as usize;
@@ -1122,12 +1270,13 @@ fn render_list_panel(
 fn build_list_lines<'a>(
     symbols: &'a [String],
     indices_count: usize,
+    lookup_start: Option<usize>,
     quotes: &HashMap<String, QuoteState>,
     selected: usize,
     mode: DisplayMode,
     period: Period,
 ) -> (Vec<Line<'a>>, Vec<usize>) {
-    let mut lines: Vec<Line<'a>> = Vec::with_capacity(symbols.len() + 3);
+    let mut lines: Vec<Line<'a>> = Vec::with_capacity(symbols.len() + 4);
     let mut ticker_lines: Vec<usize> = Vec::with_capacity(symbols.len());
     if indices_count > 0 {
         lines.push(Line::from(Span::styled(
@@ -1136,6 +1285,7 @@ fn build_list_lines<'a>(
         )));
     }
     let mut watchlist_header_emitted = indices_count == 0;
+    let mut lookup_header_emitted = false;
     for (i, sym) in symbols.iter().enumerate() {
         if !watchlist_header_emitted && i == indices_count {
             lines.push(Line::from(""));
@@ -1144,6 +1294,16 @@ fn build_list_lines<'a>(
                 Style::default().add_modifier(Modifier::DIM),
             )));
             watchlist_header_emitted = true;
+        }
+        if let Some(start) = lookup_start {
+            if !lookup_header_emitted && i == start {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "── Lookup (press x to clear) ──",
+                    Style::default().add_modifier(Modifier::DIM),
+                )));
+                lookup_header_emitted = true;
+            }
         }
         ticker_lines.push(lines.len());
         let is_selected = i == selected;

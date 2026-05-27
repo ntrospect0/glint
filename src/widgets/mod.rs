@@ -50,8 +50,14 @@ pub trait Widget: Send + Sync {
     #[allow(dead_code)] // used by config live-reload in Phase 2+.
     fn config(&self) -> serde_json::Value;
 
-    #[allow(dead_code)] // used by config live-reload in Phase 2+.
+    #[allow(dead_code)] // wired by the config watcher in app::run.
     fn apply_config(&mut self, config: serde_json::Value) -> Result<()>;
+
+    /// `(key, description)` pairs surfaced by the `?` help overlay. Default
+    /// is empty — widgets opt in by overriding.
+    fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
+        Vec::new()
+    }
 }
 
 /// Owns the set of registered widgets and resolves them by id.
