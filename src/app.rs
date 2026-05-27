@@ -375,7 +375,7 @@ fn apply_config_change(app: &mut App, path: &std::path::Path) {
     // Filename stem may be either `<kind>` (main instance) or `<kind>@<instance>`.
     let (kind, instance) = parse_widget_ref(stem);
     match kind.as_str() {
-        "clock" | "weather" | "calendar" | "news" | "stocks" => {}
+        "clock" | "weather" | "calendar" | "news" | "stocks" | "email" => {}
         _ => return, // ignore credentials/, llm.toml (no live reload), etc.
     }
     let widget_id: String = if instance == "main" {
@@ -552,6 +552,16 @@ fn register_widget(
                 cfg,
                 llm_provider,
                 news_summarize,
+                theme,
+            ));
+        }
+        "email" => {
+            let cfg: crate::widgets::email::EmailConfig =
+                config::load_widget_toml_for_instance("email", instance).unwrap_or_default();
+            manager.register(crate::widgets::email::EmailWidget::with_config_and_llm(
+                instance.to_string(),
+                cfg,
+                llm_provider,
                 theme,
             ));
         }

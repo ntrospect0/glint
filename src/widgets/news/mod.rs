@@ -496,13 +496,10 @@ impl NewsWidget {
     /// expanded) and returns the article index whose rows contain `click_row`.
     fn article_index_at(&self, click_row: u16, list_area: Rect, articles: &[Article]) -> Option<usize> {
         let st = self.state.lock().expect("news state poisoned");
-        let mut scroll = st.scroll;
+        let scroll = st.scroll;
         let selected = st.selected;
         let expanded = st.expanded;
         drop(st);
-        if expanded {
-            scroll = selected;
-        }
         let inner_width = list_area.width as usize;
         let mut y = list_area.y;
         for (i, article) in articles.iter().enumerate().skip(scroll) {
@@ -832,16 +829,15 @@ impl Widget for NewsWidget {
         // when `expanded` is true.
         const ROWS_PER_ITEM: usize = 2;
         let items_visible = (list_height as usize / ROWS_PER_ITEM).max(1);
-        if expanded {
-            // Pin the expanded item to the top so its summary has room.
+        // Keep the selected article in view, but don't snap it to the top
+        // on expand — let it grow in place so the articles above stay
+        // visible. The summary may run past the pane bottom and get
+        // clipped; ↑/↓ scrolls to bring it back.
+        if selected < scroll {
             scroll = selected;
-        } else {
-            if selected < scroll {
-                scroll = selected;
-            }
-            if selected >= scroll + items_visible {
-                scroll = selected + 1 - items_visible;
-            }
+        }
+        if selected >= scroll + items_visible {
+            scroll = selected + 1 - items_visible;
         }
 
         let now = Utc::now();

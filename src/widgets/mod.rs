@@ -1,5 +1,6 @@
 pub mod calendar;
 pub mod clock;
+pub mod email;
 pub mod gallery;
 pub mod news;
 pub mod resources;

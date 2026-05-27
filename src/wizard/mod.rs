@@ -24,6 +24,7 @@ use crate::config::layout::{GridCell, LayoutConfig};
 use crate::config::{self, config_dir, config_path};
 use crate::widgets::calendar::{CalendarConfig, ProviderEntry, ProviderKind};
 use crate::widgets::clock::{ClockConfig, SecondaryTimezone};
+use crate::widgets::email::EmailConfig;
 use crate::widgets::gallery::GalleryConfig;
 use crate::widgets::news::NewsConfig;
 use crate::widgets::parse_widget_ref;
@@ -174,6 +175,9 @@ pub fn run() -> Result<()> {
     }
     for instance in instances_for(&instances, "gallery") {
         step_gallery(&mut report, &instance)?;
+    }
+    for instance in instances_for(&instances, "email") {
+        step_email(&mut report, &instance)?;
     }
 
     // Step 4: LLM key.
@@ -366,7 +370,7 @@ fn discover_instances_from_disk() -> Vec<(String, String)> {
 /// Fallback when no config.toml exists yet — assume the original five-widget
 /// layout, single `main` instance each.
 fn default_main_instances() -> Vec<(String, String)> {
-    ["clock", "calendar", "weather", "news", "stocks", "resources", "gallery"]
+    ["clock", "calendar", "weather", "news", "stocks", "resources", "gallery", "email"]
         .into_iter()
         .map(|k| (k.to_string(), "main".to_string()))
         .collect()
@@ -511,6 +515,7 @@ fn assign_widgets(layout: &LayoutConfig) -> Result<Vec<String>> {
         "stocks",
         "resources",
         "gallery",
+        "email",
     ];
     let mut out: Vec<String> = Vec::with_capacity(n);
     // (kind, instance) pairs already assigned in this session — used to
@@ -1911,9 +1916,137 @@ fn scan_image_directory(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
     Ok(paths)
 }
 
+fn step_email(report: &mut WizardReport, instance: &str) -> Result<()> {
+    println!();
+    let header = instance_header("Email", instance);
+    println!("── Step 9: {header} ─────────────────────────────────────────");
+    let stem = widget_stem("email", instance);
+    let existing: EmailConfig = config::load_widget_toml(&stem).unwrap_or_default();
+    let path = config_dir()?.join(format!("{stem}.toml"));
+
+    println!("Current provider        : {}", existing.provider);
+    println!("Current latest_days     : {}", existing.latest_days);
+    println!("Current refresh_minutes : {}", existing.refresh_minutes);
+    println!(
+        "Current folders         : {}",
+        if existing.folders.is_empty() {
+            "(none)".to_string()
+        } else {
+            existing.folders.join(", ")
+        }
+    );
+    println!("Summarize with LLM      : {}", existing.summarize_with_llm);
+
+    if !confirm(&format!("Edit {header}?"), false)? {
+        return Ok(());
+    }
+
+    let provider_letter = select_letter(
+        "Pick an email provider:",
+        &[
+            ('o', "Outlook (Microsoft Graph)"),
+            ('g', "Gmail"),
+        ],
+    )?;
+    let provider = if provider_letter == 'g' { "gmail" } else { "outlook" };
+
+    let latest_days = loop {
+        let raw = read_line(&format!(
+            "Days of history to fetch (1-30, [keep] for {}): ",
+            existing.latest_days
+        ))?;
+        if raw.trim().is_empty() || raw.trim().eq_ignore_ascii_case("keep") {
+            break existing.latest_days;
+        }
+        match raw.trim().parse::<u32>() {
+            Ok(n) if (1..=30).contains(&n) => break n,
+            _ => println!("Enter a number between 1 and 30 (or `keep`)."),
+        }
+    };
+
+    let refresh_minutes = loop {
+        let raw = read_line(&format!(
+            "Refresh interval in minutes (≥1, [keep] for {}): ",
+            existing.refresh_minutes
+        ))?;
+        if raw.trim().is_empty() || raw.trim().eq_ignore_ascii_case("keep") {
+            break existing.refresh_minutes;
+        }
+        match raw.trim().parse::<u64>() {
+            Ok(n) if n >= 1 => break n,
+            _ => println!("Enter a positive integer (or `keep`)."),
+        }
+    };
+
+    let folders_in = read_line(
+        "Folders to monitor — comma-separated (Gmail: INBOX,SENT,…; Outlook: inbox,sentitems,…), [keep] to leave as-is: ",
+    )?;
+    let folders: Vec<String> = match folders_in.trim().to_lowercase().as_str() {
+        "keep" | "" => existing.folders.clone(),
+        _ => folders_in
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    };
+    let folders = if folders.is_empty() {
+        vec!["INBOX".to_string()]
+    } else {
+        folders
+    };
+
+    let summarize = confirm(
+        "Summarize messages with the LLM when `s` is pressed?",
+        existing.summarize_with_llm,
+    )?;
+
+    let toml = render_email_toml(provider, latest_days, refresh_minutes, &folders, summarize);
+    std::fs::write(&path, toml)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    report.note(&path);
+    println!("Wrote {}", path.display());
+    println!();
+    println!(
+        "Note: run `glint --auth {}` after this wizard if you haven't already —",
+        if provider == "gmail" { "google" } else { "outlook" }
+    );
+    println!(
+        "      Email needs the additional {} scope.",
+        if provider == "gmail" {
+            "gmail.readonly"
+        } else {
+            "Mail.Read"
+        }
+    );
+    Ok(())
+}
+
+fn render_email_toml(
+    provider: &str,
+    latest_days: u32,
+    refresh_minutes: u64,
+    folders: &[String],
+    summarize_with_llm: bool,
+) -> String {
+    let mut out = String::new();
+    out.push_str("# Email widget — read-only feed of recent messages.\n");
+    out.push_str("# Glint never marks messages read on the server; an `e` press\n");
+    out.push_str("# locally suppresses the unread indicator via\n");
+    out.push_str("# ~/.config/glint/email_seen_<provider>_<account>.json.\n\n");
+    out.push_str(&format!("provider = {}\n", toml_string(provider)));
+    out.push_str(&format!("latest_days = {latest_days}\n"));
+    out.push_str(&format!("refresh_minutes = {refresh_minutes}\n"));
+    out.push_str(&format!("folders = {}\n", toml_string_array(folders)));
+    out.push_str(&format!(
+        "summarize_with_llm = {}\n",
+        if summarize_with_llm { "true" } else { "false" }
+    ));
+    out
+}
+
 fn step_llm_key(report: &mut WizardReport) -> Result<()> {
     println!();
-    println!("── Step 9: LLM (Anthropic) API key ─────────────────────────");
+    println!("── Step 10: LLM (Anthropic) API key ─────────────────────────");
     let creds = credentials_dir()?;
     let path = creds.join("anthropic_key.toml");
     let current_set = existing_anthropic_key_set(&path);

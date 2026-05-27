@@ -152,7 +152,8 @@ mod tests {
         assert!(url.starts_with(AUTH_URL));
         assert!(url.contains("client_id=abc.apps.gusercontent.com"));
         assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A54321"));
-        assert!(url.contains("scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcalendar.readonly"));
+        assert!(url.contains("calendar.readonly"));
+        assert!(url.contains("gmail.readonly"));
         assert!(url.contains("state=s%2Ft"));
         assert!(url.contains("access_type=offline"));
     }
