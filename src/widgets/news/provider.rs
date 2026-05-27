@@ -114,15 +114,20 @@ impl RssProvider {
 #[async_trait]
 impl NewsProvider for RssProvider {
     async fn fetch(&self) -> Result<Vec<Article>> {
-        let mut all: Vec<Article> = Vec::new();
-        for feed in &self.feeds {
+        // Fan out one HTTP request per feed in parallel — sequential fetching
+        // over a dozen+ feeds was visibly slow on refresh. Per-feed errors
+        // are logged and the rest of the batch still lands.
+        let futs = self.feeds.iter().map(|feed| async move {
             match self.fetch_feed(feed).await {
-                Ok(mut chunk) => all.append(&mut chunk),
+                Ok(chunk) => chunk,
                 Err(err) => {
                     tracing::warn!(feed = %feed.label, error = %err, "news feed fetch failed");
+                    Vec::new()
                 }
             }
-        }
+        });
+        let chunks = futures::future::join_all(futs).await;
+        let mut all: Vec<Article> = chunks.into_iter().flatten().collect();
         dedup_by_url(&mut all);
         all.sort_by_key(|a| std::cmp::Reverse(a.published));
         Ok(all)

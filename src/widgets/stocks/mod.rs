@@ -41,12 +41,27 @@ pub struct StocksConfig {
     pub poll_interval_secs: u64,
 
     /// Initial display mode. One of "percent" / "dollar" / "change".
-    #[serde(default)]
-    pub display_mode: DisplayMode,
+    /// Initial display mode for the change column. Accepts the legacy name
+    /// `display_mode` for backward compatibility.
+    #[serde(default, alias = "display_mode")]
+    pub default_display_mode: DisplayMode,
 
     /// Initial graph period. One of "1d" / "1w" / "1m" / "6m" / "ytd" / "1y".
     #[serde(default)]
     pub default_period: Period,
+
+    /// Optional URL template opened when the user presses `j` (Jump). The
+    /// literal token `{ticker}` is replaced with the URL-encoded ticker
+    /// symbol — e.g. `"https://www.marketwatch.com/investing/stock/{ticker}"`.
+    /// Leave unset to make `j` a no-op.
+    #[serde(default)]
+    pub jump_url_template: Option<String>,
+
+    /// When true, horizontal mouse scroll cycles the period toggles. Default
+    /// is false because trackpad horizontal-scroll gestures often fire
+    /// accidentally while scrolling vertically.
+    #[serde(default)]
+    pub horizontal_scroll_period: bool,
 }
 
 fn default_indices() -> Vec<String> {
@@ -71,8 +86,10 @@ impl Default for StocksConfig {
             indices: default_indices(),
             watchlist: default_watchlist(),
             poll_interval_secs: default_poll_interval(),
-            display_mode: DisplayMode::default(),
+            default_display_mode: DisplayMode::default(),
             default_period: Period::default(),
+            jump_url_template: None,
+            horizontal_scroll_period: false,
         }
     }
 }
@@ -127,7 +144,7 @@ impl StocksWidget {
                 Arc::new(provider_dummy())
             }
         };
-        let display_mode = config.display_mode;
+        let display_mode = config.default_display_mode;
         let period = config.default_period;
         Self {
             id: "stocks".into(),
@@ -148,6 +165,24 @@ impl StocksWidget {
         // Force a refresh on the next tick so the chart and change%
         // catch up to the new window.
         self.mark_dirty();
+    }
+
+    /// Cycle period forward (`true`) or backward (`false`) through Period::ALL,
+    /// wrapping at the ends.
+    fn cycle_period(&mut self, forward: bool) {
+        let idx = Period::ALL
+            .iter()
+            .position(|p| *p == self.period)
+            .unwrap_or(0);
+        let n = Period::ALL.len();
+        let next = if forward {
+            (idx + 1) % n
+        } else {
+            (idx + n - 1) % n
+        };
+        if let Some(p) = Period::ALL.get(next).copied() {
+            self.set_period(p);
+        }
     }
 
     /// Concatenated list of symbols in display order: indices first, then
@@ -236,6 +271,23 @@ impl StocksWidget {
         let symbols = self.all_symbols();
         let idx = self.state.lock().expect("stocks state poisoned").selected;
         symbols.get(idx).map(|s| s.to_string())
+    }
+
+    /// Open the selected ticker in the user's browser via the configured
+    /// `jump_url_template` (replacing `{ticker}` with the URL-encoded symbol).
+    /// No-op when no template is configured.
+    fn jump_to_external(&self) {
+        let Some(template) = &self.config.jump_url_template else {
+            tracing::info!("'j' pressed but no jump_url_template is configured");
+            return;
+        };
+        let Some(symbol) = self.selected_symbol() else {
+            return;
+        };
+        let url = template.replace("{ticker}", &urlencoding::encode(&symbol));
+        if let Err(err) = open::that(&url) {
+            tracing::warn!(error = %err, url = %url, "failed to open jump URL");
+        }
     }
 
     fn snapshot_quotes(&self) -> HashMap<String, QuoteState> {
@@ -539,7 +591,7 @@ impl Widget for StocksWidget {
                 height: 1,
             };
             let hint = format!(
-                "↑/↓ select · c mode ({}) · r refresh",
+                "↑/↓ select · c mode ({}) · j jump · r refresh",
                 display_mode_label(self.display_mode)
             );
             frame.render_widget(
@@ -562,8 +614,14 @@ impl Widget for StocksWidget {
                 self.move_selection(-1);
                 EventResult::Handled
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            // `j` is the Jump key (open ticker in browser). Down navigation
+            // stays on ↓ — vim's `j`-as-down is freed up here on purpose.
+            KeyCode::Down => {
                 self.move_selection(1);
+                EventResult::Handled
+            }
+            KeyCode::Char('j') => {
+                self.jump_to_external();
                 EventResult::Handled
             }
             KeyCode::Char('%') => {
@@ -606,6 +664,17 @@ impl Widget for StocksWidget {
             }
             MouseEventKind::ScrollDown => {
                 self.move_selection(1);
+                EventResult::Handled
+            }
+            // Horizontal scroll cycles the period toggles only when the user
+            // has opted into it via `horizontal_scroll_period` in stocks.toml
+            // — accidental trackpad sideways gestures are common otherwise.
+            MouseEventKind::ScrollLeft if self.config.horizontal_scroll_period => {
+                self.cycle_period(false);
+                EventResult::Handled
+            }
+            MouseEventKind::ScrollRight if self.config.horizontal_scroll_period => {
+                self.cycle_period(true);
                 EventResult::Handled
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -1270,6 +1339,24 @@ mod tests {
         let syms = w.all_symbols();
         assert_eq!(syms[0], "^DJI");
         assert_eq!(syms[3], "AAPL");
+    }
+
+    #[test]
+    fn cycle_period_wraps_at_both_ends() {
+        let mut w = StocksWidget::with_config(StocksConfig::default());
+        assert_eq!(w.period, Period::Day);
+        w.cycle_period(true);
+        assert_eq!(w.period, Period::Week);
+        // Walk forward to the last variant, then once more to wrap to first.
+        for _ in 0..Period::ALL.len() - 2 {
+            w.cycle_period(true);
+        }
+        assert_eq!(w.period, Period::TenYear);
+        w.cycle_period(true);
+        assert_eq!(w.period, Period::Day);
+        // Backward wraps too.
+        w.cycle_period(false);
+        assert_eq!(w.period, Period::TenYear);
     }
 
     #[test]

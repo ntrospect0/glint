@@ -206,10 +206,13 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                                 }
                             }
                         }
-                        // Scroll wheel: forward to the widget under the cursor
-                        // without changing focus — most users expect "scroll
-                        // whatever I'm hovering over".
-                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        // Scroll wheel (both axes): forward to the widget
+                        // under the cursor without changing focus — most
+                        // users expect "scroll whatever I'm hovering over".
+                        MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown
+                        | MouseEventKind::ScrollLeft
+                        | MouseEventKind::ScrollRight => {
                             if let Some((id, cell_area)) = target {
                                 if let Some(widget) = app.manager.get_mut(&id) {
                                     let _ = widget.handle_mouse(mouse, cell_area);

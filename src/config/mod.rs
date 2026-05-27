@@ -110,24 +110,24 @@ pub const DEFAULT_CLOCK_TOML: &str = r#"# Optional IANA timezone name for the pr
 show_seconds = false              # show :SS in the big block-digit display
 show_seconds_ticker = true        # show a small ticking HH:MM:SS below the big digits
 show_date = true
-hour_format = 24                  # 12 or 24
+hour_format = "24h"               # "12h" or "24h"
 
 # Additional world clocks rendered when there's vertical room.
 [[secondary_timezones]]
 label = "New York"
-tz = "America/New_York"
+timezone = "America/New_York"
 
 [[secondary_timezones]]
 label = "London"
-tz = "Europe/London"
+timezone = "Europe/London"
 
 [[secondary_timezones]]
 label = "Tokyo"
-tz = "Asia/Tokyo"
+timezone = "Asia/Tokyo"
 
 [[secondary_timezones]]
 label = "Taipei"
-tz = "Asia/Taipei"
+timezone = "Asia/Taipei"
 "#;
 
 pub const DEFAULT_WEATHER_TOML: &str = r#"# Open-Meteo is free and key-less. Set lat/lon to your city.
@@ -144,10 +144,16 @@ auto_locate = true                # only consulted when lat/lon are unset
 pub const DEFAULT_NEWS_TOML: &str = r#"# Poll cadence in seconds (floor 60).
 poll_interval_secs = 900
 
-# RSS / Atom feeds to aggregate. `label` is shown in the article row.
-# Feeds are intentionally varied so each topic tab has something to show.
-# Phase 4 will add LLM-backed semantic ranking on top of these.
+# When true, horizontal mouse scroll cycles the filter tabs. Disabled by
+# default because trackpad sideways gestures often fire accidentally.
+horizontal_scroll_filters = false
 
+# RSS / Atom feeds to aggregate. `label` is shown in the article row.
+# All sources here are free / non-paywall to read (some have paywalls on
+# the article pages themselves — your browser session handles auth when
+# you hit Enter to open). Add or remove freely.
+
+# ── Tech ─────────────────────────────────────────────────────────────────────
 [[feeds]]
 label = "Hacker News"
 url = "https://hnrss.org/frontpage"
@@ -157,25 +163,78 @@ label = "Ars Technica"
 url = "https://feeds.arstechnica.com/arstechnica/index"
 
 [[feeds]]
-label = "BBC News"
-url = "http://feeds.bbci.co.uk/news/rss.xml"
+label = "The Verge"
+url = "https://www.theverge.com/rss/index.xml"
 
 [[feeds]]
-label = "BBC Business"
-url = "http://feeds.bbci.co.uk/news/business/rss.xml"
+label = "Engadget"
+url = "https://www.engadget.com/rss.xml"
+
+[[feeds]]
+label = "Phoronix"
+url = "https://www.phoronix.com/rss.php"
+
+# ── World ────────────────────────────────────────────────────────────────────
+[[feeds]]
+label = "BBC News"
+url = "http://feeds.bbci.co.uk/news/rss.xml"
 
 [[feeds]]
 label = "BBC World"
 url = "http://feeds.bbci.co.uk/news/world/rss.xml"
 
 [[feeds]]
+label = "Guardian World"
+url = "https://www.theguardian.com/world/rss"
+
+[[feeds]]
+label = "NPR World"
+url = "https://feeds.npr.org/1004/rss.xml"
+
+# ── Business / Finance ───────────────────────────────────────────────────────
+[[feeds]]
+label = "BBC Business"
+url = "http://feeds.bbci.co.uk/news/business/rss.xml"
+
+[[feeds]]
 label = "Yahoo Finance"
 url = "https://finance.yahoo.com/news/rssindex"
 
 [[feeds]]
+label = "MarketWatch"
+url = "http://feeds.marketwatch.com/marketwatch/topstories/"
+
+[[feeds]]
+label = "CNBC Top"
+url = "https://www.cnbc.com/id/100003114/device/rss/rss.html"
+
+# WSJ / Barron's headline feeds are public; article bodies are paywalled
+# but your browser session opens them when you hit Enter.
+# [[feeds]]
+# label = "WSJ Markets"
+# url = "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"
+# [[feeds]]
+# label = "Barron's"
+# url = "https://feeds.a.dj.com/rss/RSSBarronsMain.xml"
+
+# ── Canada ───────────────────────────────────────────────────────────────────
+[[feeds]]
 label = "CBC News"
 url = "https://www.cbc.ca/webfeed/rss/rss-topstories"
 
+[[feeds]]
+label = "CBC Politics"
+url = "https://www.cbc.ca/webfeed/rss/rss-politics"
+
+[[feeds]]
+label = "CBC Business"
+url = "https://www.cbc.ca/webfeed/rss/rss-business"
+
+[[feeds]]
+label = "CTV News"
+url = "https://www.ctvnews.ca/rss/ctvnews-ca-top-stories-public-rss-1.822009"
+
+# ── Entertainment ────────────────────────────────────────────────────────────
 [[feeds]]
 label = "Pitchfork"
 url = "https://pitchfork.com/rss/news/"
@@ -183,6 +242,14 @@ url = "https://pitchfork.com/rss/news/"
 [[feeds]]
 label = "Variety"
 url = "https://variety.com/feed/"
+
+[[feeds]]
+label = "Hollywood Reporter"
+url = "https://www.hollywoodreporter.com/feed/"
+
+[[feeds]]
+label = "Polygon"
+url = "https://www.polygon.com/rss/index.xml"
 
 # Topics tag articles whose title/summary contains any keyword (case-insensitive
 # substring match) and double as filter tabs across the top of the news cell
@@ -233,18 +300,21 @@ pub const DEFAULT_LLM_TOML: &str = r#"# Master switch. If false, every LLM-backe
 # structured-only counterpart (keyword filtering, raw RSS summaries, …).
 enabled = true
 
+# ── Provider ─────────────────────────────────────────────────────────────────
 [provider]
 name = "anthropic"
 model = "claude-sonnet-4-6"
 api_base = "https://api.anthropic.com"
 max_tokens = 512
 
+# ── Budget / cache ───────────────────────────────────────────────────────────
 [limits]
 max_requests_per_minute = 20
 cache_capacity = 1024
 
-# Per-feature toggles. Each defaults to a sensible value; flip off if you
-# want to avoid LLM calls for a specific feature.
+# ── Per-feature toggles ──────────────────────────────────────────────────────
+# Each defaults to a sensible value; flip off if you want to avoid LLM calls
+# for a specific feature.
 [features]
 news_summarize = true
 news_classify = false
@@ -256,24 +326,42 @@ pub const DEFAULT_ANTHROPIC_KEY_TEMPLATE: &str = r#"# Anthropic API key. Get one
 api_key = "REPLACE_WITH_YOUR_KEY"
 "#;
 
-pub const DEFAULT_STOCKS_TOML: &str = r#"# Major indices listed at the top of the ticker list. Use Yahoo Finance
+pub const DEFAULT_STOCKS_TOML: &str = r#"# ── Tickers ──────────────────────────────────────────────────────────────────
+# Major indices listed at the top of the ticker list. Use Yahoo Finance
 # symbols: ^DJI (Dow Jones), ^GSPC (S&P 500), ^IXIC (Nasdaq Composite).
 indices = ["^DJI", "^GSPC", "^IXIC"]
 
 # Your watchlist. Add or remove tickers freely.
 watchlist = ["AAPL", "MSFT", "GOOGL", "NVDA", "TSLA"]
 
+# ── Refresh ──────────────────────────────────────────────────────────────────
 # Poll cadence (seconds, floor 15). Yahoo's chart endpoint refreshes every
 # minute or so, so under 60s is overkill.
 poll_interval_secs = 60
 
-# Initial display mode: "percent" (e.g. +1.12%), "dollar" (+2.20), or
-# "change" (▲ +2.20).  Cycle while focused with % / $ / c.
-display_mode = "percent"
+# ── Display ──────────────────────────────────────────────────────────────────
+# Initial display mode for the change column. Cycle while focused with c
+# (or pick directly with % / $). One of "percent" or "dollar".
+default_display_mode = "percent"
 
 # Initial graph period: "1d", "1w", "1m", "6m", "ytd", "1y", "3y", "5y",
 # "10y". When focused, press 1..9 (or click a toggle / ‹›) to switch.
 default_period = "1d"
+
+# When true, horizontal mouse scroll cycles the period toggles. Disabled
+# by default because trackpad sideways gestures often fire accidentally.
+horizontal_scroll_period = false
+
+# ── Jump (open ticker in browser) ────────────────────────────────────────────
+# Pressing `j` on a selected ticker opens this URL. `{ticker}` is replaced
+# with the URL-encoded symbol. Leave commented out to make `j` a no-op.
+#
+# Examples:
+#   jump_url_template = "https://www.marketwatch.com/investing/stock/{ticker}"
+#   jump_url_template = "https://www.google.com/finance/quote/{ticker}"
+#   jump_url_template = "https://finance.yahoo.com/quote/{ticker}"
+#   jump_url_template = "https://www.barrons.com/market-data/stocks/{ticker}"
+# jump_url_template = "https://www.marketwatch.com/investing/stock/{ticker}"
 "#;
 
 pub const DEFAULT_CALENDAR_TOML: &str = r#"# Default view: "day", "week", or "month".

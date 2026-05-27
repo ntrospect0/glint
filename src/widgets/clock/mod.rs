@@ -34,8 +34,9 @@ pub struct ClockConfig {
     #[serde(default = "default_show_date")]
     pub show_date: bool,
 
-    /// 12 or 24. Anything else falls back to 24.
-    #[serde(default = "default_hour_format")]
+    /// `"12h"` or `"24h"` (alternatively the bare integers `12` / `24` for
+    /// backward compatibility). Anything else falls back to 24-hour.
+    #[serde(default = "default_hour_format", deserialize_with = "deserialize_hour_format")]
     pub hour_format: u8,
 
     /// Additional world clocks rendered below the primary display when the
@@ -47,7 +48,10 @@ pub struct ClockConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SecondaryTimezone {
     pub label: String,
-    pub tz: String,
+    /// IANA timezone identifier. Accepts the old short `tz` field for
+    /// backward compatibility with existing user configs.
+    #[serde(alias = "tz")]
+    pub timezone: String,
 }
 
 fn default_show_seconds_ticker() -> bool {
@@ -58,6 +62,35 @@ fn default_show_date() -> bool {
 }
 fn default_hour_format() -> u8 {
     24
+}
+
+/// Accept either `"12h"`/`"24h"` strings or the bare integers `12`/`24` so
+/// the field reads consistently with other enum-style settings while keeping
+/// existing user configs working.
+fn deserialize_hour_format<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Str(String),
+        Int(u8),
+    }
+    let n = match Repr::deserialize(deserializer)? {
+        Repr::Int(n) => n,
+        Repr::Str(s) => match s.trim().to_lowercase().as_str() {
+            "12h" | "12" => 12,
+            "24h" | "24" => 24,
+            other => {
+                return Err(D::Error::custom(format!(
+                    "unknown hour_format {other:?}, expected \"12h\" or \"24h\""
+                )))
+            }
+        },
+    };
+    Ok(n)
 }
 
 impl Default for ClockConfig {
@@ -96,10 +129,10 @@ impl ClockWidget {
             .and_then(|name| name.parse::<Tz>().ok());
         let mut secondaries = Vec::with_capacity(config.secondary_timezones.len());
         for st in &config.secondary_timezones {
-            match st.tz.parse::<Tz>() {
+            match st.timezone.parse::<Tz>() {
                 Ok(t) => secondaries.push((st.label.clone(), t)),
                 Err(_) => {
-                    tracing::warn!(label = %st.label, tz = %st.tz, "invalid IANA timezone, skipping");
+                    tracing::warn!(label = %st.label, timezone = %st.timezone, "invalid IANA timezone, skipping");
                 }
             }
         }
@@ -382,7 +415,7 @@ impl Widget for ClockWidget {
             "show_date": self.config.show_date,
             "hour_format": self.config.hour_format,
             "secondary_timezones": self.config.secondary_timezones.iter().map(|s| {
-                serde_json::json!({"label": s.label, "tz": s.tz})
+                serde_json::json!({"label": s.label, "timezone": s.timezone})
             }).collect::<Vec<_>>(),
         })
     }
@@ -464,7 +497,7 @@ mod tests {
             timezone: Some("America/Vancouver".into()),
             secondary_timezones: vec![SecondaryTimezone {
                 label: "Tokyo".into(),
-                tz: "Asia/Tokyo".into(),
+                timezone: "Asia/Tokyo".into(),
             }],
             ..ClockConfig::default()
         };
@@ -481,7 +514,7 @@ mod tests {
             timezone: Some("America/Vancouver".into()),
             secondary_timezones: vec![SecondaryTimezone {
                 label: "Tokyo".into(),
-                tz: "Asia/Tokyo".into(),
+                timezone: "Asia/Tokyo".into(),
             }],
             ..ClockConfig::default()
         };
@@ -529,11 +562,11 @@ mod tests {
             secondary_timezones: vec![
                 SecondaryTimezone {
                     label: "New York".into(),
-                    tz: "America/New_York".into(),
+                    timezone: "America/New_York".into(),
                 },
                 SecondaryTimezone {
                     label: "Bogus".into(),
-                    tz: "Not/A_Real_TZ".into(),
+                    timezone: "Not/A_Real_TZ".into(),
                 },
             ],
             ..ClockConfig::default()

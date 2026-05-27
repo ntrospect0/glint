@@ -46,6 +46,12 @@ pub struct NewsConfig {
 
     #[serde(default)]
     pub topics: Vec<Topic>,
+
+    /// When true, horizontal mouse scroll cycles the filter tabs. Default is
+    /// false because trackpad horizontal-scroll gestures often fire
+    /// accidentally while scrolling vertically.
+    #[serde(default)]
+    pub horizontal_scroll_filters: bool,
 }
 
 fn default_poll_interval() -> u64 {
@@ -58,6 +64,7 @@ impl Default for NewsConfig {
             poll_interval_secs: default_poll_interval(),
             feeds: Vec::new(),
             topics: Vec::new(),
+            horizontal_scroll_filters: false,
         }
     }
 }
@@ -101,6 +108,10 @@ pub struct NewsWidget {
     llm: Option<Arc<dyn LlmProvider>>,
     /// True when the user has opted into LLM news summaries via llm.toml.
     llm_summarize_enabled: bool,
+    /// Mirrors NewsConfig.horizontal_scroll_filters — gates the ScrollLeft /
+    /// ScrollRight handler so accidental trackpad gestures don't switch tabs
+    /// for users who haven't asked for that.
+    horizontal_scroll_filters: bool,
 }
 
 impl NewsWidget {
@@ -114,6 +125,7 @@ impl NewsWidget {
         llm_summarize_enabled: bool,
     ) -> Self {
         let feeds_configured = !config.feeds.is_empty();
+        let horizontal_scroll_filters = config.horizontal_scroll_filters;
         let mut filter_tabs = vec![ALL_TAB_LABEL.to_string()];
         filter_tabs.extend(config.topics.iter().map(|t| t.label.clone()));
         let provider: Arc<dyn NewsProvider> = match RssProvider::new(config.feeds, config.topics) {
@@ -132,6 +144,7 @@ impl NewsWidget {
             filter_tabs,
             llm,
             llm_summarize_enabled,
+            horizontal_scroll_filters,
         }
     }
 
@@ -326,6 +339,23 @@ impl NewsWidget {
         if !self.feeds_configured {
             return;
         }
+        // Snapshot the currently-selected article URL (resolved in the
+        // *filtered* view) BEFORE marking inflight, so we can restore the
+        // selection in the new filtered list after the fetch lands.
+        let prev_url: Option<String> = {
+            let filtered = self.filtered_articles();
+            let st = self.state.lock().expect("news state poisoned");
+            filtered.get(st.selected).map(|a| a.url.clone())
+        };
+        let active_label: Option<String> = {
+            let st = self.state.lock().expect("news state poisoned");
+            let idx = st.active_filter_idx;
+            if idx == 0 {
+                None
+            } else {
+                self.filter_tabs.get(idx).cloned()
+            }
+        };
         {
             let mut st = self.state.lock().expect("news state poisoned");
             st.inflight = true;
@@ -339,17 +369,21 @@ impl NewsWidget {
             st.inflight = false;
             match result {
                 Ok(articles) => {
-                    let prev_url = st.articles.get(st.selected).map(|a| a.url.clone());
                     st.articles = articles;
                     st.last_error = None;
-                    // Try to keep the same article selected across refreshes.
-                    if let Some(url) = prev_url {
-                        if let Some(idx) = st.articles.iter().position(|a| a.url == url) {
-                            st.selected = idx;
-                        } else {
-                            st.selected = 0;
-                            st.scroll = 0;
-                        }
+                    // Look up the previously-selected URL in the NEW filtered
+                    // view. If it's still there, snap selection back to it;
+                    // otherwise reset to the top.
+                    let new_idx = prev_url.as_ref().and_then(|url| match &active_label {
+                        None => st.articles.iter().position(|a| &a.url == url),
+                        Some(label) => st
+                            .articles
+                            .iter()
+                            .filter(|a| a.topics.iter().any(|t| t == label))
+                            .position(|a| &a.url == url),
+                    });
+                    if let Some(idx) = new_idx {
+                        st.selected = idx;
                     } else {
                         st.selected = 0;
                         st.scroll = 0;
@@ -369,27 +403,33 @@ impl NewsWidget {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let mut st = self.state.lock().expect("news state poisoned");
-        if st.articles.is_empty() {
+        // selected is an index into the *filtered* list (matching rendering
+        // and click handling), so bounds-check against the filtered length.
+        let filtered_len = self.filtered_articles().len();
+        if filtered_len == 0 {
             return;
         }
-        let len = st.articles.len() as isize;
-        let new_idx = (st.selected as isize + delta).clamp(0, len - 1);
+        let mut st = self.state.lock().expect("news state poisoned");
+        let new_idx = (st.selected as isize + delta).clamp(0, filtered_len as isize - 1);
         st.selected = new_idx as usize;
     }
 
     fn jump_to(&mut self, idx: usize) {
-        let mut st = self.state.lock().expect("news state poisoned");
-        if st.articles.is_empty() {
+        let filtered_len = self.filtered_articles().len();
+        if filtered_len == 0 {
             return;
         }
-        st.selected = idx.min(st.articles.len() - 1);
+        let mut st = self.state.lock().expect("news state poisoned");
+        st.selected = idx.min(filtered_len - 1);
     }
 
     fn open_selected(&self) {
+        // selected is a filtered-list index; look the URL up in the same view
+        // the user is seeing on screen.
+        let filtered = self.filtered_articles();
         let url = {
             let st = self.state.lock().expect("news state poisoned");
-            st.articles.get(st.selected).map(|a| a.url.clone())
+            filtered.get(st.selected).map(|a| a.url.clone())
         };
         if let Some(url) = url {
             if let Err(err) = open::that(&url) {
@@ -711,6 +751,17 @@ impl Widget for NewsWidget {
                 self.move_selection(1);
                 return EventResult::Handled;
             }
+            // Horizontal scroll cycles the filter tabs (same as ←/→) only
+            // when the user has opted into it via news.toml — trackpads
+            // commonly fire sideways scroll accidentally.
+            MouseEventKind::ScrollLeft if self.horizontal_scroll_filters => {
+                self.cycle_filter(false);
+                return EventResult::Handled;
+            }
+            MouseEventKind::ScrollRight if self.horizontal_scroll_filters => {
+                self.cycle_filter(true);
+                return EventResult::Handled;
+            }
             MouseEventKind::Down(MouseButton::Left) => {}
             _ => return EventResult::Ignored,
         }
@@ -931,6 +982,45 @@ mod tests {
             summary: Some("a short summary".into()),
             topics: vec![],
         }
+    }
+
+    fn tagged_article(url: &str, title: &str, topics: &[&str]) -> Article {
+        Article {
+            title: title.into(),
+            url: url.into(),
+            source: "TestFeed".into(),
+            published: Utc::now(),
+            summary: Some("a short summary".into()),
+            topics: topics.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn move_selection_respects_active_filter_bounds() {
+        let cfg = NewsConfig {
+            topics: vec![provider::Topic {
+                label: "Tech".into(),
+                keywords: vec!["AI".into()],
+            }],
+            ..NewsConfig::default()
+        };
+        let mut w = NewsWidget::with_config(cfg);
+        {
+            let mut st = w.state.lock().unwrap();
+            st.articles = vec![
+                tagged_article("https://a", "Non-tech A", &[]),
+                tagged_article("https://b", "Tech B", &["Tech"]),
+                tagged_article("https://c", "Non-tech C", &[]),
+                tagged_article("https://d", "Tech D", &["Tech"]),
+                tagged_article("https://e", "Non-tech E", &[]),
+            ];
+            st.active_filter_idx = 1; // Tech (filter_tabs[1])
+        }
+        // Filter shows 2 articles (B, D). move_selection should clamp to 0..=1.
+        w.move_selection(99);
+        assert_eq!(w.state.lock().unwrap().selected, 1);
+        w.move_selection(-99);
+        assert_eq!(w.state.lock().unwrap().selected, 0);
     }
 
     #[test]

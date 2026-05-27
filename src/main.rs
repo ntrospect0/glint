@@ -70,8 +70,27 @@ async fn run_auth(target: AuthTarget) -> Result<()> {
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+
+    // The TUI runs in alternate-screen mode, so writing tracing to stderr or
+    // stdout corrupts the dashboard the moment any widget logs a warning.
+    // Route logs to ~/.config/glint/glint.log instead — tail it when debugging.
+    let Ok(dir) = config::config_dir() else {
+        return;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("glint.log");
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
     let _ = fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_writer(std::sync::Mutex::new(file))
         .try_init();
 }
