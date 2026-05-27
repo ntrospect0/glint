@@ -139,6 +139,14 @@ pub const WIDGETS: &[WidgetDescriptor] = &[
         auth_requirements: &[],
         wizard: super::gallery::wizard_descriptor,
     },
+    #[cfg(feature = "widget-sticky")]
+    WidgetDescriptor {
+        kind: super::sticky::KIND,
+        factory: super::sticky::build,
+        default_in_first_run: false,
+        auth_requirements: &[],
+        wizard: super::sticky::wizard_descriptor,
+    },
 ];
 
 /// Look up a widget descriptor by kind string. `None` when the kind isn't

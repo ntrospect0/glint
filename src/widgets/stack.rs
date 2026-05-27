@@ -215,21 +215,28 @@ impl Widget for StackWidget {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        // Give the active child first crack at every key. Widgets that
+        // accept arbitrary text input (Notes in insert mode is the
+        // canonical example) must be able to consume `.` and `,` as
+        // text without the stack swallowing them as rotation chords.
+        // The child returns `Ignored` for keys it doesn't claim —
+        // only then does the stack's `.` / `,` rotation kick in.
+        if let Some(child) = self.children.get_mut(self.active) {
+            match child.handle_key(key) {
+                EventResult::Handled => return EventResult::Handled,
+                EventResult::Ignored => {}
+            }
+        }
         match key.code {
             KeyCode::Char(',') => {
                 self.rotate_prev();
-                return EventResult::Handled;
+                EventResult::Handled
             }
             KeyCode::Char('.') => {
                 self.rotate_next();
-                return EventResult::Handled;
+                EventResult::Handled
             }
-            _ => {}
-        }
-        if let Some(child) = self.children.get_mut(self.active) {
-            child.handle_key(key)
-        } else {
-            EventResult::Ignored
+            _ => EventResult::Ignored,
         }
     }
 
@@ -750,6 +757,61 @@ mod tests {
         assert_eq!(stack.active, 0); // wraps
         stack.handle_key(KeyEvent::from(KeyCode::Char(',')));
         assert_eq!(stack.active, 2); // wraps backward
+    }
+
+    /// When the active child claims a key (e.g. Notes in insert mode
+    /// consuming every Char as text input), the stack must NOT
+    /// interpret that same key as a rotation chord. Otherwise pasting
+    /// any text containing `.` rotates the stack instead of typing.
+    #[tokio::test]
+    async fn child_handled_key_suppresses_stack_rotation() {
+        // A stub that always claims every key — stands in for an
+        // in-insert-mode Notes widget.
+        struct GreedyChild {
+            id: String,
+        }
+        #[async_trait]
+        impl WidgetTrait for GreedyChild {
+            fn id(&self) -> &str {
+                &self.id
+            }
+            fn display_name(&self) -> &str {
+                &self.id
+            }
+            fn kind(&self) -> &str {
+                "greedy"
+            }
+            async fn update(&mut self, _ctx: &AppContext) -> Result<()> {
+                Ok(())
+            }
+            fn render(&self, _frame: &mut Frame, _area: Rect, _focused: bool) {}
+            fn handle_key(&mut self, _key: KeyEvent) -> EventResult {
+                EventResult::Handled
+            }
+            fn handle_command(&mut self, _cmd: &str, _args: &[&str]) -> Result<bool> {
+                Ok(false)
+            }
+            fn config(&self) -> serde_json::Value {
+                serde_json::json!(null)
+            }
+            fn apply_config(&mut self, _config: serde_json::Value) -> Result<()> {
+                Ok(())
+            }
+        }
+        let theme = std::sync::Arc::new(Theme::builtin_defaults());
+        let mut stack = StackWidget::new(
+            "stack:g+g".to_string(),
+            vec![
+                Box::new(GreedyChild { id: "g1".into() }),
+                Box::new(GreedyChild { id: "g2".into() }),
+            ],
+            1,
+            theme,
+        );
+        let before = stack.active;
+        stack.handle_key(KeyEvent::from(KeyCode::Char('.')));
+        stack.handle_key(KeyEvent::from(KeyCode::Char(',')));
+        assert_eq!(stack.active, before, "greedy child must suppress rotation");
     }
 
     #[tokio::test]

@@ -12,6 +12,8 @@ pub mod registry;
 #[cfg(feature = "widget-resources")]
 pub mod resources;
 pub mod stack;
+#[cfg(feature = "widget-sticky")]
+pub mod sticky;
 #[cfg(feature = "widget-stocks")]
 pub mod stocks;
 #[cfg(feature = "widget-forex")]
