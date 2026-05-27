@@ -288,6 +288,32 @@ pub trait Widget: Send + Sync {
     fn set_composite_active_index(&mut self, _idx: usize) -> bool {
         false
     }
+
+    /// Drain any "please bring me to the front" signal the widget has
+    /// queued internally. The app polls this each tick; when `Some`,
+    /// it promotes the named widget the same way `Shift+<letter>`
+    /// does — walking the stack ancestry to flip the right tab
+    /// visible and shifting input focus. The default returns `None`;
+    /// widgets opt in when they need to grab attention (timer alarm
+    /// fires, urgent notification, …). The returned id should be the
+    /// widget's *own* id (or a child id when the widget itself is a
+    /// composite). Treat this as a one-shot — the widget must clear
+    /// its internal flag inside this call so the app doesn't promote
+    /// repeatedly.
+    fn take_focus_request(&mut self) -> Option<FocusRequest> {
+        None
+    }
+}
+
+/// Widget-initiated attention grab. The app's tick loop polls every
+/// widget via `take_focus_request` and, on `Some`, walks the layout
+/// to surface the named widget.
+#[derive(Debug, Clone)]
+pub struct FocusRequest {
+    /// Id of the widget that should become focused. If the widget is
+    /// a stack child, the app flips its parent stack's active tab to
+    /// match before shifting focus.
+    pub widget_id: String,
 }
 
 /// Owns the set of registered widgets and resolves them by id.

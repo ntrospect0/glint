@@ -163,7 +163,22 @@ impl App {
         if current == self.last_persisted_stack_state {
             return;
         }
-        let payload = crate::runtime_state::RuntimeState::from_snapshot(&current);
+        // Load existing state first so we don't wipe per-widget data
+        // (e.g. clock timer durations) when writing back just the
+        // stack snapshot. Widgets manage their own keys; this routine
+        // only owns the `stacks` section.
+        let mut payload = crate::runtime_state::load();
+        payload.stacks = current
+            .iter()
+            .map(|(id, active)| {
+                (
+                    id.clone(),
+                    crate::runtime_state::StackEntry {
+                        active_tab: *active,
+                    },
+                )
+            })
+            .collect();
         if let Err(err) = crate::runtime_state::save(&payload) {
             tracing::warn!(error = %err, "failed to persist runtime state");
             return;
@@ -263,6 +278,77 @@ impl App {
         } else {
             (self.focus_idx + n - 1) % n
         };
+    }
+
+    /// Shift input focus + visible-stack-tab to the widget with the
+    /// given id. Mirrors the `Shift+<letter>` dispatcher's promotion
+    /// logic but is addressable by widget id rather than shortcut
+    /// letter — used by widget-initiated focus requests (timer alarm,
+    /// etc.) and any future "jump to this widget" plumbing. Returns
+    /// `true` when the widget was found and focus was changed.
+    fn promote_to_widget(&mut self, target_id: &str) -> bool {
+        // Direct top-level match.
+        if let Some(pos) = self.focus_order.iter().position(|w| w == target_id) {
+            self.focus_idx = pos;
+            return true;
+        }
+        // Otherwise the target is a stack child. Snapshot the
+        // (parent_id, children) pairs first so we can mutate the
+        // manager inside the loop without aliasing.
+        let parents: Vec<(String, Vec<String>)> = self
+            .focus_order
+            .iter()
+            .map(|id| {
+                let children = self
+                    .manager
+                    .get(id)
+                    .map(|w| w.composite_children())
+                    .unwrap_or_default();
+                (id.clone(), children)
+            })
+            .collect();
+        for (i, (parent_id, children)) in parents.iter().enumerate() {
+            if children.iter().any(|c| c == target_id) {
+                self.focus_idx = i;
+                if let Some(parent) = self.manager.get_mut(parent_id) {
+                    parent.switch_to_composite_child(target_id);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Drain every widget's pending focus request (including stack
+    /// children) and honor them in id order. Called from the tick
+    /// loop after `update` so widgets that decide to grab attention
+    /// inside `update` see the focus shift on the same frame.
+    /// Returns `true` when at least one request was honored, so the
+    /// caller can force a redraw even when no widget marked itself
+    /// dirty (focus changes don't auto-set the dirty bit).
+    fn process_focus_requests(&mut self) -> bool {
+        // Collect ids first (top-level + stack children) so the
+        // manager borrow stays clean while we iterate.
+        let mut all_ids: Vec<String> = Vec::new();
+        for id in self.manager.ids() {
+            all_ids.push(id.clone());
+            if let Some(w) = self.manager.get(id) {
+                all_ids.extend(w.composite_children());
+            }
+        }
+        let mut promoted = false;
+        for id in all_ids {
+            let req = self
+                .manager
+                .get_mut(&id)
+                .and_then(|w| w.take_focus_request());
+            if let Some(req) = req {
+                if self.promote_to_widget(&req.widget_id) {
+                    promoted = true;
+                }
+            }
+        }
+        promoted
     }
 
     fn handle_global_key(&mut self, key: crossterm::event::KeyEvent) {
@@ -996,13 +1082,25 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
             break;
         }
 
+        // Honor any focus requests widgets queued (e.g. a timer alarm
+        // pulling the clock to the front of its stack). Tick-only —
+        // the user-event branches (key/mouse/paste/resize) don't need
+        // this poll, and a terminal sending continuous mouse-move
+        // events shouldn't pay the per-widget iteration cost. A
+        // 250 ms latency on alarm promotion is imperceptible.
+        let focus_promoted = if is_tick {
+            app.process_focus_requests()
+        } else {
+            false
+        };
+
         let feedback_cleared = app.expire_stale_feedback();
         // Always drain widget dirty bits so they don't pile up between
         // draws — even when we already know we're going to draw (non-tick
         // events), so the next tick starts from a clean slate.
         let widgets_dirty = app.drain_widget_dirty();
         let should_draw = if is_tick {
-            widgets_dirty || feedback_cleared
+            widgets_dirty || feedback_cleared || focus_promoted
         } else {
             true
         };

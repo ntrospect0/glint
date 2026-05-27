@@ -43,6 +43,11 @@ pub struct RuntimeState {
     /// (`stack:<child1>+<child2>+…`). Missing entries default to 0.
     #[serde(default)]
     pub stacks: HashMap<String, StackEntry>,
+    /// Per-clock-instance widget state — survives restart so a set
+    /// timer duration isn't lost. Keyed by the widget id (`"clock"`,
+    /// `"clock@home"`, …). Missing entries default to empty.
+    #[serde(default)]
+    pub clocks: HashMap<String, ClockEntry>,
 }
 
 // Manual `Default` rather than `derive` so a freshly-constructed
@@ -55,6 +60,7 @@ impl Default for RuntimeState {
         Self {
             version: RUNTIME_STATE_VERSION,
             stacks: HashMap::new(),
+            clocks: HashMap::new(),
         }
     }
 }
@@ -62,6 +68,39 @@ impl Default for RuntimeState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StackEntry {
     pub active_tab: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClockEntry {
+    /// Last-committed timer duration in whole seconds. `None` when
+    /// the user has never set a timer for this clock instance.
+    #[serde(default)]
+    pub timer_duration_secs: Option<u64>,
+    /// Stopwatch accumulated time in milliseconds (sum of prior
+    /// start→stop runs). Restored as the paused value on next load.
+    #[serde(default)]
+    pub stopwatch_accumulated_ms: Option<u64>,
+    /// Unix-epoch milliseconds at which the stopwatch was last
+    /// started, if it was running when the app quit. On load the
+    /// widget computes elapsed = accumulated + (now - started) and
+    /// the stopwatch keeps ticking from where it left off.
+    /// `None` = stopwatch was paused (or never started).
+    #[serde(default)]
+    pub stopwatch_started_at_unix_ms: Option<i64>,
+    /// Unix-epoch milliseconds at which a running timer is scheduled
+    /// to fire, if the timer was Running when the app quit. On load,
+    /// if this time is in the future → Running; in the past → Fired.
+    #[serde(default)]
+    pub timer_running_end_unix_ms: Option<i64>,
+    /// Remaining time in milliseconds for a paused timer. Mutually
+    /// exclusive with `timer_running_end_unix_ms`.
+    #[serde(default)]
+    pub timer_paused_remaining_ms: Option<u64>,
+    /// Recorded stopwatch lap times, in milliseconds, in the order
+    /// the user pressed `l`. Cleared on stopwatch reset; preserved
+    /// across stop/restart and app shutdown.
+    #[serde(default)]
+    pub stopwatch_laps_ms: Vec<u64>,
 }
 
 fn default_version() -> u32 {
@@ -167,6 +206,7 @@ impl RuntimeState {
                     )
                 })
                 .collect(),
+            clocks: HashMap::new(),
         }
     }
 }
@@ -235,6 +275,7 @@ mod tests {
         let mut state = RuntimeState {
             version: RUNTIME_STATE_VERSION,
             stacks: HashMap::new(),
+            clocks: HashMap::new(),
         };
         state
             .stacks
