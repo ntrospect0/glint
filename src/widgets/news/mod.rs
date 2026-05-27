@@ -12,15 +12,16 @@ use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
 use serde::Deserialize;
 
 use crate::llm::{LlmMessage, LlmProvider, LlmRequest, Role};
-use crate::ui::{decorate_title, focus_border_style};
+use crate::theme::{ColorScheme, Theme};
+use crate::ui::decorated_title_line;
 
 use super::{AppContext, EventResult, Widget};
 
@@ -52,6 +53,26 @@ pub struct NewsConfig {
     /// accidentally while scrolling vertically.
     #[serde(default)]
     pub horizontal_scroll_filters: bool,
+
+    /// When true, each article's meta row trails with its detected topic
+    /// labels (e.g. `[Business,World]`). Many users find the categorization
+    /// noise unhelpful — flip this off to suppress it. Default true.
+    #[serde(default = "default_show_topic_labels")]
+    pub show_topic_labels: bool,
+
+    /// Per-widget style overrides layered on top of the active app
+    /// color scheme. Any role omitted here inherits from the app theme.
+    #[serde(default)]
+    pub colors: ColorScheme,
+
+    /// Prioritized `Shift+<letter>` focus shortcut preferences. Leave
+    /// empty to use the built-in default (`['n', 'e', 'w', 's']`).
+    #[serde(default)]
+    pub shortcuts: Vec<char>,
+}
+
+fn default_show_topic_labels() -> bool {
+    true
 }
 
 fn default_poll_interval() -> u64 {
@@ -65,8 +86,70 @@ impl Default for NewsConfig {
             feeds: Vec::new(),
             topics: Vec::new(),
             horizontal_scroll_filters: false,
+            show_topic_labels: default_show_topic_labels(),
+            colors: ColorScheme::default(),
+            shortcuts: Vec::new(),
         }
     }
+}
+
+/// Free-text search filter built by `:news <terms>`. Articles match if any
+/// term appears (case-insensitive substring) in the title or summary;
+/// results are sorted by total occurrence count.
+#[derive(Debug, Clone)]
+struct SearchFilter {
+    /// Original user input — used for the tab label.
+    query: String,
+    /// Lowercased tokens to match against article text.
+    terms: Vec<String>,
+}
+
+impl SearchFilter {
+    fn new(raw: &str) -> Option<Self> {
+        let terms: Vec<String> = raw
+            .split_whitespace()
+            .map(|t| t.to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if terms.is_empty() {
+            return None;
+        }
+        Some(Self {
+            query: raw.split_whitespace().collect::<Vec<_>>().join(" "),
+            terms,
+        })
+    }
+
+    /// Total number of case-insensitive substring matches of any term in
+    /// `article`'s title + summary. Used both as the "include?" predicate
+    /// (>0 means include) and as the sort key (higher wins).
+    fn hit_count(&self, article: &Article) -> usize {
+        let title = article.title.to_lowercase();
+        let summary = article
+            .summary
+            .as_deref()
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        let mut total = 0usize;
+        for term in &self.terms {
+            total += count_substring(&title, term);
+            total += count_substring(&summary, term);
+        }
+        total
+    }
+}
+
+fn count_substring(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut count = 0usize;
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        count += 1;
+        start += pos + needle.len();
+    }
+    count
 }
 
 #[derive(Default)]
@@ -77,13 +160,19 @@ struct NewsState {
     /// When true, the selected article renders its full summary (up to
     /// `MAX_SUMMARY_LINES` wrapped lines) instead of the one-line excerpt.
     expanded: bool,
-    /// Index into the widget's `filter_tabs` list. 0 is always `All`.
+    /// Index into the *visible* tab list (static topic tabs + the dynamic
+    /// search tab when one exists). 0 is always `All`.
     active_filter_idx: usize,
     last_error: Option<String>,
     last_attempt: Option<Instant>,
     inflight: bool,
     /// Per-article LLM summarization state, keyed by article URL.
     summaries: HashMap<String, SummaryState>,
+    /// Active `:news <terms>` filter, if any. When present, an extra tab
+    /// is appended to the tab bar and articles matching at least one term
+    /// are surfaced (sorted by hit count). Cleared by `x` or `:news` with
+    /// no args.
+    search: Option<SearchFilter>,
 }
 
 const MAX_SUMMARY_LINES: usize = 6;
@@ -112,23 +201,48 @@ pub struct NewsWidget {
     /// ScrollRight handler so accidental trackpad gestures don't switch tabs
     /// for users who haven't asked for that.
     horizontal_scroll_filters: bool,
+    /// Mirrors NewsConfig.show_topic_labels — when false the meta line
+    /// won't append `[Business,World,…]`.
+    show_topic_labels: bool,
+    /// App-level theme; kept so live config reloads can rebuild `theme`
+    /// from updated `colors` overrides.
+    app_theme: Arc<Theme>,
+    /// Cached widget-level `[colors]` overrides. Stored so `:scheme` can
+    /// rebuild the merged theme without re-reading `news.toml`.
+    colors_override: ColorScheme,
+    /// Merged theme (app + widget overrides). Rebuilt on `apply_config`.
+    theme: Theme,
+    /// Letter assigned by the app for `Shift+<letter>` focus, painted in
+    /// the title via `text.shortcut`. `None` = no shortcut claimed.
+    shortcut: Option<char>,
+    /// Effective shortcut preference list (TOML override or built-in).
+    shortcut_prefs: Vec<char>,
 }
 
 impl NewsWidget {
     #[cfg(test)]
     pub fn with_config(config: NewsConfig) -> Self {
-        Self::with_config_and_llm(config, None, false)
+        Self::with_config_and_llm(config, None, false, Arc::new(Theme::builtin_defaults()))
     }
 
     pub fn with_config_and_llm(
         config: NewsConfig,
         llm: Option<Arc<dyn LlmProvider>>,
         llm_summarize_enabled: bool,
+        app_theme: Arc<Theme>,
     ) -> Self {
         let feeds_configured = !config.feeds.is_empty();
         let horizontal_scroll_filters = config.horizontal_scroll_filters;
+        let show_topic_labels = config.show_topic_labels;
         let mut filter_tabs = vec![ALL_TAB_LABEL.to_string()];
         filter_tabs.extend(config.topics.iter().map(|t| t.label.clone()));
+        let colors_override = config.colors.clone();
+        let theme = app_theme.with_overrides(&colors_override);
+        let shortcut_prefs = if config.shortcuts.is_empty() {
+            vec!['n', 'e', 'w', 's']
+        } else {
+            config.shortcuts.clone()
+        };
         let provider: Arc<dyn NewsProvider> = match RssProvider::new(config.feeds, config.topics) {
             Ok(p) => Arc::new(p),
             Err(err) => {
@@ -146,6 +260,12 @@ impl NewsWidget {
             llm,
             llm_summarize_enabled,
             horizontal_scroll_filters,
+            show_topic_labels,
+            app_theme,
+            colors_override,
+            theme,
+            shortcut: None,
+            shortcut_prefs,
         }
     }
 
@@ -214,12 +334,32 @@ impl NewsWidget {
         });
     }
 
+    /// Compose the *visible* tab list = static tabs from config + an
+    /// extra `🔎 <query>` tab when a search filter is active. Callers walk
+    /// this list to render the tab bar, count clickable widths, and resolve
+    /// `active_filter_idx` to a label.
+    fn visible_tabs(&self, search: Option<&SearchFilter>) -> Vec<String> {
+        let mut tabs = self.filter_tabs.clone();
+        if let Some(s) = search {
+            tabs.push(format!("🔎 {}", s.query));
+        }
+        tabs
+    }
+
+    /// Snapshot of `visible_tabs` taken under the state lock. Used in
+    /// render/mouse paths that already need the lock for other state.
+    fn snapshot_visible_tabs(&self) -> Vec<String> {
+        let st = self.state.lock().expect("news state poisoned");
+        self.visible_tabs(st.search.as_ref())
+    }
+
     fn cycle_filter(&mut self, forward: bool) {
-        if self.filter_tabs.len() <= 1 {
+        let mut st = self.state.lock().expect("news state poisoned");
+        let tabs = self.visible_tabs(st.search.as_ref());
+        if tabs.len() <= 1 {
             return;
         }
-        let mut st = self.state.lock().expect("news state poisoned");
-        let n = self.filter_tabs.len();
+        let n = tabs.len();
         st.active_filter_idx = if forward {
             (st.active_filter_idx + 1) % n
         } else {
@@ -229,11 +369,40 @@ impl NewsWidget {
         st.scroll = 0;
     }
 
+    /// `:news <terms>` — replace any prior search with a new one and
+    /// switch focus to the search tab. Empty `terms` falls back to
+    /// `clear_search`.
+    fn set_search(&mut self, raw: &str) {
+        let Some(filter) = SearchFilter::new(raw) else {
+            self.clear_search();
+            return;
+        };
+        let mut st = self.state.lock().expect("news state poisoned");
+        st.search = Some(filter);
+        // Switch the active tab to the new (just-appended) search tab.
+        st.active_filter_idx = self.filter_tabs.len();
+        st.selected = 0;
+        st.scroll = 0;
+        st.expanded = false;
+    }
+
+    /// `x` or `:news` with no args — drop the search filter, snap back to
+    /// the All tab. No-op when no search was active.
+    fn clear_search(&mut self) {
+        let mut st = self.state.lock().expect("news state poisoned");
+        if st.search.take().is_some() {
+            st.active_filter_idx = 0;
+            st.selected = 0;
+            st.scroll = 0;
+            st.expanded = false;
+        }
+    }
+
     /// Mirrors the inner-area split used by `render`: tab bar on top (2 rows
     /// when topics exist, otherwise 1 for padding), single-row footer at the
     /// bottom, list fills the middle.
     fn split_inner(&self, inner: Rect) -> (Rect, Rect, Rect) {
-        let has_tabs = self.filter_tabs.len() > 1;
+        let has_tabs = self.snapshot_visible_tabs().len() > 1;
         let tab_height: u16 = if has_tabs { 2 } else { 1 };
         let footer_height = 1u16;
         let list_height = inner.height.saturating_sub(footer_height + tab_height);
@@ -250,8 +419,9 @@ impl NewsWidget {
 
     /// Reverse of the tab-bar render: leading space + `[label]` + space.
     fn tab_index_at(&self, click_col: u16, tab_area: Rect) -> Option<usize> {
+        let tabs = self.snapshot_visible_tabs();
         let mut x: u16 = tab_area.x + 1; // leading space
-        for (i, label) in self.filter_tabs.iter().enumerate() {
+        for (i, label) in tabs.iter().enumerate() {
             let w = label.chars().count() as u16 + 2; // [label]
             if click_col >= x && click_col < x + w {
                 return Some(i);
@@ -267,9 +437,28 @@ impl NewsWidget {
     fn filtered_articles(&self) -> Vec<Article> {
         let st = self.state.lock().expect("news state poisoned");
         let active = st.active_filter_idx;
+        let search_tab_idx = self.filter_tabs.len();
+
+        // Search tab: rank by hit count desc, drop misses.
+        if st.search.is_some() && active == search_tab_idx {
+            let search = st.search.as_ref().expect("checked above");
+            let mut scored: Vec<(usize, Article)> = st
+                .articles
+                .iter()
+                .map(|a| (search.hit_count(a), a.clone()))
+                .filter(|(n, _)| *n > 0)
+                .collect();
+            // Stable sort so equal-score articles keep recency order from
+            // the underlying provider feed.
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            return scored.into_iter().map(|(_, a)| a).collect();
+        }
+
+        // "All" tab → unfiltered.
         if active == 0 {
             return st.articles.clone();
         }
+        // Topic tab (anything between All and the search tab).
         let Some(label) = self.filter_tabs.get(active) else {
             return st.articles.clone();
         };
@@ -318,9 +507,10 @@ impl NewsWidget {
 
     #[cfg(test)]
     fn active_filter_label(&self) -> String {
-        let idx = self.state.lock().expect("news state poisoned").active_filter_idx;
-        self.filter_tabs
-            .get(idx)
+        let st = self.state.lock().expect("news state poisoned");
+        let idx = st.active_filter_idx;
+        let tabs = self.visible_tabs(st.search.as_ref());
+        tabs.get(idx)
             .cloned()
             .unwrap_or_else(|| ALL_TAB_LABEL.to_string())
     }
@@ -472,7 +662,16 @@ impl Widget for NewsWidget {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
-        let (all_articles, selected, mut scroll, expanded, active_filter_idx, inflight, last_error) = {
+        let (
+            all_articles,
+            selected,
+            mut scroll,
+            expanded,
+            active_filter_idx,
+            inflight,
+            last_error,
+            search,
+        ) = {
             let st = self.state.lock().expect("news state poisoned");
             (
                 st.articles.clone(),
@@ -482,21 +681,34 @@ impl Widget for NewsWidget {
                 st.active_filter_idx,
                 st.inflight,
                 st.last_error.clone(),
+                st.search.clone(),
             )
         };
 
-        // Apply the active filter (idx 0 = All; anything else matches a topic).
-        let active_filter: Option<&str> = if active_filter_idx == 0 {
-            None
-        } else {
-            self.filter_tabs.get(active_filter_idx).map(String::as_str)
-        };
-        let articles: Vec<Article> = match active_filter {
-            None => all_articles,
-            Some(label) => all_articles
+        let visible_tabs = self.visible_tabs(search.as_ref());
+        let search_tab_idx = self.filter_tabs.len();
+        // Apply the active filter. Tab 0 = All, the last tab when a search
+        // is active = scored search results, anything between = topic match.
+        let articles: Vec<Article> = if let Some(s) = search
+            .as_ref()
+            .filter(|_| active_filter_idx == search_tab_idx)
+        {
+            let mut scored: Vec<(usize, Article)> = all_articles
+                .into_iter()
+                .map(|a| (s.hit_count(&a), a))
+                .filter(|(n, _)| *n > 0)
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            scored.into_iter().map(|(_, a)| a).collect()
+        } else if active_filter_idx == 0 {
+            all_articles
+        } else if let Some(label) = self.filter_tabs.get(active_filter_idx) {
+            all_articles
                 .into_iter()
                 .filter(|a| a.topics.iter().any(|t| t == label))
-                .collect(),
+                .collect()
+        } else {
+            all_articles
         };
 
         let title = if articles.is_empty() {
@@ -506,10 +718,14 @@ impl Widget for NewsWidget {
         };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(focus_border_style(focused))
-            .title(Span::styled(
-                decorate_title(focused, &title),
-                Style::default().add_modifier(Modifier::BOLD),
+            .border_type(BorderType::Rounded)
+            .border_style(self.theme.border_style(focused))
+            .title(decorated_title_line(
+                focused,
+                &title,
+                self.shortcut,
+                self.theme.widget_title,
+                self.theme.text_shortcut,
             ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -517,7 +733,7 @@ impl Widget for NewsWidget {
         // Reserve a top tab-bar row (only when we have configured topics so
         // the user actually has something to filter on), a bottom footer row,
         // and a blank row between the tabs and the list.
-        let has_tabs = self.filter_tabs.len() > 1;
+        let has_tabs = visible_tabs.len() > 1;
         let tab_height: u16 = if has_tabs { 2 } else { 1 };
         let footer_height = 1u16;
         let list_height = inner.height.saturating_sub(footer_height + tab_height);
@@ -542,21 +758,19 @@ impl Widget for NewsWidget {
 
         // Render the tab bar.
         if has_tabs {
-            let mut spans: Vec<Span<'_>> = Vec::with_capacity(self.filter_tabs.len() * 2);
+            let mut spans: Vec<Span<'_>> = Vec::with_capacity(visible_tabs.len() * 2);
             spans.push(Span::raw(" "));
-            for (i, label) in self.filter_tabs.iter().enumerate() {
+            for (i, label) in visible_tabs.iter().enumerate() {
                 let is_active = i == active_filter_idx;
                 let style = if is_active {
-                    // Yellow for the active tab so it matches the selected-
-                    // headline color — "yellow = active selection".
-                    Style::default()
-                        .fg(Color::LightYellow)
-                        .add_modifier(Modifier::BOLD)
+                    // text.selected on the active tab so it matches the
+                    // selected-headline color — "yellow-ish = active".
+                    self.theme.text_selected
                 } else {
-                    Style::default().add_modifier(Modifier::DIM)
+                    self.theme.text_dim
                 };
                 spans.push(Span::styled(format!("[{label}]"), style));
-                if i + 1 < self.filter_tabs.len() {
+                if i + 1 < visible_tabs.len() {
                     spans.push(Span::raw(" "));
                 }
             }
@@ -625,19 +839,17 @@ impl Widget for NewsWidget {
 
             let prefix = if is_selected { "▸ " } else { "  " };
             let title_style = if is_selected {
-                // LightYellow matches the calendar tear-off-sheet date — the
-                // selected article should pop the same way.
-                Style::default()
-                    .fg(Color::LightYellow)
-                    .add_modifier(Modifier::BOLD)
+                // `text.selected` from the active scheme — the selected
+                // article should pop the same way as other selections
+                // (e.g. the calendar's "[Today]" pill, stocks' active period).
+                self.theme.text_selected
             } else if focused {
-                // Cyan only while the widget itself is focused — when focus
-                // moves away, the inactive cell stays calm with default text.
-                Style::default()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD)
+                // `text.focused` only while the widget itself is focused —
+                // when focus moves away, the inactive cell stays calm with
+                // default text styling.
+                self.theme.text_focused
             } else {
-                Style::default().add_modifier(Modifier::BOLD)
+                self.theme.text_brilliant
             };
             let title_room = inner_width.saturating_sub(2);
             lines.push(Line::from(vec![
@@ -648,7 +860,7 @@ impl Widget for NewsWidget {
             // Row 2: 3-space indent + dim metadata. When expanded we drop the
             // summary excerpt from this row (it has its own block underneath).
             let mut meta = format!("   {} · {}", age_label(now, article.published), article.source);
-            if !article.topics.is_empty() {
+            if self.show_topic_labels && !article.topics.is_empty() {
                 meta.push_str(&format!(" · [{}]", article.topics.join(",")));
             }
             if !expand_this {
@@ -660,7 +872,7 @@ impl Widget for NewsWidget {
             let meta = truncate(&meta, inner_width.saturating_sub(1));
             lines.push(Line::from(Span::styled(
                 meta,
-                Style::default().add_modifier(Modifier::DIM),
+                self.theme.text_dim,
             )));
 
             for sline in &summary_lines {
@@ -676,7 +888,7 @@ impl Widget for NewsWidget {
 
         let footer = Paragraph::new(Line::from(Span::styled(
             "↑/↓ select · ←/→ filter · e expand · Enter open · g/G top/bot · r refresh",
-            Style::default().add_modifier(Modifier::DIM),
+            self.theme.text_dim,
         )))
         .alignment(Alignment::Right);
         frame.render_widget(footer, footer_area);
@@ -736,6 +948,12 @@ impl Widget for NewsWidget {
             }
             KeyCode::Char(']') | KeyCode::Right | KeyCode::Char('l') => {
                 self.cycle_filter(true);
+                EventResult::Handled
+            }
+            // `x` drops the `:news <terms>` search filter, snapping back
+            // to the All tab. No-op when no search is active.
+            KeyCode::Char('x') => {
+                self.clear_search();
                 EventResult::Handled
             }
             _ => EventResult::Ignored,
@@ -808,8 +1026,21 @@ impl Widget for NewsWidget {
         EventResult::Ignored
     }
 
-    fn handle_command(&mut self, _cmd: &str, _args: &[&str]) -> Result<bool> {
-        Ok(false)
+    fn handle_command(&mut self, cmd: &str, args: &[&str]) -> Result<bool> {
+        if cmd != "news" {
+            return Ok(false);
+        }
+        let query = args.join(" ");
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            // Bare `:news` clears any active search and snaps to All.
+            self.clear_search();
+        } else {
+            self.set_search(trimmed);
+        }
+        // Return Ok(true) so the dispatcher claims focus for us — the user
+        // typing `:news climate` clearly wants to see news.
+        Ok(true)
     }
 
     fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
@@ -820,6 +1051,8 @@ impl Widget for NewsWidget {
             ("g / G", "jump to top / bottom"),
             ("Enter", "open article URL in browser"),
             ("e", "expand selected article"),
+            ("x", "clear :news <terms> search filter"),
+            (":news <terms>", "filter articles by keyword (ranked by hits)"),
             ("r", "force refresh"),
         ]
     }
@@ -834,11 +1067,26 @@ impl Widget for NewsWidget {
         let new_config: NewsConfig =
             serde_json::from_value(config).context("invalid news config payload")?;
         // Preserve the active LLM provider + summarize flag across reloads —
-        // those are app-level, not user-config-level.
+        // those are app-level, not user-config-level. Same goes for the
+        // app theme.
         let llm = self.llm.clone();
         let summarize = self.llm_summarize_enabled;
-        *self = Self::with_config_and_llm(new_config, llm, summarize);
+        let app_theme = self.app_theme.clone();
+        *self = Self::with_config_and_llm(new_config, llm, summarize, app_theme);
         Ok(())
+    }
+
+    fn set_app_theme(&mut self, theme: Arc<Theme>) {
+        self.theme = theme.with_overrides(&self.colors_override);
+        self.app_theme = theme;
+    }
+
+    fn shortcut_preferences(&self) -> &[char] {
+        &self.shortcut_prefs
+    }
+
+    fn set_shortcut(&mut self, shortcut: Option<char>) {
+        self.shortcut = shortcut;
     }
 }
 

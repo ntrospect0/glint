@@ -1,3 +1,4 @@
+pub mod icons;
 pub mod provider;
 
 use std::{
@@ -13,18 +14,21 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
 use serde::Deserialize;
 
 use crate::geolocation::{self, GeoLocation};
 use crate::providers::DataProvider;
-use crate::ui::{decorate_title, focus_border_style};
+use crate::theme::{ColorScheme, Theme};
+use crate::ui::decorated_title_line;
 
 use super::{AppContext, EventResult, Widget};
 
-use provider::{ascii_art, describe_code, OpenMeteoProvider, Units, WeatherData};
+use provider::{
+    describe_code, icon_for_code, render_icon, OpenMeteoProvider, Units, WeatherData,
+};
 
 /// User-configurable weather options (loaded from `~/.config/glint/weather.toml`).
 #[derive(Debug, Clone, Deserialize)]
@@ -51,6 +55,16 @@ pub struct WeatherConfig {
     /// refresh and caches the result for the session.
     #[serde(default = "default_auto_locate")]
     pub auto_locate: bool,
+
+    /// Per-widget style overrides layered on top of the active app
+    /// color scheme. Any role omitted here inherits from the app theme.
+    #[serde(default)]
+    pub colors: ColorScheme,
+
+    /// Prioritized `Shift+<letter>` focus shortcut preferences. Leave
+    /// empty to use the built-in default (`['w', 'e', 'a', 't', 'h', 'r']`).
+    #[serde(default)]
+    pub shortcuts: Vec<char>,
 }
 
 fn default_units() -> Units {
@@ -75,6 +89,8 @@ impl Default for WeatherConfig {
             units: default_units(),
             poll_interval_secs: default_poll_interval(),
             auto_locate: default_auto_locate(),
+            colors: ColorScheme::default(),
+            shortcuts: Vec::new(),
         }
     }
 }
@@ -100,16 +116,29 @@ pub struct WeatherWidget {
     config: WeatherConfig,
     state: Arc<Mutex<WeatherState>>,
     poll_interval: Duration,
+    /// App-level theme; kept so live config reloads can rebuild `theme`
+    /// from updated `colors` overrides.
+    app_theme: Arc<Theme>,
+    /// Merged theme (app + widget overrides). Rebuilt on `apply_config`.
+    theme: Theme,
+    /// Letter assigned by the app for `Shift+<letter>` focus, painted in
+    /// the title via `text.shortcut`. `None` = no shortcut claimed.
+    shortcut: Option<char>,
+    /// Effective shortcut preference list (TOML override or built-in).
+    shortcut_prefs: Vec<char>,
 }
 
 impl Default for WeatherWidget {
     fn default() -> Self {
-        Self::with_config(WeatherConfig::default())
+        Self::with_config(
+            WeatherConfig::default(),
+            Arc::new(Theme::builtin_defaults()),
+        )
     }
 }
 
 impl WeatherWidget {
-    pub fn with_config(config: WeatherConfig) -> Self {
+    pub fn with_config(config: WeatherConfig, app_theme: Arc<Theme>) -> Self {
         // If the user specified explicit lat/lon, seed the location immediately
         // so we skip the geolocation hop.
         let initial_location = match (config.latitude, config.longitude) {
@@ -128,11 +157,21 @@ impl WeatherWidget {
             location: initial_location,
             ..WeatherState::default()
         }));
+        let theme = app_theme.with_overrides(&config.colors);
+        let shortcut_prefs = if config.shortcuts.is_empty() {
+            vec!['w', 'e', 'a', 't', 'h', 'r']
+        } else {
+            config.shortcuts.clone()
+        };
         Self {
             id: "weather".into(),
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(30)),
             config,
             state,
+            app_theme,
+            theme,
+            shortcut: None,
+            shortcut_prefs,
         }
     }
 
@@ -299,6 +338,15 @@ impl Widget for WeatherWidget {
                 .as_ref()
                 .map(|l| format!("{} (lookup)", l.label))
                 .or_else(|| st.location.as_ref().map(|l| l.label.clone()));
+            // `revert_target` is populated only when an override is active.
+            // The default location (loaded from weather.toml) is what `x`
+            // brings us back to — surface its label so the hint reads
+            // "x: revert to Richmond, BC" rather than a vague "revert".
+            let revert_target = if st.transient_location.is_some() {
+                st.location.as_ref().map(|l| l.label.clone())
+            } else {
+                None
+            };
             Snapshot {
                 location_label: label,
                 locating: st.locating,
@@ -307,6 +355,7 @@ impl Widget for WeatherWidget {
                 last_error: st.last_error.clone(),
                 inflight: st.inflight || st.transient_searching,
                 attempted: st.last_attempt.is_some(),
+                revert_target,
             }
         };
         let title_label = snapshot
@@ -315,13 +364,41 @@ impl Widget for WeatherWidget {
             .unwrap_or_else(|| "Locating…".into());
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(focus_border_style(focused))
-            .title(Span::styled(
-                decorate_title(focused, &format!("Weather — {title_label}")),
-                Style::default().add_modifier(Modifier::BOLD),
+            .border_type(BorderType::Rounded)
+            .border_style(self.theme.border_style(focused))
+            .title(decorated_title_line(
+                focused,
+                &format!("Weather — {title_label}"),
+                self.shortcut,
+                self.theme.widget_title,
+                self.theme.text_shortcut,
             ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
+
+        // Reserve a bottom row for the override hint when `:weather <city>`
+        // is active. Falls back to the full inner area when there's no
+        // override or the cell is too short to spare a row.
+        let (body_area, hint_area) =
+            if snapshot.revert_target.is_some() && inner.height >= 2 {
+                let h = inner.height - 1;
+                (
+                    Rect {
+                        x: inner.x,
+                        y: inner.y,
+                        width: inner.width,
+                        height: h,
+                    },
+                    Some(Rect {
+                        x: inner.x,
+                        y: inner.y + h,
+                        width: inner.width,
+                        height: 1,
+                    }),
+                )
+            } else {
+                (inner, None)
+            };
 
         // When we have weather data, the ASCII art needs its own fixed-width
         // sub-rect so each art row lands at the same x offset. Centered
@@ -329,14 +406,29 @@ impl Widget for WeatherWidget {
         // different trimmed widths shift relative to each other, which made
         // the symmetric sun look broken on the bottom row.
         if let Some(data) = &snapshot.data {
-            render_with_art(frame, inner, &snapshot, data, self.config.units);
+            render_with_art(
+                frame,
+                body_area,
+                &snapshot,
+                data,
+                self.config.units,
+                &self.theme,
+            );
         } else {
-            let lines = loading_lines(&snapshot);
+            let lines = loading_lines(&snapshot, &self.theme);
             let mut padded: Vec<Line<'_>> = Vec::with_capacity(lines.len() + 1);
             padded.push(Line::from(""));
             padded.extend(lines);
             let body = Paragraph::new(padded).alignment(Alignment::Center);
-            frame.render_widget(body, inner);
+            frame.render_widget(body, body_area);
+        }
+
+        if let (Some(area), Some(target)) = (hint_area, snapshot.revert_target.as_deref()) {
+            let hint = Line::from(Span::styled(
+                format!("x: revert to {target}"),
+                self.theme.text_dim,
+            ));
+            frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), area);
         }
     }
 
@@ -388,8 +480,22 @@ impl Widget for WeatherWidget {
     fn apply_config(&mut self, config: serde_json::Value) -> Result<()> {
         let new_config: WeatherConfig =
             serde_json::from_value(config).context("invalid weather config payload")?;
-        *self = Self::with_config(new_config);
+        let app_theme = self.app_theme.clone();
+        *self = Self::with_config(new_config, app_theme);
         Ok(())
+    }
+
+    fn set_app_theme(&mut self, theme: Arc<Theme>) {
+        self.theme = theme.with_overrides(&self.config.colors);
+        self.app_theme = theme;
+    }
+
+    fn shortcut_preferences(&self) -> &[char] {
+        &self.shortcut_prefs
+    }
+
+    fn set_shortcut(&mut self, shortcut: Option<char>) {
+        self.shortcut = shortcut;
     }
 }
 
@@ -401,13 +507,12 @@ struct Snapshot {
     last_error: Option<String>,
     inflight: bool,
     attempted: bool,
+    /// Label of the configured default location (typed at startup from
+    /// `weather.toml`). Populated only when a `:weather <city>` override is
+    /// active — used to drive the "x: revert to <default>" footer hint.
+    revert_target: Option<String>,
 }
 
-/// Width of every row in `ascii_art()`. Used to carve a fixed sub-rect so all
-/// art rows render at the same x offset regardless of trailing-whitespace
-/// quirks in centered Paragraph layout.
-const ASCII_ART_WIDTH: u16 = 13;
-const ASCII_ART_HEIGHT: u16 = 4;
 
 fn render_with_art(
     frame: &mut Frame,
@@ -415,14 +520,27 @@ fn render_with_art(
     s: &Snapshot,
     data: &WeatherData,
     units: Units,
+    theme: &Theme,
 ) {
     let (label, icon) = describe_code(data.weather_code);
 
     // Header: top blank + condition label + blank.
+    //
+    // We center the icon + label manually instead of relying on
+    // `Alignment::Center`. Ratatui's center math goes through
+    // `unicode_width`, which reports the emoji + VS-16 sequence as width 1,
+    // but actual terminals render the glyph as 2 cells. Their disagreement
+    // would shift the whole line one cell off-center. `chars().count()`
+    // matches the real cell width for our icons (emoji + VS-16 = 2 chars,
+    // bare "·" fallback = 1 char) so the hand-rolled padding lines up with
+    // what the user actually sees.
+    let header_text = format!("{icon}  {label}");
+    let visual_width = header_text.chars().count() as u16;
+    let pad = inner.width.saturating_sub(visual_width) / 2;
     let header_lines: Vec<Line<'_>> = vec![
         Line::from(""),
         Line::from(Span::styled(
-            format!("{icon}  {label}"),
+            format!("{:pad$}{header_text}", "", pad = pad as usize),
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -435,29 +553,42 @@ fn render_with_art(
         height: header_height.min(inner.height),
     };
     frame.render_widget(
-        Paragraph::new(header_lines).alignment(Alignment::Center),
+        Paragraph::new(header_lines).alignment(Alignment::Left),
         header_area,
     );
 
-    // Art: own fixed-width left-aligned sub-rect, horizontally centered.
-    if inner.height >= header_height + ASCII_ART_HEIGHT {
-        let art_w = ASCII_ART_WIDTH.min(inner.width);
-        let art_x = inner.x + (inner.width.saturating_sub(art_w)) / 2;
+    // Art: pick the icon for the current weather + time-of-day, then carve
+    // out a sub-rect sized to *that* icon's actual dimensions. Using the
+    // icon's own height/width (rather than the worst-case maximum across
+    // all 16 glyphs) keeps the gap between the art and the temperature
+    // text tight regardless of which sprite is displayed.
+    //
+    // When the cell is short, the art is the first thing to go — temp,
+    // feels-like, humidity, wind, and forecast all communicate the actual
+    // weather; the glyph is decoration. `MIN_BOTTOM_ROWS_FOR_ART` is the
+    // approximate row count needed to show the full bottom block (temp +
+    // feels + blank + humidity/wind + blank + "Next 3 days" header + 3
+    // forecast rows + blank + footer = ~11). If we can't fit header + icon +
+    // that, drop the icon and let the bottom block use the freed rows.
+    const MIN_BOTTOM_ROWS_FOR_ART: u16 = 11;
+    let night = data.is_night(chrono::Local::now());
+    let icon = icon_for_code(data.weather_code, night);
+    let icon_rows = (icon.height as u16).div_ceil(2);
+    let icon_cols = (icon.width as u16).min(inner.width);
+    let mut used_top = header_height;
+    if inner.height >= header_height + icon_rows + MIN_BOTTOM_ROWS_FOR_ART {
+        let art_x = inner.x + (inner.width.saturating_sub(icon_cols)) / 2;
         let art_area = Rect {
             x: art_x,
             y: inner.y + header_height,
-            width: art_w,
-            height: ASCII_ART_HEIGHT,
+            width: icon_cols,
+            height: icon_rows,
         };
-        let art_lines: Vec<Line<'_>> = ascii_art(data.weather_code)
-            .iter()
-            .map(|s| Line::from(*s))
-            .collect();
-        frame.render_widget(Paragraph::new(art_lines), art_area);
+        frame.render_widget(Paragraph::new(render_icon(icon)), art_area);
+        used_top = used_top.saturating_add(icon_rows).saturating_add(1); // +1 trailing blank
     }
 
     // Bottom section: temp, feels-like, humidity/wind, forecast, footer.
-    let used_top = header_height + ASCII_ART_HEIGHT + 1; // +1 trailing blank
     if inner.height <= used_top {
         return;
     }
@@ -491,7 +622,7 @@ fn render_with_art(
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "── Next 3 days ──",
-            Style::default().add_modifier(Modifier::DIM),
+            theme.text_dim,
         )));
         for d in data.daily.iter().skip(1).take(3) {
             let (_, icon) = describe_code(d.weather_code);
@@ -518,10 +649,7 @@ fn render_with_art(
     } else {
         format!("Updated {age} ago")
     };
-    lines.push(Line::from(Span::styled(
-        footer,
-        Style::default().add_modifier(Modifier::DIM),
-    )));
+    lines.push(Line::from(Span::styled(footer, theme.text_dim)));
 
     frame.render_widget(
         Paragraph::new(lines).alignment(Alignment::Center),
@@ -529,7 +657,7 @@ fn render_with_art(
     );
 }
 
-fn loading_lines(s: &Snapshot) -> Vec<Line<'_>> {
+fn loading_lines(s: &Snapshot, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'_>> = Vec::new();
     lines.push(Line::from(""));
     if s.location_label.is_none() {
@@ -543,7 +671,7 @@ fn loading_lines(s: &Snapshot) -> Vec<Line<'_>> {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Set latitude/longitude in ~/.config/glint/weather.toml",
-                Style::default().add_modifier(Modifier::DIM),
+                theme.text_dim,
             )));
         } else if s.locating {
             lines.push(Line::from("Locating you via IP…"));
@@ -599,6 +727,10 @@ fn weekday_short(w: chrono::Weekday) -> &'static str {
 mod tests {
     use super::*;
 
+    fn build_widget(cfg: WeatherConfig) -> WeatherWidget {
+        WeatherWidget::with_config(cfg, Arc::new(Theme::builtin_defaults()))
+    }
+
     #[test]
     fn default_widget_seeds_richmond_location() {
         let w = WeatherWidget::default();
@@ -619,7 +751,7 @@ mod tests {
             longitude: Some(-123.133),
             ..WeatherConfig::default()
         };
-        let w = WeatherWidget::with_config(cfg);
+        let w = build_widget(cfg);
         let st = w.state.lock().unwrap();
         let loc = st.location.as_ref().expect("location should be seeded");
         assert_eq!(loc.latitude, 49.166);
@@ -632,7 +764,7 @@ mod tests {
             poll_interval_secs: 5,
             ..WeatherConfig::default()
         };
-        let w = WeatherWidget::with_config(cfg);
+        let w = build_widget(cfg);
         assert_eq!(w.poll_interval, Duration::from_secs(30));
     }
 
@@ -657,7 +789,7 @@ mod tests {
             longitude: None,
             ..WeatherConfig::default()
         };
-        let w = WeatherWidget::with_config(cfg);
+        let w = build_widget(cfg);
         assert!(matches!(w.next_action(), NextAction::Locate));
     }
 
@@ -669,7 +801,7 @@ mod tests {
             label: Some("Richmond, BC".into()),
             ..WeatherConfig::default()
         };
-        let w = WeatherWidget::with_config(cfg);
+        let w = build_widget(cfg);
         assert!(matches!(w.next_action(), NextAction::Fetch));
     }
 
@@ -681,7 +813,7 @@ mod tests {
             auto_locate: false,
             ..WeatherConfig::default()
         };
-        let w = WeatherWidget::with_config(cfg);
+        let w = build_widget(cfg);
         assert!(matches!(w.next_action(), NextAction::Wait));
     }
 }

@@ -10,6 +10,7 @@ mod event;
 mod geolocation;
 mod llm;
 mod providers;
+mod theme;
 mod ui;
 mod widgets;
 

@@ -10,6 +10,11 @@ pub struct Event {
     pub start: DateTime<Local>,
     pub end: DateTime<Local>,
     pub all_day: bool,
+    /// The backend that produced this event: "google", "outlook", "caldav",
+    /// "local". Used together with `calendar` so the color-assignment map can
+    /// disambiguate accounts that share a calendar id (e.g. both Google and
+    /// Outlook have a calendar named "primary").
+    pub source: String,
     pub calendar: String,
     pub location: Option<String>,
 }
@@ -62,6 +67,7 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Local),
             all_day,
+            source: "local".into(),
             calendar: "test".into(),
             location: None,
         }

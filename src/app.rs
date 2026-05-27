@@ -1,4 +1,4 @@
-use std::{io, path::PathBuf, time::Duration};
+use std::{cell::Cell, collections::HashMap, io, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -11,12 +11,11 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 
-use chrono::Local;
-
 use crate::{
     config::{self, Config},
     event::{Event, EventReader},
     llm::{self, LlmConfig},
+    theme::{self, Theme},
     ui,
     widgets::{
         calendar::{CalendarConfig, CalendarWidget},
@@ -32,15 +31,25 @@ use crate::{
 /// overlay land in subsequent phases.
 pub struct App {
     config: Config,
+    theme: Arc<Theme>,
     manager: WidgetManager,
     focus_idx: usize,
     /// Widget ids in the order they appear in the grid (Tab cycling order).
     focus_order: Vec<String>,
+    /// Letter → widget id map for `Shift+<letter>` focus jumps. Built once
+    /// at construction by walking each widget's `shortcut_preferences`
+    /// list; first registered widget wins on conflicts.
+    shortcuts: HashMap<char, String>,
     should_quit: bool,
-    /// Set on every successful tick to drive the status-bar "Last fetch" field.
-    last_fetch: Option<chrono::DateTime<Local>>,
     /// True when the `?` help overlay is showing.
     show_help: bool,
+    /// Row offset for the help overlay's vertical scroll. Cleared to 0
+    /// when the overlay opens.
+    help_scroll: u16,
+    /// Last-known maximum scroll value for the help overlay. Updated by
+    /// `ui::help::render` on every frame so the scroll handler can clamp
+    /// without re-computing the layout.
+    help_scroll_max: Cell<u16>,
     /// `Some` while the user is composing a command after pressing `:`.
     /// `None` when the command bar is closed.
     command_buffer: Option<String>,
@@ -51,6 +60,14 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config) -> Self {
+        // Resolve the app-level color palette. Falls back to built-in
+        // defaults if `colorschemes.toml` is missing or the named scheme
+        // can't be found — the app should always start.
+        let theme = theme::load(&config.global.theme).unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "failed to load colorschemes.toml, using built-in defaults");
+            Arc::new(Theme::builtin_defaults())
+        });
+
         let clock_cfg: ClockConfig = config::load_widget_toml("clock").unwrap_or_default();
         let weather_cfg: WeatherConfig = config::load_widget_toml("weather").unwrap_or_default();
         let calendar_cfg: CalendarConfig =
@@ -69,28 +86,43 @@ impl App {
         let news_summarize = llm_cfg.features.news_summarize;
 
         let mut manager = WidgetManager::new();
-        manager.register(StocksWidget::with_config(stocks_cfg));
-        manager.register(ClockWidget::with_config(clock_cfg));
-        manager.register(WeatherWidget::with_config(weather_cfg));
-        manager.register(CalendarWidget::with_config(calendar_cfg));
+        manager.register(StocksWidget::with_config(stocks_cfg, theme.clone()));
+        manager.register(ClockWidget::with_config(clock_cfg, theme.clone()));
+        manager.register(WeatherWidget::with_config(weather_cfg, theme.clone()));
+        manager.register(CalendarWidget::with_config(calendar_cfg, theme.clone()));
         manager.register(NewsWidget::with_config_and_llm(
             news_cfg,
             llm_provider,
             news_summarize,
+            theme.clone(),
         ));
 
         let focus_order = focus_order_from_layout(&config, &manager);
+        let shortcuts = assign_shortcuts(&mut manager);
         Self {
             config,
+            theme,
             manager,
             focus_idx: 0,
             focus_order,
+            shortcuts,
             should_quit: false,
-            last_fetch: None,
             show_help: false,
+            help_scroll: 0,
+            help_scroll_max: Cell::new(0),
             command_buffer: None,
             command_feedback: None,
         }
+    }
+
+    /// Adjust the help overlay's vertical scroll by `delta` rows. Clamps
+    /// against `help_scroll_max` (updated by the previous render) so we
+    /// never scroll past the last line of content. Called by Up/Down/k/j
+    /// /PgUp/PgDn keys and by mouse wheel events when the overlay is open.
+    fn scroll_help(&mut self, delta: i32) {
+        let max = self.help_scroll_max.get() as i32;
+        let next = (self.help_scroll as i32 + delta).clamp(0, max);
+        self.help_scroll = next as u16;
     }
 
     fn focused_widget(&self) -> Option<&str> {
@@ -110,15 +142,24 @@ impl App {
     }
 
     fn handle_global_key(&mut self, key: crossterm::event::KeyEvent) {
-        // Help overlay intercepts every key (Esc / ? close it; anything else
-        // is ignored). Returning early keeps q from quitting through the
-        // overlay accidentally.
+        // Help overlay intercepts every key. Esc / ? / q close it,
+        // ↑/↓/k/j/PgUp/PgDn/Home/End scroll the contents, anything else is
+        // swallowed so q doesn't accidentally quit through the overlay.
         if self.show_help {
-            if matches!(
-                key.code,
-                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q')
-            ) {
-                self.show_help = false;
+            match key.code {
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.show_help = false;
+                    self.help_scroll = 0;
+                }
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_help(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_help(1),
+                KeyCode::PageUp => self.scroll_help(-10),
+                KeyCode::PageDown => self.scroll_help(10),
+                KeyCode::Home | KeyCode::Char('g') => self.help_scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.help_scroll = self.help_scroll_max.get();
+                }
+                _ => {}
             }
             return;
         }
@@ -131,11 +172,25 @@ impl App {
             }
             (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
                 self.show_help = true;
+                self.help_scroll = 0;
             }
             // `:` opens the command bar when no widget claimed it.
             (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(':')) => {
                 self.command_buffer = Some(String::new());
                 self.command_feedback = None;
+            }
+            // Shift+<letter> jumps focus to the widget that claimed that
+            // letter via `shortcut_preferences`. Most terminals report
+            // Shift+C as `Char('C')` with the SHIFT modifier set, but
+            // some don't include the modifier — so we match on uppercase
+            // ASCII letters and treat the case alone as the signal.
+            (_, KeyCode::Char(c)) if c.is_ascii_uppercase() => {
+                let lower = c.to_ascii_lowercase();
+                if let Some(id) = self.shortcuts.get(&lower).cloned() {
+                    if let Some(pos) = self.focus_order.iter().position(|w| w == &id) {
+                        self.focus_idx = pos;
+                    }
+                }
             }
             _ => {}
         }
@@ -170,6 +225,73 @@ impl App {
         }
     }
 
+    /// `:scheme <name>` — re-read `colorschemes.toml`, pick the named scheme,
+    /// and propagate the new app theme to every widget without restarting.
+    /// `:scheme` with no name (or an unknown name) drops a friendly message
+    /// in the command-bar feedback slot listing the schemes that are
+    /// actually available, so the user can correct the typo without leaving
+    /// the TUI.
+    fn execute_scheme_command(&mut self, args: &[&str]) {
+        let file = match theme::load_schemes_file() {
+            Ok(f) => f,
+            Err(err) => {
+                self.command_feedback = Some(format!("colorschemes.toml: {err}"));
+                return;
+            }
+        };
+
+        // Sort once — used by both the "no arg" hint and the "not found"
+        // message so the order is stable from the user's perspective.
+        let mut available: Vec<&str> = file.schemes.keys().map(String::as_str).collect();
+        available.sort_unstable();
+        let available_csv = available.join(", ");
+
+        let Some(name) = args.first() else {
+            self.command_feedback = if available.is_empty() {
+                Some("usage: :scheme <name> — (no schemes defined in colorschemes.toml)".into())
+            } else {
+                Some(format!("usage: :scheme <name>. Available: {available_csv}"))
+            };
+            return;
+        };
+
+        let Some(scheme) = file.schemes.get(*name) else {
+            self.command_feedback = if available.is_empty() {
+                Some(format!(
+                    "unknown scheme {name:?} — colorschemes.toml has no [schemes.*] blocks"
+                ))
+            } else {
+                Some(format!(
+                    "unknown scheme {name:?}. Available: {available_csv}"
+                ))
+            };
+            return;
+        };
+
+        let new_theme = theme::theme_from_scheme(scheme);
+        self.theme = new_theme.clone();
+        self.config.global.theme = (*name).to_string();
+        for id in self.manager.ids().to_vec() {
+            if let Some(widget) = self.manager.get_mut(&id) {
+                widget.set_app_theme(new_theme.clone());
+            }
+        }
+        // Write the choice back to config.toml so it survives a restart.
+        // Failure is non-fatal — we still applied the scheme in-memory; the
+        // user will see a warning instead of the success line.
+        match theme::persist_active_scheme(name) {
+            Ok(()) => {
+                self.command_feedback = Some(format!("scheme → {name}"));
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, scheme = %name, "failed to persist scheme");
+                self.command_feedback = Some(format!(
+                    "scheme → {name} (not persisted: {err})"
+                ));
+            }
+        }
+    }
+
     fn execute_command(&mut self, line: &str) {
         if line.is_empty() {
             return;
@@ -186,6 +308,7 @@ impl App {
             }
             "help" | "?" => {
                 self.show_help = true;
+                self.help_scroll = 0;
                 return;
             }
             "refresh" | "r" => {
@@ -196,6 +319,10 @@ impl App {
                         let _ = widget.handle_command("refresh", &args);
                     }
                 }
+                return;
+            }
+            "scheme" | "theme" => {
+                self.execute_scheme_command(&args);
                 return;
             }
             _ => {}
@@ -299,6 +426,40 @@ fn widget_at(app: &App, full_area: Rect, col: u16, row: u16) -> Option<(String, 
     None
 }
 
+/// Walk widgets in registration order; assign each the first letter from
+/// its `shortcut_preferences` list that isn't already claimed. Returns the
+/// letter→id map and calls `set_shortcut(Some(letter))` on each widget
+/// that got one (or `set_shortcut(None)` if every preference was taken,
+/// so the widget can clear stale state on later reassignments).
+fn assign_shortcuts(manager: &mut WidgetManager) -> HashMap<char, String> {
+    let mut shortcuts: HashMap<char, String> = HashMap::new();
+    let mut assignments: HashMap<String, char> = HashMap::new();
+    for id in manager.ids().to_vec() {
+        let prefs: Vec<char> = manager
+            .get(&id)
+            .map(|w| w.shortcut_preferences().to_vec())
+            .unwrap_or_default();
+        for letter in prefs {
+            let letter = letter.to_ascii_lowercase();
+            if !letter.is_ascii_alphabetic() {
+                continue;
+            }
+            if !shortcuts.contains_key(&letter) {
+                shortcuts.insert(letter, id.clone());
+                assignments.insert(id.clone(), letter);
+                break;
+            }
+        }
+    }
+    for id in manager.ids().to_vec() {
+        let letter = assignments.get(&id).copied();
+        if let Some(widget) = manager.get_mut(&id) {
+            widget.set_shortcut(letter);
+        }
+    }
+    shortcuts
+}
+
 /// Build the focus-cycling order from the layout cells, keeping only widgets
 /// that the manager actually knows about.
 fn focus_order_from_layout(config: &Config, manager: &WidgetManager) -> Vec<String> {
@@ -347,10 +508,13 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                 layout: &app.config.layout,
                 manager: &app.manager,
                 focused: app.focused_widget(),
-                last_fetch: app.last_fetch,
                 show_help: app.show_help,
                 command_buffer: app.command_buffer.as_deref(),
                 command_feedback: app.command_feedback.as_deref(),
+                theme: &app.theme,
+                theme_name: &app.config.global.theme,
+                help_scroll: app.help_scroll,
+                help_scroll_max: &app.help_scroll_max,
             },
         );
     })?;
@@ -386,6 +550,40 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                 }
             }
             Event::Mouse(mouse) => {
+                // Help overlay sits on top of the entire dashboard — when
+                // it's open, mouse input belongs to it, not to the widgets
+                // visually behind it. Without this guard the scroll wheel
+                // would silently drive the widget under the cursor.
+                if app.show_help {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => app.scroll_help(-1),
+                        MouseEventKind::ScrollDown => app.scroll_help(1),
+                        _ => {}
+                    }
+                    // Swallow everything else (clicks etc.) so the layout
+                    // underneath stays inert until the overlay closes.
+                    if app.should_quit {
+                        break;
+                    }
+                    terminal.draw(|frame| {
+                        ui::render(
+                            frame,
+                            &ui::RenderState {
+                                layout: &app.config.layout,
+                                manager: &app.manager,
+                                focused: app.focused_widget(),
+                                                show_help: app.show_help,
+                                command_buffer: app.command_buffer.as_deref(),
+                                command_feedback: app.command_feedback.as_deref(),
+                                theme: &app.theme,
+                                theme_name: &app.config.global.theme,
+                                help_scroll: app.help_scroll,
+                                help_scroll_max: &app.help_scroll_max,
+                            },
+                        );
+                    })?;
+                    continue;
+                }
                 if let Ok(size) = terminal.size() {
                     let full = Rect::new(0, 0, size.width, size.height);
                     let target = widget_at(&app, full, mouse.column, mouse.row);
@@ -431,7 +629,6 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                         }
                     }
                 }
-                app.last_fetch = Some(Local::now());
             }
         }
 
@@ -446,10 +643,13 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                     layout: &app.config.layout,
                     manager: &app.manager,
                     focused: app.focused_widget(),
-                    last_fetch: app.last_fetch,
-                    show_help: app.show_help,
+                        show_help: app.show_help,
                     command_buffer: app.command_buffer.as_deref(),
                     command_feedback: app.command_feedback.as_deref(),
+                    theme: &app.theme,
+                    theme_name: &app.config.global.theme,
+                    help_scroll: app.help_scroll,
+                    help_scroll_max: &app.help_scroll_max,
                 },
             );
         })?;
@@ -529,5 +729,22 @@ mod tests {
         assert_eq!(app.focused_widget(), Some("clock"));
         app.cycle_focus(false);
         assert_eq!(app.focused_widget(), Some("stocks"));
+    }
+
+    #[test]
+    fn shortcuts_resolve_preference_conflicts_by_load_order() {
+        let app = App::new(Config::default());
+        // Registration order in App::new is stocks, clock, weather,
+        // calendar, news — so stocks gets 's', clock gets 'c', weather
+        // 'w', calendar falls through 'c' (taken) to 'd', news 'n'.
+        assert_eq!(app.shortcuts.get(&'s').map(String::as_str), Some("stocks"));
+        assert_eq!(app.shortcuts.get(&'c').map(String::as_str), Some("clock"));
+        assert_eq!(app.shortcuts.get(&'w').map(String::as_str), Some("weather"));
+        assert_eq!(
+            app.shortcuts.get(&'d').map(String::as_str),
+            Some("calendar"),
+            "calendar should fall through to 'd' since clock claimed 'c'"
+        );
+        assert_eq!(app.shortcuts.get(&'n').map(String::as_str), Some("news"));
     }
 }

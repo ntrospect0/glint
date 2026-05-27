@@ -181,6 +181,7 @@ impl RawGoogleEvent {
             start,
             end,
             all_day,
+            source: "google".into(),
             calendar: calendar_id.to_string(),
             location: self.location,
         })

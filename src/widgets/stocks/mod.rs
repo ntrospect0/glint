@@ -9,17 +9,20 @@ use std::{
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc, Weekday};
+use chrono_tz::Tz;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
 use serde::Deserialize;
 
-use crate::ui::{decorate_title, focus_border_style};
+use crate::theme::{ColorScheme, Theme};
+use crate::ui::decorated_title_line;
 
 use super::{AppContext, EventResult, Widget};
 
@@ -50,10 +53,10 @@ pub struct StocksConfig {
     #[serde(default)]
     pub default_period: Period,
 
-    /// Optional URL template opened when the user presses `j` (Jump). The
-    /// literal token `{ticker}` is replaced with the URL-encoded ticker
+    /// Optional URL template opened when the user presses Enter on a ticker.
+    /// The literal token `{ticker}` is replaced with the URL-encoded ticker
     /// symbol — e.g. `"https://www.marketwatch.com/investing/stock/{ticker}"`.
-    /// Leave unset to make `j` a no-op.
+    /// Leave unset to make Enter a no-op.
     #[serde(default)]
     pub jump_url_template: Option<String>,
 
@@ -62,7 +65,46 @@ pub struct StocksConfig {
     /// accidentally while scrolling vertically.
     #[serde(default)]
     pub horizontal_scroll_period: bool,
+
+    /// When true, draw very faint dashed lines at the visible range's high
+    /// and low on non-Day periods. Independent of the always-on reference
+    /// line (previous close on 1D, start-of-range on other periods).
+    #[serde(default = "default_graph_high_low_lines")]
+    pub graph_high_low_lines: bool,
+
+    /// When true on the 1D period, render the intraday trace against the
+    /// full trading-day x-axis instead of stretching the partial day across
+    /// the whole plot width. The remainder of the day appears as empty
+    /// space, giving a visual sense of how far along the session is.
+    #[serde(default = "default_pad_intraday_to_full_day")]
+    pub pad_intraday_to_full_day: bool,
+
+    /// Per-widget style overrides layered on top of the active app
+    /// color scheme. Any role omitted here inherits from the app theme.
+    #[serde(default)]
+    pub colors: ColorScheme,
+
+    /// Prioritized `Shift+<letter>` focus shortcut preferences. The first
+    /// letter not already claimed by an earlier-loaded widget is assigned.
+    /// Leave empty (default) to use the built-in preference list — for
+    /// stocks that's `['s', 't', 'o', 'c', 'k']`.
+    #[serde(default)]
+    pub shortcuts: Vec<char>,
 }
+
+fn default_graph_high_low_lines() -> bool {
+    true
+}
+
+fn default_pad_intraday_to_full_day() -> bool {
+    true
+}
+
+/// Number of 5-minute bars in a regular US trading session (6.5 hours).
+/// Used to size the intraday plot's "time elapsed" fraction. Yahoo's `1d`
+/// chart range only returns regular-session bars at 5m resolution, so the
+/// length of `intraday` is a stable proxy for time-of-day.
+const TRADING_DAY_BARS: usize = 78;
 
 fn default_indices() -> Vec<String> {
     vec!["^DJI".into(), "^GSPC".into(), "^IXIC".into()]
@@ -90,6 +132,10 @@ impl Default for StocksConfig {
             default_period: Period::default(),
             jump_url_template: None,
             horizontal_scroll_period: false,
+            graph_high_low_lines: default_graph_high_low_lines(),
+            pad_intraday_to_full_day: default_pad_intraday_to_full_day(),
+            colors: ColorScheme::default(),
+            shortcuts: Vec::new(),
         }
     }
 }
@@ -139,10 +185,23 @@ pub struct StocksWidget {
     display_mode: DisplayMode,
     /// Currently selected graph period (1D / 1W / 1M / 6M / YTD / 1Y).
     period: Period,
+    /// App-level theme; kept so live config reloads can rebuild `theme`
+    /// from updated `colors` overrides.
+    app_theme: Arc<Theme>,
+    /// Merged theme (app + widget overrides). Built at construction and
+    /// after every `apply_config`.
+    theme: Theme,
+    /// Letter assigned by the app for `Shift+<letter>` focus, painted in
+    /// the title via `text.shortcut`. `None` = no shortcut claimed.
+    shortcut: Option<char>,
+    /// Effective shortcut preference list. Either the user's TOML
+    /// override or the built-in default. Returned by
+    /// `shortcut_preferences` so the trait's borrow lifetime matches.
+    shortcut_prefs: Vec<char>,
 }
 
 impl StocksWidget {
-    pub fn with_config(config: StocksConfig) -> Self {
+    pub fn with_config(config: StocksConfig, app_theme: Arc<Theme>) -> Self {
         let provider = match YahooFinanceProvider::new() {
             Ok(p) => Arc::new(p),
             Err(err) => {
@@ -152,6 +211,12 @@ impl StocksWidget {
         };
         let display_mode = config.default_display_mode;
         let period = config.default_period;
+        let theme = app_theme.with_overrides(&config.colors);
+        let shortcut_prefs = if config.shortcuts.is_empty() {
+            vec!['s', 't', 'o', 'c', 'k']
+        } else {
+            config.shortcuts.clone()
+        };
         Self {
             id: "stocks".into(),
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(15)),
@@ -160,6 +225,10 @@ impl StocksWidget {
             state: Arc::new(Mutex::new(StocksState::default())),
             display_mode,
             period,
+            app_theme,
+            theme,
+            shortcut: None,
+            shortcut_prefs,
         }
     }
 
@@ -355,7 +424,7 @@ impl StocksWidget {
     /// No-op when no template is configured.
     fn jump_to_external(&self) {
         let Some(template) = &self.config.jump_url_template else {
-            tracing::info!("'j' pressed but no jump_url_template is configured");
+            tracing::info!("Enter pressed but no jump_url_template is configured");
             return;
         };
         let Some(symbol) = self.selected_symbol() else {
@@ -556,10 +625,14 @@ impl Widget for StocksWidget {
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(focus_border_style(focused))
-            .title(Span::styled(
-                decorate_title(focused, "Stocks"),
-                Style::default().add_modifier(Modifier::BOLD),
+            .border_type(BorderType::Rounded)
+            .border_style(self.theme.border_style(focused))
+            .title(decorated_title_line(
+                focused,
+                "Stocks",
+                self.shortcut,
+                self.theme.widget_title,
+                self.theme.text_shortcut,
             ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -623,10 +696,17 @@ impl Widget for StocksWidget {
                 self.display_mode,
                 self.period,
                 cur_scroll,
+                &self.theme,
             );
             self.state.lock().unwrap().list_scroll = new_scroll;
             if let Some(stats_area) = stats_area {
-                render_stats_panel(frame, stats_area, selected_sym.as_deref(), &quotes);
+                render_stats_panel(
+                    frame,
+                    stats_area,
+                    selected_sym.as_deref(),
+                    &quotes,
+                    &self.theme,
+                );
             }
             render_graph_panel(
                 frame,
@@ -634,6 +714,9 @@ impl Widget for StocksWidget {
                 selected_sym.as_deref(),
                 &quotes,
                 self.period,
+                self.config.graph_high_low_lines,
+                self.config.pad_intraday_to_full_day,
+                &self.theme,
             );
         } else {
             // Portrait: list on top (clamped to ~55% so it's readable), graph below.
@@ -661,6 +744,7 @@ impl Widget for StocksWidget {
                 self.display_mode,
                 self.period,
                 cur_scroll,
+                &self.theme,
             );
             self.state.lock().unwrap().list_scroll = new_scroll;
             render_graph_panel(
@@ -669,6 +753,9 @@ impl Widget for StocksWidget {
                 selected_sym.as_deref(),
                 &quotes,
                 self.period,
+                self.config.graph_high_low_lines,
+                self.config.pad_intraday_to_full_day,
+                &self.theme,
             );
         }
 
@@ -681,15 +768,12 @@ impl Widget for StocksWidget {
                 height: 1,
             };
             let hint = format!(
-                "↑/↓ select · c mode ({}) · j jump · r refresh",
+                "↑/↓ select · c mode ({}) · Enter open · r refresh",
                 display_mode_label(self.display_mode)
             );
             frame.render_widget(
-                Paragraph::new(Span::styled(
-                    hint,
-                    Style::default().add_modifier(Modifier::DIM),
-                ))
-                .alignment(Alignment::Right),
+                Paragraph::new(Span::styled(hint, self.theme.text_dim))
+                    .alignment(Alignment::Right),
                 footer,
             );
         }
@@ -704,13 +788,13 @@ impl Widget for StocksWidget {
                 self.move_selection(-1);
                 EventResult::Handled
             }
-            // `j` is the Jump key (open ticker in browser). Down navigation
-            // stays on ↓ — vim's `j`-as-down is freed up here on purpose.
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 self.move_selection(1);
                 EventResult::Handled
             }
-            KeyCode::Char('j') => {
+            // Enter opens the selected ticker in the browser — same gesture
+            // the news widget uses to open an article.
+            KeyCode::Enter => {
                 self.jump_to_external();
                 EventResult::Handled
             }
@@ -745,6 +829,19 @@ impl Widget for StocksWidget {
                 if let Some(p) = Period::ALL.get(idx) {
                     self.set_period(*p);
                 }
+                EventResult::Handled
+            }
+            // ← / → (and h / l for vim-style symmetry with j/k selection)
+            // cycle the graph period through Period::ALL, wrapping at the
+            // ends. Matches what horizontal scroll does when the user has
+            // `horizontal_scroll_period` enabled — but available
+            // unconditionally from the keyboard.
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.cycle_period(false);
+                EventResult::Handled
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.cycle_period(true);
                 EventResult::Handled
             }
             _ => EventResult::Ignored,
@@ -843,11 +940,12 @@ impl Widget for StocksWidget {
 
     fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
         vec![
-            ("↑ / ↓ / k", "select ticker (k = up)"),
+            ("↑ / ↓ / j / k", "select ticker (j = down, k = up)"),
+            ("← / → / h / l", "cycle graph period (prev / next)"),
             ("c", "cycle display mode (% / $)"),
             ("% / $", "set display mode directly"),
             ("1-9", "set graph period directly"),
-            ("j", "Jump: open ticker URL in browser"),
+            ("Enter", "open selected ticker in browser"),
             ("r", "force refresh"),
             ("x", "clear :stock lookup (return to default list)"),
             ("click ticker", "select that ticker"),
@@ -868,8 +966,25 @@ impl Widget for StocksWidget {
     fn apply_config(&mut self, config: serde_json::Value) -> Result<()> {
         let new_config: StocksConfig =
             serde_json::from_value(config).context("invalid stocks config payload")?;
-        *self = Self::with_config(new_config);
+        let app_theme = self.app_theme.clone();
+        *self = Self::with_config(new_config, app_theme);
         Ok(())
+    }
+
+    fn set_app_theme(&mut self, theme: Arc<Theme>) {
+        self.theme = theme.with_overrides(&self.config.colors);
+        self.app_theme = theme;
+    }
+
+    fn shortcut_preferences(&self) -> &[char] {
+        // Effective preference list — user TOML override if non-empty,
+        // otherwise the built-in `s, t, o, c, k` fallback. Built once at
+        // construction so the trait can hand out a borrow.
+        &self.shortcut_prefs
+    }
+
+    fn set_shortcut(&mut self, shortcut: Option<char>) {
+        self.shortcut = shortcut;
     }
 }
 
@@ -902,6 +1017,9 @@ fn render_graph_panel(
     selected: Option<&str>,
     quotes: &HashMap<String, QuoteState>,
     period: Period,
+    show_high_low_lines: bool,
+    pad_intraday_to_full_day: bool,
+    theme: &Theme,
 ) {
     if area.width < 4 || area.height < 4 {
         return;
@@ -917,6 +1035,7 @@ fn render_graph_panel(
             height: 1,
         },
         period,
+        theme,
     );
 
     let quote = selected.and_then(|s| match quotes.get(s) {
@@ -930,7 +1049,7 @@ fn render_graph_panel(
         };
         let para = Paragraph::new(Line::from(Span::styled(
             msg,
-            Style::default().add_modifier(Modifier::DIM),
+            theme.text_dim,
         )))
         .alignment(Alignment::Center);
         let centered = Rect {
@@ -1030,18 +1149,29 @@ fn render_graph_panel(
         frame.render_widget(
             Paragraph::new(Span::styled(
                 label,
-                Style::default().add_modifier(Modifier::DIM),
+                theme.text_dim,
             )),
             rect,
         );
     }
 
-    let rows = graph::render_series(&q.intraday, plot_h, plot_w, plot_min, plot_max);
+    // For the 1D period in "trading-day progress" mode, render the trace at
+    // a fraction of plot_w proportional to how much of the regular session
+    // has elapsed (estimated by intraday bar count vs. TRADING_DAY_BARS).
+    // After-hours and other periods always fill the full width.
+    let trace_w = if pad_intraday_to_full_day && matches!(period, Period::Day) {
+        let frac = (q.intraday.len() as f64 / TRADING_DAY_BARS as f64).clamp(0.0, 1.0);
+        let w = (plot_w as f64 * frac).round() as u16;
+        w.clamp(2, plot_w)
+    } else {
+        plot_w
+    };
+    let rows = graph::render_series(&q.intraday, plot_h, trace_w, plot_min, plot_max);
     for (i, row) in rows.iter().enumerate() {
         let rect = Rect {
             x: plot_x,
             y: plot_top + i as u16,
-            width: plot_w,
+            width: trace_w,
             height: 1,
         };
         frame.render_widget(
@@ -1054,6 +1184,47 @@ fn render_graph_panel(
                 }),
             )),
             rect,
+        );
+    }
+
+    // Reference lines: drawn AFTER the trace so we can overlay only on cells
+    // the trace left blank (preserves the trace where they would overlap).
+    //
+    // Anchor (always drawn):
+    //   - 1D view → previous day's close
+    //   - other periods → first sample of the visible range
+    // High/low lines are drawn on non-Day periods when `show_high_low_lines`
+    // is true. They're styled "very faint" so they don't compete with the trace.
+    let anchor_value = if matches!(period, Period::Day) {
+        q.previous_close
+    } else {
+        q.intraday.first().copied().unwrap_or(q.previous_close)
+    };
+    draw_reference_line(
+        frame,
+        plot_x,
+        plot_top,
+        plot_h,
+        plot_w,
+        plot_min,
+        plot_max,
+        &rows,
+        anchor_value,
+        '┄',
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::DIM),
+    );
+
+    if show_high_low_lines && !matches!(period, Period::Day) {
+        let faint = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM);
+        draw_reference_line(
+            frame, plot_x, plot_top, plot_h, plot_w, plot_min, plot_max, &rows, max, '┈', faint,
+        );
+        draw_reference_line(
+            frame, plot_x, plot_top, plot_h, plot_w, plot_min, plot_max, &rows, min, '┈', faint,
         );
     }
 
@@ -1087,10 +1258,64 @@ fn render_graph_panel(
     frame.render_widget(
         Paragraph::new(Span::styled(
             line,
-            Style::default().add_modifier(Modifier::DIM),
+            theme.text_dim,
         )),
         xaxis_rect,
     );
+}
+
+/// Overlay a horizontal reference line at the row corresponding to `value`,
+/// painting `ch` only at columns the trace left blank. Writing directly into
+/// the frame buffer keeps the trace's braille glyphs intact where they sit on
+/// the same row.
+#[allow(clippy::too_many_arguments)]
+fn draw_reference_line(
+    frame: &mut Frame,
+    plot_x: u16,
+    plot_top: u16,
+    plot_h: u16,
+    plot_w: u16,
+    plot_min: f64,
+    plot_max: f64,
+    trace_rows: &[String],
+    value: f64,
+    ch: char,
+    style: Style,
+) {
+    if plot_h == 0 || !value.is_finite() || plot_max <= plot_min {
+        return;
+    }
+    if value < plot_min || value > plot_max {
+        return;
+    }
+    let frac = (plot_max - value) / (plot_max - plot_min);
+    let ref_row = (frac * (plot_h as f64 - 1.0)).round() as usize;
+    if ref_row >= trace_rows.len() {
+        return;
+    }
+    let trace = &trace_rows[ref_row];
+    let trace_chars: Vec<char> = trace.chars().collect();
+    let y = plot_top + ref_row as u16;
+    let buf = frame.buffer_mut();
+    // Walk the full plot width even when the trace is narrower than `plot_w`
+    // (1D trading-day-progress mode). For cells the trace covers we skip
+    // anywhere the trace has a glyph; for cells past the trace's right edge
+    // we always paint, so the reference line extends across the empty
+    // "future trading time" portion too.
+    for i in 0..plot_w as usize {
+        let trace_owns_cell = match trace_chars.get(i) {
+            Some(&c) => c != ' ',
+            None => false,
+        };
+        if trace_owns_cell {
+            continue;
+        }
+        let x = plot_x + i as u16;
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_char(ch);
+            cell.set_style(style);
+        }
+    }
 }
 
 /// Returns (change_abs, change_pct) for the given period. 1D uses the
@@ -1120,7 +1345,7 @@ fn period_change(q: &StockQuote, period: Period) -> (f64, f64) {
 /// Renders the `[1D] [1W] [1M] [6M] [YTD] [1Y]` selector. If the row isn't
 /// wide enough to host all six, prepends/appends `‹` / `›` markers and shows
 /// only a window of toggles centered on the active one.
-fn render_period_toggle_bar(frame: &mut Frame, area: Rect, active: Period) {
+fn render_period_toggle_bar(frame: &mut Frame, area: Rect, active: Period, theme: &Theme) {
     if area.width == 0 {
         return;
     }
@@ -1142,7 +1367,7 @@ fn render_period_toggle_bar(frame: &mut Frame, area: Rect, active: Period) {
                     .fg(Color::LightYellow)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().add_modifier(Modifier::DIM)
+                theme.text_dim
             };
             spans.push(Span::styled(format!("[{}]", p.label()), style));
             if i + 1 < Period::ALL.len() {
@@ -1163,7 +1388,7 @@ fn render_period_toggle_bar(frame: &mut Frame, area: Rect, active: Period) {
             used += widths[start - 1];
             start -= 1;
         }
-        let dim = Style::default().add_modifier(Modifier::DIM);
+        let dim = theme.text_dim;
         if start > 0 {
             spans.push(Span::styled("‹", dim));
             spans.push(Span::raw(" "));
@@ -1215,7 +1440,7 @@ fn label_rows(plot_h: u16) -> Vec<u16> {
     rows
 }
 
-#[allow(clippy::too_many_arguments)] // 9 args, all distinct render inputs — no obvious bundle.
+#[allow(clippy::too_many_arguments)] // 10 args, all distinct render inputs — no obvious bundle.
 fn render_list_panel(
     frame: &mut Frame,
     area: Rect,
@@ -1227,6 +1452,7 @@ fn render_list_panel(
     mode: DisplayMode,
     period: Period,
     current_scroll: usize,
+    theme: &Theme,
 ) -> usize {
     let (lines, ticker_lines) = build_list_lines(
         symbols,
@@ -1236,6 +1462,7 @@ fn render_list_panel(
         selected,
         mode,
         period,
+        theme,
     );
 
     // Reserve the bottom row for the footer hint rendered in `render`.
@@ -1279,13 +1506,14 @@ fn build_list_lines<'a>(
     selected: usize,
     mode: DisplayMode,
     period: Period,
+    theme: &Theme,
 ) -> (Vec<Line<'a>>, Vec<usize>) {
     let mut lines: Vec<Line<'a>> = Vec::with_capacity(symbols.len() + 4);
     let mut ticker_lines: Vec<usize> = Vec::with_capacity(symbols.len());
     if indices_count > 0 {
         lines.push(Line::from(Span::styled(
             "── Indices ──",
-            Style::default().add_modifier(Modifier::DIM),
+            theme.text_dim,
         )));
     }
     let mut watchlist_header_emitted = indices_count == 0;
@@ -1295,7 +1523,7 @@ fn build_list_lines<'a>(
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "── Watchlist ──",
-                Style::default().add_modifier(Modifier::DIM),
+                theme.text_dim,
             )));
             watchlist_header_emitted = true;
         }
@@ -1304,7 +1532,7 @@ fn build_list_lines<'a>(
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "── Lookup (press x to clear) ──",
-                    Style::default().add_modifier(Modifier::DIM),
+                    theme.text_dim,
                 )));
                 lookup_header_emitted = true;
             }
@@ -1362,13 +1590,14 @@ fn render_stats_panel(
     area: Rect,
     selected: Option<&str>,
     quotes: &HashMap<String, QuoteState>,
+    theme: &Theme,
 ) {
     let q = match selected.and_then(|s| quotes.get(s)) {
         Some(QuoteState::Ready(q)) => q.as_ref(),
         _ => {
             let para = Paragraph::new(Span::styled(
                 "(no stats)",
-                Style::default().add_modifier(Modifier::DIM),
+                theme.text_dim,
             ))
             .alignment(Alignment::Center);
             frame.render_widget(para, area);
@@ -1377,62 +1606,296 @@ fn render_stats_panel(
     };
 
     let mut lines: Vec<Line<'_>> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        q.short_name.clone(),
-        Style::default()
-            .fg(Color::LightCyan)
-            .add_modifier(Modifier::BOLD),
-    )));
+    lines.push(Line::from(Span::styled(q.short_name.clone(), theme.text_focused)));
     lines.push(Line::from(""));
-    lines.push(stat_line("Price", &format!("{:.2}", q.price)));
-    lines.push(stat_line("Prev Close", &format!("{:.2}", q.previous_close)));
+    lines.push(stat_line("Price", &format!("{:.2}", q.price), theme));
+    lines.push(stat_line("Prev Close", &format!("{:.2}", q.previous_close), theme));
     if let (Some(h), Some(l)) = (q.day_high, q.day_low) {
-        lines.push(stat_line("Day H/L", &format!("{h:.2} / {l:.2}")));
+        lines.push(stat_line("Day H/L", &format!("{h:.2} / {l:.2}"), theme));
     }
     if let (Some(h), Some(l)) = (q.fifty_two_week_high, q.fifty_two_week_low) {
-        lines.push(stat_line("52w H/L", &format!("{h:.2} / {l:.2}")));
+        lines.push(stat_line("52w H/L", &format!("{h:.2} / {l:.2}"), theme));
     }
     if let Some(v) = q.volume {
-        lines.push(stat_line("Volume", &humanize_big(v as f64)));
+        lines.push(stat_line("Volume", &humanize_big(v as f64), theme));
     }
     if let Some(v) = q.avg_volume {
-        lines.push(stat_line("Avg Vol", &humanize_big(v as f64)));
+        lines.push(stat_line("Avg Vol", &humanize_big(v as f64), theme));
     }
     lines.push(stat_line(
         "Mkt Cap",
         &q.market_cap
             .map(|v| humanize_big(v as f64))
             .unwrap_or_else(|| "—".into()),
+        theme,
     ));
     lines.push(stat_line(
         "Shares",
         &q.shares_outstanding
             .map(|v| humanize_big(v as f64))
             .unwrap_or_else(|| "—".into()),
+        theme,
     ));
     if let Some(pe) = q.pe_ratio {
-        lines.push(stat_line("P/E", &format!("{pe:.2}")));
+        lines.push(stat_line("P/E", &format!("{pe:.2}"), theme));
     }
     if let Some(eps) = q.eps {
-        lines.push(stat_line("EPS", &format!("{eps:.2}")));
+        lines.push(stat_line("EPS", &format!("{eps:.2}"), theme));
     }
     if let Some(y) = q.dividend_yield {
-        lines.push(stat_line("Yield", &format!("{:.2}%", y * 100.0)));
+        lines.push(stat_line("Yield", &format!("{:.2}%", y * 100.0), theme));
     }
     if let Some(b) = q.beta {
-        lines.push(stat_line("Beta", &format!("{b:.2}")));
+        lines.push(stat_line("Beta", &format!("{b:.2}"), theme));
     }
+
+    // Market-hours countdown at the bottom of the ticker profile. The
+    // emphasis flips on state so a glance tells you whether the market is
+    // currently live or quiet: `text.focused` when open (counting down to
+    // close), `text.dim` when closed (counting down to next open).
+    let status = market_status_line(Utc::now());
+    let style = if status.is_open {
+        theme.text_focused
+    } else {
+        theme.text_dim
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(status.message, style)));
 
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn stat_line(label: &str, value: &str) -> Line<'static> {
+/// Snapshot of US equity-market hours: whether the regular session is
+/// currently live, and a `XhYm until …` human label describing what's
+/// next.
+struct MarketStatus {
+    is_open: bool,
+    message: String,
+}
+
+/// NYSE/Nasdaq regular session is 09:30–16:00 America/New_York, Mon–Fri.
+/// Half-days (Black Friday, certain Christmas Eves) close at 13:00 ET.
+const MARKET_TZ: &str = "America/New_York";
+const MARKET_OPEN_HOUR: u32 = 9;
+const MARKET_OPEN_MINUTE: u32 = 30;
+const MARKET_CLOSE_HOUR: u32 = 16;
+const MARKET_EARLY_CLOSE_HOUR: u32 = 13;
+
+fn market_status_line(now_utc: chrono::DateTime<Utc>) -> MarketStatus {
+    let Ok(tz) = MARKET_TZ.parse::<Tz>() else {
+        return MarketStatus {
+            is_open: false,
+            message: "Market schedule unavailable".into(),
+        };
+    };
+    let now = now_utc.with_timezone(&tz);
+
+    // `session(date)` returns `None` when the market doesn't trade that
+    // day (weekend or full-closure holiday). On half-days the close hour
+    // is bumped down to 13:00 ET.
+    let session = |date: NaiveDate| -> Option<(chrono::DateTime<Tz>, chrono::DateTime<Tz>)> {
+        if matches!(date.weekday(), Weekday::Sat | Weekday::Sun) {
+            return None;
+        }
+        if is_market_holiday(date) {
+            return None;
+        }
+        let close_hour = if is_market_half_day(date) {
+            MARKET_EARLY_CLOSE_HOUR
+        } else {
+            MARKET_CLOSE_HOUR
+        };
+        let open_naive = date.and_hms_opt(MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE, 0)?;
+        let close_naive = date.and_hms_opt(close_hour, 0, 0)?;
+        let open = tz.from_local_datetime(&open_naive).single()?;
+        let close = tz.from_local_datetime(&close_naive).single()?;
+        Some((open, close))
+    };
+
+    if let Some((open, close)) = session(now.date_naive()) {
+        if now >= open && now < close {
+            return MarketStatus {
+                is_open: true,
+                message: format!("{} until market close", format_hm(close - now)),
+            };
+        }
+    }
+
+    // Find the next session open. Today (if pre-open and a trading day),
+    // tomorrow, or whichever non-weekend, non-holiday day comes next.
+    // Cap at 14 iterations — that's enough to cross a Thanksgiving long
+    // weekend, the year-end stretch (Christmas + Boxing weekend + New
+    // Year's), or any plausible holiday cluster.
+    let mut date = now.date_naive();
+    for _ in 0..14 {
+        if let Some((open, _close)) = session(date) {
+            if open > now {
+                return MarketStatus {
+                    is_open: false,
+                    message: format!("{} until market open", format_hm(open - now)),
+                };
+            }
+        }
+        date = date + ChronoDuration::days(1);
+    }
+    MarketStatus {
+        is_open: false,
+        message: "Market schedule unavailable".into(),
+    }
+}
+
+/// NYSE full-closure holidays. Ten official holidays per year, observed on
+/// Friday when they fall on a Saturday and on Monday when they fall on a
+/// Sunday — except for MLK Day, Presidents Day, Memorial Day, Labor Day,
+/// and Thanksgiving (which are floating "nth weekday of month" dates and
+/// never need observation shifts) and Good Friday (Friday by definition).
+fn is_market_holiday(date: NaiveDate) -> bool {
+    let y = date.year();
+    let m = date.month();
+    let d = date.day();
+
+    // Fixed-date holidays, observed Friday/Monday if weekend.
+    let fixed = [
+        (1, 1),   // New Year's Day
+        (6, 19),  // Juneteenth
+        (7, 4),   // Independence Day
+        (12, 25), // Christmas
+    ];
+    for (fm, fd) in fixed {
+        if let Some(actual) = NaiveDate::from_ymd_opt(y, fm, fd) {
+            if observed(actual) == date {
+                return true;
+            }
+        }
+    }
+
+    // Floating holidays — fixed weekday rules, no observation shift.
+    if m == 1 && date == nth_weekday(y, 1, Weekday::Mon, 3).unwrap_or(date.succ_opt().unwrap_or(date)) {
+        return true; // MLK Day (3rd Mon of Jan)
+    }
+    if m == 2 && date == nth_weekday(y, 2, Weekday::Mon, 3).unwrap_or(date.succ_opt().unwrap_or(date)) {
+        return true; // Presidents Day (3rd Mon of Feb)
+    }
+    if m == 5 && date == last_weekday(y, 5, Weekday::Mon).unwrap_or(date.succ_opt().unwrap_or(date)) {
+        return true; // Memorial Day (last Mon of May)
+    }
+    if m == 9 && date == nth_weekday(y, 9, Weekday::Mon, 1).unwrap_or(date.succ_opt().unwrap_or(date)) {
+        return true; // Labor Day (1st Mon of Sep)
+    }
+    if m == 11 && date == nth_weekday(y, 11, Weekday::Thu, 4).unwrap_or(date.succ_opt().unwrap_or(date)) {
+        return true; // Thanksgiving (4th Thu of Nov)
+    }
+    if let Some(gf) = good_friday(y) {
+        if date == gf {
+            return true;
+        }
+    }
+    // Special case: when Dec 25 falls on Saturday, NYSE moves the
+    // observance to Friday Dec 24 *as a full closure* — not a half-day.
+    // The fixed-date check above already covers Dec 25 → observed Fri;
+    // nothing more to do here.
+    // Independence Day already handled via observed() above.
+    let _ = d;
+    false
+}
+
+/// Half-day closures: market closes early at 13:00 ET.
+/// - Day after Thanksgiving (always Friday).
+/// - Christmas Eve when Dec 24 is Mon/Tue/Wed/Thu (Dec 25 falls on
+///   Tue/Wed/Thu/Fri respectively). When Dec 24 is Fri (Dec 25 = Sat),
+///   it's the Christmas observed-closure day, not a half-day, and
+///   `is_market_holiday` catches it.
+fn is_market_half_day(date: NaiveDate) -> bool {
+    if date.month() == 11 {
+        if let Some(thx) = nth_weekday(date.year(), 11, Weekday::Thu, 4) {
+            if let Some(black_friday) = thx.succ_opt() {
+                if date == black_friday {
+                    return true;
+                }
+            }
+        }
+    }
+    if date.month() == 12 && date.day() == 24 {
+        return matches!(
+            date.weekday(),
+            Weekday::Mon | Weekday::Tue | Weekday::Wed | Weekday::Thu
+        );
+    }
+    false
+}
+
+/// Observation-shift rule: holiday on Saturday → observed Friday; holiday
+/// on Sunday → observed Monday. Weekdays pass through unchanged.
+fn observed(date: NaiveDate) -> NaiveDate {
+    match date.weekday() {
+        Weekday::Sat => date - ChronoDuration::days(1),
+        Weekday::Sun => date + ChronoDuration::days(1),
+        _ => date,
+    }
+}
+
+/// `n`th occurrence of `weekday` in (`year`, `month`). e.g.
+/// `nth_weekday(2026, 11, Weekday::Thu, 4)` = 4th Thursday of Nov 2026.
+fn nth_weekday(year: i32, month: u32, weekday: Weekday, n: u32) -> Option<NaiveDate> {
+    let first = NaiveDate::from_ymd_opt(year, month, 1)?;
+    let first_dow = first.weekday().num_days_from_monday();
+    let target = weekday.num_days_from_monday();
+    let delta = (target + 7 - first_dow) % 7;
+    let day = 1 + delta + 7 * (n - 1);
+    NaiveDate::from_ymd_opt(year, month, day)
+}
+
+/// Last occurrence of `weekday` in (`year`, `month`) — used for "last
+/// Monday of May" (Memorial Day).
+fn last_weekday(year: i32, month: u32, weekday: Weekday) -> Option<NaiveDate> {
+    let first_next = if month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(year, month + 1, 1)
+    }?;
+    let last = first_next - ChronoDuration::days(1);
+    let last_dow = last.weekday().num_days_from_monday();
+    let target = weekday.num_days_from_monday();
+    let delta = (last_dow + 7 - target) % 7;
+    Some(last - ChronoDuration::days(delta as i64))
+}
+
+/// Western (Gregorian) Easter via the Meeus/Jones/Butcher algorithm. Good
+/// Friday = Easter - 2 days.
+fn good_friday(year: i32) -> Option<NaiveDate> {
+    let a = year % 19;
+    let b = year / 100;
+    let c = year % 100;
+    let d = b / 4;
+    let e = b % 4;
+    let f = (b + 8) / 25;
+    let g = (b - f + 1) / 3;
+    let h = (19 * a + b - d - g + 15) % 30;
+    let i = c / 4;
+    let k = c % 4;
+    let l = (32 + 2 * e + 2 * i - h - k) % 7;
+    let mo = (a + 11 * h + 22 * l) / 451;
+    let month = ((h + l - 7 * mo + 114) / 31) as u32;
+    let day = (((h + l - 7 * mo + 114) % 31) + 1) as u32;
+    let easter = NaiveDate::from_ymd_opt(year, month, day)?;
+    Some(easter - ChronoDuration::days(2))
+}
+
+fn format_hm(d: ChronoDuration) -> String {
+    let total = d.num_seconds().max(0);
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    if h == 0 {
+        format!("{m}m")
+    } else {
+        format!("{h}h{m}m")
+    }
+}
+
+fn stat_line(label: &str, value: &str, theme: &Theme) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("{:<10}", label),
-            Style::default().add_modifier(Modifier::DIM),
-        ),
-        Span::styled(value.to_string(), Style::default()),
+        Span::styled(format!("{:<10}", label), theme.text_dim),
+        Span::styled(value.to_string(), theme.text_plain),
     ])
 }
 
@@ -1464,6 +1927,10 @@ fn provider_dummy() -> YahooFinanceProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build_widget(cfg: StocksConfig) -> StocksWidget {
+        StocksWidget::with_config(cfg, Arc::new(Theme::builtin_defaults()))
+    }
 
     fn quote(symbol: &str, price: f64, prev: f64) -> StockQuote {
         StockQuote {
@@ -1499,7 +1966,7 @@ mod tests {
 
     #[test]
     fn all_symbols_orders_indices_first_then_watchlist() {
-        let w = StocksWidget::with_config(StocksConfig::default());
+        let w = build_widget(StocksConfig::default());
         let syms = w.all_symbols();
         assert_eq!(syms[0], "^DJI");
         assert_eq!(syms[3], "AAPL");
@@ -1507,7 +1974,7 @@ mod tests {
 
     #[test]
     fn cycle_period_wraps_at_both_ends() {
-        let mut w = StocksWidget::with_config(StocksConfig::default());
+        let mut w = build_widget(StocksConfig::default());
         assert_eq!(w.period, Period::Day);
         w.cycle_period(true);
         assert_eq!(w.period, Period::Week);
@@ -1525,7 +1992,7 @@ mod tests {
 
     #[test]
     fn move_selection_clamps() {
-        let mut w = StocksWidget::with_config(StocksConfig::default());
+        let mut w = build_widget(StocksConfig::default());
         w.move_selection(-5);
         assert_eq!(w.state.lock().unwrap().selected, 0);
         w.move_selection(100);
@@ -1574,5 +2041,164 @@ mod tests {
             .collect();
         assert!(sel_text.contains("▸"));
         assert!(!un_text.contains("▸"));
+    }
+
+    /// Construct a `DateTime<Utc>` for a given America/New_York local
+    /// timestamp. Centralized so each market-hours test reads cleanly.
+    fn et_to_utc(y: i32, m: u32, d: u32, hour: u32, minute: u32) -> chrono::DateTime<Utc> {
+        let tz: Tz = MARKET_TZ.parse().unwrap();
+        let local = tz
+            .with_ymd_and_hms(y, m, d, hour, minute, 0)
+            .single()
+            .expect("valid local time");
+        local.with_timezone(&Utc)
+    }
+
+    #[test]
+    fn market_status_open_counts_down_to_close() {
+        // 2026-05-18 is a Monday. 10:30 ET → 5h30m until 16:00 close.
+        let now = et_to_utc(2026, 5, 18, 10, 30);
+        let s = market_status_line(now);
+        assert!(s.is_open);
+        assert_eq!(s.message, "5h30m until market close");
+    }
+
+    #[test]
+    fn market_status_after_hours_counts_down_to_next_open() {
+        // Monday 18:00 ET → next open is Tuesday 09:30 ET → 15h30m.
+        let now = et_to_utc(2026, 5, 18, 18, 0);
+        let s = market_status_line(now);
+        assert!(!s.is_open);
+        assert_eq!(s.message, "15h30m until market open");
+    }
+
+    #[test]
+    fn market_status_pre_open_counts_down_to_today_open() {
+        // Monday 08:00 ET → today's open at 09:30 ET → 1h30m.
+        let now = et_to_utc(2026, 5, 18, 8, 0);
+        let s = market_status_line(now);
+        assert!(!s.is_open);
+        assert_eq!(s.message, "1h30m until market open");
+    }
+
+    #[test]
+    fn market_status_weekend_skips_to_monday() {
+        // Saturday 12:00 ET → Monday 09:30 ET. ~45h30m.
+        let now = et_to_utc(2026, 5, 16, 12, 0);
+        let s = market_status_line(now);
+        assert!(!s.is_open);
+        assert!(
+            s.message.ends_with("until market open"),
+            "got {:?}",
+            s.message
+        );
+        // Saturday 12:00 → Monday 09:30 = 45.5h
+        assert!(s.message.starts_with("45h"), "got {:?}", s.message);
+    }
+
+    #[test]
+    fn format_hm_drops_hours_when_zero() {
+        assert_eq!(format_hm(ChronoDuration::minutes(45)), "45m");
+        assert_eq!(format_hm(ChronoDuration::minutes(0)), "0m");
+        assert_eq!(format_hm(ChronoDuration::seconds(7200 + 65)), "2h1m");
+    }
+
+    fn d(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn holiday_fixed_date_new_years_and_christmas() {
+        assert!(is_market_holiday(d(2026, 1, 1)));
+        assert!(is_market_holiday(d(2026, 12, 25)));
+    }
+
+    #[test]
+    fn holiday_independence_day_observed_friday_when_saturday() {
+        // July 4 2026 falls on Saturday → observed Friday Jul 3.
+        assert!(is_market_holiday(d(2026, 7, 3)));
+        // July 4 itself is the weekend; the observation logic shifts
+        // the closure to the 3rd. The 4th alone wouldn't be a trading
+        // day either way, so the test is about the observed day catching.
+    }
+
+    #[test]
+    fn holiday_floating_dates() {
+        // MLK = 3rd Mon of Jan 2026 → Jan 19.
+        assert!(is_market_holiday(d(2026, 1, 19)));
+        // Presidents = 3rd Mon of Feb 2026 → Feb 16.
+        assert!(is_market_holiday(d(2026, 2, 16)));
+        // Memorial = last Mon of May 2026 → May 25.
+        assert!(is_market_holiday(d(2026, 5, 25)));
+        // Labor = 1st Mon of Sep 2026 → Sep 7.
+        assert!(is_market_holiday(d(2026, 9, 7)));
+        // Thanksgiving = 4th Thu of Nov 2026 → Nov 26.
+        assert!(is_market_holiday(d(2026, 11, 26)));
+    }
+
+    #[test]
+    fn holiday_good_friday_via_easter_2026() {
+        // Easter 2026 = April 5; Good Friday = April 3.
+        assert!(is_market_holiday(d(2026, 4, 3)));
+        // April 2 (Thursday) is NOT a holiday.
+        assert!(!is_market_holiday(d(2026, 4, 2)));
+    }
+
+    #[test]
+    fn half_day_black_friday_2026() {
+        // Day after Thanksgiving 2026 → Friday Nov 27.
+        assert!(is_market_half_day(d(2026, 11, 27)));
+        // The Thursday before (Thanksgiving) is a full closure, not half.
+        assert!(!is_market_half_day(d(2026, 11, 26)));
+    }
+
+    #[test]
+    fn half_day_christmas_eve_weekday_only() {
+        // 2026: Dec 24 is Thursday → half-day.
+        assert!(is_market_half_day(d(2026, 12, 24)));
+        // 2027: Dec 24 is Friday → observed Christmas closure (not
+        // a half-day per our model).
+        assert!(!is_market_half_day(d(2027, 12, 24)));
+        // 2028: Dec 24 is Sunday → not a trading day either way.
+        assert!(!is_market_half_day(d(2028, 12, 24)));
+    }
+
+    #[test]
+    fn market_status_skips_full_closure_holidays() {
+        // Thursday Nov 26, 2026 is Thanksgiving → countdown points to
+        // Friday Nov 27 (the half-day) at 09:30 ET.
+        let now = et_to_utc(2026, 11, 26, 11, 0);
+        let s = market_status_line(now);
+        assert!(!s.is_open);
+        assert!(s.message.contains("until market open"));
+    }
+
+    #[test]
+    fn market_status_uses_early_close_on_half_day() {
+        // 2026-11-27 (Black Friday) at 12:00 ET → 1h until 13:00 close.
+        let now = et_to_utc(2026, 11, 27, 12, 0);
+        let s = market_status_line(now);
+        assert!(s.is_open);
+        assert_eq!(s.message, "1h0m until market close");
+    }
+
+    #[test]
+    fn nth_weekday_matches_known_dates() {
+        // 3rd Mon of Jan 2026 = Jan 19.
+        assert_eq!(
+            nth_weekday(2026, 1, Weekday::Mon, 3),
+            Some(d(2026, 1, 19))
+        );
+        // 4th Thu of Nov 2026 = Nov 26.
+        assert_eq!(
+            nth_weekday(2026, 11, Weekday::Thu, 4),
+            Some(d(2026, 11, 26))
+        );
+    }
+
+    #[test]
+    fn last_weekday_handles_december_rollover() {
+        // Last Mon of Dec 2026 = Dec 28.
+        assert_eq!(last_weekday(2026, 12, Weekday::Mon), Some(d(2026, 12, 28)));
     }
 }

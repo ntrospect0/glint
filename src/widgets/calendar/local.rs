@@ -59,6 +59,7 @@ impl RawEvent {
             start,
             end,
             all_day,
+            source: "local".into(),
             calendar: self.calendar,
             location: self.location,
         })

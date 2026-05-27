@@ -4,15 +4,20 @@ pub mod news;
 pub mod stocks;
 pub mod weather;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::{layout::Rect, Frame};
 
+use crate::theme::Theme;
+
 /// Shared app-wide context handed to widgets on each tick.
 /// Kept empty in Phase 1; future phases will plug in HTTP/LLM clients here.
+/// The app theme isn't carried here — each widget already caches its own
+/// merged `Theme` at construction (and rebuilds on `apply_config`), so the
+/// tick context doesn't need to thread it through.
 #[derive(Default)]
 pub struct AppContext;
 
@@ -58,6 +63,33 @@ pub trait Widget: Send + Sync {
     fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
         Vec::new()
     }
+
+    /// Swap the widget's app-level theme reference and rebuild its merged
+    /// theme (app + widget's `[colors]` overrides). Called by `:scheme` so
+    /// the user can change palettes without restarting glint. Default is a
+    /// no-op for widgets that don't render themed chrome (none today, but
+    /// the default keeps the trait extensible).
+    fn set_app_theme(&mut self, _theme: Arc<Theme>) {}
+
+    /// Prioritized list of `Shift+<letter>` shortcut keys the widget would
+    /// like to claim for focus. The app walks widgets in registration order
+    /// and assigns the first non-conflicting letter; later widgets fall
+    /// through their list when their preferred letter is taken. Default
+    /// `[]` = widget doesn't participate in shortcut focus (it'll still be
+    /// reachable via Tab / Shift+Tab / mouse click).
+    ///
+    /// Lifetime is the widget's own borrow rather than `'static` so widgets
+    /// can return preferences that came from the user's TOML config (which
+    /// arrive as `Vec<char>`, not literals).
+    fn shortcut_preferences(&self) -> &[char] {
+        &[]
+    }
+
+    /// Called by the app after the assignment pass with the letter that
+    /// was actually picked from `shortcut_preferences`, or `None` if every
+    /// letter in the preference list was already taken. Widgets store this
+    /// so they can paint the letter inside their title.
+    fn set_shortcut(&mut self, _shortcut: Option<char>) {}
 }
 
 /// Owns the set of registered widgets and resolves them by id.

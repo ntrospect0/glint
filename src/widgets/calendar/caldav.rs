@@ -464,6 +464,7 @@ fn ical_event_to_event(
         start,
         end,
         all_day,
+        source: "caldav".into(),
         calendar: calendar_label.to_string(),
         location,
     })

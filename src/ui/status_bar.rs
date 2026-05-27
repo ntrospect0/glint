@@ -1,33 +1,29 @@
 use chrono::Local;
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
 };
 
+use crate::theme::Theme;
+
 /// Bottom-of-screen status bar:
-/// `glint vX.Y.Z │ HH:MM:SS │ Focus: <id> │ Last fetch: HH:MM:SS │ Tab: switch · q: quit`
+/// `glint vX.Y.Z │ HH:MM:SS │ Focus: <id> │ Scheme: <name> │ Tab: switch · ? help · q quit`
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     focused_widget: Option<&str>,
-    last_fetch: Option<chrono::DateTime<Local>>,
+    scheme_name: &str,
+    theme: &Theme,
 ) {
     let now = Local::now();
     let clock = now.format("%H:%M:%S").to_string();
-    let last = match last_fetch {
-        Some(t) => t.format("%H:%M:%S").to_string(),
-        None => "—".into(),
-    };
     let version = env!("CARGO_PKG_VERSION");
     let focus = focused_widget.unwrap_or("—");
 
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let focus_style = Style::default()
-        .fg(Color::LightCyan)
-        .add_modifier(Modifier::BOLD);
     let sep = Span::styled("│", dim);
 
     let line = Line::from(vec![
@@ -36,10 +32,12 @@ pub fn render(
         Span::styled(format!(" {clock} "), dim),
         sep.clone(),
         Span::styled(" Focus: ", dim),
-        Span::styled(focus.to_string(), focus_style),
+        Span::styled(focus.to_string(), theme.text_focused),
         Span::styled(" ", dim),
         sep.clone(),
-        Span::styled(format!(" Last fetch: {last} "), dim),
+        Span::styled(" Scheme: ", dim),
+        Span::styled(scheme_name.to_string(), theme.text_selected),
+        Span::styled(" ", dim),
         sep,
         Span::styled(" Tab: switch · ? help · q quit ", dim),
     ])

@@ -38,7 +38,12 @@ pub async fn run(client: &OAuthClientConfig) -> Result<MicrosoftToken> {
         .local_addr()
         .context("failed to read loopback addr")?
         .port();
-    let redirect_uri = format!("http://127.0.0.1:{port}");
+    // Microsoft validates redirect URIs by exact string match against the
+    // app registration, and the "Mobile and desktop applications" platform
+    // option whitelists `http://localhost` — *not* `http://127.0.0.1`. The
+    // browser will resolve `localhost` to 127.0.0.1 anyway, so our listener
+    // still receives the callback.
+    let redirect_uri = format!("http://localhost:{port}");
 
     let state = loopback::random_state();
     let (verifier, challenge) = pkce_pair()?;

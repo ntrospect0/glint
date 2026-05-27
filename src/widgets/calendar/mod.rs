@@ -5,6 +5,7 @@ pub mod outlook;
 pub mod provider;
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -21,7 +22,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
 use serde::{Deserialize, Serialize};
@@ -36,7 +37,8 @@ use provider::{CalendarProvider, Event};
 
 use crate::auth::google::{store::GoogleToken, OAuthClientConfig as GoogleClientConfig};
 use crate::auth::microsoft::{store::MicrosoftToken, OAuthClientConfig as MicrosoftClientConfig};
-use crate::ui::{big_digits, decorate_title, focus_border_style};
+use crate::theme::{ColorScheme, Theme};
+use crate::ui::{big_digits, decorated_title_line};
 
 const VIEW_TABS: &[(CalendarView, &str)] = &[
     (CalendarView::Day, "Day"),
@@ -98,6 +100,41 @@ pub struct CalendarConfig {
     /// returns the full file in one shot.
     #[serde(default)]
     pub events: Vec<local::RawEvent>,
+
+    /// Optional override for the default color sequence cycled across
+    /// calendars. Names follow the standard ANSI palette (e.g. `red`,
+    /// `light_blue`, `magenta`). Calendars are assigned colors by the order
+    /// they appear in `[[providers]]`; the sequence wraps if there are more
+    /// calendars than colors.
+    #[serde(default)]
+    pub color_palette: Vec<String>,
+
+    /// Optional per-calendar overrides. Keys are `"<source>:<calendar_id>"`,
+    /// e.g. `"google:primary"` or `"outlook:primary"` — using the same
+    /// strings the `[[providers]]` block lists for `calendar_ids`. An explicit
+    /// override beats the sequence assignment.
+    #[serde(default)]
+    pub calendar_colors: HashMap<String, String>,
+
+    /// Big-digit visual style for the day-of-month numeral in Day view.
+    /// `"normal"` (default) keeps the current solid-color rendering; the
+    /// other variants apply a top-to-bottom gradient using half-height block
+    /// rendering. Press `g` while focused on the calendar to cycle. Gradient
+    /// only applies to today's date — anchor and preview days keep their
+    /// dimmed single-color treatment so today still stands out.
+    #[serde(default)]
+    pub gradient: big_digits::Gradient,
+
+    /// Per-widget style overrides layered on top of the active app
+    /// color scheme. Any role omitted here inherits from the app theme.
+    /// Distinct from the per-provider `calendar_colors` palette above.
+    #[serde(default)]
+    pub colors: ColorScheme,
+
+    /// Prioritized `Shift+<letter>` focus shortcut preferences. Leave
+    /// empty to use the built-in default (`['c', 'd', 'a', 'l', 'e', 'n', 'r']`).
+    #[serde(default)]
+    pub shortcuts: Vec<char>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,6 +170,11 @@ impl Default for CalendarConfig {
             providers: Vec::new(),
             caldav: CalDavConfig::default(),
             events: Vec::new(),
+            color_palette: Vec::new(),
+            calendar_colors: HashMap::new(),
+            gradient: big_digits::Gradient::default(),
+            colors: ColorScheme::default(),
+            shortcuts: Vec::new(),
         }
     }
 }
@@ -143,6 +185,8 @@ struct CalendarState {
     last_error: Option<String>,
     last_attempt: Option<Instant>,
     inflight: bool,
+    /// Active big-digit gradient. Seeded from config; user cycles with `g`.
+    gradient: big_digits::Gradient,
 }
 
 pub struct CalendarWidget {
@@ -159,13 +203,39 @@ pub struct CalendarWidget {
     /// no token), we keep the user-visible explanation so the widget can show
     /// "Run `glint --auth google`" instead of silently using the local seed.
     auth_hint: Option<String>,
+    colors: CalendarColors,
     state: Arc<Mutex<CalendarState>>,
     poll_interval: Duration,
+    /// App-level theme; kept so live config reloads can rebuild `theme`
+    /// from updated `colors` overrides.
+    app_theme: Arc<Theme>,
+    /// Cached widget-level `[colors]` overrides. Stored so `:scheme` can
+    /// rebuild the merged theme without re-reading `calendar.toml`.
+    colors_override: ColorScheme,
+    /// Merged theme (app + widget overrides). Rebuilt on `apply_config`.
+    theme: Theme,
+    /// Letter assigned by the app for `Shift+<letter>` focus, painted in
+    /// the title via `text.shortcut`. `None` = no shortcut claimed.
+    shortcut: Option<char>,
+    /// Effective shortcut preference list (TOML override or built-in).
+    shortcut_prefs: Vec<char>,
 }
 
 impl CalendarWidget {
-    pub fn with_config(config: CalendarConfig) -> Self {
+    pub fn with_config(config: CalendarConfig, app_theme: Arc<Theme>) -> Self {
         let (provider, source_label, auth_hint) = build_provider(&config);
+        let colors = CalendarColors::build(&config);
+        let state = CalendarState {
+            gradient: config.gradient,
+            ..CalendarState::default()
+        };
+        let colors_override = config.colors.clone();
+        let theme = app_theme.with_overrides(&colors_override);
+        let shortcut_prefs = if config.shortcuts.is_empty() {
+            vec!['c', 'd', 'a', 'l', 'e', 'n', 'r']
+        } else {
+            config.shortcuts.clone()
+        };
         Self {
             id: "calendar".into(),
             view: config.default_view,
@@ -173,8 +243,14 @@ impl CalendarWidget {
             provider,
             source_label,
             auth_hint,
-            state: Arc::new(Mutex::new(CalendarState::default())),
+            colors,
+            state: Arc::new(Mutex::new(state)),
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(15)),
+            app_theme,
+            colors_override,
+            theme,
+            shortcut: None,
+            shortcut_prefs,
         }
     }
 
@@ -191,7 +267,10 @@ impl CalendarWidget {
 
     fn current_range(&self) -> (DateTime<Local>, DateTime<Local>) {
         let (start, end) = match self.view {
-            CalendarView::Day => (self.anchor, self.anchor + ChronoDuration::days(1)),
+            // Fetch two days when in Day view: the wide layout previews the
+            // *next* day next to the anchor, and we don't want it to render
+            // "No events" just because the next day's events weren't fetched.
+            CalendarView::Day => (self.anchor, self.anchor + ChronoDuration::days(2)),
             CalendarView::Week => {
                 let s = start_of_week(self.anchor);
                 (s, s + ChronoDuration::days(7))
@@ -330,6 +409,24 @@ const MONTH_GRID_MIN_WIDTH: u16 = 37;
 enum BottomAction {
     Today,
     View(CalendarView),
+}
+
+/// Day and Month views get a 1-col gutter on each side of the widget's
+/// inner area so the content doesn't sit flush against the rounded border.
+/// Week view is already column-packed (7 cells + 6 separators); padding it
+/// would compress the day cells, so it stays flush. Both `render` and
+/// `handle_mouse` route through this helper so click→date mapping aligns
+/// with the rendered grid.
+fn content_rect_for(view: CalendarView, inner: Rect) -> Rect {
+    match view {
+        CalendarView::Day | CalendarView::Month if inner.width >= 4 => Rect {
+            x: inner.x + 1,
+            y: inner.y,
+            width: inner.width - 2,
+            height: inner.height,
+        },
+        _ => inner,
+    }
 }
 
 /// Maps a click in the bottom hint row to a button. Layout must mirror the
@@ -547,13 +644,18 @@ fn advance_month(year: i32, month: u32, delta: i32) -> (i32, u32) {
 
 /// Renders one month's 6-week grid into `area`. `is_anchor` controls header
 /// styling so the currently-focused month stands out among neighbors.
+/// `selected` is the day the user has chosen (drives the agenda below); its
+/// cell is drawn with reversed colors so the selection is unambiguous even
+/// when it coincides with — or differs from — today.
 fn render_month_grid(
     frame: &mut Frame,
     area: Rect,
     year: i32,
     month: u32,
     is_anchor: bool,
+    selected: NaiveDate,
     events: &[Event],
+    theme: &Theme,
 ) {
     let Some(first) = NaiveDate::from_ymd_opt(year, month, 1) else {
         return;
@@ -562,11 +664,9 @@ fn render_month_grid(
     let today = Local::now().date_naive();
 
     let month_header_style = if is_anchor {
-        Style::default()
-            .fg(Color::LightYellow)
-            .add_modifier(Modifier::BOLD)
+        theme.text_selected
     } else {
-        Style::default().add_modifier(Modifier::DIM)
+        theme.text_dim
     };
     let weekday_header = Line::from(
         ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
@@ -600,15 +700,22 @@ fn render_month_grid(
                 format!(" {day_str:>2} ")
             };
             let has_events = events.iter().any(|e| e.on_date(date));
-            let style = if !in_month {
-                Style::default().add_modifier(Modifier::DIM)
-            } else if has_events {
-                Style::default()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD)
+            // Cyan-bold "has events" highlight is reserved for the
+            // real-life current month (today's month). When the user
+            // navigates the anchor to July, July's event days stay neutral
+            // — we don't want a non-current month to light up just because
+            // an async fetch returned later.
+            let is_current_month = date.year() == today.year() && date.month() == today.month();
+            let mut style = if !in_month {
+                theme.text_dim
+            } else if has_events && is_current_month {
+                theme.text_focused
             } else {
-                Style::default()
+                theme.text_plain
             };
+            if date == selected {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
             spans.push(Span::styled(format!("{cell:<5}"), style));
         }
         lines.push(Line::from(spans));
@@ -644,21 +751,166 @@ fn first_of_next_month(d: NaiveDate) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, 1).unwrap_or(d)
 }
 
-/// Stable hash a calendar name to one of a handful of pleasant colors.
-fn color_for_calendar(name: &str) -> Color {
-    const PALETTE: [Color; 6] = [
-        Color::LightBlue,
-        Color::LightGreen,
-        Color::LightYellow,
-        Color::LightMagenta,
-        Color::LightCyan,
-        Color::LightRed,
-    ];
-    let mut hash: u32 = 5381;
-    for b in name.bytes() {
-        hash = hash.wrapping_mul(33).wrapping_add(u32::from(b));
+/// Built-in palette cycled across calendars when the user hasn't supplied
+/// their own `color_palette` in calendar.toml. Eight slots so up to eight
+/// calendars get unique colors before the sequence repeats.
+const DEFAULT_PALETTE: [Color; 8] = [
+    Color::LightBlue,
+    Color::LightGreen,
+    Color::LightYellow,
+    Color::LightMagenta,
+    Color::LightCyan,
+    Color::LightRed,
+    Color::Blue,
+    Color::Green,
+];
+
+/// Resolves an `Event.source + Event.calendar` pair to a terminal color.
+///
+/// Construction is config-driven: explicit overrides from `[calendar_colors]`
+/// win, then everything that appears in `[[providers]]` gets the next palette
+/// slot in declaration order, and anything we encounter at runtime that the
+/// config didn't anticipate (rare — happens with CalDAV auto-discovery)
+/// falls back to a stable hash of the composite key.
+struct CalendarColors {
+    palette: Vec<Color>,
+    /// Explicit per-calendar overrides keyed by `(source, calendar_id)`.
+    overrides: HashMap<(String, String), Color>,
+    /// Pre-computed palette index for each calendar declared in config.
+    assigned: HashMap<(String, String), usize>,
+}
+
+impl CalendarColors {
+    fn build(config: &CalendarConfig) -> Self {
+        // Parse the user palette; fall back to defaults when entries are
+        // empty or unrecognized rather than silently dropping the calendar's
+        // distinct color.
+        let palette: Vec<Color> = if config.color_palette.is_empty() {
+            DEFAULT_PALETTE.to_vec()
+        } else {
+            let mut parsed: Vec<Color> = config
+                .color_palette
+                .iter()
+                .filter_map(|s| parse_color(s))
+                .collect();
+            if parsed.is_empty() {
+                parsed = DEFAULT_PALETTE.to_vec();
+            }
+            parsed
+        };
+
+        // Per-calendar overrides. Keys take the form "source:calendar_id".
+        // Anything we can't parse is logged once and dropped so the rest of
+        // the map still applies.
+        let mut overrides: HashMap<(String, String), Color> = HashMap::new();
+        for (key, value) in &config.calendar_colors {
+            let Some((source, calendar)) = key.split_once(':') else {
+                tracing::warn!(
+                    key = %key,
+                    "calendar_colors key missing 'source:' prefix — expected e.g. \"google:primary\""
+                );
+                continue;
+            };
+            let Some(color) = parse_color(value) else {
+                tracing::warn!(key = %key, value = %value, "unrecognized color name");
+                continue;
+            };
+            overrides.insert((source.to_string(), calendar.to_string()), color);
+        }
+
+        // Walk `[[providers]]` (or the legacy single-provider form) in order
+        // and assign each declared calendar the next palette index. Overrides
+        // are skipped here — they don't consume a slot, so the next non-
+        // overridden calendar still gets palette[0].
+        let entries: Vec<ProviderEntry> = if !config.providers.is_empty() {
+            config.providers.clone()
+        } else if config.provider != ProviderKind::Local {
+            vec![ProviderEntry {
+                kind: config.provider,
+                calendar_ids: config.calendar_ids.clone(),
+            }]
+        } else {
+            Vec::new()
+        };
+
+        let mut assigned: HashMap<(String, String), usize> = HashMap::new();
+        let mut next_idx: usize = 0;
+        for entry in &entries {
+            let source = provider_kind_label(entry.kind);
+            let ids: Vec<String> = if entry.calendar_ids.is_empty() {
+                // An empty list means "the provider's default calendar".
+                // Each provider names that default slightly differently, but
+                // for color purposes we just need a stable key.
+                vec!["primary".to_string()]
+            } else {
+                entry.calendar_ids.clone()
+            };
+            for id in ids {
+                let key = (source.to_string(), id);
+                if overrides.contains_key(&key) || assigned.contains_key(&key) {
+                    continue;
+                }
+                assigned.insert(key, next_idx);
+                next_idx += 1;
+            }
+        }
+
+        Self {
+            palette,
+            overrides,
+            assigned,
+        }
     }
-    PALETTE[(hash as usize) % PALETTE.len()]
+
+    fn resolve(&self, source: &str, calendar: &str) -> Color {
+        let key = (source.to_string(), calendar.to_string());
+        if let Some(c) = self.overrides.get(&key) {
+            return *c;
+        }
+        if let Some(idx) = self.assigned.get(&key) {
+            return self.palette[idx % self.palette.len()];
+        }
+        // Unknown calendar — hash the composite key into the palette so at
+        // least same-name events stay one color across renders.
+        let mut hash: u32 = 5381;
+        for b in source.bytes().chain(b":".iter().copied()).chain(calendar.bytes()) {
+            hash = hash.wrapping_mul(33).wrapping_add(u32::from(b));
+        }
+        self.palette[(hash as usize) % self.palette.len()]
+    }
+}
+
+fn provider_kind_label(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::Local => "local",
+        ProviderKind::Google => "google",
+        ProviderKind::Outlook => "outlook",
+        ProviderKind::Caldav => "caldav",
+    }
+}
+
+/// Maps a color name (case-insensitive, hyphens or underscores) to a
+/// Ratatui `Color`. ANSI 16-color names plus a few common aliases.
+fn parse_color(s: &str) -> Option<Color> {
+    let norm = s.trim().to_ascii_lowercase().replace('-', "_");
+    Some(match norm.as_str() {
+        "black" => Color::Black,
+        "red" => Color::Red,
+        "green" => Color::Green,
+        "yellow" => Color::Yellow,
+        "blue" => Color::Blue,
+        "magenta" | "purple" => Color::Magenta,
+        "cyan" => Color::Cyan,
+        "white" => Color::White,
+        "gray" | "grey" | "dark_gray" | "dark_grey" => Color::DarkGray,
+        "light_red" | "bright_red" => Color::LightRed,
+        "light_green" | "bright_green" => Color::LightGreen,
+        "light_yellow" | "bright_yellow" => Color::LightYellow,
+        "light_blue" | "bright_blue" => Color::LightBlue,
+        "light_magenta" | "bright_magenta" | "light_purple" => Color::LightMagenta,
+        "light_cyan" | "bright_cyan" => Color::LightCyan,
+        _ => return None,
+    })
 }
 
 fn weekday_short(w: Weekday) -> &'static str {
@@ -737,7 +989,11 @@ impl CalendarWidget {
                     Constraint::Fill(1),
                 ])
                 .split(area);
-            self.render_day_column(frame, cols[0], self.anchor, true, events);
+            // Pad the agenda body 1 col away from the vertical separator on
+            // both sides. Headers stay centered in the full column, so the
+            // big-digit date numerals keep their visual anchoring while the
+            // text-heavy agenda lines breathe around the divider.
+            self.render_day_column(frame, cols[0], self.anchor, true, 0, 1, events);
             // Carve a sub-rect that's inset one row from the top (so the
             // separator doesn't kiss the cell border) and one row from the
             // bottom (so it doesn't overlap with the view-tab hint row).
@@ -753,16 +1009,16 @@ impl CalendarWidget {
                     .map(|_| {
                         Line::from(Span::styled(
                             "│",
-                            Style::default().add_modifier(Modifier::DIM),
+                            self.theme.text_dim,
                         ))
                     })
                     .collect();
                 frame.render_widget(Paragraph::new(sep_lines), sep_area);
             }
             let next = self.anchor + ChronoDuration::days(1);
-            self.render_day_column(frame, cols[2], next, false, events);
+            self.render_day_column(frame, cols[2], next, false, 1, 0, events);
         } else {
-            self.render_day_column(frame, area, self.anchor, true, events);
+            self.render_day_column(frame, area, self.anchor, true, 0, 0, events);
         }
     }
 
@@ -772,6 +1028,8 @@ impl CalendarWidget {
         area: Rect,
         date: NaiveDate,
         is_anchor: bool,
+        body_left_pad: u16,
+        body_right_pad: u16,
         events: &[Event],
     ) {
         let day_events: Vec<&Event> = events.iter().filter(|e| e.on_date(date)).collect();
@@ -783,10 +1041,13 @@ impl CalendarWidget {
             width: area.width,
             height: header_height,
         };
+        // Body inset by `body_left_pad`/`body_right_pad` lets the two-day
+        // split keep its agenda text off the central separator line.
+        let body_pad_total = body_left_pad + body_right_pad;
         let body_area = Rect {
-            x: area.x,
+            x: area.x + body_left_pad,
             y: area.y + header_height,
-            width: area.width,
+            width: area.width.saturating_sub(body_pad_total),
             height: area.height.saturating_sub(header_height),
         };
 
@@ -817,18 +1078,38 @@ impl CalendarWidget {
             Line::from(""),
             Line::from(Span::styled(
                 header_text,
-                Style::default().add_modifier(Modifier::DIM),
+                self.theme.text_dim,
             )),
         ];
-        for row in big_digits::render(&date.day().to_string()) {
-            header_lines.push(Line::from(Span::styled(row, date_style)));
+        // For today's date we hand the big-digit numeral to `render_styled`
+        // so the user's gradient choice applies. Anchor and preview days keep
+        // their dim single-color render — putting a vibrant gradient on a
+        // non-today date would defeat the visual hierarchy.
+        if is_today {
+            let gradient = self
+                .state
+                .lock()
+                .expect("calendar state poisoned")
+                .gradient;
+            let lines = big_digits::render_styled(
+                &date.day().to_string(),
+                gradient,
+                self.theme.text_selected,
+            );
+            for line in lines {
+                header_lines.push(line);
+            }
+        } else {
+            for row in big_digits::render(&date.day().to_string()) {
+                header_lines.push(Line::from(Span::styled(row, date_style)));
+            }
         }
         frame.render_widget(
             Paragraph::new(header_lines).alignment(Alignment::Center),
             header_area,
         );
 
-        let mut lines: Vec<Line<'_>> = Vec::new();
+        let mut lines: Vec<Line<'static>> = Vec::new();
         // Auth hint only renders alongside the anchor day so we don't double-up.
         if is_anchor {
             if let Some(hint) = &self.auth_hint {
@@ -839,53 +1120,111 @@ impl CalendarWidget {
                 lines.push(Line::from(""));
             }
         }
-        if day_events.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "No events.",
-                Style::default().add_modifier(Modifier::DIM),
-            )));
-        } else {
-            // Widest time label is "HH:MM–HH:MM" (11 chars). Pad every label
-            // (including "all day") to that width so every title starts at
-            // the same column.
-            const TIME_COL_WIDTH: usize = 11;
-            const TITLE_GAP: usize = 2;
-            let cont_indent = " ".repeat(TIME_COL_WIDTH + TITLE_GAP);
+        lines.extend(self.agenda_lines(&day_events, body_area.width));
+        let body = Paragraph::new(lines);
+        frame.render_widget(body, body_area);
+    }
 
-            for e in &day_events {
-                let color = color_for_calendar(&e.calendar);
-                let raw_time = if e.all_day {
-                    "all day".to_string()
+    /// Build the time-aligned event list shared by Day view and the Month
+    /// view's selected-day footer. Title and location each wrap to at most
+    /// 2 lines when they overflow `body_width`; further overflow ends with
+    /// an ellipsis (via `wrap_event_title`).
+    fn agenda_lines(&self, day_events: &[&Event], body_width: u16) -> Vec<Line<'static>> {
+        // Widest time label is "HH:MM–HH:MM" (11 chars). Pad every label
+        // (including "all day") to that width so every title starts at
+        // the same column.
+        const TIME_COL_WIDTH: usize = 11;
+        const TITLE_GAP: usize = 2;
+        const MAX_LINES_PER_FIELD: usize = 2;
+        let cont_indent = " ".repeat(TIME_COL_WIDTH + TITLE_GAP);
+        let text_width = (body_width as usize)
+            .saturating_sub(TIME_COL_WIDTH + TITLE_GAP)
+            .max(1);
+
+        if day_events.is_empty() {
+            return vec![Line::from(Span::styled(
+                "No events.",
+                self.theme.text_dim,
+            ))];
+        }
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for e in day_events {
+            let color = self.colors.resolve(&e.source, &e.calendar);
+            let raw_time = if e.all_day {
+                "all day".to_string()
+            } else {
+                format!(
+                    "{:02}:{:02}–{:02}:{:02}",
+                    e.start.hour(),
+                    e.start.minute(),
+                    e.end.hour(),
+                    e.end.minute()
+                )
+            };
+            let padded_time = format!("{:<width$}", raw_time, width = TIME_COL_WIDTH);
+            let gap = " ".repeat(TITLE_GAP);
+
+            let title_lines = wrap_event_title(&e.title, text_width, MAX_LINES_PER_FIELD);
+            for (i, t) in title_lines.into_iter().enumerate() {
+                let title_span =
+                    Span::styled(t, Style::default().fg(color).add_modifier(Modifier::BOLD));
+                if i == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{padded_time}{gap}"),
+                            Style::default().fg(Color::Gray),
+                        ),
+                        title_span,
+                    ]));
                 } else {
-                    format!(
-                        "{:02}:{:02}–{:02}:{:02}",
-                        e.start.hour(),
-                        e.start.minute(),
-                        e.end.hour(),
-                        e.end.minute()
-                    )
-                };
-                let padded_time = format!("{:<width$}", raw_time, width = TIME_COL_WIDTH);
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{padded_time}{:gap$}", "", gap = TITLE_GAP),
-                        Style::default().fg(Color::Gray),
-                    ),
-                    Span::styled(
-                        e.title.clone(),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                if let Some(loc) = &e.location {
-                    lines.push(Line::from(Span::styled(
-                        format!("{cont_indent}{loc}"),
-                        Style::default().add_modifier(Modifier::DIM),
-                    )));
+                    lines.push(Line::from(vec![
+                        Span::raw(cont_indent.clone()),
+                        title_span,
+                    ]));
+                }
+            }
+            if let Some(loc) = &e.location {
+                let loc_lines = wrap_event_title(loc, text_width, MAX_LINES_PER_FIELD);
+                for t in loc_lines {
+                    lines.push(Line::from(vec![
+                        Span::raw(cont_indent.clone()),
+                        Span::styled(t, self.theme.text_dim),
+                    ]));
                 }
             }
         }
-        let body = Paragraph::new(lines);
-        frame.render_widget(body, body_area);
+        lines
+    }
+
+    /// Render the agenda for the month-view's selected day below the calendar
+    /// grid. Shares the time-aligned event format with [`agenda_lines`].
+    fn render_month_agenda(&self, frame: &mut Frame, area: Rect, events: &[Event]) {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+        let day_events: Vec<&Event> =
+            events.iter().filter(|e| e.on_date(self.anchor)).collect();
+        let today = Local::now().date_naive();
+        let header_text = format!(
+            "{}, {} {}",
+            weekday_short(self.anchor.weekday()),
+            month_long(self.anchor.month()),
+            self.anchor.day(),
+        );
+        let header_style = if self.anchor == today {
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD)
+        };
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(Span::styled(header_text, header_style)));
+        lines.extend(self.agenda_lines(&day_events, area.width));
+        frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_week(&self, frame: &mut Frame, area: Rect, events: &[Event]) {
@@ -915,7 +1254,7 @@ impl CalendarWidget {
                 .map(|_| {
                     Line::from(Span::styled(
                         "│",
-                        Style::default().add_modifier(Modifier::DIM),
+                        self.theme.text_dim,
                     ))
                 })
                 .collect();
@@ -949,12 +1288,12 @@ impl CalendarWidget {
             if day_events.is_empty() {
                 lines.push(Line::from(Span::styled(
                     "·",
-                    Style::default().add_modifier(Modifier::DIM),
+                    self.theme.text_dim,
                 )));
             } else {
                 let wrap_width = col_area.width.saturating_sub(1) as usize;
                 for e in day_events {
-                    let color = color_for_calendar(&e.calendar);
+                    let color = self.colors.resolve(&e.source, &e.calendar);
                     let prefix = if e.all_day {
                         "•".to_string()
                     } else {
@@ -998,16 +1337,53 @@ impl CalendarWidget {
             vec![(anchor_y, anchor_m)]
         };
 
+        // Grid is 9 rows (1 pad + 1 month-name + 1 weekday header + 6 weeks).
+        // Reserve the last row for the [Today]/[Day]/[Week]/[Month] hint that
+        // `render` paints over us. If there's a comfortable gap below the
+        // grid, surface the selected day's agenda there.
+        const GRID_HEIGHT: u16 = 9;
+        const FOOTER_RESERVED: u16 = 1;
+        const SPACER: u16 = 1;
+        const AGENDA_MIN_ROWS: u16 = 2;
+        let usable = area.height.saturating_sub(FOOTER_RESERVED);
+        let show_agenda = usable >= GRID_HEIGHT + SPACER + AGENDA_MIN_ROWS;
+
+        let grid_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: if show_agenda { GRID_HEIGHT } else { area.height },
+        };
+
         let constraints: Vec<Constraint> =
             (0..months.len()).map(|_| Constraint::Ratio(1, months.len() as u32)).collect();
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(constraints)
-            .split(area);
+            .split(grid_area);
 
         for ((y, m), col_area) in months.iter().zip(cols.iter()) {
             let is_anchor = (*y, *m) == (anchor_y, anchor_m);
-            render_month_grid(frame, *col_area, *y, *m, is_anchor, events);
+            render_month_grid(
+                frame,
+                *col_area,
+                *y,
+                *m,
+                is_anchor,
+                self.anchor,
+                events,
+                &self.theme,
+            );
+        }
+
+        if show_agenda {
+            let agenda_area = Rect {
+                x: area.x,
+                y: area.y + GRID_HEIGHT + SPACER,
+                width: area.width,
+                height: usable - GRID_HEIGHT - SPACER,
+            };
+            self.render_month_agenda(frame, agenda_area, events);
         }
     }
 }
@@ -1091,19 +1467,24 @@ impl Widget for CalendarWidget {
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(focus_border_style(focused))
-            .title(Span::styled(
-                decorate_title(focused, &self.title_for_header()),
-                Style::default().add_modifier(Modifier::BOLD),
+            .border_type(BorderType::Rounded)
+            .border_style(self.theme.border_style(focused))
+            .title(decorated_title_line(
+                focused,
+                &self.title_for_header(),
+                self.shortcut,
+                self.theme.widget_title,
+                self.theme.text_shortcut,
             ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
         let events = self.snapshot_events();
+        let content = content_rect_for(self.view, inner);
         match self.view {
-            CalendarView::Day => self.render_day(frame, inner, &events),
-            CalendarView::Week => self.render_week(frame, inner, &events),
-            CalendarView::Month => self.render_month(frame, inner, &events),
+            CalendarView::Day => self.render_day(frame, content, &events),
+            CalendarView::Week => self.render_week(frame, content, &events),
+            CalendarView::Month => self.render_month(frame, content, &events),
         }
 
         // Footer row: [Today] action + [Day] [Week] [Month] view tabs on the
@@ -1116,29 +1497,19 @@ impl Widget for CalendarWidget {
                 height: 1,
             };
             let mut spans: Vec<Span<'_>> = vec![Span::raw(" ")];
-            spans.push(Span::styled(
-                "[Today]",
-                Style::default()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            spans.push(Span::styled("[Today]", self.theme.text_focused));
             spans.push(Span::raw(" "));
             for (v, label) in VIEW_TABS {
                 let active = *v == self.view;
                 let style = if active {
-                    Style::default()
-                        .fg(Color::LightYellow)
-                        .add_modifier(Modifier::BOLD)
+                    self.theme.text_selected
                 } else {
-                    Style::default().add_modifier(Modifier::DIM)
+                    self.theme.text_dim
                 };
                 spans.push(Span::styled(format!("[{label}]"), style));
                 spans.push(Span::raw(" "));
             }
-            spans.push(Span::styled(
-                "  ←/→ nav",
-                Style::default().add_modifier(Modifier::DIM),
-            ));
+            spans.push(Span::styled("  ←/→ nav", self.theme.text_dim));
             frame.render_widget(Paragraph::new(Line::from(spans)), hint_area);
         }
     }
@@ -1181,6 +1552,11 @@ impl Widget for CalendarWidget {
             KeyCode::Right | KeyCode::Char('l') => {
                 self.anchor += step;
                 self.mark_dirty();
+                EventResult::Handled
+            }
+            KeyCode::Char('g') => {
+                let mut st = self.state.lock().expect("calendar state poisoned");
+                st.gradient = st.gradient.next();
                 EventResult::Handled
             }
             _ => EventResult::Ignored,
@@ -1233,11 +1609,16 @@ impl Widget for CalendarWidget {
             }
         }
 
-        // Day-grid clicks: which date did the user pick? Always switches to
-        // Day view so the events for that date come up immediately.
+        // Day-grid clicks: which date did the user pick? Week view promotes
+        // the clicked date to Day view (the events list needs the room).
+        // Month view keeps the user in the calendar — it just moves the
+        // selection so the agenda below the grid retargets to that day.
+        // Day/Month grids are drawn in a 1-col-inset rect (see
+        // `content_rect_for`), so hit-test against the same rect.
+        let content = content_rect_for(self.view, inner);
         match self.view {
             CalendarView::Week => {
-                if let Some(date) = self.week_day_at(mouse.column, mouse.row, inner) {
+                if let Some(date) = self.week_day_at(mouse.column, mouse.row, content) {
                     self.anchor = date;
                     self.view = CalendarView::Day;
                     self.mark_dirty();
@@ -1245,9 +1626,8 @@ impl Widget for CalendarWidget {
                 }
             }
             CalendarView::Month => {
-                if let Some(date) = self.month_day_at(mouse.column, mouse.row, inner) {
+                if let Some(date) = self.month_day_at(mouse.column, mouse.row, content) {
                     self.anchor = date;
-                    self.view = CalendarView::Day;
                     self.mark_dirty();
                     return EventResult::Handled;
                 }
@@ -1255,7 +1635,7 @@ impl Widget for CalendarWidget {
             CalendarView::Day => {
                 // Two-column day view: clicking the right preview column
                 // promotes that day to the new anchor.
-                if inner.width >= 50 && mouse.column >= inner.x + inner.width / 2 {
+                if content.width >= 50 && mouse.column >= content.x + content.width / 2 {
                     self.anchor += ChronoDuration::days(1);
                     self.mark_dirty();
                     return EventResult::Handled;
@@ -1274,7 +1654,8 @@ impl Widget for CalendarWidget {
             ("d / w / m", "switch view: day / week / month"),
             ("← / → / h / l", "previous / next (per view)"),
             ("t", "jump to today"),
-            ("click day", "navigate to that day (week/month view)"),
+            ("g", "cycle digit gradient style (today's date)"),
+            ("click day", "week: open in day view; month: select for agenda"),
             ("click tab", "switch view / today"),
         ]
     }
@@ -1290,14 +1671,32 @@ impl Widget for CalendarWidget {
     fn apply_config(&mut self, config: serde_json::Value) -> Result<()> {
         let new_config: CalendarConfig =
             serde_json::from_value(config).context("invalid calendar config payload")?;
-        *self = Self::with_config(new_config);
+        let app_theme = self.app_theme.clone();
+        *self = Self::with_config(new_config, app_theme);
         Ok(())
+    }
+
+    fn set_app_theme(&mut self, theme: Arc<Theme>) {
+        self.theme = theme.with_overrides(&self.colors_override);
+        self.app_theme = theme;
+    }
+
+    fn shortcut_preferences(&self) -> &[char] {
+        &self.shortcut_prefs
+    }
+
+    fn set_shortcut(&mut self, shortcut: Option<char>) {
+        self.shortcut = shortcut;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build_widget(cfg: CalendarConfig) -> CalendarWidget {
+        CalendarWidget::with_config(cfg, Arc::new(Theme::builtin_defaults()))
+    }
 
     #[test]
     fn start_of_week_lands_on_sunday() {
@@ -1316,15 +1715,70 @@ mod tests {
     }
 
     #[test]
-    fn color_for_calendar_is_stable() {
-        let a = color_for_calendar("work");
-        let b = color_for_calendar("work");
-        assert_eq!(a, b);
+    fn color_resolver_is_stable_and_disambiguates_sources() {
+        let cfg = CalendarConfig {
+            providers: vec![
+                ProviderEntry {
+                    kind: ProviderKind::Google,
+                    calendar_ids: vec!["primary".into()],
+                },
+                ProviderEntry {
+                    kind: ProviderKind::Outlook,
+                    calendar_ids: vec!["primary".into()],
+                },
+            ],
+            ..Default::default()
+        };
+        let c = CalendarColors::build(&cfg);
+        let g = c.resolve("google", "primary");
+        let o = c.resolve("outlook", "primary");
+        assert_ne!(g, o, "same calendar id under different sources must differ");
+        assert_eq!(g, c.resolve("google", "primary"), "must be deterministic");
+    }
+
+    #[test]
+    fn explicit_calendar_color_overrides_sequence() {
+        let mut overrides = HashMap::new();
+        overrides.insert("google:primary".to_string(), "red".to_string());
+        let cfg = CalendarConfig {
+            providers: vec![ProviderEntry {
+                kind: ProviderKind::Google,
+                calendar_ids: vec!["primary".into()],
+            }],
+            calendar_colors: overrides,
+            ..Default::default()
+        };
+        let c = CalendarColors::build(&cfg);
+        assert_eq!(c.resolve("google", "primary"), Color::Red);
+    }
+
+    #[test]
+    fn custom_palette_replaces_default_sequence() {
+        let cfg = CalendarConfig {
+            providers: vec![ProviderEntry {
+                kind: ProviderKind::Google,
+                calendar_ids: vec!["a".into(), "b".into()],
+            }],
+            color_palette: vec!["red".into(), "green".into()],
+            ..Default::default()
+        };
+        let c = CalendarColors::build(&cfg);
+        assert_eq!(c.resolve("google", "a"), Color::Red);
+        assert_eq!(c.resolve("google", "b"), Color::Green);
+    }
+
+    #[test]
+    fn parse_color_accepts_common_names() {
+        assert_eq!(parse_color("red"), Some(Color::Red));
+        assert_eq!(parse_color("Light-Blue"), Some(Color::LightBlue));
+        assert_eq!(parse_color("BRIGHT_GREEN"), Some(Color::LightGreen));
+        assert_eq!(parse_color(" gray "), Some(Color::DarkGray));
+        assert_eq!(parse_color("nope"), None);
     }
 
     #[test]
     fn default_view_is_day_and_widget_starts_today() {
-        let w = CalendarWidget::with_config(CalendarConfig::default());
+        let w = build_widget(CalendarConfig::default());
         assert_eq!(w.view, CalendarView::Day);
         assert_eq!(w.anchor, Local::now().date_naive());
     }
@@ -1348,7 +1802,7 @@ mod tests {
             default_view: CalendarView::Week,
             ..CalendarConfig::default()
         };
-        let mut w = CalendarWidget::with_config(cfg);
+        let mut w = build_widget(cfg);
         w.anchor = NaiveDate::from_ymd_opt(2026, 5, 20).unwrap();
         let inner = Rect::new(0, 0, 70, 20);
         // 70 wide → each of the 7 cols ≈ 10. Click in col 0 (x=2) → Sunday.
@@ -1371,7 +1825,7 @@ mod tests {
             default_view: CalendarView::Month,
             ..CalendarConfig::default()
         };
-        let mut w = CalendarWidget::with_config(cfg);
+        let mut w = build_widget(cfg);
         w.anchor = NaiveDate::from_ymd_opt(2026, 5, 20).unwrap();
         // 40-wide column → 35-char grid centered → 2 cols leading padding,
         // so cell 0 starts at col 2, cell 6 starts at col 32.

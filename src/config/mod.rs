@@ -70,6 +70,9 @@ pub fn load(override_path: Option<&Path>) -> Result<Config> {
 pub const DEFAULT_CONFIG_TOML: &str = r#"version = 1
 
 [global]
+# Active color scheme — looked up in colorschemes.toml under [schemes.<name>].
+# Ships with "default", "nord", and "gruvbox_dark". An unrecognized name falls
+# back to glint's built-in palette.
 theme = "default"
 command_key = ":"
 refresh_all_on_focus = true
@@ -148,6 +151,10 @@ poll_interval_secs = 900
 # When true, horizontal mouse scroll cycles the filter tabs. Disabled by
 # default because trackpad sideways gestures often fire accidentally.
 horizontal_scroll_filters = false
+
+# Show the topic categorization (e.g. `[Business,World]`) on each article's
+# meta row. Many users prefer the quieter look — flip this off to hide.
+show_topic_labels = true
 
 # RSS / Atom feeds to aggregate. `label` is shown in the article row.
 # All sources here are free / non-paywall to read (some have paywalls on
@@ -241,16 +248,8 @@ label = "Pitchfork"
 url = "https://pitchfork.com/rss/news/"
 
 [[feeds]]
-label = "Variety"
-url = "https://variety.com/feed/"
-
-[[feeds]]
 label = "Hollywood Reporter"
 url = "https://www.hollywoodreporter.com/feed/"
-
-[[feeds]]
-label = "Polygon"
-url = "https://www.polygon.com/rss/index.xml"
 
 # Topics tag articles whose title/summary contains any keyword (case-insensitive
 # substring match) and double as filter tabs across the top of the news cell
@@ -296,6 +295,152 @@ keywords = [
   "EP", "soundtrack",
 ]
 "#;
+
+pub const DEFAULT_COLORSCHEMES_TOML: &str = r##"# Color schemes for glint's chrome (borders, titles) and a handful of
+# semantic text roles. Pick the active scheme via `[global] theme = "..."` in
+# config.toml — or live-switch with `:scheme <name>` from the command bar.
+# Per-widget overrides go in a `[colors]` block inside each widget's TOML
+# (clock.toml, stocks.toml, …).
+#
+# StyleSpec format — either a shorthand string ("light_cyan", "#7dd3fc") that
+# sets the foreground only, or a table with fg / bg / modifiers:
+#
+#   border.focused = "light_cyan"
+#   border.focused = { fg = "light_cyan", bg = "default", modifiers = ["bold"] }
+#
+# NOTE: write `border.focused` (unquoted) so TOML sees the dot as a nested
+# table separator. Writing `"border.focused"` produces a literal flat key
+# that the deserializer can't see — your override would parse without error
+# but silently never apply.
+#
+# Recognized modifiers: bold, dim, italic, underline, slow_blink, rapid_blink,
+# reversed, hidden, crossed_out. "default" / "reset" / "none" means "inherit
+# from the terminal" — useful for `bg` and `border.unfocused` to let your
+# terminal theme show through.
+#
+# Roles glint reads:
+#   border.focused    — widget border when the cell is focused (Tab cycles)
+#   border.unfocused  — widget border on inactive cells
+#   widget_title      — bold title text rendered in the border
+#   text.plain        — default body text (the regular off-white prose)
+#   text.brilliant    — emphasized body text (bold/bright)
+#   text.dim          — annotation text: bottom hint rows, "all day" labels,
+#                       graph axis labels, "(no stats)" placeholders, the
+#                       gray separator dividers
+#   text.selected     — selected tab, active period toggle, [Today] pill
+#   text.focused      — focused entity highlight (cyan company name in stocks,
+#                       focused article title in news, local time in clock)
+#   text.shortcut     — single highlighted letter in each widget title that
+#                       indicates the Shift+<letter> focus shortcut
+#                       (e.g. red C in Clock = Shift+C focuses the clock)
+#
+# Missing roles silently fall back to glint's built-in defaults below, so a
+# scheme can override one field and leave the rest alone.
+
+# IMPORTANT: dotted keys (border.focused, text.plain, …) must NOT be quoted.
+# In TOML, `"border.focused"` is a single literal key, while `border.focused`
+# (unquoted) creates the nested `[border] focused` structure glint expects.
+# Quoted keys parse cleanly but never reach the deserializer, so they look
+# like silent no-ops at runtime.
+
+# ── Default ─────────────────────────────────────────────────────────────────
+# Matches the original glint palette.
+[schemes.default]
+border.focused   = { fg = "light_cyan",   modifiers = ["bold"] }
+border.unfocused = "default"
+widget_title     = { modifiers = ["bold"] }
+text.plain       = "default"
+text.brilliant   = { modifiers = ["bold"] }
+text.dim         = { modifiers = ["dim"] }
+text.selected    = { fg = "light_yellow", modifiers = ["bold"] }
+text.focused     = { fg = "light_cyan",   modifiers = ["bold"] }
+text.shortcut    = { fg = "light_red",    modifiers = ["bold"] }
+
+# ── Chalktone ───────────────────────────────────────────────────────────────
+# Soft, dusty pastels — chalk on a slate blackboard. Derivation of
+# https://github.com/daneofmanythings/chalktone.nvim
+[schemes.chalktone]
+border.focused   = { fg = "#dabb87", modifiers = ["bold"] }
+border.unfocused = "#5a625e"
+widget_title     = { fg = "#e6dcc6", modifiers = ["bold"] }
+text.plain       = { fg = "#cdc4ad" }
+text.brilliant   = { fg = "#e6dcc6", modifiers = ["bold"] }
+text.dim         = { fg = "#6f7570" }
+text.selected    = { fg = "#c19a9a", modifiers = ["bold"] }
+text.focused     = { fg = "#7eafa3", modifiers = ["bold"] }
+text.shortcut    = { fg = "#c25450", modifiers = ["bold"] }
+
+# ── Gruvbox ─────────────────────────────────────────────────────────────────
+# Warm retro palette, dark medium contrast — derivation of
+# https://github.com/ellisonleao/gruvbox.nvim
+[schemes.gruvbox]
+border.focused   = { fg = "#fabd2f", modifiers = ["bold"] }
+border.unfocused = "#3c3836"
+widget_title     = { fg = "#fbf1c7", modifiers = ["bold"] }
+text.plain       = { fg = "#d5c4a1" }
+text.brilliant   = { fg = "#ebdbb2", modifiers = ["bold"] }
+text.dim         = { fg = "#7c6f64" }
+text.selected    = { fg = "#fe8019", modifiers = ["bold"] }
+text.focused     = { fg = "#8ec07c", modifiers = ["bold"] }
+text.shortcut    = { fg = "#fb4934", modifiers = ["bold"] }
+
+# ── Gruvbox Dark (legacy) ───────────────────────────────────────────────────
+# Kept under its original name so existing configs keep working. Subtly
+# different from `gruvbox` above (cooler aqua focus, deeper unfocused border).
+[schemes.gruvbox_dark]
+border.focused   = { fg = "#fabd2f", modifiers = ["bold"] }
+border.unfocused = "#504945"
+widget_title     = { fg = "#ebdbb2", modifiers = ["bold"] }
+text.plain       = { fg = "#bdae93" }
+text.brilliant   = { fg = "#fbf1c7", modifiers = ["bold"] }
+text.dim         = { fg = "#665c54" }
+text.selected    = { fg = "#fe8019", modifiers = ["bold"] }
+text.focused     = { fg = "#83a598", modifiers = ["bold"] }
+text.shortcut    = { fg = "#cc241d", modifiers = ["bold"] }
+
+# ── Nord ─────────────────────────────────────────────────────────────────────
+# Arctic, north-bluish palette — derivation of
+# https://github.com/kunzaatko/nord.nvim (which mirrors the canonical
+# https://www.nordtheme.com/ palette).
+[schemes.nord]
+border.focused   = { fg = "#88c0d0", modifiers = ["bold"] }
+border.unfocused = "#3b4252"
+widget_title     = { fg = "#eceff4", modifiers = ["bold"] }
+text.plain       = { fg = "#d8dee9" }
+text.brilliant   = { fg = "#eceff4", modifiers = ["bold"] }
+text.dim         = { fg = "#616e88" }
+text.selected    = { fg = "#ebcb8b", modifiers = ["bold"] }
+text.focused     = { fg = "#88c0d0", modifiers = ["bold"] }
+text.shortcut    = { fg = "#bf616a", modifiers = ["bold"] }
+
+# ── Bluloco ─────────────────────────────────────────────────────────────────
+# Modern dark with a signature cobalt-blue accent — derivation of
+# https://github.com/uloco/bluloco.nvim
+[schemes.bluloco]
+border.focused   = { fg = "#4090f7", modifiers = ["bold"] }
+border.unfocused = "#3e4452"
+widget_title     = { fg = "#c8ccd4", modifiers = ["bold"] }
+text.plain       = { fg = "#abb2bf" }
+text.brilliant   = { fg = "#c8ccd4", modifiers = ["bold"] }
+text.dim         = { fg = "#5c6370" }
+text.selected    = { fg = "#f9c859", modifiers = ["bold"] }
+text.focused     = { fg = "#4090f7", modifiers = ["bold"] }
+text.shortcut    = { fg = "#ff6480", modifiers = ["bold"] }
+
+# ── Miasma ──────────────────────────────────────────────────────────────────
+# Horror-tinged, earthy decay — derivation of
+# https://github.com/xero/miasma.nvim
+[schemes.miasma]
+border.focused   = { fg = "#b8823b", modifiers = ["bold"] }
+border.unfocused = "#3a3a3a"
+widget_title     = { fg = "#c9c0a8", modifiers = ["bold"] }
+text.plain       = { fg = "#a89880" }
+text.brilliant   = { fg = "#c9c0a8", modifiers = ["bold"] }
+text.dim         = { fg = "#5c5347" }
+text.selected    = { fg = "#c25450", modifiers = ["bold"] }
+text.focused     = { fg = "#78824b", modifiers = ["bold"] }
+text.shortcut    = { fg = "#a13438", modifiers = ["bold"] }
+"##;
 
 pub const DEFAULT_LLM_TOML: &str = r#"# Master switch. If false, every LLM-backed feature falls back to its
 # structured-only counterpart (keyword filtering, raw RSS summaries, …).
@@ -480,6 +625,7 @@ pub fn init_default_config() -> Result<PathBuf> {
     seed(&dir.join("news.toml"), DEFAULT_NEWS_TOML)?;
     seed(&dir.join("stocks.toml"), DEFAULT_STOCKS_TOML)?;
     seed(&dir.join("llm.toml"), DEFAULT_LLM_TOML)?;
+    seed(&dir.join("colorschemes.toml"), DEFAULT_COLORSCHEMES_TOML)?;
 
     // Credentials live in their own subdirectory (created with 0700) so they
     // can be locked down with one chmod.
@@ -536,6 +682,48 @@ mod tests {
         let cfg: Config = toml::from_str("").expect("empty config should parse");
         assert_eq!(cfg.version, 1);
         assert_eq!(cfg.layout.cells.len(), 5);
+    }
+
+    #[test]
+    fn default_colorschemes_seed_parses_and_has_default_scheme() {
+        let file: crate::theme::ColorSchemesFile =
+            toml::from_str(DEFAULT_COLORSCHEMES_TOML).expect("colorschemes seed should parse");
+        assert!(
+            file.schemes.contains_key("default"),
+            "default scheme must exist so the unmodified config.toml resolves"
+        );
+        for expected in [
+            "chalktone",
+            "gruvbox",
+            "gruvbox_dark",
+            "nord",
+            "bluloco",
+            "miasma",
+        ] {
+            assert!(
+                file.schemes.contains_key(expected),
+                "expected scheme {expected:?} in seed"
+            );
+        }
+    }
+
+    #[test]
+    fn seeded_schemes_actually_populate_roles_not_just_widget_title() {
+        // Catches the quoted-dotted-key bug at the source: if any future
+        // edit reverts to `"border.focused"`, this asserts that the
+        // override is missing.
+        let file: crate::theme::ColorSchemesFile =
+            toml::from_str(DEFAULT_COLORSCHEMES_TOML).expect("seed parses");
+        for (name, scheme) in &file.schemes {
+            assert!(
+                scheme.border.focused.is_some(),
+                "scheme {name:?} should set border.focused (use unquoted dotted keys)"
+            );
+            assert!(
+                scheme.text.focused.is_some(),
+                "scheme {name:?} should set text.focused (use unquoted dotted keys)"
+            );
+        }
     }
 
     #[test]

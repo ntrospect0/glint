@@ -220,6 +220,7 @@ impl RawGraphEvent {
             start,
             end,
             all_day,
+            source: "outlook".into(),
             calendar: calendar_label.to_string(),
             location,
         })

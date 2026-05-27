@@ -7,14 +7,15 @@ use chrono_tz::Tz;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
 use serde::Deserialize;
 
-use crate::ui::{big_digits, decorate_title, focus_border_style};
+use crate::theme::{ColorScheme, Theme};
+use crate::ui::{big_digits, decorated_title_line};
 
 use super::{AppContext, EventResult, Widget};
 
@@ -45,6 +46,23 @@ pub struct ClockConfig {
     /// cell is tall enough.
     #[serde(default)]
     pub secondary_timezones: Vec<SecondaryTimezone>,
+
+    /// Big-digit visual style. `"normal"` (default) keeps the current single-
+    /// color block digits; the other variants apply a top-to-bottom color
+    /// gradient using half-height block rendering. Press `g` while focused
+    /// on the clock widget to cycle through them at runtime.
+    #[serde(default)]
+    pub gradient: big_digits::Gradient,
+
+    /// Per-widget style overrides layered on top of the active app color
+    /// scheme. Any role omitted here inherits from the app theme.
+    #[serde(default)]
+    pub colors: ColorScheme,
+
+    /// Prioritized `Shift+<letter>` focus shortcut preferences. Leave
+    /// empty to use the built-in default (`['c', 'l', 'o', 'k']`).
+    #[serde(default)]
+    pub shortcuts: Vec<char>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -104,6 +122,9 @@ impl Default for ClockConfig {
             show_date: default_show_date(),
             hour_format: default_hour_format(),
             secondary_timezones: Vec::new(),
+            gradient: big_digits::Gradient::default(),
+            colors: ColorScheme::default(),
+            shortcuts: Vec::new(),
         }
     }
 }
@@ -116,6 +137,9 @@ struct ClockState {
     transient_tz: Option<(String, Tz)>,
     /// True while a `:time <location>` geocoding request is in flight.
     transient_searching: bool,
+    /// Currently active big-digit gradient. Seeded from config at startup; the
+    /// user can cycle through variants by pressing `g`.
+    gradient: big_digits::Gradient,
 }
 
 pub struct ClockWidget {
@@ -126,16 +150,26 @@ pub struct ClockWidget {
     /// at construction time and a warning logged.
     secondaries: Vec<(String, Tz)>,
     state: Arc<Mutex<ClockState>>,
+    /// App-level theme; kept so live config reloads can rebuild `theme`
+    /// from updated `colors` overrides.
+    app_theme: Arc<Theme>,
+    /// Merged theme (app + widget overrides). Rebuilt on `apply_config`.
+    theme: Theme,
+    /// Letter assigned by the app for `Shift+<letter>` focus, painted in
+    /// the title via `text.shortcut`. `None` = no shortcut claimed.
+    shortcut: Option<char>,
+    /// Effective shortcut preference list (TOML override or built-in).
+    shortcut_prefs: Vec<char>,
 }
 
 impl Default for ClockWidget {
     fn default() -> Self {
-        Self::with_config(ClockConfig::default())
+        Self::with_config(ClockConfig::default(), Arc::new(Theme::builtin_defaults()))
     }
 }
 
 impl ClockWidget {
-    pub fn with_config(config: ClockConfig) -> Self {
+    pub fn with_config(config: ClockConfig, app_theme: Arc<Theme>) -> Self {
         let tz = config
             .timezone
             .as_deref()
@@ -149,12 +183,26 @@ impl ClockWidget {
                 }
             }
         }
+        let state = ClockState {
+            gradient: config.gradient,
+            ..ClockState::default()
+        };
+        let theme = app_theme.with_overrides(&config.colors);
+        let shortcut_prefs = if config.shortcuts.is_empty() {
+            vec!['c', 'l', 'o', 'k']
+        } else {
+            config.shortcuts.clone()
+        };
         Self {
             id: "clock".into(),
             config,
             tz,
             secondaries,
-            state: Arc::new(Mutex::new(ClockState::default())),
+            state: Arc::new(Mutex::new(state)),
+            app_theme,
+            theme,
+            shortcut: None,
+            shortcut_prefs,
         }
     }
 
@@ -273,8 +321,18 @@ impl ClockWidget {
     /// arithmetic in their head.
     fn world_clock_entries(&self) -> Vec<(String, String)> {
         let now = chrono::Utc::now();
-        let mut out: Vec<(String, String)> = Vec::with_capacity(self.secondaries.len() + 1);
+        let mut out: Vec<(String, String)> = Vec::with_capacity(self.secondaries.len() + 2);
         let transient = self.state.lock().expect("clock state poisoned").transient_tz.clone();
+
+        // When a `:time <location>` override is active the big-digit display
+        // is showing that override, so pin Local to the top of the World
+        // Clocks list — otherwise the user has no easy way to see their
+        // actual local time at a glance.
+        if transient.is_some() {
+            let local_now = now.with_timezone(&Local);
+            out.push(("Local".to_string(), format_clock_entry(&local_now)));
+        }
+
         let (primary_label, primary_str) = match transient {
             Some((label, tz)) => {
                 let t = now.with_timezone(&tz);
@@ -409,54 +467,67 @@ impl Widget for ClockWidget {
         };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(focus_border_style(focused))
-            .title(Span::styled(
-                decorate_title(focused, &title_base),
-                Style::default().add_modifier(Modifier::BOLD),
+            .border_type(BorderType::Rounded)
+            .border_style(self.theme.border_style(focused))
+            .title(decorated_title_line(
+                focused,
+                &title_base,
+                self.shortcut,
+                self.theme.widget_title,
+                self.theme.text_shortcut,
             ));
 
         let now = chrono::Utc::now();
         let (time, ampm, date) = self.render_strings(now);
-        let big = big_digits::render(&time);
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Big-digit color: LightMagenta while a `:time <location>` override is
-        // active so the user can't miss that they're not on home base; cyan
-        // otherwise.
-        let big_color = if transient.is_some() {
-            Color::LightMagenta
+        // Big-digit color seed: `text.focused` from the active scheme by
+        // default; `text.selected` while a `:time <location>` override is
+        // active so the user can't miss that they're not on home base. The
+        // gradient (subtle / hue_shift / glow / fade) derives its full
+        // 10-stop palette from this seed, so the digits restyle on
+        // `:scheme` regardless of the gradient mode chosen.
+        let big_style = if transient.is_some() {
+            self.theme.text_selected
         } else {
-            Color::Cyan
+            self.theme.text_focused
         };
+        let gradient = self
+            .state
+            .lock()
+            .expect("clock state poisoned")
+            .gradient;
+        let big_lines = big_digits::render_styled(&time, gradient, big_style);
 
         let mut lines: Vec<Line<'_>> = Vec::new();
         // Top padding so the big digits don't kiss the border.
         lines.push(Line::from(""));
-        for row in big {
-            lines.push(Line::from(Span::styled(
-                row,
-                Style::default().fg(big_color).add_modifier(Modifier::BOLD),
-            )));
+        for line in big_lines {
+            lines.push(line);
         }
 
         if self.config.show_seconds_ticker {
+            // Blank line between the big-digit clock and the HH:MM:SS ticker
+            // beneath it — gives the ticker some breathing room from the
+            // glyphs above.
+            lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 self.ticker_string(now),
-                Style::default().add_modifier(Modifier::DIM),
+                self.theme.text_dim,
             )));
         }
 
         if !ampm.is_empty() {
-            lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 ampm,
-                Style::default().add_modifier(Modifier::DIM),
+                self.theme.text_dim,
             )));
         }
         if !date.is_empty() {
-            lines.push(Line::from(""));
+            // No blank line above the date — the ticker and the day-date sit
+            // together as one block of secondary info beneath the clock.
             lines.push(Line::from(date));
         }
 
@@ -470,37 +541,95 @@ impl Widget for ClockWidget {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "── World Clocks ──",
-                    Style::default().add_modifier(Modifier::DIM),
+                    self.theme.text_dim,
                 )));
                 let max_label = clocks.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0);
-                for (label, time_str) in &clocks {
+                // Local — and whichever entry the big-digit display is showing
+                // — get colored so the user can see at a glance which row
+                // matches the big clock. Local picks up `text.focused` from
+                // the active scheme; the `:time` override row picks up
+                // `text.selected` so it's distinct from Local but still
+                // theme-driven.
+                let local_highlight_style = self.theme.text_focused;
+                let override_highlight_style = self.theme.text_selected;
+                let has_override = transient.is_some();
+                for (idx, (label, time_str)) in clocks.iter().enumerate() {
+                    let style = if has_override {
+                        // idx 0 = Local (prepended in world_clock_entries),
+                        // idx 1 = the override entry, rest = secondaries.
+                        match idx {
+                            0 => local_highlight_style,
+                            1 => override_highlight_style,
+                            _ => Style::default(),
+                        }
+                    } else if idx == 0 {
+                        // No override — the first entry is whatever the big
+                        // digits are showing (Local by default, or the
+                        // configured `self.tz` if set), so match the focused
+                        // big-digit color from the scheme.
+                        local_highlight_style
+                    } else {
+                        Style::default()
+                    };
                     let line = format!(
                         "{:<width$}  {}",
                         label,
                         time_str,
                         width = max_label
                     );
-                    lines.push(Line::from(line));
+                    lines.push(Line::from(Span::styled(line, style)));
                 }
             }
         }
 
-        let body = Paragraph::new(lines).alignment(Alignment::Center);
-        frame.render_widget(body, inner);
+        // When a `:time <city>` override is active, append a footer hint
+        // pinned to the bottom of the cell so the user has an obvious
+        // escape route back to Local time.
+        if transient.is_some() {
+            let hint = Line::from(Span::styled(
+                "x: revert to Local",
+                self.theme.text_dim,
+            ));
+            let body = Paragraph::new(lines).alignment(Alignment::Center);
+            let body_h = inner.height.saturating_sub(1);
+            let body_area = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: body_h,
+            };
+            let hint_area = Rect {
+                x: inner.x,
+                y: inner.y + body_h,
+                width: inner.width,
+                height: 1,
+            };
+            frame.render_widget(body, body_area);
+            frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), hint_area);
+        } else {
+            let body = Paragraph::new(lines).alignment(Alignment::Center);
+            frame.render_widget(body, inner);
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        if matches!(key.code, KeyCode::Char('x')) {
-            self.clear_transient();
-            EventResult::Handled
-        } else {
-            EventResult::Ignored
+        match key.code {
+            KeyCode::Char('x') => {
+                self.clear_transient();
+                EventResult::Handled
+            }
+            KeyCode::Char('g') => {
+                let mut st = self.state.lock().expect("clock state poisoned");
+                st.gradient = st.gradient.next();
+                EventResult::Handled
+            }
+            _ => EventResult::Ignored,
         }
     }
 
     fn handle_command(&mut self, cmd: &str, args: &[&str]) -> Result<bool> {
         match cmd {
-            "time" | "t" => {
+            "time" | "t" | "clock" => {
                 if args.is_empty() {
                     anyhow::bail!("usage: :time <city or country>");
                 }
@@ -514,8 +643,10 @@ impl Widget for ClockWidget {
 
     fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
         vec![
+            ("g", "cycle digit gradient style"),
             ("x", "clear :time lookup (return to local time)"),
             (":time <city>", "switch primary clock to that location"),
+            (":clock <city>", "alias for :time"),
         ]
     }
 
@@ -529,14 +660,29 @@ impl Widget for ClockWidget {
             "secondary_timezones": self.config.secondary_timezones.iter().map(|s| {
                 serde_json::json!({"label": s.label, "timezone": s.timezone})
             }).collect::<Vec<_>>(),
+            "gradient": self.config.gradient.label(),
         })
     }
 
     fn apply_config(&mut self, config: serde_json::Value) -> Result<()> {
         let new_config: ClockConfig =
             serde_json::from_value(config).context("invalid clock config payload")?;
-        *self = Self::with_config(new_config);
+        let app_theme = self.app_theme.clone();
+        *self = Self::with_config(new_config, app_theme);
         Ok(())
+    }
+
+    fn set_app_theme(&mut self, theme: Arc<Theme>) {
+        self.theme = theme.with_overrides(&self.config.colors);
+        self.app_theme = theme;
+    }
+
+    fn shortcut_preferences(&self) -> &[char] {
+        &self.shortcut_prefs
+    }
+
+    fn set_shortcut(&mut self, shortcut: Option<char>) {
+        self.shortcut = shortcut;
     }
 }
 
@@ -544,6 +690,10 @@ impl Widget for ClockWidget {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    fn build_widget(cfg: ClockConfig) -> ClockWidget {
+        ClockWidget::with_config(cfg, Arc::new(Theme::builtin_defaults()))
+    }
 
     #[test]
     fn twelve_hour_format_renders_midnight_as_12_am() {
@@ -554,8 +704,11 @@ mod tests {
             show_date: false,
             hour_format: 12,
             secondary_timezones: Vec::new(),
+            gradient: big_digits::Gradient::default(),
+            colors: ColorScheme::default(),
+            shortcuts: Vec::new(),
         };
-        let widget = ClockWidget::with_config(cfg);
+        let widget = build_widget(cfg);
         let midnight_utc = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
         let (time, ampm, date) = widget.render_strings(midnight_utc);
         assert_eq!(time, "12:00");
@@ -572,8 +725,11 @@ mod tests {
             show_date: false,
             hour_format: 24,
             secondary_timezones: Vec::new(),
+            gradient: big_digits::Gradient::default(),
+            colors: ColorScheme::default(),
+            shortcuts: Vec::new(),
         };
-        let widget = ClockWidget::with_config(cfg);
+        let widget = build_widget(cfg);
         let t = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 9, 5, 7).unwrap();
         let (time, ampm, _) = widget.render_strings(t);
         assert_eq!(time, "09:05:07");
@@ -589,8 +745,11 @@ mod tests {
             show_date: false,
             hour_format: 24,
             secondary_timezones: Vec::new(),
+            gradient: big_digits::Gradient::default(),
+            colors: ColorScheme::default(),
+            shortcuts: Vec::new(),
         };
-        let w = ClockWidget::with_config(cfg);
+        let w = build_widget(cfg);
         let t = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 9, 5, 42).unwrap();
         assert_eq!(w.ticker_string(t), "09:05:42");
     }
@@ -604,6 +763,28 @@ mod tests {
     }
 
     #[test]
+    fn world_clock_entries_pin_local_during_time_override() {
+        use chrono_tz::Tz;
+        let cfg = ClockConfig {
+            secondary_timezones: vec![SecondaryTimezone {
+                label: "Tokyo".into(),
+                timezone: "Asia/Tokyo".into(),
+            }],
+            ..ClockConfig::default()
+        };
+        let w = build_widget(cfg);
+        {
+            let mut st = w.state.lock().unwrap();
+            st.transient_tz = Some(("Berlin".into(), "Europe/Berlin".parse::<Tz>().unwrap()));
+        }
+        let entries = w.world_clock_entries();
+        assert_eq!(entries.len(), 3, "Local + override + 1 secondary");
+        assert_eq!(entries[0].0, "Local");
+        assert_eq!(entries[1].0, "Berlin");
+        assert_eq!(entries[2].0, "Tokyo");
+    }
+
+    #[test]
     fn world_clock_entries_lead_with_primary() {
         let cfg = ClockConfig {
             timezone: Some("America/Vancouver".into()),
@@ -613,7 +794,7 @@ mod tests {
             }],
             ..ClockConfig::default()
         };
-        let w = ClockWidget::with_config(cfg);
+        let w = build_widget(cfg);
         let entries = w.world_clock_entries();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, "Vancouver");
@@ -630,7 +811,7 @@ mod tests {
             }],
             ..ClockConfig::default()
         };
-        let w = ClockWidget::with_config(cfg);
+        let w = build_widget(cfg);
         let entries = w.world_clock_entries();
         for (_label, formatted) in &entries {
             // Format: "<icon> HH:MM Wkd Mon DD"
@@ -683,7 +864,7 @@ mod tests {
             ],
             ..ClockConfig::default()
         };
-        let w = ClockWidget::with_config(cfg);
+        let w = build_widget(cfg);
         assert_eq!(w.secondaries.len(), 1);
         assert_eq!(w.secondaries[0].0, "New York");
     }
