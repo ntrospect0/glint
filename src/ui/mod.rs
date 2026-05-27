@@ -9,7 +9,7 @@ use std::{cell::Cell, sync::Arc};
 
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{block::Title, Block, BorderType, Borders, Paragraph},
     Frame,
@@ -68,9 +68,67 @@ pub struct RenderState<'a> {
 }
 
 /// Minimum char gap between the title and the right-aligned metadata on
-/// the top border. Below this we hide the metadata entirely rather than
-/// let the two strings collide.
+/// the top border. Below this we let metadata tail-truncate with `…`,
+/// and if even one content char + the ellipsis can't fit, hide it
+/// entirely rather than let the two strings collide.
 const TITLE_METADATA_MIN_GAP: usize = 3;
+
+/// Visual weight of the right-aligned title metadata. Widgets that want
+/// to draw the eye to a transient/overridden state (e.g. the weather
+/// widget showing a `:weather <city>` lookup instead of the configured
+/// home city) pass [`Emphasized`]; the framework lays italic on top of
+/// the base `theme.metadata_style(focused)` so the differentiation is
+/// preserved even when the metadata gets truncated and no textual
+/// marker survives. Other widgets pass [`Default`] and inherit the
+/// existing rendering. Adding a new emphasis variant is one match arm
+/// in [`metadata_style_for_emphasis`] plus a fallback to make sense to
+/// older callers — by convention the framework defines what each
+/// variant looks like, not the widget.
+///
+/// [`Emphasized`]: MetadataEmphasis::Emphasized
+/// [`Default`]: MetadataEmphasis::Default
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MetadataEmphasis {
+    /// Render in the standard metadata style for the current focus state.
+    #[default]
+    Default,
+    /// Layer italic on top of the standard style. Reserved for metadata
+    /// that signals "this isn't the configured default" — transient
+    /// overrides, lookup queries, ephemeral filters. Surviving narrow
+    /// widths is the point: even when the city name is tail-truncated
+    /// to `Toky…`, italics still telegraph "this isn't your home."
+    Emphasized,
+}
+
+fn metadata_style_for_emphasis(
+    theme: &Theme,
+    focused: bool,
+    emphasis: MetadataEmphasis,
+) -> Style {
+    let base = theme.metadata_style(focused);
+    match emphasis {
+        MetadataEmphasis::Default => base,
+        MetadataEmphasis::Emphasized => base.add_modifier(Modifier::ITALIC),
+    }
+}
+
+/// Tail-truncate `s` to at most `max_chars` user-perceived chars, suffixing
+/// `…` when truncation occurs. `max_chars < 1` collapses to an empty string
+/// (no room for even the ellipsis). Used by the title-row builder when
+/// metadata would otherwise overflow the inner border width.
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        return s.to_string();
+    }
+    let keep = max_chars - 1; // reserve a cell for `…`
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('…');
+    out
+}
 
 /// Build the title row for a widget's border. The title is the
 /// left-aligned `Line` painted just after `┌─`; the optional metadata is
@@ -92,12 +150,16 @@ const TITLE_METADATA_MIN_GAP: usize = 3;
 /// isn't in the title, a `[X] ` badge is prefixed instead so the user
 /// still sees the key hint.
 ///
-/// Metadata is dropped (returned as `None`) when the pane is too narrow
-/// to fit `title + min_gap + metadata` inside the inner width.
+/// Metadata is tail-truncated with `…` when the pane isn't wide enough
+/// to fit `title + min_gap + " " + metadata + " "` inside the inner
+/// width (the leading/trailing spaces are visual padding inside the
+/// border corners). Only when even one content char plus the ellipsis
+/// won't fit do we drop the metadata entirely.
 pub fn title_row(
     focused: bool,
     base: &str,
     metadata: Option<&str>,
+    emphasis: MetadataEmphasis,
     shortcut: Option<char>,
     theme: &Theme,
     area_width: u16,
@@ -110,16 +172,36 @@ pub fn title_row(
         theme.text_shortcut,
         theme.border_focused,
     );
-    let metadata_line = metadata
-        .filter(|s| !s.is_empty())
-        .map(|meta| build_metadata_line(meta, theme.metadata_style(focused)));
 
+    let metadata_style = metadata_style_for_emphasis(theme, focused, emphasis);
     let inner_w = (area_width as usize).saturating_sub(2);
-    let fits = match &metadata_line {
-        Some(m) => line_width(&title) + TITLE_METADATA_MIN_GAP + line_width(m) <= inner_w,
-        None => false,
-    };
-    (title, if fits { metadata_line } else { None })
+    let title_w = line_width(&title);
+    // build_metadata_line wraps content in 1-cell left/right padding,
+    // so the metadata line is `2 + content_chars` wide. Reserve those
+    // 2 cells plus the title and the min gap when sizing the content.
+    let frame_budget = inner_w
+        .saturating_sub(title_w)
+        .saturating_sub(TITLE_METADATA_MIN_GAP);
+    let content_budget = frame_budget.saturating_sub(2);
+
+    let metadata_line = metadata.filter(|s| !s.is_empty()).and_then(|meta| {
+        if content_budget == 0 {
+            return None;
+        }
+        let content = if meta.chars().count() <= content_budget {
+            meta.to_string()
+        } else {
+            // Need at least 1 content char + the ellipsis (2 chars) to
+            // be worth showing — anything less is just `…` in a void.
+            if content_budget < 2 {
+                return None;
+            }
+            truncate_with_ellipsis(meta, content_budget)
+        };
+        Some(build_metadata_line(&content, metadata_style))
+    });
+
+    (title, metadata_line)
 }
 
 /// Attach the title row to a block. Equivalent to calling [`title_row`]
@@ -130,11 +212,12 @@ pub fn apply_title_row<'a>(
     focused: bool,
     base: &str,
     metadata: Option<&str>,
+    emphasis: MetadataEmphasis,
     shortcut: Option<char>,
     theme: &Theme,
     area_width: u16,
 ) -> Block<'a> {
-    let (title, meta) = title_row(focused, base, metadata, shortcut, theme, area_width);
+    let (title, meta) = title_row(focused, base, metadata, emphasis, shortcut, theme, area_width);
     let mut block = block.title(Title::from(title).alignment(Alignment::Left));
     if let Some(meta) = meta {
         block = block.title(Title::from(meta).alignment(Alignment::Right));
@@ -222,7 +305,15 @@ mod tests {
     #[test]
     fn title_row_paints_first_matching_letter_uppercased() {
         let theme = Theme::builtin_defaults();
-        let (title, _) = title_row(false, "Calendar", None, Some('d'), &theme, 40);
+        let (title, _) = title_row(
+            false,
+            "Calendar",
+            None,
+            MetadataEmphasis::Default,
+            Some('d'),
+            &theme,
+            40,
+        );
         assert_eq!(line_text(&title), " CalenDar ");
         assert_eq!(
             shortcut_span(&title, theme.text_shortcut).as_deref(),
@@ -233,7 +324,15 @@ mod tests {
     #[test]
     fn title_row_paints_first_letter_when_shortcut_matches_it() {
         let theme = Theme::builtin_defaults();
-        let (title, _) = title_row(false, "Clock", None, Some('c'), &theme, 40);
+        let (title, _) = title_row(
+            false,
+            "Clock",
+            None,
+            MetadataEmphasis::Default,
+            Some('c'),
+            &theme,
+            40,
+        );
         assert_eq!(line_text(&title), " Clock ");
         assert_eq!(
             shortcut_span(&title, theme.text_shortcut).as_deref(),
@@ -244,7 +343,15 @@ mod tests {
     #[test]
     fn title_row_falls_back_to_bracket_badge_when_letter_absent() {
         let theme = Theme::builtin_defaults();
-        let (title, _) = title_row(false, "Weather", None, Some('z'), &theme, 40);
+        let (title, _) = title_row(
+            false,
+            "Weather",
+            None,
+            MetadataEmphasis::Default,
+            Some('z'),
+            &theme,
+            40,
+        );
         let text = line_text(&title);
         assert!(text.contains("[Z] Weather"));
         assert_eq!(
@@ -256,8 +363,24 @@ mod tests {
     #[test]
     fn title_row_uses_focused_style_when_focused() {
         let theme = Theme::builtin_defaults();
-        let (focused, _) = title_row(true, "Clock", None, None, &theme, 40);
-        let (unfocused, _) = title_row(false, "Clock", None, None, &theme, 40);
+        let (focused, _) = title_row(
+            true,
+            "Clock",
+            None,
+            MetadataEmphasis::Default,
+            None,
+            &theme,
+            40,
+        );
+        let (unfocused, _) = title_row(
+            false,
+            "Clock",
+            None,
+            MetadataEmphasis::Default,
+            None,
+            &theme,
+            40,
+        );
         // "Clock" sits in spans[1] (after the leading-pad span).
         assert_eq!(focused.spans[1].style, theme.widget_title_focused);
         assert_eq!(unfocused.spans[1].style, theme.widget_title_unfocused);
@@ -269,8 +392,24 @@ mod tests {
         // glyphs styled in the border-focused color so the title
         // notches into the surrounding border line.
         let theme = Theme::builtin_defaults();
-        let (focused, _) = title_row(true, "Clock", None, None, &theme, 40);
-        let (unfocused, _) = title_row(false, "Clock", None, None, &theme, 40);
+        let (focused, _) = title_row(
+            true,
+            "Clock",
+            None,
+            MetadataEmphasis::Default,
+            None,
+            &theme,
+            40,
+        );
+        let (unfocused, _) = title_row(
+            false,
+            "Clock",
+            None,
+            MetadataEmphasis::Default,
+            None,
+            &theme,
+            40,
+        );
         assert_eq!(focused.spans.first().map(|s| s.content.as_ref()), Some("┤"));
         assert_eq!(focused.spans.last().map(|s| s.content.as_ref()), Some("├"));
         assert_eq!(focused.spans.first().unwrap().style, theme.border_focused);
@@ -287,17 +426,40 @@ mod tests {
     #[test]
     fn title_row_omits_metadata_when_absent_or_empty() {
         let theme = Theme::builtin_defaults();
-        let (_, meta) = title_row(true, "Weather", None, None, &theme, 60);
+        let (_, meta) = title_row(
+            true,
+            "Weather",
+            None,
+            MetadataEmphasis::Default,
+            None,
+            &theme,
+            60,
+        );
         assert!(meta.is_none());
-        let (_, meta_empty) = title_row(true, "Weather", Some(""), None, &theme, 60);
+        let (_, meta_empty) = title_row(
+            true,
+            "Weather",
+            Some(""),
+            MetadataEmphasis::Default,
+            None,
+            &theme,
+            60,
+        );
         assert!(meta_empty.is_none());
     }
 
     #[test]
     fn title_row_returns_metadata_when_pane_wide_enough() {
         let theme = Theme::builtin_defaults();
-        let (title, meta) =
-            title_row(true, "Weather", Some("Richmond, BC"), Some('w'), &theme, 60);
+        let (title, meta) = title_row(
+            true,
+            "Weather",
+            Some("Richmond, BC"),
+            MetadataEmphasis::Default,
+            Some('w'),
+            &theme,
+            60,
+        );
         let meta = meta.expect("wide pane should keep metadata");
         assert!(line_text(&title).contains("Weather"));
         assert!(line_text(&meta).contains("Richmond, BC"));
@@ -310,18 +472,99 @@ mod tests {
     }
 
     #[test]
-    fn title_row_drops_metadata_on_narrow_pane() {
+    fn title_row_truncates_metadata_with_ellipsis_on_narrow_pane() {
+        // 20-wide cell → inner_w 18. Title "[W] Weather" (with focus
+        // brackets) is wider than the bare "Weather", min gap 3, plus
+        // 2 cells of metadata padding leaves room for only a couple
+        // of content chars. Should tail-truncate, not drop.
         let theme = Theme::builtin_defaults();
-        let (_, meta) =
-            title_row(true, "Weather", Some("Richmond, BC"), Some('w'), &theme, 20);
-        assert!(meta.is_none(), "narrow pane should hide metadata");
+        let (_, meta) = title_row(
+            true,
+            "Weather",
+            Some("Richmond, BC"),
+            MetadataEmphasis::Default,
+            Some('w'),
+            &theme,
+            20,
+        );
+        let meta = meta.expect("narrow pane should tail-truncate, not drop");
+        let body_text: String = meta
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(
+            body_text.contains('…'),
+            "narrow metadata should end with the ellipsis char, got {body_text:?}"
+        );
+        // Whatever survives, it has to be a strict prefix of the original.
+        let visible: String = body_text.trim_matches(' ').to_string();
+        let prefix: String = visible.trim_end_matches('…').to_string();
+        assert!(
+            "Richmond, BC".starts_with(prefix.as_str()),
+            "truncated text {visible:?} should be a prefix of the original"
+        );
+    }
+
+    #[test]
+    fn title_row_drops_metadata_when_even_ellipsis_wont_fit() {
+        // Tiny cell — not enough room for even a 1-char + ellipsis pair.
+        let theme = Theme::builtin_defaults();
+        let (_, meta) = title_row(
+            true,
+            "Weather",
+            Some("Richmond, BC"),
+            MetadataEmphasis::Default,
+            Some('w'),
+            &theme,
+            12,
+        );
+        assert!(
+            meta.is_none(),
+            "no room for any content + ellipsis → drop entirely"
+        );
+    }
+
+    #[test]
+    fn title_row_emphasized_metadata_adds_italic_on_top_of_focus_style() {
+        // Emphasis is layered onto the focus-derived base style, not
+        // a replacement — colors stay theme-driven, italic comes from
+        // the framework. Both focused and unfocused panes get italic;
+        // the underlying dim/highlight stays intact.
+        let theme = Theme::builtin_defaults();
+        let (_, meta) = title_row(
+            true,
+            "Weather",
+            Some("Tokyo, Japan"),
+            MetadataEmphasis::Emphasized,
+            None,
+            &theme,
+            60,
+        );
+        let meta = meta.expect("metadata visible at this width");
+        let body = meta
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "Tokyo, Japan")
+            .expect("metadata body span");
+        assert!(
+            body.style.add_modifier.contains(Modifier::ITALIC),
+            "emphasized metadata should carry the italic modifier"
+        );
     }
 
     #[test]
     fn title_row_metadata_dims_when_pane_unfocused() {
         let theme = Theme::builtin_defaults();
-        let (_, meta) =
-            title_row(false, "Weather", Some("Richmond, BC"), None, &theme, 60);
+        let (_, meta) = title_row(
+            false,
+            "Weather",
+            Some("Richmond, BC"),
+            MetadataEmphasis::Default,
+            None,
+            &theme,
+            60,
+        );
         let meta = meta.expect("metadata visible at this width");
         let body = meta
             .spans
@@ -336,9 +579,34 @@ mod tests {
     }
 
     #[test]
+    fn truncate_with_ellipsis_keeps_shorter_strings_intact() {
+        assert_eq!(truncate_with_ellipsis("Tokyo", 10), "Tokyo");
+        assert_eq!(truncate_with_ellipsis("Tokyo", 5), "Tokyo");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_tail_truncates_longer_strings() {
+        // Reserves a cell for the ellipsis: 4 chars budget = 3 content + …
+        assert_eq!(truncate_with_ellipsis("Tokyo, Japan", 4), "Tok…");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_collapses_to_empty_at_zero_budget() {
+        assert_eq!(truncate_with_ellipsis("Anything", 0), "");
+    }
+
+    #[test]
     fn title_row_never_emits_focus_arrows() {
         let theme = Theme::builtin_defaults();
-        let (title, _) = title_row(true, "Stocks", None, Some('s'), &theme, 40);
+        let (title, _) = title_row(
+            true,
+            "Stocks",
+            None,
+            MetadataEmphasis::Default,
+            Some('s'),
+            &theme,
+            40,
+        );
         let text = line_text(&title);
         assert!(!text.contains('▶'));
         assert!(!text.contains('◀'));
@@ -576,6 +844,7 @@ fn render_unknown(frame: &mut Frame, area: Rect, id: &str, focused: bool, theme:
         focused,
         id,
         None,
+        MetadataEmphasis::Default,
         None,
         theme,
         area.width,

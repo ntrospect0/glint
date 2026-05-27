@@ -36,7 +36,7 @@ use serde::Deserialize;
 use crate::cache::ScopedCache;
 use crate::llm::{LlmMessage, LlmProvider, LlmRequest, Role};
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::apply_title_row;
+use crate::ui::{apply_title_row, MetadataEmphasis};
 
 use super::{AppContext, EventResult, Widget};
 
@@ -174,15 +174,7 @@ const CACHE_KEY_ACCOUNT_ADDRESS: &str = "account_address";
 const SUMMARY_CACHE_PREFIX: &str = "summary-";
 
 fn summary_cache_key(id: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(id.as_bytes());
-    let mut key = String::with_capacity(SUMMARY_CACHE_PREFIX.len() + 16);
-    key.push_str(SUMMARY_CACHE_PREFIX);
-    for b in &digest[..8] {
-        use std::fmt::Write;
-        let _ = write!(key, "{b:02x}");
-    }
-    key
+    crate::cache::short_hash_key(SUMMARY_CACHE_PREFIX, id)
 }
 
 pub struct EmailWidget {
@@ -945,6 +937,7 @@ impl Widget for EmailWidget {
             focused,
             &base,
             Some(metadata.as_str()),
+            MetadataEmphasis::Default,
             self.shortcut,
             &self.theme,
             area.width,

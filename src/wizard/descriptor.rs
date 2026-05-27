@@ -50,6 +50,15 @@ pub struct WizardDescriptor {
     pub render_toml: Option<fn(&HashMap<String, WizardValue>, Option<&str>) -> String>,
 }
 
+impl WizardDescriptor {
+    /// Total focusable slots on this widget's setup page: one per
+    /// field plus the trailing `[ Save & Next ]` button. Encodes
+    /// the convention so callers don't repeat `fields.len() + 1`.
+    pub fn focus_total(&self) -> usize {
+        self.fields.len() + 1
+    }
+}
+
 /// One input on a widget's setup page.
 #[derive(Debug, Clone)]
 pub struct WizardField {

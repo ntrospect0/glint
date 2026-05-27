@@ -167,6 +167,24 @@ fn remove_if_present(path: &Path) -> Result<()> {
     }
 }
 
+/// Build a stable, short cache key from a free-form identifier. Used
+/// by widgets that key per-record derivations (article summaries,
+/// message summaries, gallery thumbnails) — `prefix` gives the kind
+/// a human-readable namespace; the SHA-256 prefix gives a
+/// filesystem-safe, collision-resistant suffix without holding the
+/// full id in the file name.
+pub fn short_hash_key(prefix: &str, identity: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(identity.as_bytes());
+    let mut key = String::with_capacity(prefix.len() + 16);
+    key.push_str(prefix);
+    for b in &digest[..8] {
+        use std::fmt::Write;
+        let _ = write!(key, "{b:02x}");
+    }
+    key
+}
+
 /// A `Cache` view rooted at one widget's `(kind, instance)` directory. Keys
 /// are flat strings; widgets pick whatever scheme fits their data (`articles`,
 /// `chart-AAPL-1d`, `messages-INBOX`, …).

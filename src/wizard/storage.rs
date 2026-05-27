@@ -144,7 +144,7 @@ mod tests {
     #[ignore = "mutates the process-wide XDG_CONFIG_HOME — opt in with --ignored"]
     fn save_load_round_trip() {
         let (_dir, _guard) = with_xdg("round_trip");
-        let mut st = WizardState::new();
+        let mut st = WizardState::default();
         st.global_set("theme", WizardValue::Choice("nord".into()));
         st.widget_set("clock", "show_seconds", WizardValue::Bool(true));
         st.layout = LayoutChoice::KeepExisting;
@@ -187,7 +187,7 @@ mod tests {
         let (_dir, _guard) = with_xdg("clear_idempotent");
         // Clearing a non-existent state file is fine.
         clear().unwrap();
-        save(&WizardState::new()).unwrap();
+        save(&WizardState::default()).unwrap();
         clear().unwrap();
         assert!(!state_exists());
         clear().unwrap();

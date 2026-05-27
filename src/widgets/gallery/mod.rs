@@ -31,7 +31,7 @@ use serde::Deserialize;
 
 use crate::cache::ScopedCache;
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::apply_title_row;
+use crate::ui::{apply_title_row, MetadataEmphasis};
 
 use super::{AppContext, EventResult, Widget};
 
@@ -465,6 +465,7 @@ impl Widget for GalleryWidget {
             focused,
             &title_base,
             metadata.as_deref(),
+            MetadataEmphasis::Default,
             self.shortcut,
             &self.theme,
             area.width,

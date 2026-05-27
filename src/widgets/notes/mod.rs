@@ -47,7 +47,7 @@ use ratatui::{
 use serde::Deserialize;
 
 use crate::theme::Theme;
-use crate::ui::apply_title_row;
+use crate::ui::{apply_title_row, MetadataEmphasis};
 
 use self::store::Note;
 
@@ -705,6 +705,7 @@ impl Widget for NotesWidget {
             focused,
             &self.display_name_cache,
             title_metadata.as_deref(),
+            MetadataEmphasis::Default,
             self.shortcut,
             &self.theme,
             area.width,
@@ -1057,21 +1058,8 @@ impl NotesWidget {
         frame.render_widget(Paragraph::new(sep_lines), sep_rect);
     }
 
-    /// Per-entry styling for the list column. Encodes the four-way
-    /// focus/active matrix so the rest of `render_list` stays linear.
-    ///
-    /// - List focused + entry active: `>` caret in the focused colour,
-    ///   title in **bold** focused colour — most prominent state.
-    /// - List focused + entry inactive: no caret, title in plain text
-    ///   (visible enough to navigate to).
-    /// - Content focused + entry active: no caret, title in the
-    ///   selected colour — the user knows which note's body they're
-    ///   currently editing.
-    /// - Content focused + entry inactive: no caret, title dimmed —
-    ///   pushes attention away from the list.
-    /// - Widget not focused at all: same as content-focused (active
-    ///   highlighted, others dim), since this just communicates
-    ///   "which note is current" without claiming any in-widget focus.
+    /// Encode the focus/active matrix as `(caret, caret_style,
+    /// title_style)` so `render_list` stays linear.
     fn list_entry_styles(
         &self,
         list_focused: bool,
@@ -1597,10 +1585,8 @@ fn pad_rect(rect: Rect, top: u16, bottom: u16, right: u16) -> Rect {
     }
 }
 
-/// Cursor visibility. Normal mode hides the cursor entirely — it's a
-/// view/navigation mode, not an editing one (j/k scroll the note, h/l
-/// switch focus, no editing primitives). Insert mode blinks at
-/// 500 ms-on / 500 ms-off, which signals "you're typing here right now."
+/// Cursor visibility: insert mode blinks (500 ms half-period), normal
+/// mode hides the cursor entirely.
 fn cursor_blink_visible(mode: Mode) -> bool {
     match mode {
         Mode::Normal => false,
@@ -1665,11 +1651,8 @@ fn render_cursor_line(
 /// no indent prefix — the caller applies its own hanging-indent in
 /// rendering.
 fn word_wrap(text: &str, first_w: usize, cont_w: usize) -> Vec<WrapRow> {
-    if first_w == 0 {
-        return vec![WrapRow { text: text.to_string(), source_col_start: 0, source_col_end: text.chars().count() }];
-    }
-    if text.is_empty() {
-        return vec![WrapRow { text: String::new(), source_col_start: 0, source_col_end: 0 }];
+    if first_w == 0 || text.is_empty() {
+        return vec![WrapRow::single(text)];
     }
     let chars: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
@@ -1687,14 +1670,8 @@ fn word_wrap(text: &str, first_w: usize, cont_w: usize) -> Vec<WrapRow> {
             break;
         }
         let upper = start + w;
-        // Three cases:
-        //  1. `chars[upper]` is a space → the window ends cleanly on a
-        //     word boundary; take all of `chars[start..upper]` and skip
-        //     the trailing space.
-        //  2. Otherwise look for the rightmost space *inside* the
-        //     window. If found, break there so we don't split a word.
-        //  3. No in-window space → the whole window is one long word;
-        //     hard-break mid-word so the user still sees their text.
+        // Prefer breaking on whitespace; hard-cut mid-word only when
+        // the window holds no space at all.
         let (end_excl, next_start) = if chars.get(upper) == Some(&' ') {
             (upper, upper + 1)
         } else {
@@ -1736,6 +1713,18 @@ struct WrapRow {
     /// on whitespace, so `source_col_end` of row N may differ from
     /// `source_col_start` of row N+1.
     source_col_end: usize,
+}
+
+impl WrapRow {
+    /// Single-row wrap covering `text` from column 0 — used by
+    /// `word_wrap`'s "trivial input" early returns.
+    fn single(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            source_col_start: 0,
+            source_col_end: text.chars().count(),
+        }
+    }
 }
 
 /// List-pane wrap helper. Word-wraps a title to at most `max_lines`

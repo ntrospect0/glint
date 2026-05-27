@@ -20,15 +20,15 @@
 /// Best-effort: malformed input doesn't error, it just produces a best
 /// approximation.
 pub fn html_to_text(html: &str) -> String {
-    // Step 1: drop <script>…</script> and <style>…</style> wholesale, so
-    // their bodies don't leak into the output. Case-insensitive match.
+    // Drop <script>…</script> and <style>…</style> bodies wholesale
+    // (case-insensitive) so they can't leak into the output.
     let stripped_scripts = strip_block(html, "script");
     let stripped = strip_block(&stripped_scripts, "style");
 
-    // Step 2: walk the resulting bytes, tracking whether we're inside a tag.
-    // When we hit a line-break-worthy tag, push `\n`. Everything else outside
-    // a tag goes through verbatim (decoded for entities). Whitespace is
-    // normalized at the end so quote-printed line wraps don't survive.
+    // Walk the remaining bytes, tracking tag vs body. Line-break-worthy
+    // tags push `\n`; everything else outside a tag goes through with
+    // entity decoding. Whitespace is collapsed at the end so
+    // quoted-printable wraps don't survive.
     let bytes = stripped.as_bytes();
     let mut out = String::with_capacity(bytes.len());
     let mut i = 0usize;

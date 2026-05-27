@@ -18,7 +18,7 @@ use ratatui::{
 use serde::Deserialize;
 
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::{apply_title_row, big_digits};
+use crate::ui::{apply_title_row, big_digits, MetadataEmphasis};
 
 use super::{AppContext, EventResult, Widget};
 
@@ -499,12 +499,23 @@ impl Widget for ClockWidget {
         } else {
             format!("Clock ({})", self.instance)
         };
+        // Italics carry the "this is a transient override" signal at
+        // any width — same convention as the weather widget. Drop the
+        // `(lookup)` suffix (it'd be the first thing tail-truncation
+        // ate anyway) and let `MetadataEmphasis::Emphasized` do the
+        // styling. Both the resolved-override and in-flight-lookup
+        // states get italics since both are non-default.
         let metadata = if let Some((label, _)) = &transient {
-            Some(format!("{label} (lookup)"))
+            Some(label.clone())
         } else if searching {
             Some("looking up…".to_string())
         } else {
             self.tz.map(|tz| tz.to_string())
+        };
+        let emphasis = if transient.is_some() || searching {
+            MetadataEmphasis::Emphasized
+        } else {
+            MetadataEmphasis::Default
         };
         let block = apply_title_row(
             Block::default()
@@ -514,6 +525,7 @@ impl Widget for ClockWidget {
             focused,
             &base,
             metadata.as_deref(),
+            emphasis,
             self.shortcut,
             &self.theme,
             area.width,

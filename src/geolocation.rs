@@ -99,19 +99,134 @@ pub async fn by_name(name: &str) -> Result<GeoLocation> {
     })
 }
 
-/// Split `raw` into `(city, admin_hint, country_hint)` on commas, trimming
-/// whitespace. Returns expanded hint values when the input is a recognized
-/// abbreviation (e.g. `MI` → `Michigan`, `USA` → `United States`).
+/// Resolve `raw` into `(city, admin_hint, country_hint)`. Two paths:
+///
+/// 1. **Comma-delimited** (preferred when present): split on commas,
+///    classify the parts. With three+ parts the positions are fixed —
+///    part 2 is admin, part 3 is country (`Troy, MI, USA`). With two
+///    parts we sniff part 2 against the admin tables first, then the
+///    country tables, so `Tokyo, Japan` lands as `(Tokyo, _, Japan)`
+///    instead of stuffing Japan into the admin slot.
+/// 2. **Whitespace-fuzzy**: when the user skips commas (`toronto on`,
+///    `paris france`, `los angeles california`) we peel known
+///    country names off the end first, then known admin names off
+///    what remains, leaving the city as everything still attached
+///    to the front. Multi-token names (`United Kingdom`, `New South
+///    Wales`, `South Korea`) match because the peeler tries the
+///    longest tail first. Edge case: if peeling would leave no city
+///    at all (e.g. `New York` typed bare), we back off and treat
+///    the entire string as the city.
 fn parse_query(raw: &str) -> (String, Option<String>, Option<String>) {
     let parts: Vec<&str> = raw
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
-    let city = parts.first().copied().unwrap_or("").to_string();
-    let admin_hint = parts.get(1).map(|s| expand_admin(s));
-    let country_hint = parts.get(2).map(|s| expand_country(s));
-    (city, admin_hint, country_hint)
+    if parts.len() >= 2 {
+        return parse_comma_form(&parts);
+    }
+    parse_freeform(parts.first().copied().unwrap_or(""))
+}
+
+fn parse_comma_form(parts: &[&str]) -> (String, Option<String>, Option<String>) {
+    let city = parts[0].to_string();
+    if parts.len() == 2 {
+        // `Troy, MI` vs `Tokyo, Japan` — sniff what was typed, don't
+        // jam it into a fixed slot. Falls through to admin-verbatim
+        // so `Munich, Bavaria` still passes "Bavaria" to Open-Meteo's
+        // admin1 matcher.
+        let p2 = parts[1];
+        if let Some(admin) = lookup_admin(p2) {
+            return (city, Some(admin), None);
+        }
+        if let Some(country) = lookup_country(p2) {
+            return (city, None, Some(country));
+        }
+        return (city, Some(p2.trim().to_string()), None);
+    }
+    let admin = parts.get(1).map(|s| expand_admin(s));
+    let country = parts.get(2).map(|s| expand_country(s));
+    (city, admin, country)
+}
+
+fn parse_freeform(raw: &str) -> (String, Option<String>, Option<String>) {
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    if tokens.is_empty() {
+        return (String::new(), None, None);
+    }
+    let (rest, country) = peel_known_tail(&tokens, lookup_country);
+    let (rest, admin) = peel_known_tail(&rest, lookup_admin);
+    if rest.is_empty() {
+        // Peeling consumed everything — the input was just a country
+        // or admin name on its own. That's not a usable city query,
+        // so back off: keep the original input as the city and drop
+        // the hints. `New York` typed bare goes through this branch.
+        return (tokens.join(" "), None, None);
+    }
+    (rest.join(" "), admin, country)
+}
+
+/// Try peeling 1- to 3-token tails off `tokens`, longest first, until
+/// `lookup` accepts one. Returns the trimmed prefix and the matched
+/// hint when something stuck; otherwise the input verbatim with `None`.
+/// Always leaves at least one token in the prefix so the caller can
+/// still produce a city. Longest-first matters for multi-token names
+/// like `United Kingdom`, `New South Wales`, `South Korea`.
+fn peel_known_tail<'a, F>(
+    tokens: &[&'a str],
+    lookup: F,
+) -> (Vec<&'a str>, Option<String>)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    const MAX_TAIL: usize = 3;
+    let max_tail = tokens.len().saturating_sub(1).min(MAX_TAIL);
+    for n in (1..=max_tail).rev() {
+        let split = tokens.len() - n;
+        let tail = tokens[split..].join(" ");
+        if let Some(full) = lookup(&tail) {
+            return (tokens[..split].to_vec(), Some(full));
+        }
+    }
+    (tokens.to_vec(), None)
+}
+
+/// Look up a state/province/region by abbreviation or full name. Returns
+/// `None` when no table matches — the peeler uses this as its "stop
+/// here" signal. The comma path uses [`expand_admin`] (which falls
+/// through to passthrough) to keep behavior compatible with loose
+/// names like `Bavaria`.
+fn lookup_admin(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    for table in [US_STATES, CA_PROVINCES, AU_STATES, MX_STATES, GB_NATIONS] {
+        if let Some((_, full)) = table.iter().find(|(k, _)| *k == upper) {
+            return Some((*full).to_string());
+        }
+    }
+    let lower = trimmed.to_lowercase();
+    for table in [US_STATES, CA_PROVINCES, AU_STATES, MX_STATES, GB_NATIONS] {
+        if let Some((_, full)) = table.iter().find(|(_, full)| full.to_lowercase() == lower) {
+            return Some((*full).to_string());
+        }
+    }
+    None
+}
+
+/// Look up a country by abbreviation or full name. `None` when no
+/// known table entry matches. Peeler stops on `None`; the comma path
+/// uses [`expand_country`] for verbatim passthrough.
+fn lookup_country(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    if let Some((_, full)) = COUNTRIES.iter().find(|(k, _)| *k == upper) {
+        return Some((*full).to_string());
+    }
+    let lower = trimmed.to_lowercase();
+    if let Some((_, full)) = COUNTRIES.iter().find(|(_, full)| full.to_lowercase() == lower) {
+        return Some((*full).to_string());
+    }
+    None
 }
 
 /// Score how well a geocoding candidate matches the user's hints. Higher
@@ -151,23 +266,13 @@ fn matches_hint(got: &str, want: &str) -> bool {
 /// no abbreviation match is found, so loose typing like "Michigan" or
 /// "Bavaria" passes through verbatim.
 fn expand_admin(s: &str) -> String {
-    let key = s.trim().to_ascii_uppercase();
-    for table in [US_STATES, CA_PROVINCES, AU_STATES, MX_STATES, GB_NATIONS] {
-        if let Some(full) = table.iter().find(|(k, _)| *k == key) {
-            return full.1.to_string();
-        }
-    }
-    s.trim().to_string()
+    lookup_admin(s).unwrap_or_else(|| s.trim().to_string())
 }
 
 /// Expand a country hint (`USA`, `US`, `UK`, `GB`, `CAN`, ...). Same
 /// fall-through as `expand_admin`.
 fn expand_country(s: &str) -> String {
-    let key = s.trim().to_ascii_uppercase();
-    if let Some(full) = COUNTRIES.iter().find(|(k, _)| *k == key) {
-        return full.1.to_string();
-    }
-    s.trim().to_string()
+    lookup_country(s).unwrap_or_else(|| s.trim().to_string())
 }
 
 /// US state + DC abbreviation → full name.
@@ -533,5 +638,126 @@ mod tests {
     fn score_zero_when_no_hints() {
         let troy = hit("Troy", Some("Michigan"), Some("United States"));
         assert_eq!(score_hit(&troy, None, None), 0);
+    }
+
+    #[test]
+    fn comma_path_two_parts_classifies_country_correctly() {
+        // 2-part comma form used to jam everything into admin. Now
+        // sniffs admin tables first, country tables second, falls
+        // back to admin-verbatim for unknown strings.
+        let (city, admin, country) = parse_query("Tokyo, Japan");
+        assert_eq!(city, "Tokyo");
+        assert!(admin.is_none());
+        assert_eq!(country.as_deref(), Some("Japan"));
+    }
+
+    #[test]
+    fn comma_path_two_parts_still_prefers_admin_when_ambiguous() {
+        let (_, admin, country) = parse_query("Troy, MI");
+        assert_eq!(admin.as_deref(), Some("Michigan"));
+        assert!(country.is_none());
+    }
+
+    #[test]
+    fn freeform_recognizes_trailing_province_abbreviation() {
+        // "toronto on" without commas — peel the trailing token as
+        // admin, leave "toronto" as the city.
+        let (city, admin, country) = parse_query("toronto on");
+        assert_eq!(city, "toronto");
+        assert_eq!(admin.as_deref(), Some("Ontario"));
+        assert!(country.is_none());
+    }
+
+    #[test]
+    fn freeform_recognizes_trailing_country_name() {
+        let (city, admin, country) = parse_query("paris france");
+        assert_eq!(city, "paris");
+        assert!(admin.is_none());
+        assert_eq!(country.as_deref(), Some("France"));
+    }
+
+    #[test]
+    fn freeform_recognizes_trailing_country_alias() {
+        let (city, _, country) = parse_query("toronto canada");
+        assert_eq!(city, "toronto");
+        assert_eq!(country.as_deref(), Some("Canada"));
+    }
+
+    #[test]
+    fn freeform_handles_multi_word_city_with_admin_tail() {
+        let (city, admin, _) = parse_query("san francisco california");
+        assert_eq!(city, "san francisco");
+        assert_eq!(admin.as_deref(), Some("California"));
+    }
+
+    #[test]
+    fn freeform_handles_multi_word_country_at_tail() {
+        // "South Korea" / "United Kingdom" / "United Arab Emirates"
+        // must match as a 2- or 3-token tail before single-token
+        // peeling — otherwise "south" or "united" wouldn't match and
+        // we'd lose the country entirely.
+        let (city, _, country) = parse_query("seoul south korea");
+        assert_eq!(city, "seoul");
+        assert_eq!(country.as_deref(), Some("South Korea"));
+
+        let (city, _, country) = parse_query("london united kingdom");
+        assert_eq!(city, "london");
+        assert_eq!(country.as_deref(), Some("United Kingdom"));
+    }
+
+    #[test]
+    fn freeform_peels_admin_and_country_in_sequence() {
+        let (city, admin, country) = parse_query("los angeles ca usa");
+        assert_eq!(city, "los angeles");
+        assert_eq!(admin.as_deref(), Some("California"));
+        assert_eq!(country.as_deref(), Some("United States"));
+    }
+
+    #[test]
+    fn freeform_bare_city_with_no_recognized_tail_is_unchanged() {
+        // "new york" has no matching tail in admin tables when only
+        // 1 token can be peeled (need at least 1 token to remain as
+        // city). Should stay as the city verbatim.
+        let (city, admin, country) = parse_query("new york");
+        assert_eq!(city, "new york");
+        assert!(admin.is_none());
+        assert!(country.is_none());
+    }
+
+    #[test]
+    fn freeform_recognizes_admin_on_multi_word_city() {
+        // "new york" alone is the city; "new york ny" peels NY off
+        // the end, leaving "new york" as the city.
+        let (city, admin, _) = parse_query("new york ny");
+        assert_eq!(city, "new york");
+        assert_eq!(admin.as_deref(), Some("New York"));
+    }
+
+    #[test]
+    fn freeform_handles_country_alone_by_keeping_input_as_city() {
+        // No usable city to peel from — back off to treating the
+        // whole input as the city. Open-Meteo will fail to resolve
+        // it; that's an honest "we don't know what city you mean"
+        // rather than silently substituting empty input.
+        let (city, admin, country) = parse_query("united kingdom");
+        assert_eq!(city, "united kingdom");
+        assert!(admin.is_none());
+        assert!(country.is_none());
+    }
+
+    #[test]
+    fn lookup_admin_matches_full_names_and_abbreviations() {
+        assert_eq!(lookup_admin("ON").as_deref(), Some("Ontario"));
+        assert_eq!(lookup_admin("ontario").as_deref(), Some("Ontario"));
+        assert_eq!(lookup_admin("california").as_deref(), Some("California"));
+        assert_eq!(lookup_admin("Bavaria"), None);
+    }
+
+    #[test]
+    fn lookup_country_matches_full_names_and_abbreviations() {
+        assert_eq!(lookup_country("japan").as_deref(), Some("Japan"));
+        assert_eq!(lookup_country("usa").as_deref(), Some("United States"));
+        assert_eq!(lookup_country("united kingdom").as_deref(), Some("United Kingdom"));
+        assert_eq!(lookup_country("nowhereistan"), None);
     }
 }

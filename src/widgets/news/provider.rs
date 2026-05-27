@@ -228,7 +228,10 @@ fn entry_to_article(
 
 /// Strip rudimentary HTML, decode common entities (`&amp;`, `&#8217;`, etc.),
 /// and collapse whitespace so RSS `<description>` blobs render readably.
-fn sanitize_summary(raw: &str) -> String {
+/// Public for reuse by the body-extraction fallback in `mod.rs`, which
+/// pulls `<p>` text out of `data-component="text-block"` divs when
+/// Readability undershoots on React-rendered article pages.
+pub(super) fn sanitize_summary(raw: &str) -> String {
     decode_entities(&strip_tags(raw))
 }
 

@@ -271,9 +271,16 @@ impl Widget for StackWidget {
 
     fn handle_command(&mut self, cmd: &str, args: &[&str]) -> Result<bool> {
         // Route command-bar commands to every child; first claimant wins.
-        // Stack itself doesn't own commands.
-        for child in self.children.iter_mut() {
-            if child.handle_command(cmd, args)? {
+        // Stack itself doesn't own commands. When a child claims, raise
+        // it to active so the user actually sees the effect — `:news
+        // nvidia` running on a hidden tab is invisible feedback and
+        // strictly worse than the no-stack case.
+        for idx in 0..self.children.len() {
+            if self.children[idx].handle_command(cmd, args)? {
+                if self.active != idx {
+                    self.active = idx;
+                    self.refresh_active_name();
+                }
                 return Ok(true);
             }
         }
@@ -843,6 +850,82 @@ mod tests {
         for c in counters {
             assert_eq!(*c.lock().unwrap(), 5);
         }
+    }
+
+    /// A `:news nvidia` typed by the user wants visible feedback. If
+    /// the news widget lives on a non-active tab, the stack has to
+    /// raise it on claim — otherwise the search runs invisibly under
+    /// whatever was on top.
+    #[tokio::test]
+    async fn command_claim_raises_child_to_active() {
+        struct ClaimsCmd {
+            id: String,
+            cmd_match: &'static str,
+        }
+        #[async_trait]
+        impl WidgetTrait for ClaimsCmd {
+            fn id(&self) -> &str {
+                &self.id
+            }
+            fn display_name(&self) -> &str {
+                &self.id
+            }
+            fn kind(&self) -> &str {
+                "claims-cmd"
+            }
+            async fn update(&mut self, _ctx: &AppContext) -> Result<()> {
+                Ok(())
+            }
+            fn render(&self, _frame: &mut Frame, _area: Rect, _focused: bool) {}
+            fn handle_key(&mut self, _key: KeyEvent) -> EventResult {
+                EventResult::Ignored
+            }
+            fn handle_command(&mut self, cmd: &str, _args: &[&str]) -> Result<bool> {
+                Ok(cmd == self.cmd_match)
+            }
+            fn config(&self) -> serde_json::Value {
+                serde_json::json!(null)
+            }
+            fn apply_config(&mut self, _config: serde_json::Value) -> Result<()> {
+                Ok(())
+            }
+        }
+        let theme = std::sync::Arc::new(Theme::builtin_defaults());
+        let mut stack = StackWidget::new(
+            "stack:email+news".to_string(),
+            vec![
+                Box::new(ClaimsCmd {
+                    id: "email".into(),
+                    cmd_match: "email",
+                }),
+                Box::new(ClaimsCmd {
+                    id: "news".into(),
+                    cmd_match: "news",
+                }),
+            ],
+            1,
+            theme,
+        );
+        assert_eq!(stack.active, 0, "stack defaults to first child");
+        let claimed = stack.handle_command("news", &["nvidia"]).unwrap();
+        assert!(claimed, "news child must claim its own command");
+        assert_eq!(
+            stack.active, 1,
+            "stack must raise the claiming child to active"
+        );
+    }
+
+    /// Inverse: a command no child claims must not disturb the active
+    /// tab. Otherwise typing an unrelated command would silently
+    /// reshuffle which widget the user is looking at.
+    #[tokio::test]
+    async fn unclaimed_command_leaves_active_unchanged() {
+        let (mut stack, _) = build_stack(1);
+        stack.handle_key(KeyEvent::from(KeyCode::Char('.')));
+        assert_eq!(stack.active, 1);
+        let claimed = stack.handle_command("bogus", &[]).unwrap();
+        assert!(!claimed);
+        assert_eq!(stack.active, 1, "no claim → active stays put");
     }
 
     #[test]

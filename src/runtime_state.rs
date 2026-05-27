@@ -35,7 +35,7 @@ pub const RUNTIME_STATE_VERSION: u32 = 1;
 /// File name (relative to the config dir). Dot-prefixed.
 pub const RUNTIME_STATE_FILENAME: &str = ".runtime_state.toml";
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeState {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -43,6 +43,20 @@ pub struct RuntimeState {
     /// (`stack:<child1>+<child2>+…`). Missing entries default to 0.
     #[serde(default)]
     pub stacks: HashMap<String, StackEntry>,
+}
+
+// Manual `Default` rather than `derive` so a freshly-constructed
+// `RuntimeState` already carries the current schema version. Without
+// this, `RuntimeState::default()` produced `version: 0`, which
+// `load()` then rejected as a version mismatch — round-tripping a
+// blank state through disk would silently throw it away.
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self {
+            version: RUNTIME_STATE_VERSION,
+            stacks: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,9 +187,9 @@ mod tests {
     }
 
     #[test]
-    fn default_state_is_empty() {
+    fn default_state_carries_current_version_and_is_empty() {
         let s = RuntimeState::default();
-        assert_eq!(s.version, 0);
+        assert_eq!(s.version, RUNTIME_STATE_VERSION);
         assert!(s.stacks.is_empty());
     }
 

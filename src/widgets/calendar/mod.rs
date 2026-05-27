@@ -42,7 +42,7 @@ use crate::auth::google::{store::GoogleToken, OAuthClientConfig as GoogleClientC
 use crate::auth::microsoft::{store::MicrosoftToken, OAuthClientConfig as MicrosoftClientConfig};
 use crate::cache::ScopedCache;
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::{apply_title_row, big_digits};
+use crate::ui::{apply_title_row, big_digits, MetadataEmphasis};
 
 const VIEW_TABS: &[(CalendarView, &str)] = &[
     (CalendarView::Day, "Day"),
@@ -227,7 +227,20 @@ pub struct CalendarWidget {
     shortcut_prefs: Vec<char>,
     /// Persistent cache of the merged event timeline.
     cache: ScopedCache,
+    /// Timestamp of the last accepted horizontal scroll click. Trackpad
+    /// swipes emit ~20-30 ScrollLeft/Right events per gesture, so we
+    /// debounce them through [`HORIZONTAL_SCROLL_COOLDOWN`] to collapse
+    /// a quick flick into a single navigation step instead of skipping
+    /// 20 days at once.
+    last_horizontal_scroll: Option<Instant>,
 }
+
+/// Minimum gap between two horizontal-scroll-driven anchor jumps. Chosen
+/// so a typical trackpad flick (a ~300ms gesture of ~30 events) produces
+/// roughly one navigation step, while a deliberate slow scroll still
+/// dials through dates at a usable cadence. View-independent — applies
+/// to Day, Week, and Month equally.
+const HORIZONTAL_SCROLL_COOLDOWN: Duration = Duration::from_millis(200);
 
 impl CalendarWidget {
     pub fn with_config(
@@ -285,6 +298,7 @@ impl CalendarWidget {
             shortcut: None,
             shortcut_prefs,
             cache,
+            last_horizontal_scroll: None,
         }
     }
 
@@ -354,9 +368,6 @@ impl CalendarWidget {
         if self.current_range_covered() {
             return;
         }
-        // Inline the `mark_dirty` body so a sweep replacing
-        // `self.mark_dirty()` → `self.mark_dirty_if_uncovered()` at
-        // navigation sites doesn't accidentally recurse here.
         let mut st = self.state.lock().expect("calendar state poisoned");
         st.last_attempt = None;
     }
@@ -426,6 +437,58 @@ impl CalendarWidget {
         st.agenda_scroll = 0;
         st.agenda_scroll_max = 0;
         st.agenda_autoscroll_done = false;
+    }
+
+    /// Does the currently-shown range cover today? Day view checks
+    /// anchor-equals-today; Week view checks today falls inside the
+    /// Sun..=Sat window containing the anchor; Month view checks
+    /// today's calendar month matches the anchor's. Drives the
+    /// `[Today]` button's lit-vs-dim styling so the user can tell
+    /// at a glance whether jumping to today would change the view.
+    fn current_view_contains_today(&self) -> bool {
+        let today = Local::now().date_naive();
+        match self.view {
+            CalendarView::Day => self.anchor == today,
+            CalendarView::Week => {
+                let start = start_of_week(self.anchor);
+                let end = start + ChronoDuration::days(6);
+                today >= start && today <= end
+            }
+            CalendarView::Month => {
+                today.year() == self.anchor.year() && today.month() == self.anchor.month()
+            }
+        }
+    }
+
+    /// Accept-or-drop gate for ScrollLeft/Right. Returns `true` when
+    /// enough time has elapsed since the last accepted horizontal
+    /// scroll to take another one. Trackpad gestures emit a burst of
+    /// ~20-30 events in ~300ms; without this gate a single flick
+    /// would skip 20+ days at once. The [`HORIZONTAL_SCROLL_COOLDOWN`]
+    /// constant controls the cadence — quick flick ≈ 1 step, slow
+    /// deliberate scroll still feeds steady steps.
+    fn consume_horizontal_scroll(&mut self) -> bool {
+        let now = Instant::now();
+        if let Some(prev) = self.last_horizontal_scroll {
+            if now.duration_since(prev) < HORIZONTAL_SCROLL_COOLDOWN {
+                return false;
+            }
+        }
+        self.last_horizontal_scroll = Some(now);
+        true
+    }
+
+    /// Distance one ←/→ keystroke (or one accepted horizontal scroll-
+    /// wheel click) advances the anchor by. View-dependent: Day → 1
+    /// day, Week → 7 days, Month → ~30 days. Used by both `handle_key`
+    /// and `handle_mouse` so keyboard and trackpad navigation stay
+    /// in lockstep.
+    fn nav_step(&self) -> ChronoDuration {
+        match self.view {
+            CalendarView::Day => ChronoDuration::days(1),
+            CalendarView::Week => ChronoDuration::days(7),
+            CalendarView::Month => ChronoDuration::days(30),
+        }
     }
 
     /// Adjust the agenda scroll by `delta` rows, clamping against the
@@ -1449,9 +1512,7 @@ impl CalendarWidget {
             st.agenda_scroll_max = max_scroll;
             !st.agenda_autoscroll_done
         };
-        let today_naive = today;
-        let do_autoscroll =
-            needs_autoscroll && self.anchor == today_naive && max_scroll > 0;
+        let do_autoscroll = needs_autoscroll && self.anchor == today && max_scroll > 0;
         let scroll = if do_autoscroll {
             let now = Local::now();
             if let Some(rel) = self.first_future_event_line(&day_events, area.width, now) {
@@ -1727,6 +1788,7 @@ impl Widget for CalendarWidget {
             focused,
             &self.title_for_header(),
             Some(metadata.as_str()),
+            MetadataEmphasis::Default,
             self.shortcut,
             &self.theme,
             area.width,
@@ -1752,7 +1814,17 @@ impl Widget for CalendarWidget {
                 height: 1,
             };
             let mut spans: Vec<Span<'_>> = vec![Span::raw(" ")];
-            spans.push(Span::styled("[Today]", self.theme.text_focused));
+            // [Today] lights up when the current view already covers
+            // today (clicking it would be a no-op); dims when it
+            // wouldn't (clicking jumps the anchor). Mirrors the
+            // active/inactive treatment of the view tabs to its right
+            // so the whole footer reads as a row of state indicators.
+            let today_style = if self.current_view_contains_today() {
+                self.theme.text_focused
+            } else {
+                self.theme.text_dim
+            };
+            spans.push(Span::styled("[Today]", today_style));
             spans.push(Span::raw(" "));
             for (v, label) in VIEW_TABS {
                 let active = *v == self.view;
@@ -1780,11 +1852,7 @@ impl Widget for CalendarWidget {
                 return EventResult::Ignored;
             }
         }
-        let step = match self.view {
-            CalendarView::Day => ChronoDuration::days(1),
-            CalendarView::Week => ChronoDuration::days(7),
-            CalendarView::Month => ChronoDuration::days(30),
-        };
+        let step = self.nav_step();
         match key.code {
             KeyCode::Char('d') => {
                 self.view = CalendarView::Day;
@@ -1851,8 +1919,10 @@ impl Widget for CalendarWidget {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> EventResult {
-        // Scroll wheel: walks the selected day's agenda. Time navigation
-        // lives on clicks (the day grid in Week/Month) and on ←/→ keys.
+        // Vertical scroll walks the selected day's agenda; horizontal
+        // scroll walks time by the same unit ←/→ does (1 day in Day
+        // view, 1 week in Week view, ~1 month in Month view). Click
+        // navigation on the day grid stays untouched.
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_agenda(-1);
@@ -1860,6 +1930,22 @@ impl Widget for CalendarWidget {
             }
             MouseEventKind::ScrollDown => {
                 self.scroll_agenda(1);
+                return EventResult::Handled;
+            }
+            MouseEventKind::ScrollLeft => {
+                if self.consume_horizontal_scroll() {
+                    self.anchor -= self.nav_step();
+                    self.reset_agenda_scroll();
+                    self.mark_dirty_if_uncovered();
+                }
+                return EventResult::Handled;
+            }
+            MouseEventKind::ScrollRight => {
+                if self.consume_horizontal_scroll() {
+                    self.anchor += self.nav_step();
+                    self.reset_agenda_scroll();
+                    self.mark_dirty_if_uncovered();
+                }
                 return EventResult::Handled;
             }
             MouseEventKind::Down(MouseButton::Left) => {}
@@ -2087,9 +2173,9 @@ pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
 
 fn load_calendar_from_toml(
     doc: &toml::Value,
-) -> std::collections::HashMap<String, crate::wizard::descriptor::WizardValue> {
+) -> HashMap<String, crate::wizard::descriptor::WizardValue> {
     use crate::wizard::descriptor::WizardValue;
-    let mut out = std::collections::HashMap::new();
+    let mut out = HashMap::new();
     if let Some(n) = doc.get("poll_interval_secs").and_then(|v| v.as_integer()) {
         out.insert("poll_interval_secs".into(), WizardValue::Number(n as f64));
     }
@@ -2121,7 +2207,7 @@ fn load_calendar_from_toml(
 }
 
 fn render_calendar_toml(
-    values: &std::collections::HashMap<String, crate::wizard::descriptor::WizardValue>,
+    values: &HashMap<String, crate::wizard::descriptor::WizardValue>,
     existing: Option<&str>,
 ) -> String {
     use crate::wizard::descriptor::WizardValue;
@@ -2141,7 +2227,7 @@ fn render_calendar_toml(
         Some(WizardValue::MultiChoice(items)) => items.clone(),
         _ => vec!["local".into()],
     };
-    let existing_blocks: std::collections::HashMap<String, String> =
+    let existing_blocks: HashMap<String, String> =
         existing_provider_blocks_by_kind(existing.unwrap_or(""));
 
     let mut provider_blocks = String::new();
@@ -2184,9 +2270,9 @@ fn render_calendar_toml(
 /// source ticked.
 fn existing_provider_blocks_by_kind(
     text: &str,
-) -> std::collections::HashMap<String, String> {
-    let mut out: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> =
+        HashMap::new();
     let Ok(doc) = toml::from_str::<toml::Value>(text) else {
         return out;
     };
@@ -2249,6 +2335,155 @@ mod tests {
             Arc::new(Theme::builtin_defaults()),
             ScopedCache::ephemeral(),
         )
+    }
+
+    fn mouse_scroll(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Horizontal scroll moves the anchor by the same unit ←/→ does:
+    /// 1 day in Day view, so one accepted ScrollRight click advances
+    /// the anchor by exactly one day. Cooldown is cleared between
+    /// clicks so the test exercises the per-event stride, not the
+    /// debounce gate (covered separately below).
+    #[test]
+    fn horizontal_scroll_in_day_view_steps_by_one_day() {
+        let mut w = build_widget(CalendarConfig::default());
+        w.view = CalendarView::Day;
+        let start = w.anchor;
+        let area = Rect::new(0, 0, 40, 20);
+        assert_eq!(
+            w.handle_mouse(mouse_scroll(MouseEventKind::ScrollRight), area),
+            EventResult::Handled
+        );
+        assert_eq!(w.anchor, start + ChronoDuration::days(1));
+        w.last_horizontal_scroll = None;
+        assert_eq!(
+            w.handle_mouse(mouse_scroll(MouseEventKind::ScrollLeft), area),
+            EventResult::Handled
+        );
+        assert_eq!(w.anchor, start);
+    }
+
+    /// Week view → 7-day step per accepted horizontal scroll click.
+    /// Keeps keyboard ←/→ and trackpad swipe in lockstep.
+    #[test]
+    fn horizontal_scroll_in_week_view_steps_by_seven_days() {
+        let mut w = build_widget(CalendarConfig::default());
+        w.view = CalendarView::Week;
+        let start = w.anchor;
+        let area = Rect::new(0, 0, 40, 20);
+        w.handle_mouse(mouse_scroll(MouseEventKind::ScrollRight), area);
+        assert_eq!(w.anchor, start + ChronoDuration::days(7));
+    }
+
+    /// Month view uses ~30-day stride. Same approximation as the ←/→
+    /// keys — keeps mouse and keyboard navigation consistent.
+    #[test]
+    fn horizontal_scroll_in_month_view_steps_by_thirty_days() {
+        let mut w = build_widget(CalendarConfig::default());
+        w.view = CalendarView::Month;
+        let start = w.anchor;
+        let area = Rect::new(0, 0, 40, 20);
+        w.handle_mouse(mouse_scroll(MouseEventKind::ScrollRight), area);
+        assert_eq!(w.anchor, start + ChronoDuration::days(30));
+    }
+
+    /// A burst of ScrollRight events arriving within the cooldown
+    /// window must collapse to a single navigation step. Without the
+    /// debounce a trackpad flick (20-30 events in ~300ms) would jump
+    /// 20+ days at once, which is what triggered this whole change.
+    #[test]
+    fn horizontal_scroll_burst_within_cooldown_collapses_to_one_step() {
+        let mut w = build_widget(CalendarConfig::default());
+        w.view = CalendarView::Day;
+        let start = w.anchor;
+        let area = Rect::new(0, 0, 40, 20);
+        for _ in 0..20 {
+            w.handle_mouse(mouse_scroll(MouseEventKind::ScrollRight), area);
+        }
+        assert_eq!(
+            w.anchor,
+            start + ChronoDuration::days(1),
+            "rapid burst within cooldown should advance only once"
+        );
+    }
+
+    /// Events arriving after the cooldown window each move the anchor.
+    /// Simulated by clearing `last_horizontal_scroll` between calls —
+    /// equivalent to letting 200ms+ elapse in real use.
+    #[test]
+    fn horizontal_scroll_after_cooldown_accepts_next_step() {
+        let mut w = build_widget(CalendarConfig::default());
+        w.view = CalendarView::Day;
+        let start = w.anchor;
+        let area = Rect::new(0, 0, 40, 20);
+        w.handle_mouse(mouse_scroll(MouseEventKind::ScrollRight), area);
+        w.last_horizontal_scroll = None;
+        w.handle_mouse(mouse_scroll(MouseEventKind::ScrollRight), area);
+        assert_eq!(w.anchor, start + ChronoDuration::days(2));
+    }
+
+    /// Vertical scroll still walks the agenda — horizontal nav doesn't
+    /// hijack the existing ScrollUp/Down behavior.
+    #[test]
+    fn vertical_scroll_does_not_move_anchor() {
+        let mut w = build_widget(CalendarConfig::default());
+        let start = w.anchor;
+        let area = Rect::new(0, 0, 40, 20);
+        w.handle_mouse(mouse_scroll(MouseEventKind::ScrollUp), area);
+        w.handle_mouse(mouse_scroll(MouseEventKind::ScrollDown), area);
+        assert_eq!(w.anchor, start);
+    }
+
+    /// Day view: [Today] is lit only when the anchor IS today.
+    #[test]
+    fn today_button_state_in_day_view_tracks_anchor() {
+        let mut w = build_widget(CalendarConfig::default());
+        w.view = CalendarView::Day;
+        w.anchor = Local::now().date_naive();
+        assert!(w.current_view_contains_today());
+        w.anchor -= ChronoDuration::days(3);
+        assert!(!w.current_view_contains_today());
+    }
+
+    /// Week view: today is "in view" when it falls inside the Sun..=Sat
+    /// window containing the anchor — not just when the anchor itself
+    /// is today. Walking 3 days forward or back from today stays in
+    /// the same week (most of the time).
+    #[test]
+    fn today_button_state_in_week_view_covers_whole_week() {
+        let mut w = build_widget(CalendarConfig::default());
+        w.view = CalendarView::Week;
+        let today = Local::now().date_naive();
+        // Anchor on the start of the current week → should still
+        // count as "today in view."
+        w.anchor = start_of_week(today);
+        assert!(w.current_view_contains_today());
+        // Jump to the start of a different week — today is no longer
+        // inside the anchored Sun..=Sat range.
+        w.anchor = start_of_week(today) - ChronoDuration::days(14);
+        assert!(!w.current_view_contains_today());
+    }
+
+    /// Month view: any day within today's calendar month counts.
+    /// Crossing the month boundary flips the state.
+    #[test]
+    fn today_button_state_in_month_view_covers_whole_month() {
+        let mut w = build_widget(CalendarConfig::default());
+        w.view = CalendarView::Month;
+        let today = Local::now().date_naive();
+        // Anchor on the 1st of this month — same month → lit.
+        w.anchor = NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap();
+        assert!(w.current_view_contains_today());
+        // Anchor on the previous month's 15th.
+        w.anchor = first_of_next_month(today) + ChronoDuration::days(45);
+        assert!(!w.current_view_contains_today());
     }
 
     #[test]

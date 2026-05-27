@@ -38,7 +38,7 @@ pub fn handle_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
             // existing TOMLs so "new session" still surfaces their actual
             // config as defaults — the alternative (truly blank state)
             // would force them to retype values they already have on disk.
-            let mut fresh = WizardState::new();
+            let mut fresh = WizardState::default();
             hydrate::hydrate_from_disk(&mut fresh);
             app.state = fresh;
             PageAction::Advance

@@ -54,7 +54,7 @@ use serde::Deserialize;
 
 use crate::cache::ScopedCache;
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::apply_title_row;
+use crate::ui::{apply_title_row, MetadataEmphasis};
 
 use super::{AppContext, EventResult, Widget};
 
@@ -711,20 +711,14 @@ impl ForexWidget {
                 target.retain(|c| c != code);
                 target.insert(0, code.to_string());
             };
-            // Step 1: promote old_primary (skipped if it's already
-            // the configured primary — step 2 will handle it).
-            if old_primary != configured && !configured.is_empty() {
+            // Inserts run in reverse-display order so the configured
+            // primary ends up at index 0 of its category. Skip the
+            // old-primary insert when it IS the configured primary —
+            // the second insert handles it once.
+            if old_primary != configured {
                 prepend(&old_primary, &mut fiat, &mut crypto);
             }
-            // Step 2: promote the configured primary so it stays
-            // permanently anchored at the top of its category.
-            if !configured.is_empty() {
-                prepend(&configured, &mut fiat, &mut crypto);
-            } else if old_primary != configured {
-                // Defensive fallback: if configured is somehow blank,
-                // at least keep the previous old_primary behaviour.
-                prepend(&old_primary, &mut fiat, &mut crypto);
-            }
+            prepend(&configured, &mut fiat, &mut crypto);
             let (alts, cs) = build_alternates(&fiat, &crypto, &new_upper);
             self.alternates = alts;
             self.crypto_start = cs;
@@ -950,6 +944,7 @@ impl Widget for ForexWidget {
             focused,
             &title,
             metadata.as_deref(),
+            MetadataEmphasis::Default,
             self.shortcut,
             &self.theme,
             area.width,

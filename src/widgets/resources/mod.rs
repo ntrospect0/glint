@@ -23,7 +23,7 @@ use serde::Deserialize;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::apply_title_row;
+use crate::ui::{apply_title_row, MetadataEmphasis};
 
 use super::{AppContext, EventResult, Widget};
 
@@ -373,6 +373,7 @@ impl Widget for ResourcesWidget {
             focused,
             &title_base,
             None,
+            MetadataEmphasis::Default,
             self.shortcut,
             &self.theme,
             area.width,

@@ -25,7 +25,7 @@ use serde::Deserialize;
 use crate::cache::ScopedCache;
 use crate::geolocation::{self, GeoLocation};
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::apply_title_row;
+use crate::ui::{apply_title_row, MetadataEmphasis};
 
 use super::{AppContext, EventResult, Widget};
 
@@ -381,16 +381,21 @@ impl Widget for WeatherWidget {
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
         let snapshot = {
             let st = self.state.lock().expect("weather state poisoned");
-            let label = st
-                .transient_location
-                .as_ref()
-                .map(|l| format!("{} (lookup)", l.label))
-                .or_else(|| st.location.as_ref().map(|l| l.label.clone()));
+            // The override marker is the *italic* styling layered onto
+            // the title metadata, not a `(lookup)` suffix — the suffix
+            // would be the first thing tail-truncation eats, leaving
+            // the user with no visual signal that the displayed city
+            // isn't their default. The framework's `MetadataEmphasis`
+            // does the heavy lifting; we just hand it the raw label.
+            let (label, override_active) = match st.transient_location.as_ref() {
+                Some(l) => (Some(l.label.clone()), true),
+                None => (st.location.as_ref().map(|l| l.label.clone()), false),
+            };
             // `revert_target` is populated only when an override is active.
             // The default location (loaded from weather.toml) is what `x`
             // brings us back to — surface its label so the hint reads
             // "x: revert to Richmond, BC" rather than a vague "revert".
-            let revert_target = if st.transient_location.is_some() {
+            let revert_target = if override_active {
                 st.location.as_ref().map(|l| l.label.clone())
             } else {
                 None
@@ -404,6 +409,7 @@ impl Widget for WeatherWidget {
                 inflight: st.inflight || st.transient_searching,
                 attempted: st.last_attempt.is_some(),
                 revert_target,
+                override_active,
             }
         };
         let title_label = snapshot.location_label.clone();
@@ -413,6 +419,11 @@ impl Widget for WeatherWidget {
             format!("Weather ({})", self.instance)
         };
         let metadata = title_label.or_else(|| Some("Locating…".to_string()));
+        let emphasis = if snapshot.override_active {
+            MetadataEmphasis::Emphasized
+        } else {
+            MetadataEmphasis::Default
+        };
         let block = apply_title_row(
             Block::default()
                 .borders(Borders::ALL)
@@ -421,6 +432,7 @@ impl Widget for WeatherWidget {
             focused,
             &title_prefix,
             metadata.as_deref(),
+            emphasis,
             self.shortcut,
             &self.theme,
             area.width,
@@ -590,6 +602,12 @@ struct Snapshot {
     /// `weather.toml`). Populated only when a `:weather <city>` override is
     /// active — used to drive the "x: revert to <default>" footer hint.
     revert_target: Option<String>,
+    /// `true` when `:weather <city>` has displaced the configured
+    /// location. Drives `MetadataEmphasis::Emphasized` in the title row
+    /// so the italic styling tells the user at a glance that the
+    /// displayed city isn't their default, even when the city label
+    /// itself has been tail-truncated by a narrow widget cell.
+    override_active: bool,
 }
 
 

@@ -25,7 +25,7 @@ use serde::Deserialize;
 use crate::cache::ScopedCache;
 use crate::llm::{LlmMessage, LlmProvider, LlmRequest, Role};
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::apply_title_row;
+use crate::ui::{apply_title_row, MetadataEmphasis};
 
 use super::{AppContext, EventResult, Widget};
 
@@ -201,13 +201,8 @@ struct NewsState {
     /// header. Toggled by `e` (expand/collapse) and `s` (which also
     /// expands if collapsed, like the email widget's `s`).
     expanded: bool,
-    /// Per-article "show LLM summary instead of raw excerpt" flag,
-    /// keyed by URL. Mirrors the email widget's pattern: `s` flips
-    /// this and (when entering summary view) lazily fires the LLM
-    /// request if one isn't already in flight or cached. Absent or
-    /// `false` means "show the raw excerpt"; `true` means "prefer the
-    /// LLM summary." Per-article so toggling on one article doesn't
-    /// affect the others.
+    /// Per-article "prefer LLM summary over raw excerpt" toggle, keyed
+    /// by URL. `s` flips it.
     summary_view: HashMap<String, bool>,
     /// Index into the *visible* tab list (static topic tabs + the dynamic
     /// search tab when one exists). 0 is always `All`.
@@ -217,11 +212,9 @@ struct NewsState {
     inflight: bool,
     /// Per-article LLM summarization state, keyed by article URL.
     summaries: HashMap<String, SummaryState>,
-    /// Per-article HTTP body fetch state, keyed by URL. Populated by
-    /// `ensure_body_fetched` when the user opts into the LLM summary
-    /// via `s` on a feed whose `fetch_body` is enabled. The LLM task
-    /// is chained off `BodyState::Ready` so a successful body becomes
-    /// the LLM prompt's input; failures fall back to the RSS excerpt.
+    /// Per-article HTTP body fetch state, keyed by URL. Filled
+    /// lazily by `ensure_body_then_summary` and chained into the LLM
+    /// task; `Failed` falls back to the RSS excerpt for the summary.
     bodies: HashMap<String, BodyState>,
     /// Active `:news <terms>` filter, if any. When present, an extra tab
     /// is appended to the tab bar and articles matching at least one term
@@ -262,6 +255,14 @@ const BODY_CACHE_PREFIX: &str = "body-";
 /// while still giving the LLM far more substance than the RSS excerpt.
 const MAX_BODY_BYTES: usize = 30_000;
 
+/// Floor for accepting a Readability-extracted body as the real article.
+/// Under this we assume extraction misfired (typically: a React-rendered
+/// page where each paragraph is its own deeply-nested block, so the
+/// density scorer picks one paragraph and stops). At that point we try
+/// the `data-component="text-block"` fallback below before giving up.
+/// 800 chars is roughly "more than a single quote, less than an article."
+const MIN_EXTRACTED_BODY_BYTES: usize = 800;
+
 /// HTTP timeout for fetching an article page. RSS feeds get 30s via the
 /// shared client; article pages live behind more layers (Cloudflare,
 /// rendering pipelines) so we give them headroom. Still tight enough
@@ -269,23 +270,11 @@ const MAX_BODY_BYTES: usize = 30_000;
 const ARTICLE_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn summary_cache_key(url: &str) -> String {
-    cache_key_with_prefix(SUMMARY_CACHE_PREFIX, url)
+    crate::cache::short_hash_key(SUMMARY_CACHE_PREFIX, url)
 }
 
 fn body_cache_key(url: &str) -> String {
-    cache_key_with_prefix(BODY_CACHE_PREFIX, url)
-}
-
-fn cache_key_with_prefix(prefix: &str, url: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(url.as_bytes());
-    let mut key = String::with_capacity(prefix.len() + 16);
-    key.push_str(prefix);
-    for b in &digest[..8] {
-        use std::fmt::Write;
-        let _ = write!(key, "{b:02x}");
-    }
-    key
+    crate::cache::short_hash_key(BODY_CACHE_PREFIX, url)
 }
 
 pub struct NewsWidget {
@@ -496,16 +485,16 @@ impl NewsWidget {
         };
         match body_state {
             Some(BodyState::Ready(text)) => {
-                tracing::info!(url = %article.url, "news body: already in memory; chaining to summary");
+                tracing::debug!(url = %article.url, "news body: already in memory; chaining to summary");
                 self.ensure_summary_requested(article, Some(text));
                 return;
             }
             Some(BodyState::Requested) => {
-                tracing::info!(url = %article.url, "news body: fetch already in flight; summary will chain on completion");
+                tracing::debug!(url = %article.url, "news body: fetch already in flight; summary will chain on completion");
                 return;
             }
             Some(BodyState::Failed) => {
-                tracing::info!(url = %article.url, "news body: previously failed; summarizing RSS excerpt");
+                tracing::debug!(url = %article.url, "news body: previously failed; summarizing RSS excerpt");
                 self.ensure_summary_requested(article, None);
                 return;
             }
@@ -513,7 +502,7 @@ impl NewsWidget {
         }
         // Try the persisted body cache.
         if let Some(entry) = self.cache.load::<String>(&body_cache_key(&article.url)) {
-            tracing::info!(url = %article.url, "news body: hydrated from on-disk cache; chaining to summary");
+            tracing::debug!(url = %article.url, "news body: hydrated from on-disk cache; chaining to summary");
             let body = entry.value;
             {
                 let mut st = self.state.lock().expect("news state poisoned");
@@ -586,13 +575,13 @@ impl NewsWidget {
     /// No-op when there are no articles or no LLM is configured.
     fn toggle_summary_view(&mut self) {
         if !self.llm_summarize_enabled {
-            tracing::info!(
+            tracing::debug!(
                 "news `s` ignored: summarize_with_llm = false in news.toml"
             );
             return;
         }
         if self.llm.is_none() {
-            tracing::info!(
+            tracing::debug!(
                 "news `s` ignored: no LLM provider configured (check llm.toml)"
             );
             return;
@@ -600,13 +589,13 @@ impl NewsWidget {
         let (article_url, will_show_summary) = {
             let mut st = self.state.lock().expect("news state poisoned");
             if st.articles.is_empty() {
-                tracing::info!("news `s` ignored: no articles loaded yet");
+                tracing::debug!("news `s` ignored: no articles loaded yet");
                 return;
             }
             let url = match st.articles.get(st.selected) {
                 Some(a) => a.url.clone(),
                 None => {
-                    tracing::info!(
+                    tracing::debug!(
                         selected = st.selected,
                         len = st.articles.len(),
                         "news `s` ignored: selected index out of range"
@@ -1048,11 +1037,6 @@ impl Widget for NewsWidget {
             all_articles
         };
 
-        let base = if self.instance == "main" {
-            "News".to_string()
-        } else {
-            format!("News ({})", self.instance)
-        };
         let metadata = if articles.is_empty() {
             None
         } else {
@@ -1064,8 +1048,9 @@ impl Widget for NewsWidget {
                 .border_type(BorderType::Rounded)
                 .border_style(self.theme.border_style(focused)),
             focused,
-            &base,
+            &self.display_name_cache,
             metadata.as_deref(),
+            MetadataEmphasis::Default,
             self.shortcut,
             &self.theme,
             area.width,
@@ -1134,23 +1119,14 @@ impl Widget for NewsWidget {
             return;
         }
 
-        // Each article occupies two rows by default (title + dim metadata).
-        // The selected article expands to (1 + 1 + up to MAX_SUMMARY_LINES)
-        // when `expanded` is true.
+        // title row + meta row; selected expands by wrapped summary lines on top.
         const ROWS_PER_ITEM: usize = 2;
 
         let now = Utc::now();
         let inner_width = inner.width as usize;
 
-        // Resolve the selected article's expanded summary up front so the
-        // scroll calc can factor its real height in. Without this, a tall
-        // expansion at the visible bottom would push title+meta past
-        // list_height and the loop would break before emitting anything —
-        // the user would lose the article entirely.
-        // No LLM request fired here — `s` is now the explicit opt-in,
-        // and `ensure_summary_requested` runs from `toggle_summary_view`
-        // when the user actually asks for the summary. That matches the
-        // email widget and avoids billing the user for every `e` press.
+        // Resolve the selected expansion up front so the scroll math
+        // below can factor its row count in.
         let selected_summary_lines: Vec<String> = if expanded && selected < articles.len() {
             let article = &articles[selected];
             expanded_summary_lines(
@@ -1162,18 +1138,8 @@ impl Widget for NewsWidget {
         } else {
             Vec::new()
         };
-        // Scroll math — mirrors the email widget's pattern row-for-
-        // row so navigation feels identical between the two. ROWS_
-        // PER_ITEM = 2 (title + meta) means "items_visible" here is
-        // measured in *articles*, not rows; the expansion height is
-        // the only term carried in raw row units. Three clamps in
-        // order:
-        //   1. Keep selected from scrolling above the viewport.
-        //   2. Keep selected from scrolling below the viewport.
-        //   3. When expanded, scroll up just enough that the title +
-        //      meta + summary fits without clipping at the bottom —
-        //      and never past `selected` (so the selected row stays
-        //      visible even when the expansion is taller than the pane).
+        // `items_visible` is in articles (each takes ROWS_PER_ITEM rows);
+        // expansion height is the only term measured in raw rows.
         let summary_rows = selected_summary_lines.len() as u16;
         let items_visible = (list_height / ROWS_PER_ITEM as u16).max(1) as usize;
         if selected < scroll {
@@ -1669,35 +1635,53 @@ async fn fetch_and_extract_body(url: &str) -> Result<String> {
         .bytes()
         .await
         .with_context(|| format!("reading body of {url} failed"))?;
+    let html_bytes = resp.to_vec();
+    let html_len = html_bytes.len();
     // Readability extraction is CPU-bound (html5ever DOM walk +
     // scoring heuristics); offload to a blocking-friendly task so we
-    // don't block the tokio reactor on long documents.
-    let html_bytes = resp.to_vec();
+    // don't block the tokio reactor on long documents. We hand the
+    // raw HTML to the fallback extractor on the same thread so we
+    // pay the UTF-8 conversion (and the marker-scan) once.
     let parsed_clone = parsed.clone();
     let extracted = tokio::task::spawn_blocking(move || {
-        let mut cursor = std::io::Cursor::new(html_bytes);
-        readability::extractor::extract(&mut cursor, &parsed_clone)
-            .map_err(|err| anyhow::anyhow!("readability extraction failed: {err}"))
+        let raw_html = String::from_utf8_lossy(&html_bytes).into_owned();
+        let readability_text = {
+            let mut cursor = std::io::Cursor::new(html_bytes);
+            readability::extractor::extract(&mut cursor, &parsed_clone)
+                .map(|p| p.text)
+                .unwrap_or_default()
+        };
+        let cleaned = normalize_extracted_text(readability_text);
+        // Readability fell short — usually a React-rendered page where
+        // each paragraph is its own `data-component="text-block"`
+        // sibling and the density scorer picks just one. Try the
+        // text-block extractor before bailing.
+        if cleaned.len() < MIN_EXTRACTED_BODY_BYTES {
+            if let Some(joined) = salvage_paragraphs(&raw_html) {
+                let fallback = normalize_extracted_text(joined);
+                if fallback.len() > cleaned.len() {
+                    return fallback;
+                }
+            }
+        }
+        cleaned
     })
     .await
-    .context("readability task panicked")??;
-    let mut text = extracted.text;
-    // Collapse whitespace runs that Readability sometimes leaves
-    // behind (multiple blank lines from sectioning elements) so the
-    // LLM doesn't waste tokens on filler.
-    text = text
-        .lines()
-        .map(|l| l.trim_end())
-        .collect::<Vec<_>>()
-        .join("\n");
-    while text.contains("\n\n\n") {
-        text = text.replace("\n\n\n", "\n\n");
+    .context("body extraction task panicked")?;
+    let _ = parsed; // keep Url ownership tidy
+    if extracted.trim().is_empty() {
+        anyhow::bail!("body extraction returned empty text — likely a paywall or JS-rendered page");
     }
-    if text.trim().is_empty() {
-        anyhow::bail!("readability returned an empty body — likely a paywall or JS-rendered page");
+    if extracted.len() < MIN_EXTRACTED_BODY_BYTES && html_len > 20_000 {
+        anyhow::bail!(
+            "body extraction returned only {} chars from {} KB of HTML — \
+             likely a layout we can't parse; falling back to RSS excerpt",
+            extracted.len(),
+            html_len / 1024,
+        );
     }
+    let mut text = extracted;
     if text.len() > MAX_BODY_BYTES {
-        let _ = parsed; // keep Url ownership tidy
         text.truncate(MAX_BODY_BYTES);
         // Don't sever a multi-byte UTF-8 sequence at the truncation
         // boundary.
@@ -1706,6 +1690,172 @@ async fn fetch_and_extract_body(url: &str) -> Result<String> {
         }
     }
     Ok(text)
+}
+
+/// Trim trailing whitespace per line and collapse 3+ consecutive newlines
+/// down to 2. Readability sometimes leaves blocky whitespace behind from
+/// sectioning elements; the text-block fallback joins paragraphs with
+/// `\n\n` already, so a final pass keeps both inputs uniform before they
+/// reach the length floor and the LLM.
+fn normalize_extracted_text(input: String) -> String {
+    let mut text = input
+        .lines()
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
+    while text.contains("\n\n\n") {
+        text = text.replace("\n\n\n", "\n\n");
+    }
+    text.trim().to_string()
+}
+
+/// Best-effort fallback when Readability undershoots on a substantial
+/// HTML page (most often a React/styled-components site where each
+/// paragraph is its own deeply-nested DOM subtree, so the density
+/// scorer picks one block and stops). Tries two strategies in order:
+///
+/// 1. **Marker-anchored**: known publishers (BBC News uses
+///    `data-component="text-block"`) wrap each paragraph in an
+///    attributed sibling div. Walking the markers and pulling the
+///    inner `<p>` gives an exact article body with no caption /
+///    pull-quote noise. Marker list is data-driven so adding the
+///    next site we see is one entry.
+/// 2. **Generic `<p>` salvage**: scan every `<p>` tag in the
+///    document, sanitize, drop fragments under 40 chars (kills
+///    nav-link UI text), and drop anything that looks like a
+///    concatenated nav menu (very low whitespace ratio). Works on
+///    any HTML where the article paragraphs are at least `<p>`-
+///    shaped, even when there's no useful site-specific marker.
+///
+/// Whichever strategy yields more text wins — strategy 1 is usually
+/// cleaner on sites it recognizes, but strategy 2 covers the long
+/// tail. Hand-rolled string scanner rather than a DOM parse: we'd
+/// otherwise be paying for a second html5ever walk on the same
+/// document Readability just chewed through.
+fn salvage_paragraphs(html: &str) -> Option<String> {
+    let marker = extract_marker_anchored_paragraphs(html);
+    let generic = extract_p_tag_paragraphs(html);
+    match (marker, generic) {
+        (Some(m), Some(g)) => Some(if g.len() > m.len() { g } else { m }),
+        (Some(m), None) => Some(m),
+        (None, Some(g)) => Some(g),
+        (None, None) => None,
+    }
+}
+
+/// Attribute substrings that publishers use to mark editorial paragraph
+/// blocks. Each one identifies the *wrapper* of a single paragraph; the
+/// extractor pulls the first `<p>` inside that wrapper and moves on to
+/// the next sibling. Add new entries here as you encounter sites whose
+/// React renderer breaks Readability — no other code changes required.
+const PARAGRAPH_BLOCK_MARKERS: &[&str] = &[
+    // BBC News / BBC Sport / BBC iPlayer all share this attribute on
+    // their per-paragraph wrapper div.
+    "data-component=\"text-block\"",
+];
+
+fn extract_marker_anchored_paragraphs(html: &str) -> Option<String> {
+    for &marker in PARAGRAPH_BLOCK_MARKERS {
+        if let Some(joined) = paragraphs_for_marker(html, marker) {
+            return Some(joined);
+        }
+    }
+    None
+}
+
+fn paragraphs_for_marker(html: &str, marker: &str) -> Option<String> {
+    if !html.contains(marker) {
+        return None;
+    }
+    let mut paragraphs: Vec<String> = Vec::new();
+    let mut cursor = 0;
+    while let Some(rel) = html[cursor..].find(marker) {
+        let block_start = cursor + rel + marker.len();
+        // Marker hits are siblings — bound the inner-<p> search by
+        // the next marker so we never cross into the next block.
+        let scope_end = html[block_start..]
+            .find(marker)
+            .map(|i| block_start + i)
+            .unwrap_or(html.len());
+        let scope = &html[block_start..scope_end];
+        if let Some(p_open) = scope.find("<p") {
+            if let Some(p_tag_end) = scope[p_open..].find('>').map(|i| p_open + i + 1) {
+                if let Some(p_close) = scope[p_tag_end..].find("</p>").map(|i| p_tag_end + i) {
+                    let cleaned = provider::sanitize_summary(&scope[p_tag_end..p_close]);
+                    if !cleaned.is_empty() {
+                        paragraphs.push(cleaned);
+                    }
+                }
+            }
+        }
+        cursor = scope_end;
+    }
+    if paragraphs.is_empty() {
+        None
+    } else {
+        Some(paragraphs.join("\n\n"))
+    }
+}
+
+/// Pull every `<p>...</p>` from the document, filter out junk, return the
+/// rest joined. The filters are deliberately coarse: real article paragraphs
+/// average 100+ chars and 5-10 chars per whitespace boundary, while
+/// nav/footer/menu content that leaks into a `<p>` is either much shorter
+/// or much denser (camel-cased lists of links with no spaces between).
+fn extract_p_tag_paragraphs(html: &str) -> Option<String> {
+    const MIN_PARAGRAPH_LEN: usize = 40;
+    let mut paragraphs: Vec<String> = Vec::new();
+    let mut cursor = 0;
+    while let Some(p_open_rel) = html[cursor..].find("<p") {
+        let p_open = cursor + p_open_rel;
+        // Disambiguate `<p>` from `<pre>`, `<picture>`, `<path>`, etc.
+        // — require whitespace, `>`, or `/` after the `p`.
+        let after_p = &html[p_open + 2..];
+        let real_p = after_p
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
+        if !real_p {
+            cursor = p_open + 2;
+            continue;
+        }
+        let p_tag_end = match html[p_open..].find('>').map(|i| p_open + i + 1) {
+            Some(e) => e,
+            None => break,
+        };
+        let p_close = match html[p_tag_end..].find("</p>").map(|i| p_tag_end + i) {
+            Some(e) => e,
+            None => break,
+        };
+        let cleaned = provider::sanitize_summary(&html[p_tag_end..p_close]);
+        if cleaned.len() >= MIN_PARAGRAPH_LEN && !looks_like_navigation_run(&cleaned) {
+            paragraphs.push(cleaned);
+        }
+        cursor = p_close + 4;
+    }
+    if paragraphs.is_empty() {
+        None
+    } else {
+        Some(paragraphs.join("\n\n"))
+    }
+}
+
+/// Detect concatenated nav-menu text masquerading as a paragraph. Real
+/// prose averages roughly 5-8 chars between whitespace; menus lists
+/// rendered as `<p>HomeNewsSportBusiness…</p>` push that ratio past 25
+/// because the words run together. This catches BBC's footer/menu blob
+/// that lands in a `<p>` after the article, and similar patterns on
+/// other sites.
+fn looks_like_navigation_run(text: &str) -> bool {
+    let char_count = text.chars().count();
+    if char_count == 0 {
+        return false;
+    }
+    let space_count = text.chars().filter(|c| c.is_whitespace()).count();
+    if space_count == 0 {
+        return true;
+    }
+    char_count / space_count >= 25
 }
 
 /// Returns the wrapped lines to render under an expanded article.
@@ -2364,6 +2514,85 @@ mod tests {
             summary: Some("a short summary".into()),
             topics: topics.iter().map(|t| t.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn salvage_paragraphs_returns_none_for_marker_only_pages_with_no_real_p() {
+        // No marker, no <p> tags long enough to clear the salvage floor.
+        let html = "<html><body><article><p>short.</p></article></body></html>";
+        assert!(salvage_paragraphs(html).is_none());
+    }
+
+    #[test]
+    fn salvage_paragraphs_handles_bbc_style_marker_blocks() {
+        // Mimics BBC News: each paragraph wrapped in its own
+        // `data-component="text-block"` sibling, with 3 levels of
+        // styled-component divs in between. Marker-anchored strategy
+        // should pull all three paragraphs out and skip the headline.
+        let html = r#"
+            <html><body>
+            <div data-component="headline-block"><h1>Title</h1></div>
+            <div data-component="text-block" class="x"><div class="y"><div class="z"><p class="q">First paragraph of the article.</p></div></div></div>
+            <div data-component="text-block" class="x"><div class="y"><div class="z"><p class="q">Second &amp; deeper paragraph.</p></div></div></div>
+            <div data-component="text-block" class="x"><div class="y"><div class="z"><p class="q">Third with <a href="/foo">a link</a> inside.</p></div></div></div>
+            </body></html>
+        "#;
+        let out = salvage_paragraphs(html).expect("should extract");
+        assert!(out.contains("First paragraph of the article."));
+        assert!(out.contains("Second & deeper paragraph."));
+        assert!(out.contains("Third with a link inside."));
+        assert!(out.contains("\n\n"));
+    }
+
+    #[test]
+    fn salvage_paragraphs_falls_back_to_p_tags_without_known_markers() {
+        // No publisher-specific markers — just plain <p> tags scattered
+        // through a React-shaped DOM. Generic-salvage strategy should
+        // catch the editorial content while dropping short UI strings
+        // and the run-on footer-menu nav blob.
+        let html = r#"
+            <html><body>
+            <nav><p>Home</p><p>About</p></nav>
+            <main>
+              <div><div><p>This is a substantial article paragraph with several words and punctuation, so it clears the salvage filters easily.</p></div></div>
+              <div><div><p>Another reasonably long paragraph that should be preserved verbatim and joined with the first one for the LLM.</p></div></div>
+            </main>
+            <footer><p>HomeNewsSportBusinessTechnologyHealthCultureWeatherShopBritBoxBBCInOtherLanguages</p></footer>
+            </body></html>
+        "#;
+        let out = salvage_paragraphs(html).expect("should extract");
+        assert!(out.contains("substantial article paragraph"));
+        assert!(out.contains("Another reasonably long paragraph"));
+        // Short UI <p>s (Home, About) filtered by length floor.
+        assert!(!out.contains("Home\n") && !out.starts_with("Home"));
+        // Concatenated menu blob filtered by the nav-run heuristic.
+        assert!(!out.contains("HomeNewsSportBusiness"));
+    }
+
+    #[test]
+    fn looks_like_navigation_run_flags_concatenated_menus_but_not_prose() {
+        assert!(looks_like_navigation_run(
+            "HomeNewsSportBusinessTechnologyHealthCulture"
+        ));
+        assert!(!looks_like_navigation_run(
+            "The president signed the bill on Tuesday, citing record support across both chambers."
+        ));
+        // Mixed: nav blob with a couple of trailing words. Still flags
+        // because the per-space ratio is dominated by the run-on.
+        assert!(looks_like_navigation_run(
+            "HomeNewsSportBusinessTechnologyHealthCultureArtsTravel News"
+        ));
+    }
+
+    #[test]
+    fn normalize_extracted_text_collapses_blank_runs_and_trims() {
+        // Trailing whitespace per line is removed, runs of 3+ newlines
+        // collapse to 2, and leading/trailing whitespace on the whole
+        // string is trimmed. Per-line leading whitespace is intentionally
+        // preserved (Readability sometimes uses it for list indentation).
+        let raw = "Para one.   \n\n\n\nPara two.  \n\n\nPara three.\n\n".to_string();
+        let out = normalize_extracted_text(raw);
+        assert_eq!(out, "Para one.\n\nPara two.\n\nPara three.");
     }
 
     #[test]

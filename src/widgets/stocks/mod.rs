@@ -26,7 +26,7 @@ use serde::Deserialize;
 
 use crate::cache::ScopedCache;
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::apply_title_row;
+use crate::ui::{apply_title_row, MetadataEmphasis};
 
 use super::{AppContext, EventResult, Widget};
 
@@ -408,11 +408,25 @@ impl StocksWidget {
     /// :stock <query> dispatch.
     fn lookup_and_set_transient(&self, query: &str) {
         let query_trim = query.trim().to_string();
+        // Fast path: the query already names a row we're displaying —
+        // an index, a watchlist entry, or the currently-pinned
+        // transient. Snap selection to that row and stop. Without
+        // this, `:stock AAPL` against a watchlist that already
+        // contains AAPL would set `transient_ticker = Some("AAPL")`
+        // and `selected = base_slot`, but `all_symbols()` dedupes the
+        // transient against the watchlist — leaving selection
+        // pointing past the end of the visible list and nothing
+        // loads. Case-insensitive so `:stock aapl` works the same.
+        if let Some(idx) = self.locate_displayed(&query_trim) {
+            let mut st = self.state.lock().expect("stocks state poisoned");
+            st.selected = idx;
+            st.transient_searching = None;
+            return;
+        }
         // If it already looks like a ticker (short, ASCII-uppercase + ^ . - =)
         // skip the search round-trip.
-        let direct = is_tickerish(&query_trim).then(|| query_trim.to_uppercase());
-        if let Some(symbol) = direct {
-            self.set_transient_now(symbol);
+        if is_tickerish(&query_trim) {
+            self.set_transient_now(query_trim.to_uppercase());
             return;
         }
         // Mark "searching…" so the UI can show feedback while the request flies.
@@ -422,16 +436,42 @@ impl StocksWidget {
         }
         let provider = self.provider.clone();
         let state = self.state.clone();
+        // Snapshot the configured lists so the async resolver can check
+        // "is the resolved ticker already on screen?" without holding a
+        // reference to `self`. The transient slot is read fresh from
+        // the locked state inside the task.
+        let indices = self.config.indices.clone();
+        let watchlist = self.config.watchlist.clone();
         // Total slot count (indices + watchlist) — knowing this lets us snap
         // selection straight to the transient row (last slot) when search
         // resolves.
-        let base_slot = self.config.indices.len() + self.config.watchlist.len();
+        let base_slot = indices.len() + watchlist.len();
         tokio::spawn(async move {
             let result = provider.search(&query_trim).await;
             let mut st = state.lock().expect("stocks state poisoned");
             st.transient_searching = None;
             match result {
                 Ok(symbol) => {
+                    // Same idea as the fast path, applied to the
+                    // resolved ticker: `:stock apple` → Yahoo returns
+                    // `AAPL` → if AAPL is already on screen, just
+                    // snap. Don't re-pin a row we're already showing.
+                    let known = indices
+                        .iter()
+                        .chain(watchlist.iter())
+                        .position(|s| s.eq_ignore_ascii_case(&symbol));
+                    if let Some(idx) = known {
+                        st.selected = idx;
+                        return;
+                    }
+                    if st
+                        .transient_ticker
+                        .as_deref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case(&symbol))
+                    {
+                        st.selected = base_slot;
+                        return;
+                    }
                     st.transient_ticker = Some(symbol);
                     st.selected = base_slot;
                     st.last_attempt = None;
@@ -441,6 +481,20 @@ impl StocksWidget {
                 }
             }
         });
+    }
+
+    /// Case-insensitive search for `query` against the currently-displayed
+    /// symbol list (indices + watchlist + transient). Returns the slot
+    /// index when found, `None` otherwise. Used by `:stock <query>` to
+    /// short-circuit a lookup that would otherwise pin a duplicate row.
+    fn locate_displayed(&self, query: &str) -> Option<usize> {
+        let needle = query.trim();
+        if needle.is_empty() {
+            return None;
+        }
+        self.all_symbols()
+            .iter()
+            .position(|s| s.eq_ignore_ascii_case(needle))
     }
 
     /// Insert `symbol` as the transient lookup synchronously (used when the
@@ -696,6 +750,7 @@ impl Widget for StocksWidget {
             focused,
             &title,
             metadata.as_deref(),
+            MetadataEmphasis::Default,
             self.shortcut,
             &self.theme,
             area.width,
@@ -2341,6 +2396,82 @@ mod tests {
         let syms = w.all_symbols();
         assert_eq!(syms[0], "^DJI");
         assert_eq!(syms[3], "AAPL");
+    }
+
+    /// `:stock AAPL` against a watchlist that already contains AAPL
+    /// used to set `transient_ticker = Some("AAPL")` + `selected =
+    /// base_slot`, but `all_symbols()` dedupes the transient against
+    /// the watchlist — so selection landed past the visible list and
+    /// the graph stayed blank. Snap to the existing row instead.
+    #[test]
+    fn lookup_existing_uppercase_ticker_jumps_to_watchlist_row() {
+        let w = build_widget(StocksConfig::default());
+        // AAPL sits at index 3 (3 indices + AAPL at watchlist[0]).
+        w.lookup_and_set_transient("AAPL");
+        let st = w.state.lock().unwrap();
+        assert_eq!(st.selected, 3);
+        assert!(st.transient_ticker.is_none(), "no transient pin needed");
+    }
+
+    /// Same fast path, lower-cased. The case-insensitive match
+    /// catches `:stock aapl` typed by muscle memory.
+    #[test]
+    fn lookup_existing_lowercase_ticker_jumps_to_watchlist_row() {
+        let w = build_widget(StocksConfig::default());
+        w.lookup_and_set_transient("aapl");
+        let st = w.state.lock().unwrap();
+        assert_eq!(st.selected, 3);
+        assert!(st.transient_ticker.is_none());
+    }
+
+    /// Indices count too: `:stock ^GSPC` should land on the S&P row,
+    /// not pin a duplicate transient. ^GSPC is indices[1].
+    #[test]
+    fn lookup_existing_index_symbol_jumps_to_index_row() {
+        let w = build_widget(StocksConfig::default());
+        w.lookup_and_set_transient("^GSPC");
+        let st = w.state.lock().unwrap();
+        assert_eq!(st.selected, 1);
+        assert!(st.transient_ticker.is_none());
+    }
+
+    /// Already-pinned transient gets snapped to instead of re-pinned.
+    /// User pins SPY (transient row appears at the end), then types
+    /// `:stock spy` again — selection should land on the existing
+    /// transient row.
+    #[test]
+    fn lookup_existing_transient_jumps_to_transient_row() {
+        let w = build_widget(StocksConfig::default());
+        w.lookup_and_set_transient("SPY");
+        let base_slot = w.config.indices.len() + w.config.watchlist.len();
+        {
+            let st = w.state.lock().unwrap();
+            assert_eq!(st.selected, base_slot);
+            assert_eq!(st.transient_ticker.as_deref(), Some("SPY"));
+        }
+        // Second invocation — same symbol, different case. Should
+        // snap to the existing transient row, not re-pin it.
+        w.lookup_and_set_transient("spy");
+        let st = w.state.lock().unwrap();
+        assert_eq!(st.selected, base_slot);
+        assert_eq!(
+            st.transient_ticker.as_deref(),
+            Some("SPY"),
+            "transient should still be SPY, not re-pinned"
+        );
+    }
+
+    /// New ticker that isn't on screen → pin it as transient at
+    /// `base_slot`, same as the original behavior. Guards against the
+    /// fast-path swallowing legitimate new-ticker lookups.
+    #[test]
+    fn lookup_new_ticker_pins_transient_at_base_slot() {
+        let w = build_widget(StocksConfig::default());
+        let base_slot = w.config.indices.len() + w.config.watchlist.len();
+        w.lookup_and_set_transient("BRK-A");
+        let st = w.state.lock().unwrap();
+        assert_eq!(st.selected, base_slot);
+        assert_eq!(st.transient_ticker.as_deref(), Some("BRK-A"));
     }
 
     #[test]

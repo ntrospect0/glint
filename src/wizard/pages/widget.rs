@@ -62,12 +62,10 @@ pub fn handle_key(key: KeyEvent, app: &mut WizardApp, widget_idx: usize) -> Page
 
     let field_count = wd.fields.len();
     let widget_id = assignment.widget_id();
-    // Focus slots = fields + 1 trailing [ Save & Next ] button. The
-    // user lands on the button by Tab-ing past the last field (or
-    // pressing Enter from inside any field, which now behaves like Tab
-    // — see comment further down). Pressing Enter while focused on the
-    // button advances the page.
-    let focus_total = field_count + 1;
+    // Trailing focus slot is the [ Save & Next ] button. Tab past the
+    // last field lands on it; Enter from inside a field also moves
+    // here (per `move_focus`); Enter on the button advances the page.
+    let focus_total = wd.focus_total();
     let on_next_button = app.focus == field_count;
 
     // Field-navigation keys behave identically regardless of focused field
@@ -248,8 +246,7 @@ fn handle_options_key(
             // button. To advance the page, the user lands on the
             // button (the trailing focus slot) and presses Enter there.
             commit_option_selection(app, widget_id, field);
-            let focus_total = wd.fields.len() + 1;
-            move_focus(app, widget_id, wd, 1, focus_total);
+            move_focus(app, widget_id, wd, 1, wd.focus_total());
             PageAction::Stay
         }
         _ => PageAction::Stay,
@@ -418,8 +415,7 @@ fn handle_lookup_key(
                 app.text_buffer.clear();
                 app.lookup_offset = position_in_unfiltered(field, &value);
             }
-            let focus_total = wd.fields.len() + 1;
-            move_focus(app, widget_id, wd, 1, focus_total);
+            move_focus(app, widget_id, wd, 1, wd.focus_total());
             PageAction::Stay
         }
         _ => PageAction::Stay,

@@ -215,6 +215,26 @@ impl App {
             .map(|(text, severity, _)| (text.as_str(), *severity))
     }
 
+    /// Snapshot the App's draw-time inputs into a `RenderState` for the
+    /// UI layer. One constructor instead of three inline literals;
+    /// adding a render-state field becomes a one-line change here
+    /// instead of three identical edits.
+    fn render_state(&self) -> ui::RenderState<'_> {
+        ui::RenderState {
+            layout: &self.config.layout,
+            manager: &self.manager,
+            focused: self.focused_widget(),
+            show_help: self.show_help,
+            command_buffer: self.command_buffer.as_deref(),
+            command_feedback: self.feedback_for_render(),
+            theme: &self.theme,
+            theme_name: &self.config.global.theme,
+            help_scroll: self.help_scroll,
+            help_scroll_max: &self.help_scroll_max,
+            show_status_bar: self.config.global.show_status_bar,
+        }
+    }
+
     fn cycle_focus(&mut self, forward: bool) {
         if self.focus_order.is_empty() {
             return;
@@ -804,22 +824,7 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
     // Initial draw before the first event arrives.
     app.expire_stale_feedback();
     terminal.draw(|frame| {
-        ui::render(
-            frame,
-            &ui::RenderState {
-                layout: &app.config.layout,
-                manager: &app.manager,
-                focused: app.focused_widget(),
-                show_help: app.show_help,
-                command_buffer: app.command_buffer.as_deref(),
-                command_feedback: app.feedback_for_render(),
-                theme: &app.theme,
-                theme_name: &app.config.global.theme,
-                help_scroll: app.help_scroll,
-                help_scroll_max: &app.help_scroll_max,
-                show_status_bar: app.config.global.show_status_bar,
-            },
-        );
+        ui::render(frame, &app.render_state());
     })?;
 
     let ctx = AppContext;
@@ -882,22 +887,7 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                     }
                     app.expire_stale_feedback();
                     terminal.draw(|frame| {
-                        ui::render(
-                            frame,
-                            &ui::RenderState {
-                                layout: &app.config.layout,
-                                manager: &app.manager,
-                                focused: app.focused_widget(),
-                                show_help: app.show_help,
-                                command_buffer: app.command_buffer.as_deref(),
-                                command_feedback: app.feedback_for_render(),
-                                theme: &app.theme,
-                                theme_name: &app.config.global.theme,
-                                help_scroll: app.help_scroll,
-                                help_scroll_max: &app.help_scroll_max,
-                                show_status_bar: app.config.global.show_status_bar,
-                            },
-                        );
+                        ui::render(frame, &app.render_state());
                     })?;
                     continue;
                 }
@@ -955,22 +945,7 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
 
         app.expire_stale_feedback();
         terminal.draw(|frame| {
-            ui::render(
-                frame,
-                &ui::RenderState {
-                    layout: &app.config.layout,
-                    manager: &app.manager,
-                    focused: app.focused_widget(),
-                    show_help: app.show_help,
-                    command_buffer: app.command_buffer.as_deref(),
-                    command_feedback: app.feedback_for_render(),
-                    theme: &app.theme,
-                    theme_name: &app.config.global.theme,
-                    help_scroll: app.help_scroll,
-                    help_scroll_max: &app.help_scroll_max,
-                    show_status_bar: app.config.global.show_status_bar,
-                },
-            );
+            ui::render(frame, &app.render_state());
         })?;
     }
 

@@ -127,7 +127,7 @@ pub enum AuthStatus {
 /// The full wizard buffer — everything the user has answered up to (but
 /// not including) the Complete-and-Save step. Serialised to disk as
 /// `~/.config/glint/.wizard_state.toml`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WizardState {
     /// Schema version of this state file. Bump when we make incompatible
     /// changes; loaders fall back to "start fresh" on mismatch so a stale
@@ -172,14 +172,26 @@ fn default_state_version() -> u32 {
     1
 }
 
-impl WizardState {
-    pub fn new() -> Self {
+// Manual `Default` so a freshly-constructed `WizardState` already
+// carries the current schema version. The derived `Default` produced
+// `version: 0`, which `storage::load` would then reject as a version
+// mismatch.
+impl Default for WizardState {
+    fn default() -> Self {
         Self {
             version: default_state_version(),
-            ..Self::default()
+            global: HashMap::new(),
+            layout: LayoutChoice::default(),
+            assignments: Vec::new(),
+            widget_values: HashMap::new(),
+            auth_status: HashMap::new(),
+            completed_pages: Vec::new(),
+            last_page: None,
         }
     }
+}
 
+impl WizardState {
     /// Fetch a global config value by key.
     pub fn global_get(&self, key: &str) -> Option<&WizardValue> {
         self.global.get(key)
@@ -256,7 +268,7 @@ mod tests {
 
     #[test]
     fn widget_get_set_round_trips() {
-        let mut st = WizardState::new();
+        let mut st = WizardState::default();
         st.widget_set("clock", "hour_format", WizardValue::Choice("24h".into()));
         assert_eq!(
             st.widget_get("clock", "hour_format"),
@@ -268,7 +280,7 @@ mod tests {
 
     #[test]
     fn global_get_set_round_trips() {
-        let mut st = WizardState::new();
+        let mut st = WizardState::default();
         st.global_set("theme", WizardValue::Choice("nord".into()));
         assert_eq!(
             st.global_get("theme"),
@@ -278,7 +290,7 @@ mod tests {
 
     #[test]
     fn mark_completed_is_idempotent() {
-        let mut st = WizardState::new();
+        let mut st = WizardState::default();
         st.mark_completed("layout");
         st.mark_completed("layout");
         st.mark_completed("global");
