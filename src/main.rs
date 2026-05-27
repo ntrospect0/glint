@@ -33,6 +33,7 @@ struct Cli {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum AuthTarget {
     Google,
+    Outlook,
 }
 
 fn main() -> Result<()> {
@@ -62,6 +63,12 @@ async fn run_auth(target: AuthTarget) -> Result<()> {
             let client = auth::google::OAuthClientConfig::load()?;
             auth::google::flow::run(&client).await?;
             println!("Google Calendar authorization complete.");
+            Ok(())
+        }
+        AuthTarget::Outlook => {
+            let client = auth::microsoft::OAuthClientConfig::load()?;
+            auth::microsoft::flow::run(&client).await?;
+            println!("Microsoft Outlook authorization complete.");
             Ok(())
         }
     }

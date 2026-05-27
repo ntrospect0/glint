@@ -327,6 +327,41 @@ pub const DEFAULT_ANTHROPIC_KEY_TEMPLATE: &str = r#"# Anthropic API key. Get one
 api_key = "REPLACE_WITH_YOUR_KEY"
 "#;
 
+pub const DEFAULT_MICROSOFT_CLIENT_TEMPLATE: &str = r#"# Microsoft OAuth client config for Outlook calendar access.
+#
+# One-time setup:
+#   1. Go to https://portal.azure.com/ → Microsoft Entra ID → App registrations
+#   2. New registration. Name it "glint" (or anything). For "Supported account
+#      types" pick "Accounts in any organizational directory and personal
+#      Microsoft accounts". Leave Redirect URI blank for now and click Register.
+#   3. On the new app's overview page, copy the "Application (client) ID" UUID
+#      into client_id below.
+#   4. Sidebar → Authentication → "Add a platform" → "Mobile and desktop
+#      applications" → check the "http://localhost" loopback option. Save.
+#   5. Sidebar → API permissions → "Add a permission" → Microsoft Graph →
+#      Delegated permissions → check `Calendars.Read` → Add.
+#   6. Back here, save this file, then run:  glint --auth outlook
+#
+# `tenant` defaults to "common" which accepts both personal and work/school
+# accounts. Set it to a specific tenant UUID if your org requires it.
+client_id = "REPLACE_WITH_AZURE_APP_CLIENT_ID"
+tenant = "common"
+"#;
+
+pub const DEFAULT_CALDAV_TEMPLATE: &str = r#"# CalDAV calendar credentials.
+#
+# Apple iCloud: generate an app-specific password at https://appleid.apple.com
+# (Sign-In and Security → App-Specific Passwords). Your Apple ID is the
+# `username`; the generated password (looks like `abcd-efgh-ijkl-mnop`) is
+# `app_password`. Server URL stays as the iCloud default below.
+#
+# Other CalDAV servers (Fastmail, Nextcloud, Synology, etc.) use the same
+# fields — just point `server` at the provider's CalDAV root.
+server = "https://caldav.icloud.com"
+username = "your.email@icloud.com"
+app_password = "REPLACE_WITH_APP_SPECIFIC_PASSWORD"
+"#;
+
 pub const DEFAULT_STOCKS_TOML: &str = r#"# ── Tickers ──────────────────────────────────────────────────────────────────
 # Major indices listed at the top of the ticker list. Use Yahoo Finance
 # symbols: ^DJI (Dow Jones), ^GSPC (S&P 500), ^IXIC (Nasdaq Composite).
@@ -369,9 +404,39 @@ pub const DEFAULT_CALENDAR_TOML: &str = r#"# Default view: "day", "week", or "mo
 default_view = "day"
 poll_interval_secs = 60
 
+# Provider: "local" (use the [[events]] block below), "google" (run
+# `glint --auth google` first; calendars listed in `calendar_ids`),
+# "outlook" (Microsoft 365 / outlook.com — run `glint --auth outlook`
+# after filling in microsoft_oauth_client.toml), or "caldav" (Apple
+# iCloud / Fastmail / Nextcloud / Synology — fills in caldav.toml).
+provider = "local"
+
+# Multi-provider mode: merge events from two or more backends into one
+# timeline. When [[providers]] entries exist, they take priority over the
+# singular `provider` field above. Cell title shows "google+outlook" etc.
+#
+# [[providers]]
+# kind = "google"
+# calendar_ids = ["primary"]
+#
+# [[providers]]
+# kind = "outlook"
+# calendar_ids = []          # empty = the account's default calendar
+#
+# [[providers]]
+# kind = "caldav"
+# calendar_ids = []          # empty = auto-discover every iCloud calendar
+
+# Google-only: which calendars to fetch. Use "primary" for your main one.
+# calendar_ids = ["primary", "team@group.calendar.google.com"]
+
+# CalDAV-only: optional explicit calendar URLs. Leave empty to auto-discover
+# every calendar your account has access to.
+# [caldav]
+# calendars = []
+
 # Example events. Replace these with your own — timed events use RFC3339
 # timestamps with a timezone offset; all-day events use bare YYYY-MM-DD.
-# Google Calendar wiring lands in a later release.
 
 [[events]]
 title = "Team standup"
@@ -419,22 +484,28 @@ pub fn init_default_config() -> Result<PathBuf> {
     // Credentials live in their own subdirectory (created with 0700) so they
     // can be locked down with one chmod.
     let credentials = crate::auth::credentials_dir()?;
-    let key_file = credentials.join("anthropic_key.toml");
-    if !key_file.exists() {
-        std::fs::write(&key_file, DEFAULT_ANTHROPIC_KEY_TEMPLATE).with_context(|| {
-            format!("failed to write Anthropic key template at {}", key_file.display())
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &key_file,
-                std::fs::Permissions::from_mode(0o600),
-            );
-        }
-        tracing::info!(path = %key_file.display(), "wrote Anthropic key template");
-    }
+    seed_credentials(&credentials.join("anthropic_key.toml"), DEFAULT_ANTHROPIC_KEY_TEMPLATE)?;
+    seed_credentials(&credentials.join("caldav.toml"), DEFAULT_CALDAV_TEMPLATE)?;
+    seed_credentials(
+        &credentials.join("microsoft_oauth_client.toml"),
+        DEFAULT_MICROSOFT_CLIENT_TEMPLATE,
+    )?;
     Ok(main)
+}
+
+fn seed_credentials(path: &Path, contents: &str) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    std::fs::write(path, contents)
+        .with_context(|| format!("failed to write credentials template at {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    tracing::info!(path = %path.display(), "wrote credentials template");
+    Ok(())
 }
 
 fn seed(path: &Path, contents: &str) -> Result<()> {

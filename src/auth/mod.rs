@@ -1,4 +1,6 @@
 pub mod google;
+pub mod loopback;
+pub mod microsoft;
 
 use std::path::PathBuf;
 

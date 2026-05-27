@@ -1,5 +1,7 @@
+pub mod caldav;
 pub mod google;
 pub mod local;
+pub mod outlook;
 pub mod provider;
 
 use std::{
@@ -26,11 +28,14 @@ use serde::{Deserialize, Serialize};
 
 use super::{AppContext, EventResult, Widget};
 
+use caldav::{CalDavCredentials, CalDavProvider};
 use google::GoogleCalendarProvider;
 use local::{LocalCalendarFile, LocalCalendarProvider};
+use outlook::OutlookCalendarProvider;
 use provider::{CalendarProvider, Event};
 
-use crate::auth::google::{store::GoogleToken, OAuthClientConfig};
+use crate::auth::google::{store::GoogleToken, OAuthClientConfig as GoogleClientConfig};
+use crate::auth::microsoft::{store::MicrosoftToken, OAuthClientConfig as MicrosoftClientConfig};
 use crate::ui::{big_digits, decorate_title, focus_border_style};
 
 const VIEW_TABS: &[(CalendarView, &str)] = &[
@@ -54,6 +59,10 @@ pub enum ProviderKind {
     #[default]
     Local,
     Google,
+    #[serde(alias = "apple", alias = "icloud")]
+    Caldav,
+    #[serde(alias = "microsoft", alias = "ms365")]
+    Outlook,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -64,18 +73,50 @@ pub struct CalendarConfig {
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
 
+    /// Single-provider config (legacy / convenience). For multi-provider use,
+    /// fill in `[[providers]]` blocks instead — both forms are accepted.
     #[serde(default)]
     pub provider: ProviderKind,
 
-    /// Google calendar IDs to fetch from when `provider = "google"`. Use
-    /// "primary" for the user's main calendar. Ignored for local provider.
+    /// Legacy single-provider calendar IDs. Used when `provider` is set and
+    /// `providers` is empty.
     #[serde(default)]
     pub calendar_ids: Vec<String>,
+
+    /// Multi-provider config — each entry is one calendar account. When
+    /// non-empty, takes precedence over the singular `provider` field. Lets
+    /// you merge events from Google + Outlook + CalDAV into one timeline.
+    #[serde(default)]
+    pub providers: Vec<ProviderEntry>,
+
+    /// CalDAV-specific options. Used by any `caldav`-kind provider entry
+    /// that doesn't supply its own `calendar_ids`. Kept for backward compat.
+    #[serde(default)]
+    pub caldav: CalDavConfig,
 
     /// Local events to seed the provider. Kept here so `config::load_widget_toml`
     /// returns the full file in one shot.
     #[serde(default)]
     pub events: Vec<local::RawEvent>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderEntry {
+    pub kind: ProviderKind,
+    /// Provider-specific calendar identifiers — Google calendar IDs, Outlook
+    /// calendar IDs, or CalDAV calendar URLs. Empty = the provider's default
+    /// (e.g. Google "primary", Outlook default calendar, all CalDAV calendars).
+    #[serde(default)]
+    pub calendar_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CalDavConfig {
+    /// Optional explicit calendar URLs to fetch. When empty, the provider
+    /// discovers them automatically by walking the standard CalDAV chain
+    /// (current-user-principal → calendar-home-set → calendars).
+    #[serde(default)]
+    pub calendars: Vec<String>,
 }
 
 fn default_poll_interval() -> u64 {
@@ -89,6 +130,8 @@ impl Default for CalendarConfig {
             poll_interval_secs: default_poll_interval(),
             provider: ProviderKind::default(),
             calendar_ids: Vec::new(),
+            providers: Vec::new(),
+            caldav: CalDavConfig::default(),
             events: Vec::new(),
         }
     }
@@ -109,9 +152,9 @@ pub struct CalendarWidget {
     /// For Week, the week containing it. For Month, the month containing it.
     anchor: NaiveDate,
     provider: Arc<dyn CalendarProvider>,
-    /// Source of the active provider — surfaced in the title and footer so the
-    /// user can tell at a glance whether they're on local or Google data.
-    provider_kind: ProviderKind,
+    /// Source label surfaced in the cell title, e.g. `google`, `local`,
+    /// `google+outlook`. Generated when the provider stack is built.
+    source_label: String,
     /// When Google was requested but failed to initialize (no client config or
     /// no token), we keep the user-visible explanation so the widget can show
     /// "Run `glint --auth google`" instead of silently using the local seed.
@@ -122,13 +165,13 @@ pub struct CalendarWidget {
 
 impl CalendarWidget {
     pub fn with_config(config: CalendarConfig) -> Self {
-        let (provider, kind, auth_hint) = build_provider(&config);
+        let (provider, source_label, auth_hint) = build_provider(&config);
         Self {
             id: "calendar".into(),
             view: config.default_view,
             anchor: Local::now().date_naive(),
             provider,
-            provider_kind: kind,
+            source_label,
             auth_hint,
             state: Arc::new(Mutex::new(CalendarState::default())),
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(15)),
@@ -309,12 +352,13 @@ fn bottom_action_at(click_col: u16, hint_x: u16) -> Option<BottomAction> {
     None
 }
 
-/// Returns (provider, effective_kind, auth_hint). When Google is requested but
-/// the client/token isn't on disk, falls back to the local provider and stashes
-/// a hint string the widget can surface.
+/// Returns `(provider, source_label, auth_hint)`. The provider is either a
+/// single backend (Local / Google / Outlook / CalDAV) or a CompositeProvider
+/// fanning out to multiple. `source_label` becomes the `[label]` shown in the
+/// cell title (`google`, `local`, `google+outlook`, etc.).
 fn build_provider(
     config: &CalendarConfig,
-) -> (Arc<dyn CalendarProvider>, ProviderKind, Option<String>) {
+) -> (Arc<dyn CalendarProvider>, String, Option<String>) {
     let local_file = LocalCalendarFile {
         events: config.events.clone(),
     };
@@ -326,33 +370,171 @@ fn build_provider(
         }
     };
 
-    if config.provider != ProviderKind::Google {
-        return (local, ProviderKind::Local, None);
+    // Normalize the user's config into a list of provider entries. The new
+    // [[providers]] form wins when present; otherwise we synthesize a single
+    // entry from the legacy top-level `provider` + `calendar_ids` fields.
+    let entries: Vec<ProviderEntry> = if !config.providers.is_empty() {
+        config.providers.clone()
+    } else if config.provider != ProviderKind::Local {
+        vec![ProviderEntry {
+            kind: config.provider,
+            calendar_ids: config.calendar_ids.clone(),
+        }]
+    } else {
+        return (local, "local".into(), None);
+    };
+
+    let mut built: Vec<(Arc<dyn CalendarProvider>, &'static str)> = Vec::new();
+    let mut hints: Vec<String> = Vec::new();
+    for entry in &entries {
+        match build_entry(entry, config) {
+            Ok((provider, label)) => built.push((provider, label)),
+            Err(hint) => hints.push(hint),
+        }
     }
 
-    let client = match OAuthClientConfig::load() {
-        Ok(c) => c,
-        Err(err) => {
-            tracing::warn!(error = %err, "google_oauth_client.toml missing or invalid");
-            return (local, ProviderKind::Local, Some("Drop google_oauth_client.toml in ~/.config/glint/credentials/".into()));
-        }
+    if built.is_empty() {
+        // Every requested provider failed — fall back to local so the widget
+        // keeps rendering something useful with the hint banner above.
+        let hint = if hints.is_empty() {
+            None
+        } else {
+            Some(hints.join(" · "))
+        };
+        return (local, "local".into(), hint);
+    }
+
+    let labels: Vec<&'static str> = built.iter().map(|(_, l)| *l).collect();
+    let source_label = labels.join("+");
+    let hint = if hints.is_empty() {
+        None
+    } else {
+        Some(hints.join(" · "))
     };
+    let provider: Arc<dyn CalendarProvider> = if built.len() == 1 {
+        built.into_iter().next().unwrap().0
+    } else {
+        Arc::new(CompositeProvider::new(
+            built.into_iter().map(|(p, _)| p).collect(),
+        ))
+    };
+    (provider, source_label, hint)
+}
+
+/// Build one provider entry. Returns Ok with a static label on success, Err
+/// with a human-readable hint string on configuration failure.
+fn build_entry(
+    entry: &ProviderEntry,
+    config: &CalendarConfig,
+) -> Result<(Arc<dyn CalendarProvider>, &'static str), String> {
+    match entry.kind {
+        ProviderKind::Local => {
+            let file = LocalCalendarFile {
+                events: config.events.clone(),
+            };
+            let p = LocalCalendarProvider::from_file(file)
+                .map_err(|e| format!("local events: {e}"))?;
+            Ok((Arc::new(p), "local"))
+        }
+        ProviderKind::Google => build_google_entry(&entry.calendar_ids).map(|p| (p, "google")),
+        ProviderKind::Outlook => build_outlook_entry(&entry.calendar_ids).map(|p| (p, "outlook")),
+        ProviderKind::Caldav => {
+            let urls = if entry.calendar_ids.is_empty() {
+                config.caldav.calendars.clone()
+            } else {
+                entry.calendar_ids.clone()
+            };
+            build_caldav_entry(urls).map(|p| (p, "caldav"))
+        }
+    }
+}
+
+fn build_outlook_entry(calendar_ids: &[String]) -> Result<Arc<dyn CalendarProvider>, String> {
+    let client = MicrosoftClientConfig::load()
+        .map_err(|err| {
+            tracing::warn!(error = %err, "microsoft_oauth_client.toml missing or invalid");
+            "Drop microsoft_oauth_client.toml in ~/.config/glint/credentials/".to_string()
+        })?;
+    let token = MicrosoftToken::load()
+        .map_err(|err| format!("Outlook token unreadable: {err}"))?
+        .ok_or_else(|| "Run `glint --auth outlook` to connect Microsoft Outlook".to_string())?;
+    OutlookCalendarProvider::new(client, token, calendar_ids.to_vec())
+        .map(|p| Arc::new(p) as Arc<dyn CalendarProvider>)
+        .map_err(|err| format!("Outlook init failed: {err}"))
+}
+
+fn build_google_entry(calendar_ids: &[String]) -> Result<Arc<dyn CalendarProvider>, String> {
+    let client = GoogleClientConfig::load().map_err(|err| {
+        tracing::warn!(error = %err, "google_oauth_client.toml missing or invalid");
+        "Drop google_oauth_client.toml in ~/.config/glint/credentials/".to_string()
+    })?;
     let token = match GoogleToken::load() {
         Ok(Some(t)) => t,
         Ok(None) => {
-            return (local, ProviderKind::Local, Some("Run `glint --auth google` to connect Google Calendar".into()));
+            return Err("Run `glint --auth google` to connect Google Calendar".into());
         }
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to load saved Google token");
-            return (local, ProviderKind::Local, Some(format!("Token unreadable: {err}")));
-        }
+        Err(err) => return Err(format!("Google token unreadable: {err}")),
     };
-    match GoogleCalendarProvider::new(client, token, config.calendar_ids.clone()) {
-        Ok(p) => (Arc::new(p), ProviderKind::Google, None),
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to build Google calendar provider");
-            (local, ProviderKind::Local, Some(format!("Google init failed: {err}")))
+    GoogleCalendarProvider::new(client, token, calendar_ids.to_vec())
+        .map(|p| Arc::new(p) as Arc<dyn CalendarProvider>)
+        .map_err(|err| format!("Google init failed: {err}"))
+}
+
+fn build_caldav_entry(urls: Vec<String>) -> Result<Arc<dyn CalendarProvider>, String> {
+    let creds = match CalDavCredentials::load() {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return Err(
+                "Fill in ~/.config/glint/credentials/caldav.toml to connect CalDAV".into(),
+            );
         }
+        Err(err) => return Err(format!("CalDAV credentials unreadable: {err}")),
+    };
+    CalDavProvider::new(creds, urls)
+        .map(|p| Arc::new(p) as Arc<dyn CalendarProvider>)
+        .map_err(|err| format!("CalDAV init failed: {err}"))
+}
+
+/// Meta-provider that fans `fetch_range` calls out to every wrapped provider
+/// in parallel and merges the results. Each child's failures are logged
+/// individually; one failing source doesn't block the others.
+struct CompositeProvider {
+    inner: Vec<Arc<dyn CalendarProvider>>,
+}
+
+impl CompositeProvider {
+    fn new(inner: Vec<Arc<dyn CalendarProvider>>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl CalendarProvider for CompositeProvider {
+    async fn fetch_range(
+        &self,
+        start: DateTime<Local>,
+        end: DateTime<Local>,
+    ) -> Result<Vec<Event>> {
+        let futs = self
+            .inner
+            .iter()
+            .map(|p| p.fetch_range(start, end));
+        let results = futures::future::join_all(futs).await;
+        let mut all = Vec::new();
+        for r in results {
+            match r {
+                Ok(mut chunk) => all.append(&mut chunk),
+                Err(err) => {
+                    tracing::warn!(error = %err, "child calendar provider failed");
+                }
+            }
+        }
+        all.sort_by_key(|e| e.start);
+        Ok(all)
+    }
+
+    fn name(&self) -> &str {
+        "composite"
     }
 }
 
@@ -511,10 +693,7 @@ fn month_long(m: u32) -> &'static str {
 
 impl CalendarWidget {
     fn title_for_header(&self) -> String {
-        let source = match self.provider_kind {
-            ProviderKind::Google => "google",
-            ProviderKind::Local => "local",
-        };
+        let source = self.source_label.as_str();
         match self.view {
             CalendarView::Day => format!(
                 "Calendar [{source}] — {} {} {}, {}",
@@ -616,9 +795,20 @@ impl CalendarWidget {
             weekday_short(date.weekday()),
             month_long(date.month()),
         );
-        let date_style = if is_anchor {
+        // Yellow if this column is showing the actual current date; gray for
+        // every other day. Keeps "today" instantly identifiable when the user
+        // has navigated away with ← / →.
+        let today = Local::now().date_naive();
+        let is_today = date == today;
+        let date_style = if is_today {
             Style::default()
                 .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD)
+        } else if is_anchor {
+            // The anchor day (selected but not today) — slightly brighter
+            // than the preview column so the user can tell which is active.
+            Style::default()
+                .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
@@ -1093,7 +1283,7 @@ impl Widget for CalendarWidget {
         serde_json::json!({
             "default_view": self.view,
             "poll_interval_secs": self.poll_interval.as_secs(),
-            "provider": self.provider_kind,
+            "provider": self.source_label,
         })
     }
 

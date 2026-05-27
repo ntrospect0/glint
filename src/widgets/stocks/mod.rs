@@ -880,16 +880,20 @@ fn display_mode_label(m: DisplayMode) -> &'static str {
     }
 }
 
-/// Heuristic: does `s` look like a Yahoo ticker (e.g. AAPL, ^GSPC, BRK-A,
-/// CAD=X)? If so we skip the search hop. Tickers are short and use a small
-/// punctuation set; company names have lowercase letters or spaces.
+/// Heuristic: does `s` look like a Yahoo ticker (e.g. `AAPL`, `^GSPC`,
+/// `BRK-A`, `CAD=X`) for which we can skip the search hop? Requires that
+/// every letter already be uppercase — a query like "vertex" (6 lowercase
+/// letters) passes the alphanumeric test but is almost always a company
+/// name, not a ticker. Forcing case-sensitivity routes those through
+/// Yahoo's search where they belong.
 fn is_tickerish(s: &str) -> bool {
     let len = s.chars().count();
     if !(1..=8).contains(&len) {
         return false;
     }
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '^' | '.' | '-' | '='))
+    s.chars().all(|c| {
+        c.is_ascii_uppercase() || c.is_ascii_digit() || matches!(c, '^' | '.' | '-' | '=')
+    })
 }
 
 fn render_graph_panel(
