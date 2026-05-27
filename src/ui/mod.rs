@@ -198,11 +198,13 @@ pub fn render(frame: &mut Frame, state: &RenderState) {
     let status_area = chunks[2];
 
     for resolved in state.layout.resolve(main_area) {
-        let id = resolved.cell.widget.as_str();
-        let is_focused = state.focused == Some(id);
-        match state.manager.get(id) {
+        let Some(id) = resolved.cell.render_target_id() else {
+            continue;
+        };
+        let is_focused = state.focused == Some(id.as_str());
+        match state.manager.get(&id) {
             Some(widget) => widget.render(frame, resolved.area, is_focused),
-            None => render_unknown(frame, resolved.area, id, is_focused, state.theme),
+            None => render_unknown(frame, resolved.area, &id, is_focused, state.theme),
         }
     }
 
@@ -283,13 +285,15 @@ fn build_help_sections(
     let mut sections = vec![global];
 
     // Per-widget sections, ordered by layout appearance.
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut seen_owned: std::collections::HashSet<String> = std::collections::HashSet::new();
     for cell in &layout.cells {
-        let id = cell.widget.as_str();
-        if !seen.insert(id) {
+        let Some(id) = cell.render_target_id() else {
+            continue;
+        };
+        if !seen_owned.insert(id.clone()) {
             continue;
         }
-        let Some(widget) = manager.get(id) else {
+        let Some(widget) = manager.get(&id) else {
             continue;
         };
         let bindings: Vec<(String, String)> = widget

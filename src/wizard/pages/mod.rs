@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 pub mod assign;
+pub mod assign_stack;
 pub mod confirm;
 pub mod global;
 pub mod layout;
@@ -36,6 +37,13 @@ pub enum Page {
     OAuthSetup {
         provider: String,
     },
+    /// Stack-cell composition picker. Pushed onto history when the
+    /// user picks "Stack" on the Assign page; walks them through
+    /// slot 1 / slot 2 / slot 3. Pops back to Assign on save or
+    /// cancel.
+    AssignStack {
+        cell_index: usize,
+    },
     Confirm,
 }
 
@@ -49,6 +57,7 @@ impl Page {
             Page::Assign => "assign".into(),
             Page::Widget(i) => format!("widget-{i}"),
             Page::OAuthSetup { provider } => format!("oauth-setup-{provider}"),
+            Page::AssignStack { cell_index } => format!("assign-stack-{cell_index}"),
             Page::Confirm => "confirm".into(),
         }
     }
@@ -65,6 +74,7 @@ impl Page {
                 None => "Widget".into(),
             },
             Page::OAuthSetup { provider } => format!("Authorize {provider}"),
+            Page::AssignStack { cell_index } => format!("Configure stack — cell {cell_index}"),
             Page::Confirm => "Confirm".into(),
         }
     }
@@ -87,6 +97,10 @@ pub enum PageAction {
     /// The resulting [`super::state::AuthStatus`] is written into
     /// `app.state.auth_status[provider]` by the app loop.
     RunAuth(String),
+    /// Push the AssignStack page onto history for the given cell. The
+    /// app loop performs the navigation; the assign page emits this
+    /// when the user picks "Stack" as the cell kind.
+    OpenAssignStack(usize),
 }
 
 /// Dispatch a key event to the active page's `handle_key`.
@@ -101,6 +115,7 @@ pub fn dispatch_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
         Page::Assign => assign::handle_key(key, app),
         Page::Widget(i) => widget::handle_key(key, app, i),
         Page::OAuthSetup { provider } => oauth_setup::handle_key(key, app, &provider),
+        Page::AssignStack { cell_index } => assign_stack::handle_key(key, app, cell_index),
         Page::Confirm => confirm::handle_key(key, app),
     }
 }
@@ -114,6 +129,7 @@ pub fn render_body(frame: &mut Frame, area: Rect, app: &WizardApp) {
         Page::Assign => assign::render(frame, area, app),
         Page::Widget(i) => widget::render(frame, area, app, *i),
         Page::OAuthSetup { provider } => oauth_setup::render(frame, area, app, provider),
+        Page::AssignStack { cell_index } => assign_stack::render(frame, area, app, *cell_index),
         Page::Confirm => confirm::render(frame, area, app),
     }
 }
@@ -128,6 +144,7 @@ pub fn on_enter(app: &mut WizardApp) {
         Page::Widget(i) => widget::on_enter(app, i),
         Page::Assign => assign::on_enter(app),
         Page::OAuthSetup { provider } => oauth_setup::on_enter(app, &provider),
+        Page::AssignStack { cell_index } => assign_stack::on_enter(app, cell_index),
         _ => {}
     }
 }

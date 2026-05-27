@@ -11,6 +11,7 @@ pub mod news;
 pub mod registry;
 #[cfg(feature = "widget-resources")]
 pub mod resources;
+pub mod stack;
 #[cfg(feature = "widget-stocks")]
 pub mod stocks;
 #[cfg(feature = "widget-weather")]
@@ -163,6 +164,44 @@ pub trait Widget: Send + Sync {
     /// (or `None` if every preference was taken). Widgets cache this to
     /// paint the highlight inside their title.
     fn set_shortcut(&mut self, _shortcut: Option<char>) {}
+
+    /// IDs of widgets owned by this widget (used by stack widgets only).
+    /// Returns an empty vec for leaf widgets. The shortcut dispatcher
+    /// walks these to assign `Shift+<letter>` to children inside a
+    /// stack — see `app::assign_shortcuts`.
+    fn composite_children(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Borrow a child by id (composite widgets only). Default returns
+    /// `None`, which means the leaf widget owns no children. Stack
+    /// widgets return `Some(&mut child)` so the shortcut dispatcher
+    /// can call `set_shortcut` on the right widget and so the runtime
+    /// can route Shift+letter into the right pane.
+    fn composite_child_mut(&mut self, _child_id: &str) -> Option<&mut dyn Widget> {
+        None
+    }
+
+    /// For composite widgets: make the named child the active one.
+    /// Returns `true` when the id matched and the widget switched.
+    /// Default returns `false` (leaf widgets have nothing to switch).
+    fn switch_to_composite_child(&mut self, _child_id: &str) -> bool {
+        false
+    }
+
+    /// For composite widgets (stacks): the currently-active child's
+    /// index. `None` for leaf widgets. Used by the runtime to
+    /// persist active-tab state across runs.
+    fn composite_active_index(&self) -> Option<usize> {
+        None
+    }
+
+    /// For composite widgets (stacks): set the active child by
+    /// index. No-op (and returns `false`) for leaf widgets or for
+    /// out-of-range indices.
+    fn set_composite_active_index(&mut self, _idx: usize) -> bool {
+        false
+    }
 }
 
 /// Owns the set of registered widgets and resolves them by id.

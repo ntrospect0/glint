@@ -290,6 +290,21 @@ pub fn run_wizard() -> Result<WizardOutcome> {
                     }
                 }
             }
+            PageAction::OpenAssignStack(cell_index) => {
+                // Push current Assign page onto history; switch to the
+                // AssignStack sub-page for this cell. Pop back happens
+                // when the sub-page returns PageAction::Back.
+                let prev = std::mem::replace(
+                    &mut app.page,
+                    Page::AssignStack { cell_index },
+                );
+                app.history.push(prev);
+                app.focus = 0;
+                app.text_buffer.clear();
+                app.lookup_offset = 0;
+                app.feedback = None;
+                super::pages::on_enter(&mut app);
+            }
         }
     }
 }

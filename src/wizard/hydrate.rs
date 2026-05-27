@@ -113,6 +113,49 @@ fn hydrate_assignments_from_layout(state: &mut WizardState, doc: &toml::Value) {
     };
     let mut next_cell = 0usize;
     for cell in cells {
+        // Stack cell: `widgets = [...]`. Take precedence over the
+        // scalar `widget` field if both are present (which would be
+        // invalid TOML but we're defensive).
+        if let Some(arr) = cell.get("widgets").and_then(|v| v.as_array()) {
+            let mut children: Vec<crate::wizard::state::StackChild> = Vec::new();
+            for entry in arr {
+                let Some(s) = entry.as_str() else {
+                    continue;
+                };
+                let s = s.trim();
+                if s.is_empty() {
+                    continue;
+                }
+                let (kind, instance) = parse_widget_id(s);
+                if registry::find(&kind).is_none() {
+                    continue;
+                }
+                children.push(crate::wizard::state::StackChild { kind, instance });
+            }
+            if children.len() >= 2 {
+                state.assignments.push(CellAssignment {
+                    cell_index: next_cell,
+                    kind: String::new(),
+                    instance: "main".into(),
+                    stack_children: children,
+                });
+                next_cell += 1;
+                continue;
+            }
+            // Single-element widgets array degrades to non-stack;
+            // fall through to the scalar path so the cell still
+            // registers correctly.
+            if let Some(only) = children.into_iter().next() {
+                state.assignments.push(CellAssignment {
+                    cell_index: next_cell,
+                    kind: only.kind,
+                    instance: only.instance,
+                    stack_children: Vec::new(),
+                });
+                next_cell += 1;
+                continue;
+            }
+        }
         let Some(widget_id) = cell.get("widget").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -126,6 +169,7 @@ fn hydrate_assignments_from_layout(state: &mut WizardState, doc: &toml::Value) {
             cell_index: next_cell,
             kind,
             instance,
+            stack_children: Vec::new(),
         });
         next_cell += 1;
     }

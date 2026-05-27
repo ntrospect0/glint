@@ -317,7 +317,29 @@ fn substitute_assignments(layout: String, state: &WizardState) -> String {
     let mut out = layout;
     for assignment in &state.assignments {
         let placeholder = format!("<cell-{}>", assignment.cell_index);
-        if assignment.kind.is_empty() {
+        if assignment.is_stack() {
+            // Replace `widget = "<cell-N>"` with
+            // `widgets = ["child1", "child2", ...]`. Search for the
+            // full single-quoted assignment so we don't accidentally
+            // touch a line that contains `<cell-N>` as a substring.
+            let single_line = format!("widget = \"{placeholder}\"");
+            if let Some(idx) = out.find(&single_line) {
+                let ids = assignment
+                    .stack_children
+                    .iter()
+                    .map(|c| format!("\"{}\"", c.widget_id()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let replacement = format!("widgets = [{ids}]");
+                out.replace_range(idx..idx + single_line.len(), &replacement);
+            } else {
+                // Defensive: if the preset rendering changed shape and
+                // we can't find the single-line form, just substitute
+                // the placeholder so we don't leave an unresolved
+                // token behind.
+                out = out.replace(&placeholder, &assignment.widget_id());
+            }
+        } else if assignment.kind.is_empty() {
             out = strip_cell_block(&out, &placeholder);
         } else {
             out = out.replace(&placeholder, &assignment.widget_id());
@@ -399,7 +421,22 @@ fn apply_assignments_to_existing_layout(layout: &str, state: &WizardState) -> St
         out.push_str(&layout[cursor..*start]);
         cursor = *end;
         match state.assignments.get(i) {
-            Some(a) if a.kind.is_empty() => {
+            Some(a) if a.is_stack() => {
+                // Rewrite `widget = "..."` as `widgets = [...]` for
+                // stack cells. The block's other keys (col, row,
+                // col_span, comments) stay intact.
+                let block_text = &layout[*start..*end];
+                let ids = a
+                    .stack_children
+                    .iter()
+                    .map(|c| format!("\"{}\"", c.widget_id()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let rewritten =
+                    rewrite_widget_line_to_widgets_array(block_text, &ids);
+                out.push_str(&rewritten);
+            }
+            Some(a) if a.kind.is_empty() && a.stack_children.is_empty() => {
                 // Strip — push nothing for this block (its trailing
                 // whitespace, which lives inside the block range, also
                 // disappears so we don't leave double-blank gaps).
@@ -475,6 +512,50 @@ fn rewrite_widget_line(block: &str, new_widget: &str) -> String {
     out
 }
 
+/// Like `rewrite_widget_line` but emits `widgets = [...]` instead of
+/// the scalar form. Used for stack cells (per docs/stack-spec.md §1).
+/// `widgets_array` is the already-formatted comma-separated body
+/// (e.g. `"clock", "weather"`).
+fn rewrite_widget_line_to_widgets_array(block: &str, widgets_array: &str) -> String {
+    let mut out = String::with_capacity(block.len() + widgets_array.len());
+    let mut replaced = false;
+    for line in block.split_inclusive('\n') {
+        if !replaced {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("widget") && line_assigns_key("widget", trimmed) {
+                let leading = &line[..line.len() - trimmed.len()];
+                out.push_str(leading);
+                out.push_str("widgets = [");
+                out.push_str(widgets_array);
+                out.push_str("]\n");
+                replaced = true;
+                continue;
+            }
+            // A pre-existing `widgets = [...]` line should also be
+            // replaced — happens when an existing stack cell gets a
+            // different child list from the wizard.
+            if trimmed.starts_with("widgets")
+                && line_assigns_key("widgets", trimmed)
+            {
+                let leading = &line[..line.len() - trimmed.len()];
+                out.push_str(leading);
+                out.push_str("widgets = [");
+                out.push_str(widgets_array);
+                out.push_str("]\n");
+                replaced = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    if !replaced {
+        out.push_str("widgets = [");
+        out.push_str(widgets_array);
+        out.push_str("]\n");
+    }
+    out
+}
+
 /// `true` when `trimmed` looks like a TOML key assignment of the form
 /// `<key> = ...` (allowing whitespace around `=`). Guards against
 /// accidentally matching keys whose names start with `widget` (e.g.
@@ -514,6 +595,7 @@ mod tests {
                 cell_index,
                 kind: kind.to_string(),
                 instance: "main".to_string(),
+                stack_children: Vec::new(),
             })
             .collect();
         state
@@ -525,6 +607,71 @@ mod tests {
     /// where single-pane setups landed a 5-cell magazine grid.
     fn cell_block_count(layout: &str) -> usize {
         layout.matches("[[layout.cells]]").count()
+    }
+
+    #[test]
+    fn stack_assignment_emits_widgets_array_in_preset_layout() {
+        // Build a state with a stack assignment in cell 0; render the
+        // single preset; verify the output contains
+        // `widgets = ["clock", "weather"]` instead of `widget = "..."`.
+        let mut state = state_for("single", vec![(0, "stocks")]);
+        state.assignments[0].kind = String::new();
+        state.assignments[0].stack_children = vec![
+            crate::wizard::state::StackChild {
+                kind: "clock".into(),
+                instance: "main".into(),
+            },
+            crate::wizard::state::StackChild {
+                kind: "weather".into(),
+                instance: "main".into(),
+            },
+        ];
+        let layout = substitute_assignments(render_preset_layout("single"), &state);
+        assert!(
+            layout.contains("widgets = [\"clock\", \"weather\"]"),
+            "expected widgets array in layout:\n{layout}"
+        );
+        assert!(
+            !layout.contains("widget = \"<cell-0>\""),
+            "placeholder should be consumed:\n{layout}"
+        );
+    }
+
+    #[test]
+    fn keep_existing_rewrites_stack_assignment_as_widgets_array() {
+        // Pre-existing single-widget cell becomes a 2-widget stack.
+        let existing = "[layout]\n\
+                        columns = [50, 50]\n\
+                        rows = [100]\n\
+                        \n\
+                        [[layout.cells]]\n\
+                        widget = \"clock\"\n\
+                        col = 0\n\
+                        row = 0\n\
+                        \n\
+                        [[layout.cells]]\n\
+                        widget = \"weather\"\n\
+                        col = 1\n\
+                        row = 0\n";
+        let mut state = state_for("magazine", vec![(0, "clock"), (1, "weather")]);
+        // Turn cell 0 into a stack.
+        state.assignments[0].kind = String::new();
+        state.assignments[0].stack_children = vec![
+            crate::wizard::state::StackChild {
+                kind: "clock".into(),
+                instance: "main".into(),
+            },
+            crate::wizard::state::StackChild {
+                kind: "stocks".into(),
+                instance: "main".into(),
+            },
+        ];
+        let out = apply_assignments_to_existing_layout(existing, &state);
+        assert!(out.contains("widgets = [\"clock\", \"stocks\"]"));
+        // Other cell stays a single-widget cell.
+        assert!(out.contains("widget = \"weather\""));
+        // Cell metadata preserved.
+        assert!(out.contains("col = 0"));
     }
 
     #[test]

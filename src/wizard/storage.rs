@@ -149,6 +149,7 @@ mod tests {
             cell_index: 0,
             kind: "clock".into(),
             instance: "main".into(),
+            stack_children: Vec::new(),
         });
         save(&st).unwrap();
         assert!(state_exists());

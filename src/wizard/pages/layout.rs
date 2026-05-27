@@ -615,6 +615,7 @@ fn seed_assignments(state: &mut WizardState, choice: &LayoutChoice) {
             cell_index: state.assignments.len(),
             kind: String::new(),
             instance: "main".into(),
+            stack_children: Vec::new(),
         });
     }
 }

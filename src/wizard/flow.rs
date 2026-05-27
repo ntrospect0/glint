@@ -64,6 +64,7 @@ pub fn next_page(current: &Page, state: &WizardState) -> Option<Page> {
         // the linear flow's forward sense; the app loop pushes/pops it
         // around the regular sequence via the history stack.
         Page::OAuthSetup { .. } => None,
+        Page::AssignStack { .. } => None,
         Page::Confirm => None,
     }
 }
@@ -82,6 +83,7 @@ pub fn prev_page(current: &Page, state: &WizardState) -> Option<Page> {
             None => Some(Page::Assign),
         },
         Page::OAuthSetup { .. } => None,
+        Page::AssignStack { .. } => None,
         Page::Confirm => match last_populated_before(state, state.assignments.len()) {
             Some(i) => Some(Page::Widget(i)),
             None => Some(Page::Assign),
@@ -127,6 +129,8 @@ pub fn current_step(current: &Page, state: &WizardState) -> usize {
         // history stack; we can't recompute the originating widget
         // index cheaply, so report the last populated widget's step.
         Page::OAuthSetup { .. } => 4 + populated.max(1),
+        // AssignStack overlays Assign — same step number.
+        Page::AssignStack { .. } => 4,
         Page::Confirm => 5 + populated.max(1),
     }
 }

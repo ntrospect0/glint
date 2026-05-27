@@ -104,10 +104,18 @@ pub fn handle_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
             PageAction::Stay
         }
         KeyCode::Char(' ') => {
+            // "Stack" doesn't commit a kind; it opens the AssignStack
+            // sub-page so the user can pick 2-3 widgets for the cell.
+            if highlighted_value(&options, app) == Some(STACK_VALUE) {
+                return PageAction::OpenAssignStack(app.focus);
+            }
             commit_focused(app, &options);
             PageAction::Stay
         }
         KeyCode::Enter => {
+            if highlighted_value(&options, app) == Some(STACK_VALUE) {
+                return PageAction::OpenAssignStack(app.focus);
+            }
             // Enter inside a cell row commits the highlighted widget
             // kind (so the user's cursor work isn't dropped) and moves
             // focus forward. Page advance lives on the trailing
@@ -125,10 +133,24 @@ fn commit_focused(app: &mut WizardApp, options: &[(&'static str, &'static str)])
     let Some((value, _)) = options.get(app.lookup_offset) else {
         return;
     };
+    if *value == STACK_VALUE {
+        // Handled by the caller via PageAction::OpenAssignStack.
+        return;
+    }
     let Some(cell) = app.state.assignments.get_mut(app.focus) else {
         return;
     };
     cell.kind = (*value).to_string();
+    // Picking a non-stack kind clears any existing stack_children so
+    // the cell unambiguously becomes a single-widget cell.
+    cell.stack_children.clear();
+}
+
+fn highlighted_value(
+    options: &[(&'static str, &'static str)],
+    app: &WizardApp,
+) -> Option<&'static str> {
+    options.get(app.lookup_offset).map(|(v, _)| *v)
 }
 
 fn current_value_index(app: &WizardApp) -> usize {
@@ -142,12 +164,19 @@ fn current_value_index(app: &WizardApp) -> usize {
         .unwrap_or(0)
 }
 
-/// Available widget kinds (from the registry) plus a trailing "(empty)"
-/// entry that maps to the sentinel value. Returns owned slice each call;
+/// Sentinel value for the "stack" option — picking this on the Assign
+/// page kicks off the AssignStack sub-page rather than committing a
+/// kind directly. Distinct from `EMPTY_VALUE` because empty means
+/// "skip this cell" and stack means "compose multiple widgets here."
+const STACK_VALUE: &str = "__stack__";
+
+/// Available widget kinds (from the registry) plus a "Stack" entry
+/// and a trailing "(empty)" entry. Returns owned slice each call;
 /// cheap since both halves of each tuple are `&'static str`.
 fn options() -> Vec<(&'static str, &'static str)> {
     let mut out: Vec<(&'static str, &'static str)> =
         WIDGETS.iter().map(|d| (d.kind, d.kind)).collect();
+    out.push((STACK_VALUE, "Stack — pick up to 3 widgets for this cell"));
     out.push((EMPTY_VALUE, "(empty — skip this cell)"));
     out
 }
@@ -215,7 +244,16 @@ fn render_cell_list(frame: &mut Frame, area: Rect, app: &WizardApp) {
     let options = options();
     for (i, cell) in app.state.assignments.iter().enumerate() {
         let focused = i == app.focus;
-        let summary = if cell.kind.is_empty() {
+        let summary = if cell.is_stack() {
+            format!(
+                "Stack: {}",
+                cell.stack_children
+                    .iter()
+                    .map(|c| c.widget_id())
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            )
+        } else if cell.kind.is_empty() {
             "(empty)".to_string()
         } else {
             cell.widget_id()

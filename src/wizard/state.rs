@@ -52,17 +52,56 @@ pub struct CellAssignment {
     pub cell_index: usize,
     pub kind: String,
     pub instance: String,
+    /// Stack children when this cell is a stack. Empty for
+    /// single-widget cells. Stored as `(kind, instance)` pairs so the
+    /// finalize path can emit `widgets = ["clock", "weather@home"]`.
+    /// Per spec §1, contains 2–3 entries when non-empty; a
+    /// single-element list is collapsed to a non-stack cell at
+    /// commit time.
+    #[serde(default)]
+    pub stack_children: Vec<StackChild>,
 }
 
-impl CellAssignment {
-    /// Canonical widget id (`"clock"` or `"clock@home"`) used as the key
-    /// into [`WizardState::widget_values`].
+/// One entry in a stack cell's `widgets` array.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackChild {
+    pub kind: String,
+    pub instance: String,
+}
+
+impl StackChild {
     pub fn widget_id(&self) -> String {
         if self.instance == "main" {
             self.kind.clone()
         } else {
             format!("{}@{}", self.kind, self.instance)
         }
+    }
+}
+
+impl CellAssignment {
+    /// Canonical widget id (`"clock"` or `"clock@home"`) used as the key
+    /// into [`WizardState::widget_values`]. For stack cells this is
+    /// `stack:<child1>+<child2>+...` matching `GridCell::render_target_id`.
+    pub fn widget_id(&self) -> String {
+        if !self.stack_children.is_empty() {
+            let joined = self
+                .stack_children
+                .iter()
+                .map(|c| c.widget_id())
+                .collect::<Vec<_>>()
+                .join("+");
+            return format!("stack:{joined}");
+        }
+        if self.instance == "main" {
+            self.kind.clone()
+        } else {
+            format!("{}@{}", self.kind, self.instance)
+        }
+    }
+
+    pub fn is_stack(&self) -> bool {
+        self.stack_children.len() >= 2
     }
 }
 
@@ -184,6 +223,7 @@ mod tests {
             cell_index: 0,
             kind: "clock".into(),
             instance: "main".into(),
+            stack_children: Vec::new(),
         };
         assert_eq!(main.widget_id(), "clock");
 
@@ -191,8 +231,24 @@ mod tests {
             cell_index: 1,
             kind: "clock".into(),
             instance: "home".into(),
+            stack_children: Vec::new(),
         };
         assert_eq!(named.widget_id(), "clock@home");
+    }
+
+    #[test]
+    fn cell_assignment_with_stack_children_yields_stack_widget_id() {
+        let stack = CellAssignment {
+            cell_index: 0,
+            kind: String::new(),
+            instance: "main".into(),
+            stack_children: vec![
+                StackChild { kind: "clock".into(), instance: "main".into() },
+                StackChild { kind: "weather".into(), instance: "main".into() },
+            ],
+        };
+        assert!(stack.is_stack());
+        assert_eq!(stack.widget_id(), "stack:clock+weather");
     }
 
     #[test]

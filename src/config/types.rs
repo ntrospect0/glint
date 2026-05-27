@@ -43,6 +43,19 @@ pub struct GlobalConfig {
     /// write up=up / down=down — automatically honor the user's preference.
     #[serde(default)]
     pub mouse_scroll: MouseScroll,
+
+    /// Polling cadence multiplier for widgets hidden inside a stack
+    /// (see docs/stack-spec.md §2). `1` = full rate; `3` (default) =
+    /// hidden children's `update()` is called every 3rd tick; higher
+    /// = even less frequent. Saves CPU + API calls for stacks the
+    /// user doesn't actively switch through. Visible / non-stacked
+    /// widgets are unaffected.
+    #[serde(default = "default_stack_hidden_poll_ratio")]
+    pub stack_hidden_poll_ratio: u32,
+}
+
+fn default_stack_hidden_poll_ratio() -> u32 {
+    3
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -78,6 +91,7 @@ impl Default for GlobalConfig {
             log_level: default_log_level(),
             log_file: None,
             mouse_scroll: MouseScroll::default(),
+            stack_hidden_poll_ratio: default_stack_hidden_poll_ratio(),
         }
     }
 }

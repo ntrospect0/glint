@@ -1428,6 +1428,7 @@ mod tests {
             cell_index: 0,
             kind: "stocks".into(),
             instance: "main".into(),
+            stack_children: Vec::new(),
         });
         let mut app = WizardApp::new(state);
         app.page = Page::Widget(0);
@@ -1498,6 +1499,7 @@ mod tests {
             cell_index: 0,
             kind: "stocks".into(),
             instance: "main".into(),
+            stack_children: Vec::new(),
         });
         let mut app = WizardApp::new(state);
         app.focus = 0;
@@ -1557,6 +1559,7 @@ mod tests {
             cell_index: 0,
             kind: "stocks".into(),
             instance: "main".into(),
+            stack_children: Vec::new(),
         });
         let mut app = WizardApp::new(state);
         app.focus = 0;

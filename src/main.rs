@@ -13,6 +13,7 @@ mod config;
 mod event;
 mod geolocation;
 mod llm;
+mod runtime_state;
 mod theme;
 mod ui;
 mod widgets;
