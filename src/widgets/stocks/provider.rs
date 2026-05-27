@@ -1,0 +1,576 @@
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use serde::Deserialize;
+use tokio::sync::Mutex;
+
+use crate::providers::DataProvider;
+
+/// Time window selectable by the user from the stocks graph toggle bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Period {
+    #[default]
+    #[serde(alias = "1d", alias = "day")]
+    Day,
+    #[serde(alias = "1w", alias = "week", alias = "5d")]
+    Week,
+    #[serde(alias = "1m", alias = "month", alias = "1mo")]
+    Month,
+    #[serde(alias = "6m", alias = "6mo")]
+    SixMonth,
+    #[serde(alias = "ytd", alias = "year_to_date")]
+    YearToDate,
+    #[serde(alias = "1y", alias = "year")]
+    Year,
+    #[serde(alias = "3y", alias = "threeyear")]
+    ThreeYear,
+    #[serde(alias = "5y", alias = "fiveyear")]
+    FiveYear,
+    #[serde(alias = "10y", alias = "tenyear")]
+    TenYear,
+}
+
+impl Period {
+    pub const ALL: [Period; 9] = [
+        Period::Day,
+        Period::Week,
+        Period::Month,
+        Period::SixMonth,
+        Period::YearToDate,
+        Period::Year,
+        Period::ThreeYear,
+        Period::FiveYear,
+        Period::TenYear,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Period::Day => "1D",
+            Period::Week => "1W",
+            Period::Month => "1M",
+            Period::SixMonth => "6M",
+            Period::YearToDate => "YTD",
+            Period::Year => "1Y",
+            Period::ThreeYear => "3Y",
+            Period::FiveYear => "5Y",
+            Period::TenYear => "10Y",
+        }
+    }
+
+    /// (interval, range) query parameters for Yahoo's v8/chart endpoint.
+    /// Longer windows use coarser intervals so the series stays a sane size.
+    /// Yahoo doesn't expose a native 3-year range; we request 5y and trim
+    /// client-side after the response comes back.
+    fn yahoo_params(self) -> (&'static str, &'static str) {
+        match self {
+            Period::Day => ("5m", "1d"),
+            Period::Week => ("30m", "5d"),
+            Period::Month => ("1d", "1mo"),
+            Period::SixMonth => ("1d", "6mo"),
+            Period::YearToDate => ("1d", "ytd"),
+            Period::Year => ("1d", "1y"),
+            // For 3y we ask for 5y of daily bars then slice client-side.
+            Period::ThreeYear => ("1d", "5y"),
+            // 1-week and 1-month bars for the long ranges keep the series
+            // small enough to render cleanly in a braille graph.
+            Period::FiveYear => ("1wk", "5y"),
+            Period::TenYear => ("1mo", "10y"),
+        }
+    }
+}
+
+/// Snapshot of a single ticker, derived from Yahoo Finance's v8/chart endpoint.
+/// Some fields the spec calls out (P/E, EPS, market cap, yield) require a
+/// separate quoteSummary call and are filled in only when available — keep
+/// them `Option` so the renderer can show `—` cleanly.
+#[derive(Debug, Clone)]
+pub struct StockQuote {
+    pub symbol: String,
+    pub short_name: String,
+    pub price: f64,
+    pub previous_close: f64,
+    pub day_high: Option<f64>,
+    pub day_low: Option<f64>,
+    pub fifty_two_week_high: Option<f64>,
+    pub fifty_two_week_low: Option<f64>,
+    pub volume: Option<u64>,
+    pub avg_volume: Option<u64>,
+    pub market_cap: Option<u64>,
+    pub shares_outstanding: Option<u64>,
+    pub pe_ratio: Option<f64>,
+    pub eps: Option<f64>,
+    /// Dividend yield as a fraction (e.g. 0.0052 = 0.52%). Multiply by 100
+    /// for the display string.
+    pub dividend_yield: Option<f64>,
+    pub beta: Option<f64>,
+    pub currency: Option<String>,
+    /// Closing-price intraday series for graphing (5-minute bars by default).
+    pub intraday: Vec<f64>,
+    #[allow(dead_code)] // surfaced in status bar / staleness label in a follow-up.
+    pub fetched_at: chrono::DateTime<chrono::Local>,
+}
+
+impl StockQuote {
+    pub fn change(&self) -> f64 {
+        self.price - self.previous_close
+    }
+
+    pub fn change_pct(&self) -> f64 {
+        if self.previous_close == 0.0 {
+            0.0
+        } else {
+            (self.price - self.previous_close) / self.previous_close * 100.0
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct YahooFinanceProvider {
+    client: reqwest::Client,
+    base_url: String,
+    /// query2 is the host Yahoo uses for the auth-gated quoteSummary endpoint.
+    summary_base_url: String,
+    /// Lazily-fetched crumb. The same crumb is paired with the cookie jar on
+    /// the `client` for the lifetime of the provider; if the server rejects
+    /// it (401) we invalidate and re-fetch.
+    crumb: Arc<Mutex<Option<String>>>,
+}
+
+impl YahooFinanceProvider {
+    pub fn new() -> Result<Self> {
+        // Yahoo blocks generic user-agents on the chart endpoint, so we send
+        // a browser-shaped UA. Identifies as glint underneath for transparency
+        // in their server logs. cookie_store(true) lets us hold the B / A1
+        // session cookies needed for the quoteSummary auth flow.
+        let client = reqwest::Client::builder()
+            .user_agent(concat!(
+                "Mozilla/5.0 (compatible; glint-tui/",
+                env!("CARGO_PKG_VERSION"),
+                ")"
+            ))
+            .timeout(std::time::Duration::from_secs(10))
+            .cookie_store(true)
+            .build()
+            .context("failed to build Yahoo Finance HTTP client")?;
+        Ok(Self {
+            client,
+            base_url: "https://query1.finance.yahoo.com".into(),
+            summary_base_url: "https://query2.finance.yahoo.com".into(),
+            crumb: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Ensure we have a valid crumb cached. First call seeds session cookies
+    /// by hitting fc.yahoo.com, then asks v1/test/getcrumb for the token.
+    async fn ensure_crumb(&self) -> Result<String> {
+        let mut guard = self.crumb.lock().await;
+        if let Some(c) = guard.as_ref() {
+            return Ok(c.clone());
+        }
+        // Seed the B / A1 cookies. Errors here are not fatal — getcrumb may
+        // succeed anyway if cookies are already in the jar.
+        let _ = self
+            .client
+            .get("https://fc.yahoo.com/")
+            .send()
+            .await;
+        let crumb = self
+            .client
+            .get(format!("{}/v1/test/getcrumb", self.summary_base_url))
+            .send()
+            .await
+            .context("getcrumb request failed")?
+            .text()
+            .await
+            .context("getcrumb response unreadable")?
+            .trim()
+            .to_string();
+        if crumb.is_empty() || crumb.contains('<') {
+            anyhow::bail!("Yahoo returned an empty or invalid crumb");
+        }
+        *guard = Some(crumb.clone());
+        Ok(crumb)
+    }
+
+    async fn invalidate_crumb(&self) {
+        let mut guard = self.crumb.lock().await;
+        *guard = None;
+    }
+
+    pub async fn fetch_quote(&self, symbol: &str, period: Period) -> Result<StockQuote> {
+        // Chart and summary fetched in parallel — summary failures (common
+        // for indices and after crumb expiry) don't fail the whole quote.
+        let (chart_res, summary_res) =
+            tokio::join!(self.fetch_chart(symbol, period), self.fetch_summary(symbol));
+        let mut quote = chart_res?;
+        match summary_res {
+            Ok(summary) => {
+                if summary.market_cap.is_some() {
+                    quote.market_cap = summary.market_cap;
+                }
+                if summary.shares_outstanding.is_some() {
+                    quote.shares_outstanding = summary.shares_outstanding;
+                }
+                quote.pe_ratio = summary.pe_ratio;
+                quote.eps = summary.eps;
+                quote.dividend_yield = summary.dividend_yield;
+                quote.beta = summary.beta;
+            }
+            Err(err) => {
+                tracing::debug!(symbol = %symbol, error = %err, "quoteSummary fetch failed");
+            }
+        }
+        Ok(quote)
+    }
+
+    async fn fetch_chart(&self, symbol: &str, period: Period) -> Result<StockQuote> {
+        let (interval, range) = period.yahoo_params();
+        let url = format!(
+            "{base}/v8/finance/chart/{sym}?interval={interval}&range={range}",
+            base = self.base_url.trim_end_matches('/'),
+            sym = urlencoding::encode(symbol)
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {symbol} failed"))?
+            .error_for_status()
+            .with_context(|| format!("{symbol} returned non-2xx"))?
+            .json::<ChartResponse>()
+            .await
+            .with_context(|| format!("failed to deserialize {symbol} response"))?;
+
+        if let Some(err) = resp.chart.error {
+            anyhow::bail!("Yahoo returned error for {symbol}: {}", err.description);
+        }
+        let result = resp
+            .chart
+            .result
+            .and_then(|mut r| r.pop())
+            .with_context(|| format!("Yahoo returned no result for {symbol}"))?;
+        let meta = result.meta;
+        let intraday: Vec<f64> = result
+            .indicators
+            .and_then(|i| i.quote.into_iter().next())
+            .map(|q| q.close.into_iter().flatten().collect())
+            .unwrap_or_default();
+
+        // 3-year approximation: Yahoo gave us 5y of daily bars, keep the last
+        // ~60% (~3 of the 5 years).
+        let intraday: Vec<f64> = if matches!(period, Period::ThreeYear) {
+            let keep = (intraday.len() * 3) / 5;
+            let skip = intraday.len().saturating_sub(keep);
+            intraday.into_iter().skip(skip).collect()
+        } else {
+            intraday
+        };
+
+        Ok(StockQuote {
+            symbol: meta.symbol.unwrap_or_else(|| symbol.to_string()),
+            short_name: meta
+                .short_name
+                .or(meta.long_name)
+                .unwrap_or_else(|| symbol.to_string()),
+            price: meta.regular_market_price.unwrap_or(0.0),
+            previous_close: meta
+                .chart_previous_close
+                .or(meta.previous_close)
+                .unwrap_or(meta.regular_market_price.unwrap_or(0.0)),
+            day_high: meta.regular_market_day_high,
+            day_low: meta.regular_market_day_low,
+            fifty_two_week_high: meta.fifty_two_week_high,
+            fifty_two_week_low: meta.fifty_two_week_low,
+            volume: meta.regular_market_volume,
+            avg_volume: meta.average_daily_volume_10_day,
+            market_cap: meta.market_cap,
+            // These come from v10/quoteSummary, which fetch_quote merges in
+            // after the chart resolves.
+            shares_outstanding: None,
+            pe_ratio: None,
+            eps: None,
+            dividend_yield: None,
+            beta: None,
+            currency: meta.currency,
+            intraday,
+            fetched_at: chrono::Local::now(),
+        })
+    }
+}
+
+impl YahooFinanceProvider {
+    /// Pulls the fundamentals modules from v10/quoteSummary. On a 401 we
+    /// invalidate the cached crumb so the next call re-authenticates.
+    async fn fetch_summary(&self, symbol: &str) -> Result<SummaryFields> {
+        let crumb = self.ensure_crumb().await?;
+        let url = format!(
+            "{base}/v10/finance/quoteSummary/{sym}?modules=summaryDetail,defaultKeyStatistics&crumb={crumb}",
+            base = self.summary_base_url.trim_end_matches('/'),
+            sym = urlencoding::encode(symbol),
+            crumb = urlencoding::encode(&crumb),
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("quoteSummary GET {symbol} failed"))?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.invalidate_crumb().await;
+            anyhow::bail!("quoteSummary returned 401 (crumb invalidated)");
+        }
+        let body: SummaryResponse = resp
+            .error_for_status()
+            .with_context(|| format!("quoteSummary {symbol} returned non-2xx"))?
+            .json()
+            .await
+            .with_context(|| format!("failed to deserialize quoteSummary for {symbol}"))?;
+        if let Some(err) = body.quote_summary.error {
+            anyhow::bail!("Yahoo quoteSummary error for {symbol}: {}", err.description);
+        }
+        let result = body
+            .quote_summary
+            .result
+            .and_then(|mut r| r.pop())
+            .with_context(|| format!("quoteSummary returned no result for {symbol}"))?;
+        let detail = result.summary_detail.as_ref();
+        let stats = result.default_key_statistics.as_ref();
+        Ok(SummaryFields {
+            market_cap: detail
+                .and_then(|d| d.market_cap.as_ref())
+                .and_then(|v| v.raw_u64()),
+            shares_outstanding: stats
+                .and_then(|s| s.shares_outstanding.as_ref())
+                .and_then(|v| v.raw_u64()),
+            pe_ratio: detail
+                .and_then(|d| d.trailing_pe.as_ref())
+                .and_then(|v| v.raw),
+            eps: stats
+                .and_then(|s| s.trailing_eps.as_ref())
+                .and_then(|v| v.raw),
+            dividend_yield: detail
+                .and_then(|d| d.dividend_yield.as_ref())
+                .and_then(|v| v.raw),
+            beta: stats
+                .and_then(|s| s.beta.as_ref())
+                .and_then(|v| v.raw),
+        })
+    }
+}
+
+/// What we extract from one quoteSummary response. All fields optional —
+/// indices and many ETFs don't have most of these populated.
+#[derive(Debug, Default, Clone)]
+struct SummaryFields {
+    market_cap: Option<u64>,
+    shares_outstanding: Option<u64>,
+    pe_ratio: Option<f64>,
+    eps: Option<f64>,
+    dividend_yield: Option<f64>,
+    beta: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryResponse {
+    #[serde(rename = "quoteSummary")]
+    quote_summary: SummaryBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryBody {
+    #[serde(default)]
+    result: Option<Vec<SummaryResult>>,
+    #[serde(default)]
+    error: Option<ChartError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryResult {
+    #[serde(rename = "summaryDetail", default)]
+    summary_detail: Option<SummaryDetail>,
+    #[serde(rename = "defaultKeyStatistics", default)]
+    default_key_statistics: Option<DefaultKeyStatistics>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SummaryDetail {
+    #[serde(default)]
+    market_cap: Option<RawF64>,
+    #[serde(default)]
+    trailing_pe: Option<RawF64>,
+    #[serde(default)]
+    dividend_yield: Option<RawF64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DefaultKeyStatistics {
+    #[serde(default)]
+    shares_outstanding: Option<RawF64>,
+    #[serde(default)]
+    trailing_eps: Option<RawF64>,
+    #[serde(default)]
+    beta: Option<RawF64>,
+}
+
+/// Yahoo's "{raw, fmt, longFmt}" wrapper. Empty objects ({}) also appear when
+/// a field is unknown, so all fields are optional.
+#[derive(Debug, Deserialize)]
+struct RawF64 {
+    #[serde(default)]
+    raw: Option<f64>,
+}
+
+impl RawF64 {
+    fn raw_u64(&self) -> Option<u64> {
+        self.raw.filter(|v| v.is_finite() && *v >= 0.0).map(|v| v as u64)
+    }
+}
+
+/// Thin wrapper so the generic `DataProvider` trait stays useful for stocks —
+/// `fetch_quote` is the more natural per-symbol entry point used by the widget.
+#[async_trait]
+impl DataProvider for YahooFinanceProvider {
+    type Data = ();
+
+    async fn fetch(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "yahoo-finance"
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ChartResponse {
+    chart: ChartBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChartBody {
+    #[serde(default)]
+    result: Option<Vec<ChartResult>>,
+    #[serde(default)]
+    error: Option<ChartError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChartError {
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChartResult {
+    meta: ChartMeta,
+    #[serde(default)]
+    indicators: Option<ChartIndicators>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChartMeta {
+    #[serde(default)]
+    symbol: Option<String>,
+    #[serde(default)]
+    short_name: Option<String>,
+    #[serde(default)]
+    long_name: Option<String>,
+    #[serde(default)]
+    currency: Option<String>,
+    #[serde(default)]
+    regular_market_price: Option<f64>,
+    #[serde(default)]
+    previous_close: Option<f64>,
+    #[serde(default)]
+    chart_previous_close: Option<f64>,
+    #[serde(default)]
+    regular_market_day_high: Option<f64>,
+    #[serde(default)]
+    regular_market_day_low: Option<f64>,
+    #[serde(default)]
+    fifty_two_week_high: Option<f64>,
+    #[serde(default)]
+    fifty_two_week_low: Option<f64>,
+    #[serde(default)]
+    regular_market_volume: Option<u64>,
+    #[serde(default)]
+    average_daily_volume_10_day: Option<u64>,
+    #[serde(default)]
+    market_cap: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChartIndicators {
+    #[serde(default)]
+    quote: Vec<QuoteBars>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuoteBars {
+    #[serde(default)]
+    close: Vec<Option<f64>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn change_and_pct_use_previous_close() {
+        let q = StockQuote {
+            symbol: "AAPL".into(),
+            short_name: "Apple".into(),
+            price: 200.0,
+            previous_close: 196.0,
+            day_high: None,
+            day_low: None,
+            fifty_two_week_high: None,
+            fifty_two_week_low: None,
+            volume: None,
+            avg_volume: None,
+            market_cap: None,
+            shares_outstanding: None,
+            pe_ratio: None,
+            eps: None,
+            dividend_yield: None,
+            beta: None,
+            currency: None,
+            intraday: vec![],
+            fetched_at: chrono::Local::now(),
+        };
+        assert!((q.change() - 4.0).abs() < 1e-9);
+        assert!((q.change_pct() - 2.040_816).abs() < 1e-3);
+    }
+
+    #[test]
+    fn change_pct_handles_zero_previous_close_safely() {
+        let q = StockQuote {
+            symbol: "TEST".into(),
+            short_name: "Test".into(),
+            price: 100.0,
+            previous_close: 0.0,
+            day_high: None,
+            day_low: None,
+            fifty_two_week_high: None,
+            fifty_two_week_low: None,
+            volume: None,
+            avg_volume: None,
+            market_cap: None,
+            shares_outstanding: None,
+            pe_ratio: None,
+            eps: None,
+            dividend_yield: None,
+            beta: None,
+            currency: None,
+            intraday: vec![],
+            fetched_at: chrono::Local::now(),
+        };
+        assert_eq!(q.change_pct(), 0.0);
+    }
+}

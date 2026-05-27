@@ -124,6 +124,10 @@ tz = "Europe/London"
 [[secondary_timezones]]
 label = "Tokyo"
 tz = "Asia/Tokyo"
+
+[[secondary_timezones]]
+label = "Taipei"
+tz = "Asia/Taipei"
 "#;
 
 pub const DEFAULT_WEATHER_TOML: &str = r#"# Open-Meteo is free and key-less. Set lat/lon to your city.
@@ -252,6 +256,26 @@ pub const DEFAULT_ANTHROPIC_KEY_TEMPLATE: &str = r#"# Anthropic API key. Get one
 api_key = "REPLACE_WITH_YOUR_KEY"
 "#;
 
+pub const DEFAULT_STOCKS_TOML: &str = r#"# Major indices listed at the top of the ticker list. Use Yahoo Finance
+# symbols: ^DJI (Dow Jones), ^GSPC (S&P 500), ^IXIC (Nasdaq Composite).
+indices = ["^DJI", "^GSPC", "^IXIC"]
+
+# Your watchlist. Add or remove tickers freely.
+watchlist = ["AAPL", "MSFT", "GOOGL", "NVDA", "TSLA"]
+
+# Poll cadence (seconds, floor 15). Yahoo's chart endpoint refreshes every
+# minute or so, so under 60s is overkill.
+poll_interval_secs = 60
+
+# Initial display mode: "percent" (e.g. +1.12%), "dollar" (+2.20), or
+# "change" (▲ +2.20).  Cycle while focused with % / $ / c.
+display_mode = "percent"
+
+# Initial graph period: "1d", "1w", "1m", "6m", "ytd", "1y", "3y", "5y",
+# "10y". When focused, press 1..9 (or click a toggle / ‹›) to switch.
+default_period = "1d"
+"#;
+
 pub const DEFAULT_CALENDAR_TOML: &str = r#"# Default view: "day", "week", or "month".
 default_view = "day"
 poll_interval_secs = 60
@@ -300,6 +324,7 @@ pub fn init_default_config() -> Result<PathBuf> {
     seed(&dir.join("weather.toml"), DEFAULT_WEATHER_TOML)?;
     seed(&dir.join("calendar.toml"), DEFAULT_CALENDAR_TOML)?;
     seed(&dir.join("news.toml"), DEFAULT_NEWS_TOML)?;
+    seed(&dir.join("stocks.toml"), DEFAULT_STOCKS_TOML)?;
     seed(&dir.join("llm.toml"), DEFAULT_LLM_TOML)?;
 
     // Credentials live in their own subdirectory (created with 0700) so they
@@ -369,6 +394,10 @@ mod tests {
             toml::from_str(DEFAULT_LLM_TOML).expect("llm seed should parse");
         assert!(llm.enabled);
         assert_eq!(llm.provider.name, "anthropic");
+        let stocks: crate::widgets::stocks::StocksConfig =
+            toml::from_str(DEFAULT_STOCKS_TOML).expect("stocks seed should parse");
+        assert!(!stocks.indices.is_empty());
+        assert!(!stocks.watchlist.is_empty());
     }
 
     #[test]

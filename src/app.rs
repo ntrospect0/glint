@@ -22,7 +22,7 @@ use crate::{
         calendar::{CalendarConfig, CalendarWidget},
         clock::{ClockConfig, ClockWidget},
         news::{NewsConfig, NewsWidget},
-        stocks::StocksWidget,
+        stocks::{StocksConfig, StocksWidget},
         weather::{WeatherConfig, WeatherWidget},
         AppContext, EventResult, WidgetManager,
     },
@@ -48,6 +48,7 @@ impl App {
         let calendar_cfg: CalendarConfig =
             config::load_widget_toml("calendar").unwrap_or_default();
         let news_cfg: NewsConfig = config::load_widget_toml("news").unwrap_or_default();
+        let stocks_cfg: StocksConfig = config::load_widget_toml("stocks").unwrap_or_default();
 
         // LLM is optional: if llm.toml is missing or no Anthropic key is on
         // disk, `build_provider` returns None and widgets fall back to their
@@ -60,7 +61,7 @@ impl App {
         let news_summarize = llm_cfg.features.news_summarize;
 
         let mut manager = WidgetManager::new();
-        manager.register(StocksWidget::new());
+        manager.register(StocksWidget::with_config(stocks_cfg));
         manager.register(ClockWidget::with_config(clock_cfg));
         manager.register(WeatherWidget::with_config(weather_cfg));
         manager.register(CalendarWidget::with_config(calendar_cfg));
