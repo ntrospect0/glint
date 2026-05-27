@@ -246,7 +246,7 @@ fn default_rpm() -> u32 {
     20
 }
 fn default_cache_capacity() -> usize {
-    1024
+    128
 }
 
 impl Default for LimitsConfig {

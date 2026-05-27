@@ -349,7 +349,13 @@ impl EmailWidget {
         }
         if let Some(entry) = cache.load::<Vec<EmailMessage>>(CACHE_KEY_MESSAGES) {
             let age = entry.age().min(poll_interval);
-            initial_state.messages = entry.value;
+            let mut messages = entry.value;
+            // Old cache entries may have full-sized bodies; trim on read
+            // so the in-memory copy honours the same cap as fresh fetches.
+            for m in &mut messages {
+                truncate_body_in_place(&mut m.plain_body, 4096);
+            }
+            initial_state.messages = messages;
             initial_state.last_attempt = Some(Instant::now() - age);
         }
 
@@ -456,6 +462,16 @@ impl EmailWidget {
             }
             // Sort newest-first across all folders.
             messages.sort_by_key(|m| std::cmp::Reverse(m.received));
+            // Trim oversized bodies. The expanded view caps at
+            // `MAX_SUMMARY_LINES` (5) and full-message read happens via
+            // `o` opening the user's mail client, so we never paint
+            // more than the first ~400 chars in glint anyway. 4 KB is
+            // ample headroom for the visible snippet + LLM summary
+            // context, and drops mailing-list bodies that routinely
+            // ship 50+ KB of HTML-stripped text per message.
+            for m in &mut messages {
+                truncate_body_in_place(&mut m.plain_body, 4096);
+            }
             // Persist before swapping state so a concurrent reload sees the
             // same payload either way. Errors are warned and ignored.
             if last_error.is_none() {
@@ -1435,6 +1451,22 @@ fn format_received(now: DateTime<Local>, received: DateTime<Local>) -> String {
 
 /// Truncate `s` so it occupies at most `max` *terminal cells* (not code
 /// points). Wide glyphs (CJK, most emoji) report a width of 2 via
+/// Cap `body`'s in-memory length at `max_chars`, appending a brief "…"
+/// marker so a future reader notices the truncation. Operates in place
+/// to avoid a clone on the common no-op path. Char-boundary safe.
+fn truncate_body_in_place(body: &mut String, max_chars: usize) {
+    if body.chars().count() <= max_chars {
+        return;
+    }
+    let cutoff = body
+        .char_indices()
+        .nth(max_chars.saturating_sub(2))
+        .map(|(i, _)| i)
+        .unwrap_or(body.len());
+    body.truncate(cutoff);
+    body.push_str("…");
+}
+
 /// `unicode-width`; control/zero-width chars report 0. When truncation
 /// happens, the trailing chars are replaced with `…` (1 cell) so the
 /// result still fits inside `max`.
@@ -1868,6 +1900,33 @@ mod tests {
         );
         assert!(n.chars().count() <= 10);
         assert!(n.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_body_in_place_is_noop_under_cap() {
+        let mut s = String::from("short body");
+        truncate_body_in_place(&mut s, 4096);
+        assert_eq!(s, "short body");
+    }
+
+    #[test]
+    fn truncate_body_in_place_caps_long_body_with_ellipsis() {
+        let mut s = "x".repeat(10_000);
+        truncate_body_in_place(&mut s, 4096);
+        assert!(s.chars().count() <= 4096);
+        assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_body_in_place_respects_char_boundaries() {
+        // Multi-byte chars near the cutoff must not produce an invalid
+        // UTF-8 String. Use a body of 100 emoji glyphs (4 bytes each)
+        // and cap at 60 chars.
+        let mut s: String = "😀".repeat(100);
+        truncate_body_in_place(&mut s, 60);
+        assert!(s.chars().count() <= 60);
+        assert!(s.ends_with('…'));
+        // String must still be valid UTF-8 — implicit in being a String.
     }
 
     #[test]

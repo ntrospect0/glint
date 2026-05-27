@@ -650,6 +650,13 @@ impl NewsWidget {
                         tracing::warn!(error = %err, "news cache store failed");
                     }
                     st.articles = articles;
+                    // Drop in-memory summaries for articles that rotated
+                    // out of the feed. The summary text is already on
+                    // disk via the scoped cache, so a rare re-encounter
+                    // (e.g. the article comes back) just re-loads.
+                    let live: std::collections::HashSet<String> =
+                        st.articles.iter().map(|a| a.url.clone()).collect();
+                    st.summaries.retain(|url, _| live.contains(url));
                     st.last_error = None;
                     // Look up the previously-selected URL in the NEW filtered
                     // view. If it's still there, snap selection back to it;

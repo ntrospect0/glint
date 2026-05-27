@@ -37,11 +37,7 @@ pub struct OutlookEmailProvider {
 
 impl OutlookEmailProvider {
     pub fn new(client: OAuthClientConfig, token: MicrosoftToken) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("glint-tui/", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .context("failed to build Microsoft Graph HTTP client")?;
+        let http = crate::http::shared();
         Ok(Self {
             http,
             client,

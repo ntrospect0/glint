@@ -2,11 +2,18 @@ use std::{
     hash::{Hash, Hasher},
     num::NonZeroUsize,
     sync::Mutex,
+    time::{Duration, Instant},
 };
 
 use lru::LruCache;
 
 use super::{LlmRequest, LlmResponse, Role};
+
+/// Cached responses older than this are evicted on read. Summaries the
+/// user sees today aren't useful a week later — by then the source
+/// article has rotated out of the news feed anyway. Keeps the cache
+/// from holding multi-week-old text forever.
+const ENTRY_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Hash-based key. Avoids holding the full prompt in the cache key; we only
 /// store a stable digest so memory stays bounded.
@@ -30,8 +37,13 @@ impl CacheKey {
     }
 }
 
+struct Entry {
+    value: LlmResponse,
+    inserted_at: Instant,
+}
+
 pub struct ResponseCache {
-    inner: Mutex<LruCache<CacheKey, LlmResponse>>,
+    inner: Mutex<LruCache<CacheKey, Entry>>,
 }
 
 impl ResponseCache {
@@ -44,12 +56,23 @@ impl ResponseCache {
 
     pub fn get(&self, key: CacheKey) -> Option<LlmResponse> {
         let mut g = self.inner.lock().expect("cache poisoned");
-        g.get(&key).cloned()
+        let entry = g.get(&key)?;
+        if entry.inserted_at.elapsed() >= ENTRY_TTL {
+            g.pop(&key);
+            return None;
+        }
+        Some(entry.value.clone())
     }
 
     pub fn put(&self, key: CacheKey, value: LlmResponse) {
         let mut g = self.inner.lock().expect("cache poisoned");
-        g.put(key, value);
+        g.put(
+            key,
+            Entry {
+                value,
+                inserted_at: Instant::now(),
+            },
+        );
     }
 }
 
@@ -93,5 +116,20 @@ mod tests {
         cache.put(key, val.clone());
         let got = cache.get(key).unwrap();
         assert_eq!(got.text, "cached");
+    }
+
+    #[test]
+    fn cache_evicts_entries_past_ttl_on_read() {
+        // Push an entry whose `inserted_at` is already older than the TTL
+        // by reaching past the LRU and mutating directly. Verifies the
+        // TTL gate, not the wall clock.
+        let cache = ResponseCache::with_capacity(4);
+        let key = CacheKey(7);
+        let stale = Entry {
+            value: LlmResponse { text: "stale".into() },
+            inserted_at: Instant::now() - (ENTRY_TTL + Duration::from_secs(1)),
+        };
+        cache.inner.lock().unwrap().put(key, stale);
+        assert!(cache.get(key).is_none(), "stale entry should be evicted");
     }
 }

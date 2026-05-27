@@ -70,11 +70,7 @@ pub struct RssProvider {
 
 impl RssProvider {
     pub fn new(feeds: Vec<FeedConfig>, topics: Vec<Topic>) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("glint-tui/", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(12))
-            .build()
-            .context("failed to build news HTTP client")?;
+        let http = crate::http::shared();
         Ok(Self {
             http,
             feeds,

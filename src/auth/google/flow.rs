@@ -75,7 +75,7 @@ async fn exchange_code(
     redirect_uri: &str,
     code: &str,
 ) -> Result<GoogleToken> {
-    let http = reqwest::Client::new();
+    let http = crate::http::shared();
     let resp = http
         .post(TOKEN_URL)
         .form(&[
@@ -112,7 +112,7 @@ async fn exchange_code(
 /// Exchange a refresh token for a new access token. Reuses the existing refresh
 /// token if Google doesn't issue a new one.
 pub async fn refresh(client: &OAuthClientConfig, prev: &GoogleToken) -> Result<GoogleToken> {
-    let http = reqwest::Client::new();
+    let http = crate::http::shared();
     let resp = http
         .post(TOKEN_URL)
         .form(&[

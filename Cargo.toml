@@ -32,6 +32,11 @@ widget-weather = []
 widget-calendar = []
 widget-news = []
 widget-stocks = []
+# Forex reuses Stocks' Yahoo `Period` mapping verbatim, so enabling
+# widget-forex implicitly pulls in widget-stocks. (The graph renderer is
+# duplicated under forex/graph.rs — the Period enum is the load-bearing
+# dependency.)
+widget-forex = ["widget-stocks"]
 widget-email = []
 widget-resources = []
 widget-gallery = []
@@ -41,6 +46,7 @@ widgets-all = [
   "widget-calendar",
   "widget-news",
   "widget-stocks",
+  "widget-forex",
   "widget-email",
   "widget-resources",
   "widget-gallery",

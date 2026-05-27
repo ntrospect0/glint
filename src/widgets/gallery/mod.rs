@@ -206,7 +206,16 @@ impl GalleryWidget {
         // the post-expansion total so "Loading m/n images…" gives an honest
         // denominator from the first frame; it's shared with the loader so
         // periodic rescans can update it.
-        let initial_paths = expand_all_patterns(&config.images);
+        let mut initial_paths = expand_all_patterns(&config.images);
+        let total_matched = initial_paths.len();
+        if initial_paths.len() > MAX_LOADED_SLIDES {
+            tracing::info!(
+                matched = total_matched,
+                cap = MAX_LOADED_SLIDES,
+                "gallery: matched paths exceed slide cap; truncating"
+            );
+            initial_paths.truncate(MAX_LOADED_SLIDES);
+        }
         let target_count = Arc::new(std::sync::atomic::AtomicUsize::new(initial_paths.len()));
 
         // Floor non-zero rescan intervals at 30s; `0` disables the loop.
@@ -262,8 +271,11 @@ impl GalleryWidget {
                         if !sleep_with_cancel(rescan_interval, &stop) {
                             return;
                         }
-                        let next = expand_all_patterns(&patterns);
+                        let mut next = expand_all_patterns(&patterns);
                         target_for_loader.store(next.len(), Ordering::Relaxed);
+                        if next.len() > MAX_LOADED_SLIDES {
+                            next.truncate(MAX_LOADED_SLIDES);
+                        }
                         reconcile_slides(
                             &mut picker,
                             &cache_for_loader,
@@ -687,14 +699,24 @@ impl Widget for GalleryWidget {
     }
 }
 
-/// Upper bound on each image's long side after pre-resize. Picked to
-/// comfortably cover any reasonable pane on any reasonable terminal
-/// (say 240-col terminal × ~60% pane width × ~10 px/cell = ~1400 px),
-/// with ~2× headroom in case the user grows the window. Loader thread
-/// shrinks every source image to this bound before handing it to
-/// `Picker::new_resize_protocol`, so the protocol's cached source is
-/// already small.
-const MAX_IMAGE_DIM: u32 = 1600;
+/// Upper bound on each image's long side after pre-resize. Sized to
+/// fit typical TUI panes without upscaling: a 200-col terminal × ~60%
+/// pane width × ~10 px/cell ≈ 1200 px. ratatui_image's `Resize::Fit`
+/// won't upscale beyond the source, so panes that paint wider than
+/// this render at source size and leave a gap; bump it up if you run
+/// hi-DPI fonts (cell width 15–20 px) with very wide gallery panes.
+/// Each step down quadratically reduces the protocol's cached source
+/// (1280² is 64% of 1600²).
+const MAX_IMAGE_DIM: u32 = 1280;
+
+/// Upper bound on concurrently-decoded slides held in RAM. Each one
+/// keeps a ratatui_image `StatefulProtocol` whose internal pixel cache
+/// scales with `MAX_IMAGE_DIM²`, so the per-slide cost is bounded but
+/// non-trivial (~3 MB on landscape sources). Slideshows with more
+/// matched files than this stop loading at the cap; the rotation walks
+/// only the loaded subset until a future change adds rolling
+/// pre-decode. Documented in the wizard help text.
+const MAX_LOADED_SLIDES: usize = 60;
 
 /// If either side of `img` exceeds `max_dim` pixels, return an
 /// aspect-correct downscaled copy. Otherwise return the input
@@ -873,7 +895,10 @@ fn load_thumb(cache: &ScopedCache, path: &Path) -> Result<DynamicImage> {
         let fresh = src_mtime.map_or(true, |m| stored >= m);
         if fresh {
             match image::load_from_memory(&entry.value) {
-                Ok(img) => return Ok(img),
+                // Old caches were encoded at a larger MAX_IMAGE_DIM; re-apply
+                // the downscale on read so a stale cache entry doesn't reach
+                // the protocol at the previous (larger) size.
+                Ok(img) => return Ok(downscale_to_max_dim(img, MAX_IMAGE_DIM)),
                 Err(err) => {
                     // Stored bytes won't decode — drop them and fall through
                     // to a fresh source decode + re-encode.
@@ -1073,7 +1098,9 @@ pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
                 help: "Each entry is a literal path (\"~/Pictures/cover.png\") \
                        or a simple glob (\"~/Pictures/*\", \"/photos/*.jpg\"). \
                        `~/` expands to $HOME. Failed loads skip with a \
-                       glint.log warning.",
+                       glint.log warning. Patterns that resolve to more than \
+                       60 files are truncated — narrow the glob if you want \
+                       different images in rotation.",
                 required: false,
                 kind: WizardFieldKind::TextList {
                     default: Vec::new(),

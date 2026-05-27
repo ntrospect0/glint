@@ -14,6 +14,8 @@ pub mod resources;
 pub mod stack;
 #[cfg(feature = "widget-stocks")]
 pub mod stocks;
+#[cfg(feature = "widget-forex")]
+pub mod forex;
 #[cfg(feature = "widget-weather")]
 pub mod weather;
 

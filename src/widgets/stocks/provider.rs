@@ -60,7 +60,10 @@ impl Period {
     /// Longer windows use coarser intervals so the series stays a sane size.
     /// Yahoo doesn't expose a native 3-year range; we request 5y and trim
     /// client-side after the response comes back.
-    fn yahoo_params(self) -> (&'static str, &'static str) {
+    ///
+    /// `pub(crate)` so sibling widgets that talk to the same endpoint (forex)
+    /// can reuse the period→params mapping verbatim.
+    pub(crate) fn yahoo_params(self) -> (&'static str, &'static str) {
         match self {
             Period::Day => ("5m", "1d"),
             Period::Week => ("30m", "5d"),
@@ -265,6 +268,13 @@ impl YahooFinanceProvider {
         } else {
             intraday
         };
+
+        // Downsample multi-year series before they hit memory + disk cache.
+        // The chart renderer interpolates the series across `trace_w` columns
+        // (typically 40–160), so 240 source points is well above the
+        // visible resolution. 5Y/10Y daily bars compress 6–12× with no
+        // perceptible chart-quality loss.
+        let intraday = downsample_to_max(intraday, 240);
 
         Ok(StockQuote {
             symbol: meta.symbol.unwrap_or_else(|| symbol.to_string()),
@@ -545,6 +555,24 @@ struct QuoteBars {
     close: Vec<Option<f64>>,
 }
 
+/// Trim `series` to at most `max` evenly-spaced points, preserving the
+/// first and last samples. Used to keep multi-year daily series from
+/// holding thousands of points in memory + disk cache when the chart
+/// can only show ~200 columns at the widest.
+pub(super) fn downsample_to_max(series: Vec<f64>, max: usize) -> Vec<f64> {
+    if max == 0 || series.len() <= max {
+        return series;
+    }
+    let n = series.len();
+    let mut out = Vec::with_capacity(max);
+    for i in 0..max {
+        // Map output index 0..max-1 → input 0..n-1, preserving endpoints.
+        let idx = (i * (n - 1)) / (max - 1);
+        out.push(series[idx]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,6 +602,29 @@ mod tests {
         };
         assert!((q.change() - 4.0).abs() < 1e-9);
         assert!((q.change_pct() - 2.040_816).abs() < 1e-3);
+    }
+
+    #[test]
+    fn downsample_returns_input_when_already_under_cap() {
+        let s = vec![1.0, 2.0, 3.0, 4.0];
+        assert_eq!(downsample_to_max(s.clone(), 10), s);
+        assert_eq!(downsample_to_max(s.clone(), 4), s);
+    }
+
+    #[test]
+    fn downsample_preserves_endpoints_and_caps_length() {
+        let s: Vec<f64> = (0..1000).map(|i| i as f64).collect();
+        let out = downsample_to_max(s, 240);
+        assert_eq!(out.len(), 240);
+        assert_eq!(out[0], 0.0);
+        assert_eq!(out[239], 999.0);
+    }
+
+    #[test]
+    fn downsample_handles_empty_and_zero_max() {
+        assert_eq!(downsample_to_max(vec![], 100), Vec::<f64>::new());
+        let s = vec![1.0, 2.0, 3.0];
+        assert_eq!(downsample_to_max(s.clone(), 0), s);
     }
 
     #[test]

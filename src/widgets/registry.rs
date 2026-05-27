@@ -57,6 +57,14 @@ pub const WIDGETS: &[WidgetDescriptor] = &[
         auth_requirements: &[],
         wizard: super::stocks::wizard_descriptor,
     },
+    #[cfg(feature = "widget-forex")]
+    WidgetDescriptor {
+        kind: super::forex::KIND,
+        factory: super::forex::build,
+        default_in_first_run: false,
+        auth_requirements: &[],
+        wizard: super::forex::wizard_descriptor,
+    },
     #[cfg(feature = "widget-clock")]
     WidgetDescriptor {
         kind: super::clock::KIND,

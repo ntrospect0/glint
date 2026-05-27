@@ -93,6 +93,15 @@ impl App {
             tracing::warn!(error = %err, "failed to resolve cache dir; using temp dir");
             Cache::at(std::env::temp_dir().join("glint-cache"))
         });
+        // Best-effort startup sweep: drop cache files no widget has touched
+        // in 30 days. Each widget's cache size is bounded per entry, but
+        // long-running setups accumulate orphans (renamed feeds, dropped
+        // tickers, gallery images that moved). Cheap enough to run every
+        // launch; failures log and the dashboard proceeds.
+        let removed = cache.sweep_older_than(std::time::Duration::from_secs(30 * 24 * 60 * 60));
+        if removed > 0 {
+            tracing::info!(removed, "cache sweep: dropped stale entries");
+        }
 
         let mut manager = WidgetManager::new();
         register_widgets_from_layout(

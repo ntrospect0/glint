@@ -48,17 +48,14 @@ pub async fn by_name(name: &str) -> Result<GeoLocation> {
         return Err(anyhow!("empty geocoding query"));
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .user_agent(concat!("glint-tui/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("failed to build geocoding HTTP client")?;
+    let client = crate::http::shared();
     let url = format!(
         "https://geocoding-api.open-meteo.com/v1/search?name={q}&count=10",
         q = urlencoding::encode(&city)
     );
     let resp = client
         .get(&url)
+        .timeout(std::time::Duration::from_secs(8))
         .send()
         .await
         .context("open-meteo geocoding request failed")?
@@ -393,13 +390,10 @@ struct GeocodingHit {
 /// Returns an error if the request fails or the response is malformed — callers
 /// are expected to fall back to a sensible default.
 pub async fn by_ip() -> Result<GeoLocation> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .user_agent(concat!("glint-tui/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("failed to build geolocation HTTP client")?;
+    let client = crate::http::shared();
     let resp = client
         .get("https://ipapi.co/json/")
+        .timeout(std::time::Duration::from_secs(8))
         .send()
         .await
         .context("ipapi.co request failed")?

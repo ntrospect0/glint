@@ -713,6 +713,19 @@ impl Widget for StocksWidget {
             None
         };
 
+        // Reserve the bottom row of the cell for the footer hint
+        // before splitting up the rest. Without this carve-off the
+        // graph's x-axis labels (rendered on the last row of the
+        // graph panel) end up on the same row as the footer hint, so
+        // the footer overwrites them.
+        let footer_h: u16 = if inner.height >= 2 { 1 } else { 0 };
+        let body = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: inner.height - footer_h,
+        };
+
         // Adaptive layout: in landscape mode (wide), list | stats | graph
         // run horizontally — list + stats get their full width first, graph
         // fills whatever's left. In portrait mode (narrow), they stack
@@ -726,8 +739,8 @@ impl Widget for StocksWidget {
         const WIDE_LIST_W: u16 = 32;
         const WIDE_STATS_W: u16 = 30;
         const MIN_GRAPH_W: u16 = 24;
-        let is_wide = inner.width >= WIDE_LIST_W + MIN_GRAPH_W;
-        let with_stats = is_wide && inner.width >= WIDE_LIST_W + WIDE_STATS_W + MIN_GRAPH_W;
+        let is_wide = body.width >= WIDE_LIST_W + MIN_GRAPH_W;
+        let with_stats = is_wide && body.width >= WIDE_LIST_W + WIDE_STATS_W + MIN_GRAPH_W;
 
         // 1-col gaps between panels so they don't visually run together.
         if is_wide {
@@ -743,7 +756,7 @@ impl Widget for StocksWidget {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints(constraints)
-                .split(inner);
+                .split(body);
             let list_area = cols[0];
             let (stats_area, graph_area) = if with_stats {
                 (Some(cols[2]), cols[4])
@@ -789,7 +802,7 @@ impl Widget for StocksWidget {
             );
         } else {
             // Portrait: list on top (clamped to ~55% so it's readable), graph below.
-            let list_h = ((inner.height as f32) * 0.55).round() as u16;
+            let list_h = ((body.height as f32) * 0.55).round() as u16;
             let rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -797,7 +810,7 @@ impl Widget for StocksWidget {
                     Constraint::Length(1),
                     Constraint::Fill(1),
                 ])
-                .split(inner);
+                .split(body);
             let (sel, cur_scroll) = {
                 let st = self.state.lock().unwrap();
                 (st.selected, st.list_scroll)
@@ -1355,26 +1368,28 @@ fn render_graph_panel(
         width: plot_w,
         height: 1,
     };
-    let labels: &[&str] = match period {
-        Period::Day => &["9:30", "10:45", "12:00", "13:15", "14:30", "15:45"],
-        Period::Week => &["Mon", "Tue", "Wed", "Thu", "Fri"],
-        Period::Month => &["wk1", "wk2", "wk3", "wk4"],
-        Period::SixMonth => &["1mo", "2mo", "3mo", "4mo", "5mo", "6mo"],
-        Period::YearToDate => &["Jan", "Mar", "May", "Jul", "Sep", "Nov"],
-        Period::Year => &["Jan", "Mar", "May", "Jul", "Sep", "Nov"],
-        Period::ThreeYear => &["-3y", "-2y", "-1y", "now"],
-        Period::FiveYear => &["-5y", "-4y", "-3y", "-2y", "-1y", "now"],
-        Period::TenYear => &["-10y", "-8y", "-6y", "-4y", "-2y", "now"],
-    };
-    let step = (plot_w / labels.len() as u16).max(1);
-    let mut line = String::with_capacity(plot_w as usize);
-    for (i, lbl) in labels.iter().enumerate() {
-        let target = (i as u16 * step) as usize;
-        while line.chars().count() < target {
-            line.push(' ');
+    // 1Y is a rolling 12-month window ending today — labels walk back
+    // from this month at 2-month intervals, 7 labels total. Static
+    // `Jan Mar May Jul Sep Nov` would mis-represent any 1Y graph that
+    // doesn't happen to start in January. YTD adds a trailing `Dec`
+    // so the year visibly spans Jan→Dec across the plot.
+    let labels: Vec<String> = match period {
+        Period::Day => str_labels(&["9:30", "10:45", "12:00", "13:15", "14:30", "15:45"]),
+        Period::Week => str_labels(&["Mon", "Tue", "Wed", "Thu", "Fri"]),
+        Period::Month => str_labels(&["wk1", "wk2", "wk3", "wk4"]),
+        Period::SixMonth => str_labels(&["1mo", "2mo", "3mo", "4mo", "5mo", "6mo"]),
+        Period::YearToDate => {
+            str_labels(&["Jan", "Mar", "May", "Jul", "Sep", "Nov", "Dec"])
         }
-        line.push_str(lbl);
-    }
+        Period::Year => rolling_year_month_labels(chrono::Local::now().date_naive()),
+        Period::ThreeYear => str_labels(&["-3y", "-2y", "-1y", "now"]),
+        Period::FiveYear => str_labels(&["-5y", "-4y", "-3y", "-2y", "-1y", "now"]),
+        Period::TenYear => str_labels(&["-10y", "-8y", "-6y", "-4y", "-2y", "now"]),
+    };
+    let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+    // Distribute labels so the first one's left edge is at column 0
+    // and the last one's right edge anchors at the plot's right edge.
+    let line = lay_out_x_axis_labels(&label_refs, plot_w as usize);
     frame.render_widget(
         Paragraph::new(Span::styled(
             line,
@@ -1382,6 +1397,78 @@ fn render_graph_panel(
         )),
         xaxis_rect,
     );
+}
+
+/// Pack `labels` into a single string `width` cells wide where the
+/// first label is left-anchored at column 0 and the last label is
+/// right-anchored at column `width`. Intermediate labels are spaced
+/// linearly. Trailing chars that would overflow `width` are clipped.
+/// Copy a static `&[&str]` into an owned `Vec<String>` so the x-axis
+/// label match arm can mix static + dynamic sets without lifetime
+/// gymnastics.
+fn str_labels(labels: &[&str]) -> Vec<String> {
+    labels.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// 7 month-name labels for a rolling 12-month window ending today,
+/// stepped 2 months apart so the `lay_out_x_axis_labels` 6-interval
+/// layout maps exactly to 12 months. e.g. today=2026-05-23 →
+/// `["May","Jul","Sep","Nov","Jan","Mar","May"]`.
+fn rolling_year_month_labels(today: chrono::NaiveDate) -> Vec<String> {
+    use chrono::Datelike;
+    let now_month = today.month() as i32;
+    let offsets = [12i32, 10, 8, 6, 4, 2, 0];
+    offsets
+        .iter()
+        .map(|off| {
+            let m_idx = (now_month - off - 1).rem_euclid(12);
+            month_short_name((m_idx as u32) + 1).to_string()
+        })
+        .collect()
+}
+
+fn month_short_name(m: u32) -> &'static str {
+    match m {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "???",
+    }
+}
+
+fn lay_out_x_axis_labels(labels: &[&str], width: usize) -> String {
+    if labels.is_empty() || width == 0 {
+        return String::new();
+    }
+    let n = labels.len();
+    if n == 1 {
+        return labels[0].chars().take(width).collect();
+    }
+    let last_w = labels.last().map(|s| s.chars().count()).unwrap_or(0);
+    let usable = width.saturating_sub(last_w);
+    let mut line = String::with_capacity(width);
+    for (i, lbl) in labels.iter().enumerate() {
+        let target = (i * usable) / (n - 1);
+        while line.chars().count() < target {
+            line.push(' ');
+        }
+        for c in lbl.chars() {
+            if line.chars().count() >= width {
+                break;
+            }
+            line.push(c);
+        }
+    }
+    line
 }
 
 /// Overlay a horizontal reference line at the row corresponding to `value`,
@@ -2491,5 +2578,53 @@ mod tests {
         assert!(is_leap_year(2000)); // /400 → leap
         assert!(!is_leap_year(1900)); // /100 but not /400 → common
         assert!(is_leap_year(2400));
+    }
+
+    #[test]
+    fn x_axis_label_layout_anchors_last_label_at_right_edge() {
+        // 6 labels into 60 cells: the old `step = plot_w/n` formula
+        // placed "now" at col 50, leaving 7 cells of trailing
+        // whitespace short of the plot's right edge. The new layout
+        // puts "now" so its right edge lands at col 60 (i.e. left
+        // edge at col 57).
+        let labels = ["-5y", "-4y", "-3y", "-2y", "-1y", "now"];
+        let line = lay_out_x_axis_labels(&labels, 60);
+        let trimmed = line.trim_end_matches(' ');
+        assert!(trimmed.ends_with("now"));
+        assert_eq!(line.chars().count(), 60);
+        // "now" sits at cols 57..60 (left-edge 57 = (5 * 57) / 5 = 57).
+        assert_eq!(&line[line.len() - 3..], "now");
+    }
+
+    #[test]
+    fn x_axis_label_layout_left_anchors_first_label() {
+        let labels = ["Jan", "Mar", "May", "Jul", "Sep", "Nov"];
+        let line = lay_out_x_axis_labels(&labels, 60);
+        assert!(line.starts_with("Jan"));
+    }
+
+    #[test]
+    fn x_axis_label_layout_handles_single_label() {
+        let labels = ["solo"];
+        let line = lay_out_x_axis_labels(&labels, 20);
+        assert_eq!(line, "solo");
+    }
+
+    #[test]
+    fn rolling_year_labels_walk_back_from_today_in_2_month_steps() {
+        // Today = 2026-05-23 → 12mo ago = May 2025, 10mo = Jul, …,
+        // 2mo = Mar 2026, 0mo = May 2026.
+        let today = NaiveDate::from_ymd_opt(2026, 5, 23).unwrap();
+        let labels = rolling_year_month_labels(today);
+        assert_eq!(labels, vec!["May", "Jul", "Sep", "Nov", "Jan", "Mar", "May"]);
+    }
+
+    #[test]
+    fn rolling_year_labels_handle_year_boundaries() {
+        // Today = 2026-01-15 → 12mo ago = Jan 2025, 10mo = Mar 2025,
+        // …, 0mo = Jan 2026. Walks through Mar/May/Jul/Sep/Nov.
+        let today = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        let labels = rolling_year_month_labels(today);
+        assert_eq!(labels, vec!["Jan", "Mar", "May", "Jul", "Sep", "Nov", "Jan"]);
     }
 }

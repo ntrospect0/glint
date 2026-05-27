@@ -96,11 +96,7 @@ pub struct OpenMeteoProvider {
 
 impl OpenMeteoProvider {
     pub fn new(latitude: f64, longitude: f64, units: Units) -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent(concat!("glint-tui/", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("reqwest client should build with default features");
+        let client = crate::http::shared();
         Self {
             client,
             latitude,

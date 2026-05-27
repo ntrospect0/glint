@@ -579,9 +579,10 @@ api_base = "https://api.anthropic.com"
 max_tokens = 512
 
 # ── Budget / cache ───────────────────────────────────────────────────────────
+# Cached entries also expire 7 days after insertion regardless of capacity.
 [limits]
 max_requests_per_minute = 20
-cache_capacity = 1024
+cache_capacity = 128
 
 # ── Per-feature toggles ──────────────────────────────────────────────────────
 # Per-widget LLM toggles live in each widget's own TOML — e.g. news.toml has

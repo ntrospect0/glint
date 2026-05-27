@@ -80,11 +80,7 @@ impl AnthropicProvider {
         default_max_tokens: u32,
         limits: LimitsConfig,
     ) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .user_agent(concat!("glint-tui/", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(45))
-            .build()
-            .context("failed to build anthropic HTTP client")?;
+        let client = crate::http::shared();
         Ok(Self {
             client,
             key,

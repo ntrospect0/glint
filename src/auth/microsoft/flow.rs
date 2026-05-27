@@ -95,7 +95,7 @@ async fn exchange_code(
     code: &str,
     verifier: &str,
 ) -> Result<MicrosoftToken> {
-    let http = reqwest::Client::new();
+    let http = crate::http::shared();
     let url = TOKEN_URL.replace("common", &client.tenant);
     let resp = http
         .post(&url)
@@ -135,7 +135,7 @@ async fn exchange_code(
 /// refresh token too; if a new one is returned we use it, otherwise we keep
 /// the existing one.
 pub async fn refresh(client: &OAuthClientConfig, prev: &MicrosoftToken) -> Result<MicrosoftToken> {
-    let http = reqwest::Client::new();
+    let http = crate::http::shared();
     let url = TOKEN_URL.replace("common", &client.tenant);
     let resp = http
         .post(&url)

@@ -91,8 +91,59 @@ impl Cache {
         remove_dir_if_present(&self.root.join(sanitize(kind)).join(sanitize(instance)))
     }
 
+    /// Walk the cache root and remove files older than `max_age`. Best-effort
+    /// — individual failures log and are skipped rather than bubbled up so a
+    /// single unreadable file doesn't abort the sweep. Empty leaf directories
+    /// left after deletion are pruned too. Returns the number of files
+    /// removed.
+    pub fn sweep_older_than(&self, max_age: Duration) -> usize {
+        if !self.root.exists() {
+            return 0;
+        }
+        let cutoff = match SystemTime::now().checked_sub(max_age) {
+            Some(t) => t,
+            None => return 0,
+        };
+        let mut removed = 0;
+        sweep_dir(&self.root, cutoff, &mut removed);
+        removed
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
+    }
+}
+
+/// Recursive helper for `sweep_older_than`. Removes any regular file whose
+/// modified-time is older than `cutoff`; then removes the directory itself
+/// if it became empty.
+fn sweep_dir(dir: &Path, cutoff: SystemTime, removed: &mut usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            sweep_dir(&path, cutoff, removed);
+            // After recursing, drop the directory if it emptied out.
+            let _ = fs::remove_dir(&path);
+        } else if meta.is_file() {
+            let stale = meta
+                .modified()
+                .map(|m| m < cutoff)
+                .unwrap_or(false);
+            if stale {
+                match fs::remove_file(&path) {
+                    Ok(()) => *removed += 1,
+                    Err(err) => tracing::debug!(
+                        path = %path.display(),
+                        error = %err,
+                        "cache sweep: remove failed"
+                    ),
+                }
+            }
+        }
     }
 }
 
@@ -612,5 +663,41 @@ mod tests {
         // Whatever value ended up there must at least be parsable.
         let got: Option<CacheEntry<Sample>> = scoped.load("k");
         assert!(got.is_some());
+    }
+
+    #[test]
+    fn sweep_removes_files_older_than_max_age_and_keeps_fresh_ones() {
+        use std::fs::File;
+        use std::time::Duration;
+
+        let dir = tmpdir();
+        let cache = Cache::at(&dir);
+        let scoped = cache.scoped("news", "main");
+
+        // Two entries: one we'll backdate, one we leave fresh.
+        scoped.store("stale", &Sample { title: "old".into(), count: 1 }).unwrap();
+        scoped.store("fresh", &Sample { title: "new".into(), count: 2 }).unwrap();
+
+        // Backdate the stale file by hand so we don't have to sleep.
+        let stale_path = scoped.path_for("stale");
+        let backdated = SystemTime::now() - Duration::from_secs(60 * 24 * 60 * 60);
+        let f = File::options().write(true).open(&stale_path).unwrap();
+        f.set_modified(backdated).unwrap();
+        drop(f);
+
+        let removed = cache.sweep_older_than(Duration::from_secs(30 * 24 * 60 * 60));
+        assert_eq!(removed, 1, "expected exactly the stale file to go");
+        assert!(!stale_path.exists(), "stale file should be removed");
+        assert!(
+            scoped.path_for("fresh").exists(),
+            "fresh file should survive"
+        );
+    }
+
+    #[test]
+    fn sweep_is_a_noop_when_cache_root_is_missing() {
+        let dir = tmpdir().join("never-created");
+        let cache = Cache::at(&dir);
+        assert_eq!(cache.sweep_older_than(Duration::from_secs(1)), 0);
     }
 }
