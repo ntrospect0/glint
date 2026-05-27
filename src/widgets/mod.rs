@@ -1,6 +1,8 @@
 pub mod calendar;
 pub mod clock;
+pub mod gallery;
 pub mod news;
+pub mod resources;
 pub mod stocks;
 pub mod weather;
 
@@ -30,11 +32,54 @@ pub enum EventResult {
     Ignored,
 }
 
+/// Parse a layout cell's `widget` field into `(kind, instance)`.
+///
+/// `clock`           → ("clock", "main")
+/// `clock@home`      → ("clock", "home")
+/// Empty `instance` after the @ → falls back to "main".
+pub fn parse_widget_ref(s: &str) -> (String, String) {
+    match s.split_once('@') {
+        None => (s.to_string(), "main".to_string()),
+        Some((kind, instance)) => {
+            let instance = instance.trim();
+            if instance.is_empty() {
+                (kind.to_string(), "main".to_string())
+            } else {
+                (kind.to_string(), instance.to_string())
+            }
+        }
+    }
+}
+
+/// Returns the per-instance TOML filename (without extension) for a
+/// `(kind, instance)` pair.  `("clock","main")` → `"clock"`;
+/// `("clock","home")` → `"clock@home"`. Used by `load_widget_toml`.
+pub fn widget_config_stem(kind: &str, instance: &str) -> String {
+    if instance == "main" {
+        kind.to_string()
+    } else {
+        format!("{kind}@{instance}")
+    }
+}
+
 #[async_trait]
 pub trait Widget: Send + Sync {
     fn id(&self) -> &str;
     #[allow(dead_code)] // surfaced in status bar / command bar in later phases.
     fn display_name(&self) -> &str;
+
+    /// Static identifier shared by every instance of this widget type
+    /// (e.g. `"clock"`, `"stocks"`). No default — each widget supplies it.
+    #[allow(dead_code)] // surfaced by future per-kind dispatch (e.g. multi-widget routing).
+    fn kind(&self) -> &str;
+
+    /// Instance suffix for this widget. `"main"` (the default) maps to the
+    /// canonical id (e.g. `clock`); any other value composes into
+    /// `<kind>@<instance>` (e.g. `clock@home`).
+    #[allow(dead_code)] // exposed for diagnostics / wizard introspection.
+    fn instance(&self) -> &str {
+        "main"
+    }
 
     async fn update(&mut self, ctx: &AppContext) -> Result<()>;
 
@@ -123,5 +168,46 @@ impl WidgetManager {
 
     pub fn ids(&self) -> &[String] {
         &self.order
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_widget_ref_no_suffix_means_main() {
+        assert_eq!(parse_widget_ref("clock"), ("clock".into(), "main".into()));
+        assert_eq!(parse_widget_ref("stocks"), ("stocks".into(), "main".into()));
+    }
+
+    #[test]
+    fn parse_widget_ref_explicit_instance() {
+        assert_eq!(
+            parse_widget_ref("clock@home"),
+            ("clock".into(), "home".into())
+        );
+        assert_eq!(
+            parse_widget_ref("stocks@compare"),
+            ("stocks".into(), "compare".into())
+        );
+    }
+
+    #[test]
+    fn parse_widget_ref_empty_suffix_falls_back_to_main() {
+        assert_eq!(parse_widget_ref("clock@"), ("clock".into(), "main".into()));
+        assert_eq!(parse_widget_ref("clock@   "), ("clock".into(), "main".into()));
+    }
+
+    #[test]
+    fn widget_config_stem_main_drops_suffix() {
+        assert_eq!(widget_config_stem("clock", "main"), "clock");
+        assert_eq!(widget_config_stem("stocks", "main"), "stocks");
+    }
+
+    #[test]
+    fn widget_config_stem_appends_instance_for_non_main() {
+        assert_eq!(widget_config_stem("clock", "home"), "clock@home");
+        assert_eq!(widget_config_stem("stocks", "compare"), "stocks@compare");
     }
 }

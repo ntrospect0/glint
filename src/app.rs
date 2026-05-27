@@ -14,13 +14,14 @@ use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use crate::{
     config::{self, Config},
     event::{Event, EventReader},
-    llm::{self, LlmConfig},
+    llm::{self, LlmConfig, LlmProvider},
     theme::{self, Theme},
     ui,
     widgets::{
         calendar::{CalendarConfig, CalendarWidget},
         clock::{ClockConfig, ClockWidget},
         news::{NewsConfig, NewsWidget},
+        parse_widget_ref,
         stocks::{StocksConfig, StocksWidget},
         weather::{WeatherConfig, WeatherWidget},
         AppContext, EventResult, WidgetManager,
@@ -68,13 +69,6 @@ impl App {
             Arc::new(Theme::builtin_defaults())
         });
 
-        let clock_cfg: ClockConfig = config::load_widget_toml("clock").unwrap_or_default();
-        let weather_cfg: WeatherConfig = config::load_widget_toml("weather").unwrap_or_default();
-        let calendar_cfg: CalendarConfig =
-            config::load_widget_toml("calendar").unwrap_or_default();
-        let news_cfg: NewsConfig = config::load_widget_toml("news").unwrap_or_default();
-        let stocks_cfg: StocksConfig = config::load_widget_toml("stocks").unwrap_or_default();
-
         // LLM is optional: if llm.toml is missing or no Anthropic key is on
         // disk, `build_provider` returns None and widgets fall back to their
         // non-LLM paths.
@@ -86,16 +80,21 @@ impl App {
         let news_summarize = llm_cfg.features.news_summarize;
 
         let mut manager = WidgetManager::new();
-        manager.register(StocksWidget::with_config(stocks_cfg, theme.clone()));
-        manager.register(ClockWidget::with_config(clock_cfg, theme.clone()));
-        manager.register(WeatherWidget::with_config(weather_cfg, theme.clone()));
-        manager.register(CalendarWidget::with_config(calendar_cfg, theme.clone()));
-        manager.register(NewsWidget::with_config_and_llm(
-            news_cfg,
-            llm_provider,
-            news_summarize,
+        register_widgets_from_layout(
+            &mut manager,
+            &config,
             theme.clone(),
-        ));
+            llm_provider.clone(),
+            news_summarize,
+        );
+
+        // If the layout produced no recognizable widgets (empty layout, or
+        // every cell references an unknown kind), fall back to the original
+        // five-widget seed so first-run with an empty config still shows
+        // something useful.
+        if manager.ids().is_empty() {
+            register_default_widgets(&mut manager, theme.clone(), llm_provider, news_summarize);
+        }
 
         let focus_order = focus_order_from_layout(&config, &manager);
         let shortcuts = assign_shortcuts(&mut manager);
@@ -373,9 +372,16 @@ fn apply_config_change(app: &mut App, path: &std::path::Path) {
     let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
         return;
     };
-    let widget_id = match stem {
-        "clock" | "weather" | "calendar" | "news" | "stocks" => stem,
+    // Filename stem may be either `<kind>` (main instance) or `<kind>@<instance>`.
+    let (kind, instance) = parse_widget_ref(stem);
+    match kind.as_str() {
+        "clock" | "weather" | "calendar" | "news" | "stocks" => {}
         _ => return, // ignore credentials/, llm.toml (no live reload), etc.
+    }
+    let widget_id: String = if instance == "main" {
+        kind.clone()
+    } else {
+        format!("{kind}@{instance}")
     };
     let Ok(contents) = std::fs::read_to_string(path) else {
         return;
@@ -394,7 +400,7 @@ fn apply_config_change(app: &mut App, path: &std::path::Path) {
             return;
         }
     };
-    let Some(widget) = app.manager.get_mut(widget_id) else {
+    let Some(widget) = app.manager.get_mut(&widget_id) else {
         return;
     };
     if let Err(err) = widget.apply_config(json) {
@@ -461,18 +467,142 @@ fn assign_shortcuts(manager: &mut WidgetManager) -> HashMap<char, String> {
 }
 
 /// Build the focus-cycling order from the layout cells, keeping only widgets
-/// that the manager actually knows about.
+/// that the manager actually knows about. Each cell's `widget` ref is parsed
+/// into `(kind, instance)` and recomposed into the canonical id so the
+/// lookup matches what `register_widgets_from_layout` registered.
 fn focus_order_from_layout(config: &Config, manager: &WidgetManager) -> Vec<String> {
-    config
-        .layout
-        .cells
-        .iter()
-        .filter_map(|c| {
-            manager
-                .get(&c.widget)
-                .map(|w| w.id().to_string())
-        })
-        .collect()
+    let mut order: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for cell in &config.layout.cells {
+        let (kind, instance) = parse_widget_ref(&cell.widget);
+        let id = if instance == "main" {
+            kind
+        } else {
+            format!("{kind}@{instance}")
+        };
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if manager.get(&id).is_some() {
+            order.push(id);
+        }
+    }
+    order
+}
+
+/// Walk the layout, deduplicate `(kind, instance)` pairs in order, load each
+/// pair's TOML config from the matching `<kind>[@<instance>].toml` file, and
+/// register the resulting widget with the manager. Unknown kinds are
+/// skipped with a warning.
+fn register_widgets_from_layout(
+    manager: &mut WidgetManager,
+    config: &Config,
+    theme: Arc<Theme>,
+    llm_provider: Option<Arc<dyn LlmProvider>>,
+    news_summarize: bool,
+) {
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for cell in &config.layout.cells {
+        let (kind, instance) = parse_widget_ref(&cell.widget);
+        if !seen.insert((kind.clone(), instance.clone())) {
+            continue;
+        }
+        register_widget(
+            manager,
+            &kind,
+            &instance,
+            theme.clone(),
+            llm_provider.clone(),
+            news_summarize,
+        );
+    }
+}
+
+/// Construct + register a single widget for a `(kind, instance)` pair. No-op
+/// (with a warning) when `kind` doesn't match a known widget.
+fn register_widget(
+    manager: &mut WidgetManager,
+    kind: &str,
+    instance: &str,
+    theme: Arc<Theme>,
+    llm_provider: Option<Arc<dyn LlmProvider>>,
+    news_summarize: bool,
+) {
+    match kind {
+        "clock" => {
+            let cfg: ClockConfig =
+                config::load_widget_toml_for_instance("clock", instance).unwrap_or_default();
+            manager.register(ClockWidget::with_config(instance.to_string(), cfg, theme));
+        }
+        "weather" => {
+            let cfg: WeatherConfig =
+                config::load_widget_toml_for_instance("weather", instance).unwrap_or_default();
+            manager.register(WeatherWidget::with_config(instance.to_string(), cfg, theme));
+        }
+        "calendar" => {
+            let cfg: CalendarConfig =
+                config::load_widget_toml_for_instance("calendar", instance).unwrap_or_default();
+            manager.register(CalendarWidget::with_config(instance.to_string(), cfg, theme));
+        }
+        "news" => {
+            let cfg: NewsConfig =
+                config::load_widget_toml_for_instance("news", instance).unwrap_or_default();
+            manager.register(NewsWidget::with_config_and_llm(
+                instance.to_string(),
+                cfg,
+                llm_provider,
+                news_summarize,
+                theme,
+            ));
+        }
+        "stocks" => {
+            let cfg: StocksConfig =
+                config::load_widget_toml_for_instance("stocks", instance).unwrap_or_default();
+            manager.register(StocksWidget::with_config(instance.to_string(), cfg, theme));
+        }
+        "resources" => {
+            let cfg: crate::widgets::resources::ResourcesConfig =
+                config::load_widget_toml_for_instance("resources", instance).unwrap_or_default();
+            manager.register(crate::widgets::resources::ResourcesWidget::with_config(
+                instance.to_string(),
+                cfg,
+                theme,
+            ));
+        }
+        "gallery" => {
+            let cfg: crate::widgets::gallery::GalleryConfig =
+                config::load_widget_toml_for_instance("gallery", instance).unwrap_or_default();
+            manager.register(crate::widgets::gallery::GalleryWidget::with_config(
+                instance.to_string(),
+                cfg,
+                theme,
+            ));
+        }
+        other => {
+            tracing::warn!(kind = %other, instance = %instance, "unknown widget kind in layout, skipping");
+        }
+    }
+}
+
+/// Fallback registration when the layout is empty or yields no recognized
+/// widgets — keep the original five-widget hardcoded set so first-run with
+/// no config still gives the user something to look at.
+fn register_default_widgets(
+    manager: &mut WidgetManager,
+    theme: Arc<Theme>,
+    llm_provider: Option<Arc<dyn LlmProvider>>,
+    news_summarize: bool,
+) {
+    for kind in ["stocks", "clock", "weather", "calendar", "news"] {
+        register_widget(
+            manager,
+            kind,
+            "main",
+            theme.clone(),
+            llm_provider.clone(),
+            news_summarize,
+        );
+    }
 }
 
 /// Set up the terminal, run the main loop, then tear the terminal back down
@@ -729,6 +859,62 @@ mod tests {
         assert_eq!(app.focused_widget(), Some("clock"));
         app.cycle_focus(false);
         assert_eq!(app.focused_widget(), Some("stocks"));
+    }
+
+    #[test]
+    fn multi_instance_widgets_register_under_composed_ids() {
+        // Two clocks (home + office) + one stocks should yield three widgets
+        // with ids "clock@home", "clock@office", "stocks".
+        use crate::config::layout::{GridCell, LayoutConfig};
+        let mut config = Config::default();
+        config.layout = LayoutConfig {
+            columns: vec![50, 50],
+            rows: vec![50, 50],
+            cells: vec![
+                GridCell {
+                    widget: "clock@home".into(),
+                    col: 0,
+                    row: 0,
+                    col_span: 1,
+                    row_span: 1,
+                },
+                GridCell {
+                    widget: "clock@office".into(),
+                    col: 1,
+                    row: 0,
+                    col_span: 1,
+                    row_span: 1,
+                },
+                GridCell {
+                    widget: "stocks".into(),
+                    col: 0,
+                    row: 1,
+                    col_span: 2,
+                    row_span: 1,
+                },
+            ],
+        };
+        let app = App::new(config);
+        let ids: Vec<&str> = app.manager.ids().iter().map(String::as_str).collect();
+        assert!(ids.contains(&"clock@home"), "got {ids:?}");
+        assert!(ids.contains(&"clock@office"), "got {ids:?}");
+        assert!(ids.contains(&"stocks"), "got {ids:?}");
+        assert_eq!(ids.len(), 3, "no extra widgets registered: {ids:?}");
+
+        // Two clocks should claim *different* letters from the
+        // ['c', 'l', 'o', 'k'] preference list — the second falls through
+        // to 'l' because 'c' is taken.
+        let home_letter = app
+            .shortcuts
+            .iter()
+            .find_map(|(k, v)| (v == "clock@home").then_some(*k));
+        let office_letter = app
+            .shortcuts
+            .iter()
+            .find_map(|(k, v)| (v == "clock@office").then_some(*k));
+        assert!(home_letter.is_some(), "clock@home should have a shortcut");
+        assert!(office_letter.is_some(), "clock@office should have a shortcut");
+        assert_ne!(home_letter, office_letter);
     }
 
     #[test]

@@ -176,6 +176,10 @@ struct StocksState {
 
 pub struct StocksWidget {
     id: String,
+    instance: String,
+    /// Cached `Stocks` / `Stocks (instance)` label so `display_name()` can
+    /// hand out a `&str` without per-call allocation.
+    display_name_cache: String,
     config: StocksConfig,
     provider: Arc<YahooFinanceProvider>,
     state: Arc<Mutex<StocksState>>,
@@ -201,7 +205,7 @@ pub struct StocksWidget {
 }
 
 impl StocksWidget {
-    pub fn with_config(config: StocksConfig, app_theme: Arc<Theme>) -> Self {
+    pub fn with_config(instance: String, config: StocksConfig, app_theme: Arc<Theme>) -> Self {
         let provider = match YahooFinanceProvider::new() {
             Ok(p) => Arc::new(p),
             Err(err) => {
@@ -217,8 +221,20 @@ impl StocksWidget {
         } else {
             config.shortcuts.clone()
         };
+        let id = if instance == "main" {
+            "stocks".to_string()
+        } else {
+            format!("stocks@{instance}")
+        };
+        let display_name_cache = if instance == "main" {
+            "Stocks".to_string()
+        } else {
+            format!("Stocks ({instance})")
+        };
         Self {
-            id: "stocks".into(),
+            id,
+            instance,
+            display_name_cache,
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(15)),
             config,
             provider,
@@ -444,7 +460,13 @@ impl StocksWidget {
     /// Compute the same panel rects `render` uses so click handlers can map
     /// coordinates back to a target panel.
     fn compute_layout(&self, inner: Rect) -> StocksPanels {
-        const WIDE_LIST_W: u16 = 36;
+        // List column is sized to exactly fit the widest row content
+        // (prefix + 7-col symbol + 10-col price + 2-col gap + 10-col
+        // change = 31 chars), leaving a single col of trailing
+        // whitespace. Combined with the 1-col explicit gap between
+        // panels, that's ~2 visual spaces between the list and the
+        // stats column — tight without crowding.
+        const WIDE_LIST_W: u16 = 32;
         const WIDE_STATS_W: u16 = 30;
         const MIN_GRAPH_W: u16 = 24;
         let is_wide = inner.width >= WIDE_LIST_W + MIN_GRAPH_W;
@@ -611,8 +633,16 @@ impl Widget for StocksWidget {
         &self.id
     }
 
+    fn kind(&self) -> &str {
+        "stocks"
+    }
+
+    fn instance(&self) -> &str {
+        &self.instance
+    }
+
     fn display_name(&self) -> &str {
-        "Stocks"
+        &self.display_name_cache
     }
 
     async fn update(&mut self, _ctx: &AppContext) -> Result<()> {
@@ -623,13 +653,18 @@ impl Widget for StocksWidget {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
+        let title = if self.instance == "main" {
+            "Stocks".to_string()
+        } else {
+            format!("Stocks ({})", self.instance)
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(self.theme.border_style(focused))
             .title(decorated_title_line(
                 focused,
-                "Stocks",
+                &title,
                 self.shortcut,
                 self.theme.widget_title,
                 self.theme.text_shortcut,
@@ -654,7 +689,13 @@ impl Widget for StocksWidget {
         // run horizontally — list + stats get their full width first, graph
         // fills whatever's left. In portrait mode (narrow), they stack
         // vertically: list on top, graph on the bottom.
-        const WIDE_LIST_W: u16 = 36;
+        // List column is sized to exactly fit the widest row content
+        // (prefix + 7-col symbol + 10-col price + 2-col gap + 10-col
+        // change = 31 chars), leaving a single col of trailing
+        // whitespace. Combined with the 1-col explicit gap between
+        // panels, that's ~2 visual spaces between the list and the
+        // stats column — tight without crowding.
+        const WIDE_LIST_W: u16 = 32;
         const WIDE_STATS_W: u16 = 30;
         const MIN_GRAPH_W: u16 = 24;
         let is_wide = inner.width >= WIDE_LIST_W + MIN_GRAPH_W;
@@ -967,7 +1008,8 @@ impl Widget for StocksWidget {
         let new_config: StocksConfig =
             serde_json::from_value(config).context("invalid stocks config payload")?;
         let app_theme = self.app_theme.clone();
-        *self = Self::with_config(new_config, app_theme);
+        let instance = self.instance.clone();
+        *self = Self::with_config(instance, new_config, app_theme);
         Ok(())
     }
 
@@ -1121,7 +1163,13 @@ fn render_graph_panel(
         min -= 0.5;
         max += 0.5;
     }
-    let pad = (max - min) * 0.08;
+    // Padding above/below the data range. Set to 0 so the trace peak
+    // touches the top row and the trough touches the bottom — that way
+    // the high/low reference lines line up exactly with where the trace
+    // visually reaches. A non-zero pad (e.g. 0.05) was the previous
+    // default; it gave the trace breathing room from the border but
+    // pushed reference lines ~1 row off the edges.
+    let pad = 0.0;
     let plot_min = min - pad;
     let plot_max = max + pad;
 
@@ -1155,12 +1203,23 @@ fn render_graph_panel(
         );
     }
 
-    // For the 1D period in "trading-day progress" mode, render the trace at
-    // a fraction of plot_w proportional to how much of the regular session
+    // For 1D in "trading-day progress" mode, render the trace at a
+    // fraction of plot_w proportional to how much of the regular session
     // has elapsed (estimated by intraday bar count vs. TRADING_DAY_BARS).
-    // After-hours and other periods always fill the full width.
+    // For YTD, do the analogous thing across the calendar year: the
+    // x-axis labels span Jan…Nov (the full year) and the trace fills
+    // only the elapsed fraction so the May data doesn't get stretched
+    // out to look like it spans through November.
+    // Other periods fill the full width.
     let trace_w = if pad_intraday_to_full_day && matches!(period, Period::Day) {
         let frac = (q.intraday.len() as f64 / TRADING_DAY_BARS as f64).clamp(0.0, 1.0);
+        let w = (plot_w as f64 * frac).round() as u16;
+        w.clamp(2, plot_w)
+    } else if matches!(period, Period::YearToDate) {
+        let now = chrono::Local::now();
+        let day_of_year = now.ordinal() as f64; // 1..=366
+        let days_in_year = if is_leap_year(now.year()) { 366.0 } else { 365.0 };
+        let frac = (day_of_year / days_in_year).clamp(0.0, 1.0);
         let w = (plot_w as f64 * frac).round() as u16;
         w.clamp(2, plot_w)
     } else {
@@ -1240,7 +1299,7 @@ fn render_graph_panel(
         Period::Week => &["Mon", "Tue", "Wed", "Thu", "Fri"],
         Period::Month => &["wk1", "wk2", "wk3", "wk4"],
         Period::SixMonth => &["1mo", "2mo", "3mo", "4mo", "5mo", "6mo"],
-        Period::YearToDate => &["Q1", "Q2", "Q3", "Q4"],
+        Period::YearToDate => &["Jan", "Mar", "May", "Jul", "Sep", "Nov"],
         Period::Year => &["Jan", "Mar", "May", "Jul", "Sep", "Nov"],
         Period::ThreeYear => &["-3y", "-2y", "-1y", "now"],
         Period::FiveYear => &["-5y", "-4y", "-3y", "-2y", "-1y", "now"],
@@ -1316,6 +1375,12 @@ fn draw_reference_line(
             cell.set_style(style);
         }
     }
+}
+
+/// Gregorian leap-year predicate. Inlined so the YTD x-axis math
+/// doesn't need a chrono detour for one ternary.
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 /// Returns (change_abs, change_pct) for the given period. 1D uses the
@@ -1929,7 +1994,11 @@ mod tests {
     use super::*;
 
     fn build_widget(cfg: StocksConfig) -> StocksWidget {
-        StocksWidget::with_config(cfg, Arc::new(Theme::builtin_defaults()))
+        StocksWidget::with_config(
+            "main".to_string(),
+            cfg,
+            Arc::new(Theme::builtin_defaults()),
+        )
     }
 
     fn quote(symbol: &str, price: f64, prev: f64) -> StockQuote {
@@ -2200,5 +2269,15 @@ mod tests {
     fn last_weekday_handles_december_rollover() {
         // Last Mon of Dec 2026 = Dec 28.
         assert_eq!(last_weekday(2026, 12, Weekday::Mon), Some(d(2026, 12, 28)));
+    }
+
+    #[test]
+    fn is_leap_year_matches_gregorian_rule() {
+        assert!(is_leap_year(2024));
+        assert!(!is_leap_year(2025));
+        assert!(!is_leap_year(2026));
+        assert!(is_leap_year(2000)); // /400 → leap
+        assert!(!is_leap_year(1900)); // /100 but not /400 → common
+        assert!(is_leap_year(2400));
     }
 }

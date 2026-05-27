@@ -113,6 +113,10 @@ struct WeatherState {
 
 pub struct WeatherWidget {
     id: String,
+    instance: String,
+    /// Cached `Weather` / `Weather (instance)` label so `display_name()`
+    /// can hand out a `&str` without per-call allocation.
+    display_name_cache: String,
     config: WeatherConfig,
     state: Arc<Mutex<WeatherState>>,
     poll_interval: Duration,
@@ -131,6 +135,7 @@ pub struct WeatherWidget {
 impl Default for WeatherWidget {
     fn default() -> Self {
         Self::with_config(
+            "main".to_string(),
             WeatherConfig::default(),
             Arc::new(Theme::builtin_defaults()),
         )
@@ -138,7 +143,7 @@ impl Default for WeatherWidget {
 }
 
 impl WeatherWidget {
-    pub fn with_config(config: WeatherConfig, app_theme: Arc<Theme>) -> Self {
+    pub fn with_config(instance: String, config: WeatherConfig, app_theme: Arc<Theme>) -> Self {
         // If the user specified explicit lat/lon, seed the location immediately
         // so we skip the geolocation hop.
         let initial_location = match (config.latitude, config.longitude) {
@@ -163,8 +168,20 @@ impl WeatherWidget {
         } else {
             config.shortcuts.clone()
         };
+        let id = if instance == "main" {
+            "weather".to_string()
+        } else {
+            format!("weather@{instance}")
+        };
+        let display_name_cache = if instance == "main" {
+            "Weather".to_string()
+        } else {
+            format!("Weather ({instance})")
+        };
         Self {
-            id: "weather".into(),
+            id,
+            instance,
+            display_name_cache,
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(30)),
             config,
             state,
@@ -317,8 +334,16 @@ impl Widget for WeatherWidget {
         &self.id
     }
 
+    fn kind(&self) -> &str {
+        "weather"
+    }
+
+    fn instance(&self) -> &str {
+        &self.instance
+    }
+
     fn display_name(&self) -> &str {
-        "Weather"
+        &self.display_name_cache
     }
 
     async fn update(&mut self, _ctx: &AppContext) -> Result<()> {
@@ -362,13 +387,18 @@ impl Widget for WeatherWidget {
             .location_label
             .clone()
             .unwrap_or_else(|| "Locating…".into());
+        let title_prefix = if self.instance == "main" {
+            "Weather".to_string()
+        } else {
+            format!("Weather ({})", self.instance)
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(self.theme.border_style(focused))
             .title(decorated_title_line(
                 focused,
-                &format!("Weather — {title_label}"),
+                &format!("{title_prefix} — {title_label}"),
                 self.shortcut,
                 self.theme.widget_title,
                 self.theme.text_shortcut,
@@ -481,7 +511,8 @@ impl Widget for WeatherWidget {
         let new_config: WeatherConfig =
             serde_json::from_value(config).context("invalid weather config payload")?;
         let app_theme = self.app_theme.clone();
-        *self = Self::with_config(new_config, app_theme);
+        let instance = self.instance.clone();
+        *self = Self::with_config(instance, new_config, app_theme);
         Ok(())
     }
 
@@ -643,9 +674,19 @@ fn render_with_art(
         .signed_duration_since(data.fetched_at)
         .num_seconds()
         .max(0);
+    // Sub-minute ages aren't useful to surface as a seconds counter —
+    // they tick noisily every second when nothing's actually changed.
+    // Collapse anything under a minute to a single "Just updated" line.
+    let fresh = age_secs < 60;
     let age = format_age(age_secs);
     let footer = if let Some(e) = &s.last_error {
-        format!("⚠ stale ({e}) — updated {age} ago")
+        if fresh {
+            format!("⚠ stale ({e}) — just updated")
+        } else {
+            format!("⚠ stale ({e}) — updated {age} ago")
+        }
+    } else if fresh {
+        "Just updated".to_string()
     } else {
         format!("Updated {age} ago")
     };
@@ -728,7 +769,11 @@ mod tests {
     use super::*;
 
     fn build_widget(cfg: WeatherConfig) -> WeatherWidget {
-        WeatherWidget::with_config(cfg, Arc::new(Theme::builtin_defaults()))
+        WeatherWidget::with_config(
+            "main".to_string(),
+            cfg,
+            Arc::new(Theme::builtin_defaults()),
+        )
     }
 
     #[test]

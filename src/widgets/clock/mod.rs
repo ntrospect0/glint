@@ -144,6 +144,10 @@ struct ClockState {
 
 pub struct ClockWidget {
     id: String,
+    instance: String,
+    /// Cached `Clock` / `Clock (instance)` label so `display_name()` can
+    /// return a `&str` without per-call allocation.
+    display_name_cache: String,
     config: ClockConfig,
     tz: Option<Tz>,
     /// Parsed secondary timezones — entries with invalid IANA names get dropped
@@ -164,12 +168,16 @@ pub struct ClockWidget {
 
 impl Default for ClockWidget {
     fn default() -> Self {
-        Self::with_config(ClockConfig::default(), Arc::new(Theme::builtin_defaults()))
+        Self::with_config(
+            "main".to_string(),
+            ClockConfig::default(),
+            Arc::new(Theme::builtin_defaults()),
+        )
     }
 }
 
 impl ClockWidget {
-    pub fn with_config(config: ClockConfig, app_theme: Arc<Theme>) -> Self {
+    pub fn with_config(instance: String, config: ClockConfig, app_theme: Arc<Theme>) -> Self {
         let tz = config
             .timezone
             .as_deref()
@@ -193,8 +201,20 @@ impl ClockWidget {
         } else {
             config.shortcuts.clone()
         };
+        let id = if instance == "main" {
+            "clock".to_string()
+        } else {
+            format!("clock@{instance}")
+        };
+        let display_name_cache = if instance == "main" {
+            "Clock".to_string()
+        } else {
+            format!("Clock ({instance})")
+        };
         Self {
-            id: "clock".into(),
+            id,
+            instance,
+            display_name_cache,
             config,
             tz,
             secondaries,
@@ -445,8 +465,16 @@ impl Widget for ClockWidget {
         &self.id
     }
 
+    fn kind(&self) -> &str {
+        "clock"
+    }
+
+    fn instance(&self) -> &str {
+        &self.instance
+    }
+
     fn display_name(&self) -> &str {
-        "Clock"
+        &self.display_name_cache
     }
 
     async fn update(&mut self, _ctx: &AppContext) -> Result<()> {
@@ -455,14 +483,19 @@ impl Widget for ClockWidget {
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
         let (transient, searching) = self.snapshot_transient();
+        let base = if self.instance == "main" {
+            "Clock".to_string()
+        } else {
+            format!("Clock ({})", self.instance)
+        };
         let title_base = if let Some((label, _)) = &transient {
-            format!("Clock — {label} (lookup)")
+            format!("{base} — {label} (lookup)")
         } else if searching {
-            "Clock — looking up…".into()
+            format!("{base} — looking up…")
         } else {
             match &self.tz {
-                Some(tz) => format!("Clock — {tz}"),
-                None => "Clock".into(),
+                Some(tz) => format!("{base} — {tz}"),
+                None => base,
             }
         };
         let block = Block::default()
@@ -668,7 +701,8 @@ impl Widget for ClockWidget {
         let new_config: ClockConfig =
             serde_json::from_value(config).context("invalid clock config payload")?;
         let app_theme = self.app_theme.clone();
-        *self = Self::with_config(new_config, app_theme);
+        let instance = self.instance.clone();
+        *self = Self::with_config(instance, new_config, app_theme);
         Ok(())
     }
 
@@ -692,7 +726,7 @@ mod tests {
     use chrono::TimeZone;
 
     fn build_widget(cfg: ClockConfig) -> ClockWidget {
-        ClockWidget::with_config(cfg, Arc::new(Theme::builtin_defaults()))
+        ClockWidget::with_config("main".to_string(), cfg, Arc::new(Theme::builtin_defaults()))
     }
 
     #[test]

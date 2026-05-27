@@ -187,10 +187,32 @@ struct CalendarState {
     inflight: bool,
     /// Active big-digit gradient. Seeded from config; user cycles with `g`.
     gradient: big_digits::Gradient,
+    /// Row offset for the day's agenda list (Day view body + Month
+    /// view's selected-day footer). ↑/↓ keys and mouse wheel drive this;
+    /// reset to 0 whenever the anchor day or view changes so the user
+    /// doesn't get stranded mid-list after navigating.
+    agenda_scroll: u16,
+    /// Last-known maximum scroll offset for the agenda — written by
+    /// render after measuring lines vs viewport, read by the scroll
+    /// handler so it can clamp without re-running the layout.
+    agenda_scroll_max: u16,
+    /// False until the agenda has been auto-scrolled once for the
+    /// current (anchor, view) pair. Render flips this to true after
+    /// it places the viewport on "now or later" events; manual
+    /// scrolling (keys / wheel) also sets it so render stops fighting
+    /// the user. Inverted (done-flag vs pending-flag) so the
+    /// `#[derive(Default)]` default of `false` means "needs an
+    /// autoscroll pass on the next render", which matches the right
+    /// behavior on first construction without a manual override.
+    agenda_autoscroll_done: bool,
 }
 
 pub struct CalendarWidget {
     id: String,
+    instance: String,
+    /// Cached `Calendar` / `Calendar (instance)` label so `display_name()`
+    /// can hand out a `&str` without per-call allocation.
+    display_name_cache: String,
     view: CalendarView,
     /// Anchor date used by all three views. For Day, it's the day shown.
     /// For Week, the week containing it. For Month, the month containing it.
@@ -222,7 +244,7 @@ pub struct CalendarWidget {
 }
 
 impl CalendarWidget {
-    pub fn with_config(config: CalendarConfig, app_theme: Arc<Theme>) -> Self {
+    pub fn with_config(instance: String, config: CalendarConfig, app_theme: Arc<Theme>) -> Self {
         let (provider, source_label, auth_hint) = build_provider(&config);
         let colors = CalendarColors::build(&config);
         let state = CalendarState {
@@ -236,8 +258,20 @@ impl CalendarWidget {
         } else {
             config.shortcuts.clone()
         };
+        let id = if instance == "main" {
+            "calendar".to_string()
+        } else {
+            format!("calendar@{instance}")
+        };
+        let display_name_cache = if instance == "main" {
+            "Calendar".to_string()
+        } else {
+            format!("Calendar ({instance})")
+        };
         Self {
-            id: "calendar".into(),
+            id,
+            instance,
+            display_name_cache,
             view: config.default_view,
             anchor: Local::now().date_naive(),
             provider,
@@ -319,11 +353,37 @@ impl CalendarWidget {
         st.last_attempt = None;
     }
 
+    /// Reset the agenda scroll offset to the top and re-arm the
+    /// auto-scroll-to-now pass. Called whenever the anchor day or
+    /// the view mode changes so the user doesn't land mid-list after
+    /// navigating to a different day — the next render will then
+    /// re-position to the first event at-or-after the current time
+    /// (when the displayed day is today).
+    fn reset_agenda_scroll(&self) {
+        let mut st = self.state.lock().expect("calendar state poisoned");
+        st.agenda_scroll = 0;
+        st.agenda_scroll_max = 0;
+        st.agenda_autoscroll_done = false;
+    }
+
+    /// Adjust the agenda scroll by `delta` rows, clamping against the
+    /// last-rendered maximum. Up/Down keys and mouse wheel route here.
+    /// Also marks the autoscroll as done so render doesn't fight the
+    /// user's manual position on the next tick.
+    fn scroll_agenda(&self, delta: i32) {
+        let mut st = self.state.lock().expect("calendar state poisoned");
+        let max = st.agenda_scroll_max as i32;
+        let next = (st.agenda_scroll as i32 + delta).clamp(0, max);
+        st.agenda_scroll = next as u16;
+        st.agenda_autoscroll_done = true;
+    }
+
     fn snapshot_events(&self) -> Vec<Event> {
         let st = self.state.lock().expect("calendar state poisoned");
         st.events.clone()
     }
 
+    #[allow(dead_code)] // kept for parity with handle_key's `step` calc; may be re-used later.
     fn nav_step(&self) -> ChronoDuration {
         match self.view {
             CalendarView::Day => ChronoDuration::days(1),
@@ -946,9 +1006,14 @@ fn month_long(m: u32) -> &'static str {
 impl CalendarWidget {
     fn title_for_header(&self) -> String {
         let source = self.source_label.as_str();
+        let base = if self.instance == "main" {
+            "Calendar".to_string()
+        } else {
+            format!("Calendar ({})", self.instance)
+        };
         match self.view {
             CalendarView::Day => format!(
-                "Calendar [{source}] — {} {} {}, {}",
+                "{base} [{source}] — {} {} {}, {}",
                 weekday_short(self.anchor.weekday()),
                 month_long(self.anchor.month()),
                 self.anchor.day(),
@@ -958,14 +1023,14 @@ impl CalendarWidget {
                 let s = start_of_week(self.anchor);
                 let e = s + ChronoDuration::days(6);
                 format!(
-                    "Calendar [{source}] — week of {} {}–{}",
+                    "{base} [{source}] — week of {} {}–{}",
                     month_long(s.month()),
                     s.day(),
                     e.day()
                 )
             }
             CalendarView::Month => format!(
-                "Calendar [{source}] — {} {}",
+                "{base} [{source}] — {} {}",
                 month_long(self.anchor.month()),
                 self.anchor.year()
             ),
@@ -1120,8 +1185,59 @@ impl CalendarWidget {
                 lines.push(Line::from(""));
             }
         }
+        // How many lines came from auth_hint? Subtract them when
+        // mapping event indices to the agenda_lines coordinate space —
+        // first_future_event_line reports indices relative to the
+        // agenda-only block.
+        let agenda_offset_in_lines = lines.len() as u16;
         lines.extend(self.agenda_lines(&day_events, body_area.width));
-        let body = Paragraph::new(lines);
+
+        // The anchor column owns the scrollable agenda — ↑/↓/wheel
+        // drive its offset. The preview column (`is_anchor = false`)
+        // stays anchored at the top so the two days stay visually
+        // synced.
+        let total_lines = lines.len() as u16;
+        let max_scroll = total_lines.saturating_sub(body_area.height);
+        let effective = if is_anchor {
+            let needs_autoscroll = {
+                let mut st = self.state.lock().expect("calendar state poisoned");
+                st.agenda_scroll_max = max_scroll;
+                !st.agenda_autoscroll_done
+            };
+            // Only consider auto-positioning when the visible day IS
+            // today AND the agenda overflows. Past/future days keep
+            // the natural top-of-list position; days that fit fully
+            // never need scrolling at all.
+            let today = Local::now().date_naive();
+            let do_autoscroll = needs_autoscroll
+                && date == today
+                && max_scroll > 0;
+            if do_autoscroll {
+                let now = Local::now();
+                if let Some(rel_line) =
+                    self.first_future_event_line(&day_events, body_area.width, now)
+                {
+                    let target = (rel_line + agenda_offset_in_lines).min(max_scroll);
+                    let mut st = self.state.lock().expect("calendar state poisoned");
+                    st.agenda_scroll = target;
+                    st.agenda_autoscroll_done = true;
+                    target
+                } else {
+                    // No current/future events — leave at top and mark
+                    // done so render doesn't keep checking.
+                    let mut st = self.state.lock().expect("calendar state poisoned");
+                    st.agenda_autoscroll_done = true;
+                    st.agenda_scroll
+                }
+            } else {
+                let st = self.state.lock().expect("calendar state poisoned");
+                st.agenda_scroll
+            }
+        } else {
+            0
+        };
+        let effective = effective.min(max_scroll);
+        let body = Paragraph::new(lines).scroll((effective, 0));
         frame.render_widget(body, body_area);
     }
 
@@ -1197,6 +1313,43 @@ impl CalendarWidget {
         lines
     }
 
+    /// Compute the line index where the first "still upcoming or in
+    /// progress" event lands inside the agenda layout for `day_events`
+    /// (events with `end >= now`). Returns `None` when no events meet
+    /// the criterion. Mirrors the per-event line accounting in
+    /// `agenda_lines` exactly — title rows (up to 2 wrap lines) +
+    /// optional location rows (up to 2 wrap lines).
+    fn first_future_event_line(
+        &self,
+        day_events: &[&Event],
+        body_width: u16,
+        now: chrono::DateTime<chrono::Local>,
+    ) -> Option<u16> {
+        const TIME_COL_WIDTH: usize = 11;
+        const TITLE_GAP: usize = 2;
+        const MAX_LINES_PER_FIELD: usize = 2;
+        let text_width = (body_width as usize)
+            .saturating_sub(TIME_COL_WIDTH + TITLE_GAP)
+            .max(1);
+
+        let mut cursor: u16 = 0;
+        for e in day_events {
+            // First line of this event — that's the candidate scroll
+            // target if the event qualifies.
+            if e.end >= now {
+                return Some(cursor);
+            }
+            // Otherwise advance by however many lines this event consumes.
+            let title_lines = wrap_event_title(&e.title, text_width, MAX_LINES_PER_FIELD);
+            cursor = cursor.saturating_add(title_lines.len().max(1) as u16);
+            if let Some(loc) = &e.location {
+                let loc_lines = wrap_event_title(loc, text_width, MAX_LINES_PER_FIELD);
+                cursor = cursor.saturating_add(loc_lines.len() as u16);
+            }
+        }
+        None
+    }
+
     /// Render the agenda for the month-view's selected day below the calendar
     /// grid. Shares the time-aligned event format with [`agenda_lines`].
     fn render_month_agenda(&self, frame: &mut Frame, area: Rect, events: &[Event]) {
@@ -1223,8 +1376,45 @@ impl CalendarWidget {
         };
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(Span::styled(header_text, header_style)));
+        // Header row counts as 1 line of lead-in; agenda events begin
+        // at relative line 0 inside `agenda_lines`, which lands at
+        // line 1 of `lines`. Track that offset so the autoscroll target
+        // is mapped correctly.
+        let agenda_offset_in_lines: u16 = lines.len() as u16;
         lines.extend(self.agenda_lines(&day_events, area.width));
-        frame.render_widget(Paragraph::new(lines), area);
+
+        // Same scroll wiring as the Day view's anchor column — Month
+        // view's footer agenda is also driven by ↑/↓ and the wheel,
+        // and auto-scrolls to "now or later" events when the selected
+        // day is today.
+        let total = lines.len() as u16;
+        let max_scroll = total.saturating_sub(area.height);
+        let needs_autoscroll = {
+            let mut st = self.state.lock().expect("calendar state poisoned");
+            st.agenda_scroll_max = max_scroll;
+            !st.agenda_autoscroll_done
+        };
+        let today_naive = today;
+        let do_autoscroll =
+            needs_autoscroll && self.anchor == today_naive && max_scroll > 0;
+        let scroll = if do_autoscroll {
+            let now = Local::now();
+            if let Some(rel) = self.first_future_event_line(&day_events, area.width, now) {
+                let target = (rel + agenda_offset_in_lines).min(max_scroll);
+                let mut st = self.state.lock().expect("calendar state poisoned");
+                st.agenda_scroll = target;
+                st.agenda_autoscroll_done = true;
+                target
+            } else {
+                let mut st = self.state.lock().expect("calendar state poisoned");
+                st.agenda_autoscroll_done = true;
+                st.agenda_scroll.min(max_scroll)
+            }
+        } else {
+            let st = self.state.lock().expect("calendar state poisoned");
+            st.agenda_scroll.min(max_scroll)
+        };
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
     }
 
     fn render_week(&self, frame: &mut Frame, area: Rect, events: &[Event]) {
@@ -1453,8 +1643,16 @@ impl Widget for CalendarWidget {
         &self.id
     }
 
+    fn kind(&self) -> &str {
+        "calendar"
+    }
+
+    fn instance(&self) -> &str {
+        &self.instance
+    }
+
     fn display_name(&self) -> &str {
-        "Calendar"
+        &self.display_name_cache
     }
 
     async fn update(&mut self, _ctx: &AppContext) -> Result<()> {
@@ -1526,32 +1724,57 @@ impl Widget for CalendarWidget {
         match key.code {
             KeyCode::Char('d') => {
                 self.view = CalendarView::Day;
+                self.reset_agenda_scroll();
                 self.mark_dirty();
                 EventResult::Handled
             }
             KeyCode::Char('w') => {
                 self.view = CalendarView::Week;
+                self.reset_agenda_scroll();
                 self.mark_dirty();
                 EventResult::Handled
             }
             KeyCode::Char('m') => {
                 self.view = CalendarView::Month;
+                self.reset_agenda_scroll();
                 self.mark_dirty();
                 EventResult::Handled
             }
             KeyCode::Char('t') => {
                 self.anchor = Local::now().date_naive();
+                self.reset_agenda_scroll();
                 self.mark_dirty();
                 EventResult::Handled
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.anchor -= step;
+                self.reset_agenda_scroll();
                 self.mark_dirty();
                 EventResult::Handled
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 self.anchor += step;
+                self.reset_agenda_scroll();
                 self.mark_dirty();
+                EventResult::Handled
+            }
+            // ↑ / ↓ (and j/k) scroll the day's agenda when it has more
+            // events than fit in the body. Time navigation lives on
+            // ←/→ + clicks — no overlap.
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.scroll_agenda(-1);
+                EventResult::Handled
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.scroll_agenda(1);
+                EventResult::Handled
+            }
+            KeyCode::PageUp => {
+                self.scroll_agenda(-10);
+                EventResult::Handled
+            }
+            KeyCode::PageDown => {
+                self.scroll_agenda(10);
                 EventResult::Handled
             }
             KeyCode::Char('g') => {
@@ -1564,18 +1787,15 @@ impl Widget for CalendarWidget {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> EventResult {
-        // Scroll wheel: same effect as ←/→ navigation in the current view.
+        // Scroll wheel: walks the selected day's agenda. Time navigation
+        // lives on clicks (the day grid in Week/Month) and on ←/→ keys.
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                let step = self.nav_step();
-                self.anchor -= step;
-                self.mark_dirty();
+                self.scroll_agenda(-1);
                 return EventResult::Handled;
             }
             MouseEventKind::ScrollDown => {
-                let step = self.nav_step();
-                self.anchor += step;
-                self.mark_dirty();
+                self.scroll_agenda(1);
                 return EventResult::Handled;
             }
             MouseEventKind::Down(MouseButton::Left) => {}
@@ -1621,6 +1841,7 @@ impl Widget for CalendarWidget {
                 if let Some(date) = self.week_day_at(mouse.column, mouse.row, content) {
                     self.anchor = date;
                     self.view = CalendarView::Day;
+                    self.reset_agenda_scroll();
                     self.mark_dirty();
                     return EventResult::Handled;
                 }
@@ -1628,6 +1849,7 @@ impl Widget for CalendarWidget {
             CalendarView::Month => {
                 if let Some(date) = self.month_day_at(mouse.column, mouse.row, content) {
                     self.anchor = date;
+                    self.reset_agenda_scroll();
                     self.mark_dirty();
                     return EventResult::Handled;
                 }
@@ -1637,6 +1859,7 @@ impl Widget for CalendarWidget {
                 // promotes that day to the new anchor.
                 if content.width >= 50 && mouse.column >= content.x + content.width / 2 {
                     self.anchor += ChronoDuration::days(1);
+                    self.reset_agenda_scroll();
                     self.mark_dirty();
                     return EventResult::Handled;
                 }
@@ -1653,6 +1876,9 @@ impl Widget for CalendarWidget {
         vec![
             ("d / w / m", "switch view: day / week / month"),
             ("← / → / h / l", "previous / next (per view)"),
+            ("↑ / ↓ / j / k", "scroll the day's agenda"),
+            ("PgUp / PgDn", "scroll agenda ±10 lines"),
+            ("wheel", "scroll the day's agenda"),
             ("t", "jump to today"),
             ("g", "cycle digit gradient style (today's date)"),
             ("click day", "week: open in day view; month: select for agenda"),
@@ -1672,7 +1898,8 @@ impl Widget for CalendarWidget {
         let new_config: CalendarConfig =
             serde_json::from_value(config).context("invalid calendar config payload")?;
         let app_theme = self.app_theme.clone();
-        *self = Self::with_config(new_config, app_theme);
+        let instance = self.instance.clone();
+        *self = Self::with_config(instance, new_config, app_theme);
         Ok(())
     }
 
@@ -1695,7 +1922,11 @@ mod tests {
     use super::*;
 
     fn build_widget(cfg: CalendarConfig) -> CalendarWidget {
-        CalendarWidget::with_config(cfg, Arc::new(Theme::builtin_defaults()))
+        CalendarWidget::with_config(
+            "main".to_string(),
+            cfg,
+            Arc::new(Theme::builtin_defaults()),
+        )
     }
 
     #[test]
@@ -1865,5 +2096,68 @@ mod tests {
         let lines = wrap_event_title("supercalifragilistic", 5, 3);
         assert!(lines[0].ends_with('…'));
         assert!(lines[0].chars().count() <= 5);
+    }
+
+    fn make_event(start: chrono::DateTime<Local>, end: chrono::DateTime<Local>, title: &str) -> Event {
+        Event {
+            title: title.into(),
+            start,
+            end,
+            all_day: false,
+            source: "local".into(),
+            calendar: "test".into(),
+            location: None,
+        }
+    }
+
+    #[test]
+    fn first_future_event_line_skips_past_events() {
+        let w = build_widget(CalendarConfig::default());
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 5, 21, 14, 0, 0)
+            .unwrap();
+        let one_hour = chrono::Duration::hours(1);
+        // Three events: 09–10 (past), 12–13 (past), 15–16 (future).
+        let events: Vec<Event> = vec![
+            make_event(now - chrono::Duration::hours(5), now - chrono::Duration::hours(4), "morning standup"),
+            make_event(now - chrono::Duration::hours(2), now - chrono::Duration::hours(1), "lunch chat"),
+            make_event(now + one_hour, now + one_hour * 2, "design review"),
+        ];
+        let refs: Vec<&Event> = events.iter().collect();
+        // Each event with no location and a short title takes exactly 1 line.
+        // So the third event lands at line 2.
+        let line = w.first_future_event_line(&refs, 60, now);
+        assert_eq!(line, Some(2));
+    }
+
+    #[test]
+    fn first_future_event_line_returns_none_when_all_events_past() {
+        let w = build_widget(CalendarConfig::default());
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 5, 21, 23, 0, 0)
+            .unwrap();
+        let events = vec![make_event(
+            now - chrono::Duration::hours(10),
+            now - chrono::Duration::hours(9),
+            "long-finished meeting",
+        )];
+        let refs: Vec<&Event> = events.iter().collect();
+        assert_eq!(w.first_future_event_line(&refs, 60, now), None);
+    }
+
+    #[test]
+    fn first_future_event_line_includes_in_progress_event() {
+        let w = build_widget(CalendarConfig::default());
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 5, 21, 14, 30, 0)
+            .unwrap();
+        // Event is 14:00–15:00 — currently in progress; should qualify.
+        let events = vec![make_event(
+            now - chrono::Duration::minutes(30),
+            now + chrono::Duration::minutes(30),
+            "in-progress sync",
+        )];
+        let refs: Vec<&Event> = events.iter().collect();
+        assert_eq!(w.first_future_event_line(&refs, 60, now), Some(0));
     }
 }

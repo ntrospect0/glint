@@ -26,6 +26,17 @@ where
     Ok(value)
 }
 
+/// Like `load_widget_toml`, but resolves to `<kind>@<instance>.toml` for
+/// non-main instances. Falls back to `T::default()` when the file doesn't
+/// exist.
+pub fn load_widget_toml_for_instance<T>(kind: &str, instance: &str) -> Result<T>
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    let stem = crate::widgets::widget_config_stem(kind, instance);
+    load_widget_toml(&stem)
+}
+
 /// Returns `~/.config/glint/` on every platform (overridable with
 /// `$XDG_CONFIG_HOME`). The XDG Base Directory layout is what the spec
 /// promises, so we use it consistently rather than falling back to

@@ -13,6 +13,7 @@ mod providers;
 mod theme;
 mod ui;
 mod widgets;
+mod wizard;
 
 /// glint — terminal dashboard for stocks, calendar, news, and beyond.
 #[derive(Parser, Debug)]
@@ -21,6 +22,10 @@ struct Cli {
     /// Create ~/.config/glint/ and seed default config files, then exit.
     #[arg(long)]
     init: bool,
+
+    /// Launch the interactive setup wizard (plain stdin/stdout — no TUI), then exit.
+    #[arg(long)]
+    setup: bool,
 
     /// Run an authentication flow for the given provider, then exit.
     #[arg(long, value_enum, value_name = "PROVIDER")]
@@ -51,11 +56,43 @@ fn main() -> Result<()> {
             println!("Initialized config at {}", path.display());
             return Ok(());
         }
+        if cli.setup {
+            // The wizard is fully synchronous — it does plain stdin/stdout
+            // text prompts and never touches the tokio runtime. The runtime
+            // already exists at this point; we just don't use it here.
+            return wizard::run();
+        }
         if let Some(target) = cli.auth {
             return run_auth(target).await;
         }
+
+        // First-run UX: a fresh install has no ~/.config/glint/config.toml.
+        // Drop the user into the setup wizard before opening the TUI, then
+        // continue into the dashboard with whatever they configured.
+        // `--config <path>` skips this — the user is explicitly pointing
+        // at an alternate file, so we trust they know what they're doing.
+        if cli.config.is_none() && !looks_initialized() {
+            eprintln!("No config detected at ~/.config/glint/config.toml — launching the setup wizard.");
+            eprintln!("(You can re-run `glint --setup` later to make changes.)");
+            eprintln!();
+            wizard::run()?;
+            eprintln!();
+            eprintln!("Launching glint…");
+        }
+
         app::run(cli.config).await
     })
+}
+
+/// Quick predicate: does the user's `~/.config/glint/config.toml` exist?
+/// Used as a proxy for "have they finished initial setup?". Any failure
+/// to resolve the path (e.g. missing home dir) is treated as "yes,
+/// initialized" so we never block a launch on something exotic — the
+/// wizard is a convenience, not a gate.
+fn looks_initialized() -> bool {
+    config::config_path()
+        .map(|p| p.exists())
+        .unwrap_or(true)
 }
 
 async fn run_auth(target: AuthTarget) -> Result<()> {

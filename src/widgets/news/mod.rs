@@ -186,6 +186,10 @@ faithfully, respond with the single sentence: \"Insufficient content to summariz
 
 pub struct NewsWidget {
     id: String,
+    instance: String,
+    /// Cached `News` / `News (instance)` label so `display_name()` can hand
+    /// out a `&str` without per-call allocation.
+    display_name_cache: String,
     provider: Arc<dyn NewsProvider>,
     state: Arc<Mutex<NewsState>>,
     poll_interval: Duration,
@@ -222,10 +226,17 @@ pub struct NewsWidget {
 impl NewsWidget {
     #[cfg(test)]
     pub fn with_config(config: NewsConfig) -> Self {
-        Self::with_config_and_llm(config, None, false, Arc::new(Theme::builtin_defaults()))
+        Self::with_config_and_llm(
+            "main".to_string(),
+            config,
+            None,
+            false,
+            Arc::new(Theme::builtin_defaults()),
+        )
     }
 
     pub fn with_config_and_llm(
+        instance: String,
         config: NewsConfig,
         llm: Option<Arc<dyn LlmProvider>>,
         llm_summarize_enabled: bool,
@@ -250,8 +261,20 @@ impl NewsWidget {
                 Arc::new(EmptyProvider)
             }
         };
+        let id = if instance == "main" {
+            "news".to_string()
+        } else {
+            format!("news@{instance}")
+        };
+        let display_name_cache = if instance == "main" {
+            "News".to_string()
+        } else {
+            format!("News ({instance})")
+        };
         Self {
-            id: "news".into(),
+            id,
+            instance,
+            display_name_cache,
             provider,
             state: Arc::new(Mutex::new(NewsState::default())),
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(60)),
@@ -650,8 +673,16 @@ impl Widget for NewsWidget {
         &self.id
     }
 
+    fn kind(&self) -> &str {
+        "news"
+    }
+
+    fn instance(&self) -> &str {
+        &self.instance
+    }
+
     fn display_name(&self) -> &str {
-        "News"
+        &self.display_name_cache
     }
 
     async fn update(&mut self, _ctx: &AppContext) -> Result<()> {
@@ -711,10 +742,15 @@ impl Widget for NewsWidget {
             all_articles
         };
 
-        let title = if articles.is_empty() {
+        let base = if self.instance == "main" {
             "News".to_string()
         } else {
-            format!("News — {} articles", articles.len())
+            format!("News ({})", self.instance)
+        };
+        let title = if articles.is_empty() {
+            base
+        } else {
+            format!("{base} — {} articles", articles.len())
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1068,11 +1104,12 @@ impl Widget for NewsWidget {
             serde_json::from_value(config).context("invalid news config payload")?;
         // Preserve the active LLM provider + summarize flag across reloads —
         // those are app-level, not user-config-level. Same goes for the
-        // app theme.
+        // app theme and the widget's instance identity.
         let llm = self.llm.clone();
         let summarize = self.llm_summarize_enabled;
         let app_theme = self.app_theme.clone();
-        *self = Self::with_config_and_llm(new_config, llm, summarize, app_theme);
+        let instance = self.instance.clone();
+        *self = Self::with_config_and_llm(instance, new_config, llm, summarize, app_theme);
         Ok(())
     }
 

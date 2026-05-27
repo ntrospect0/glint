@@ -8,6 +8,13 @@ repository = "https://github.com/ntrospect0/glint"
 keywords = ["tui", "dashboard", "terminal", "stocks", "ratatui"]
 categories = ["command-line-interface"]
 
+# The package crate is `glint-tui` (kept for crates.io publishing), but the
+# produced binary is just `glint` — that's what ships to $PATH and what the
+# user types to launch the dashboard.
+[[bin]]
+name = "glint"
+path = "src/main.rs"
+
 [dependencies]
 # TUI
 ratatui = "0.28"
@@ -44,6 +51,17 @@ strsim = "0.11"
 notify = "6"
 dirs = "5"
 clap = { version = "4", features = ["derive"] }
+
+# System metrics (powers the Resources widget). Cross-platform read-only
+# CPU / memory / process snapshots; no FFI of our own.
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+
+# Inline image rendering (powers the Gallery widget). Detects the host
+# terminal's image protocol — iTerm2, Kitty, Sixel — and falls back to
+# unicode halfblocks when none is available. Pulls in the `image` crate
+# for PNG/JPEG/GIF decoding.
+ratatui-image = { version = "2", default-features = false, features = ["image-defaults", "crossterm", "rustix"] }
+image = "0.25"
 
 [dev-dependencies]
 wiremock = "0.6"
