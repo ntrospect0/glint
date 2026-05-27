@@ -76,6 +76,15 @@ pub struct ForexConfig {
     #[serde(default = "default_watchlist")]
     pub watchlist: Vec<String>,
 
+    /// Crypto tickers, in display order. Always rendered in a
+    /// separate `── Crypto ──` section below the fiat watchlist.
+    /// Empty by default — bring your own if you want crypto rows.
+    /// Codes here implicitly opt into Yahoo's hyphenated `BTC-USD`
+    /// symbol format regardless of whether they appear in the
+    /// provider's built-in `CRYPTO_CODES` set.
+    #[serde(default = "default_crypto_watchlist")]
+    pub crypto_watchlist: Vec<String>,
+
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
 
@@ -129,6 +138,15 @@ fn default_watchlist() -> Vec<String> {
     ]
 }
 
+fn default_crypto_watchlist() -> Vec<String> {
+    vec![
+        "BTC".into(),
+        "ETH".into(),
+        "SOL".into(),
+        "XRP".into(),
+    ]
+}
+
 fn default_poll_interval() -> u64 {
     600
 }
@@ -146,6 +164,7 @@ impl Default for ForexConfig {
         Self {
             primary: default_primary(),
             watchlist: default_watchlist(),
+            crypto_watchlist: default_crypto_watchlist(),
             poll_interval_secs: default_poll_interval(),
             default_period: Period::default(),
             jump_url_template: None,
@@ -281,6 +300,11 @@ pub struct ForexWidget {
     /// position 0, so "what was just primary" is always one row down
     /// from the top.
     alternates: Vec<String>,
+    /// Index in `alternates` where the crypto section starts.
+    /// `alternates[..crypto_start]` are fiat; `alternates[crypto_start..]`
+    /// are crypto. The list renderer uses this to position the
+    /// `── Currencies ──` / `── Crypto ──` headers.
+    crypto_start: usize,
     /// Editable amount, in units of `primary`. Defaults to the
     /// canonical unit for the configured primary at construction time.
     /// Survives across renders; reset by `c` or a primary swap.
@@ -328,18 +352,15 @@ impl ForexWidget {
         let amount = canonical_amount(&config, &primary);
         let period = config.default_period;
         let poll_interval = Duration::from_secs(config.poll_interval_secs.max(60));
-        // Alternates seeded from watchlist, primary filtered out, codes
-        // normalized to uppercase. Duplicates are dropped (first wins).
-        let mut alternates: Vec<String> = Vec::with_capacity(config.watchlist.len());
-        for code in &config.watchlist {
-            let upper = code.to_ascii_uppercase();
-            if upper == primary {
-                continue;
-            }
-            if !alternates.iter().any(|c| c == &upper) {
-                alternates.push(upper);
-            }
-        }
+        // Alternates: fiat from `watchlist` then crypto from
+        // `crypto_watchlist`, primary filtered out, codes normalized
+        // to uppercase, duplicates dropped (first wins). The boundary
+        // index drives section-header placement at render time.
+        let (alternates, crypto_start) = build_alternates(
+            &config.watchlist,
+            &config.crypto_watchlist,
+            &primary,
+        );
 
         // Seed quotes from cache so the widget paints prior rates
         // immediately and survives transient fetch failures with the
@@ -372,6 +393,7 @@ impl ForexWidget {
             state: Arc::new(Mutex::new(initial_state)),
             primary,
             alternates,
+            crypto_start,
             amount,
             period,
             app_theme,
@@ -457,6 +479,15 @@ impl ForexWidget {
         let state = self.state.clone();
         let cache = self.cache.clone();
         let period = self.period;
+        // Only persist to disk when the live primary matches the
+        // configured one — the disk cache is the seed for the *next*
+        // process start, which always launches at config.primary.
+        // Storing quotes from a transient swap (e.g. user was on BTC
+        // primary when they quit) would seed the next launch with
+        // BTC-keyed symbols that don't match the USD-keyed lookups
+        // the widget makes at startup, leaving every row blank
+        // until the first fresh fetch returns.
+        let persist_cache = self.primary.eq_ignore_ascii_case(&self.config.primary);
         tokio::spawn(async move {
             let futs = pairs.iter().map(|(base, quote)| {
                 let provider = provider.clone();
@@ -506,7 +537,7 @@ impl ForexWidget {
             }
             st.any_inflight = false;
             drop(st);
-            if !snapshot.is_empty() {
+            if persist_cache && !snapshot.is_empty() {
                 if let Err(err) = cache.store(&quotes_cache_key(period), &snapshot) {
                     tracing::warn!(error = %err, "forex cache store failed");
                 }
@@ -581,19 +612,34 @@ impl ForexWidget {
         }
         let old_primary = std::mem::replace(&mut self.primary, new_upper.clone());
 
-        // Convert the displayed amount via the current rate so the user
-        // keeps roughly the same buying-power across the swap. If we
-        // don't have a fresh rate, fall back to the new primary's
-        // canonical unit (better than zero).
-        let symbol = YahooForexProvider::symbol_for(&old_primary, &new_upper);
-        let converted = {
-            let st = self.state.lock().expect("forex state poisoned");
-            match st.quotes.get(&symbol) {
-                Some(QuoteState::Ready(q)) if q.price > 0.0 => Some(self.amount * q.price),
-                _ => None,
-            }
+        // Decide the new amount. For fiat→fiat or fiat→fiat-style
+        // swaps, convert via the current rate so the user keeps
+        // roughly the same buying-power across the swap. For crypto
+        // primaries we deliberately *don't* preserve buying power —
+        // a converted amount like `0.0000113 BTC` (from 1 USD)
+        // buries the per-unit comparison the user actually wants.
+        // Always-1 makes "what is 1 BTC worth in X" the immediate
+        // read. Falls back to the new primary's canonical unit if
+        // no rate is available.
+        let new_is_crypto = self
+            .config
+            .crypto_watchlist
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&new_upper))
+            || provider::is_crypto(&new_upper);
+        self.amount = if new_is_crypto {
+            1.0
+        } else {
+            let symbol = YahooForexProvider::symbol_for(&old_primary, &new_upper);
+            let converted = {
+                let st = self.state.lock().expect("forex state poisoned");
+                match st.quotes.get(&symbol) {
+                    Some(QuoteState::Ready(q)) if q.price > 0.0 => Some(self.amount * q.price),
+                    _ => None,
+                }
+            };
+            converted.unwrap_or_else(|| canonical_amount(&self.config, &new_upper))
         };
-        self.amount = converted.unwrap_or_else(|| canonical_amount(&self.config, &new_upper));
 
         // Reorder alternates. Two cases:
         //
@@ -610,23 +656,75 @@ impl ForexWidget {
         //   "what's the just-replaced currency worth now?" follow-up.
         let original_primary = self.config.primary.to_ascii_uppercase();
         if new_upper == original_primary {
-            // Re-seed from config, filtering out the new primary and
-            // dropping duplicates (same logic as `with_config`).
-            let mut alternates: Vec<String> = Vec::with_capacity(self.config.watchlist.len());
-            for code in &self.config.watchlist {
-                let upper = code.to_ascii_uppercase();
-                if upper == new_upper {
-                    continue;
-                }
-                if !alternates.iter().any(|c| c == &upper) {
-                    alternates.push(upper);
-                }
-            }
-            self.alternates = alternates;
+            // Re-seed from config with the same fiat-then-crypto
+            // grouping `with_config` uses.
+            let (alts, cs) = build_alternates(
+                &self.config.watchlist,
+                &self.config.crypto_watchlist,
+                &new_upper,
+            );
+            self.alternates = alts;
+            self.crypto_start = cs;
         } else {
-            self.alternates
-                .retain(|c| !c.eq_ignore_ascii_case(&new_upper));
-            self.alternates.insert(0, old_primary.clone());
+            // Rebuild from config, with up to two prepends:
+            //   1. `old_primary` lands at position 0 of its native
+            //      category so a swap-back-to-just-swapped is row 1.
+            //   2. `config.primary` (the user's *home base*) is then
+            //      prepended on top of that, so the original primary
+            //      stays permanently at the top of its category no
+            //      matter how many hops the user has taken.
+            //
+            // Order matters: insert `old_primary` first, then
+            // `config.primary`, so the final layout is
+            //   [config.primary, old_primary, …rest…]
+            // when both share a category. The previous logic only did
+            // step 1, which caused the configured primary to fall out
+            // of the list entirely on the second swap (USD→BTC→ETH
+            // would drop USD because old_primary became BTC).
+            let configured = self.config.primary.to_ascii_uppercase();
+            let category_of = |code: &str| -> bool {
+                self.config
+                    .crypto_watchlist
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(code))
+                    || provider::is_crypto(code)
+            };
+            let mut fiat: Vec<String> = self
+                .config
+                .watchlist
+                .iter()
+                .map(|s| s.to_ascii_uppercase())
+                .collect();
+            let mut crypto: Vec<String> = self
+                .config
+                .crypto_watchlist
+                .iter()
+                .map(|s| s.to_ascii_uppercase())
+                .collect();
+            let prepend = |code: &str,
+                           fiat: &mut Vec<String>,
+                           crypto: &mut Vec<String>| {
+                let target = if category_of(code) { crypto } else { fiat };
+                target.retain(|c| c != code);
+                target.insert(0, code.to_string());
+            };
+            // Step 1: promote old_primary (skipped if it's already
+            // the configured primary — step 2 will handle it).
+            if old_primary != configured && !configured.is_empty() {
+                prepend(&old_primary, &mut fiat, &mut crypto);
+            }
+            // Step 2: promote the configured primary so it stays
+            // permanently anchored at the top of its category.
+            if !configured.is_empty() {
+                prepend(&configured, &mut fiat, &mut crypto);
+            } else if old_primary != configured {
+                // Defensive fallback: if configured is somehow blank,
+                // at least keep the previous old_primary behaviour.
+                prepend(&old_primary, &mut fiat, &mut crypto);
+            }
+            let (alts, cs) = build_alternates(&fiat, &crypto, &new_upper);
+            self.alternates = alts;
+            self.crypto_start = cs;
         }
 
         // Selection: find the old-primary row in the new list. For
@@ -894,6 +992,12 @@ impl Widget for ForexWidget {
         const MIN_GRAPH_W: u16 = 24;
         let is_wide = body.width >= WIDE_LIST_W + MIN_GRAPH_W;
         let with_stats = is_wide && body.width >= WIDE_LIST_W + WIDE_STATS_W + MIN_GRAPH_W;
+        // Scaling factor for rate-shaped displays in the graph header,
+        // y-axis, and stats panel. e.g. KRW=1000 turns the graph's
+        // "1 KRW = 0.0007 USD" into "1000 KRW = 0.7 USD". Configured
+        // per-currency via `[canonical_units]` in forex.toml, falling
+        // back to the built-in map (`default_canonical_unit`).
+        let primary_unit = canonical_amount(&self.config, &self.primary);
 
         if is_wide {
             let mut constraints: Vec<Constraint> =
@@ -922,6 +1026,9 @@ impl Widget for ForexWidget {
                 list_area,
                 &rows,
                 &self.primary,
+                // rows = [primary, alternates..., transient?] → crypto
+                // section starts at `1 + crypto_start` in rows space.
+                1 + self.crypto_start,
                 self.amount,
                 editing.as_deref(),
                 &quotes,
@@ -942,6 +1049,7 @@ impl Widget for ForexWidget {
                     stats_area,
                     selected_code.as_deref(),
                     &self.primary,
+                    primary_unit,
                     &quotes,
                     &self.theme,
                 );
@@ -951,6 +1059,7 @@ impl Widget for ForexWidget {
                 graph_area,
                 selected_code.as_deref(),
                 &self.primary,
+                primary_unit,
                 &quotes,
                 self.period,
                 self.config.graph_high_low_lines,
@@ -977,6 +1086,7 @@ impl Widget for ForexWidget {
                 rows_layout[0],
                 &rows,
                 &self.primary,
+                1 + self.crypto_start,
                 self.amount,
                 editing.as_deref(),
                 &quotes,
@@ -996,6 +1106,7 @@ impl Widget for ForexWidget {
                 rows_layout[2],
                 selected_code.as_deref(),
                 &self.primary,
+                primary_unit,
                 &quotes,
                 self.period,
                 self.config.graph_high_low_lines,
@@ -1335,6 +1446,10 @@ fn render_list_panel<F>(
     area: Rect,
     rows: &[String],
     primary: &str,
+    // Index in `rows` where the crypto section begins. Equals
+    // `rows.len()` when no crypto alternates are configured —
+    // the renderer then never emits a `── Crypto ──` header.
+    crypto_row_start: usize,
     amount: f64,
     editing: Option<&str>,
     quotes: &HashMap<String, QuoteState>,
@@ -1361,7 +1476,8 @@ where
     // *logical* line index — convert to absolute later.
     let mut hits_by_logical: Vec<(usize, RowHits)> = Vec::new();
 
-    let mut alternates_separator_emitted = false;
+    let mut currencies_header_emitted = false;
+    let mut crypto_header_emitted = false;
     let mut transient_header_emitted = false;
 
     // Top padding: a blank row above the primary row gives the list
@@ -1370,16 +1486,27 @@ where
 
     for (i, code) in rows.iter().enumerate() {
         let is_primary = code == primary;
-        // Visual separator between the primary row and the alternates
-        // section: a blank line + the "── Currencies ──" header so the
-        // two halves of the list are clearly distinct.
-        if !is_primary && !alternates_separator_emitted {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "── Currencies ──",
-                theme.text_dim,
-            )));
-            alternates_separator_emitted = true;
+        // Emit the appropriate category header the first time we hit
+        // each section. `build_alternates` guarantees fiat indices
+        // come before crypto indices in the underlying alternates
+        // list, so checking against `crypto_row_start` is enough.
+        if !is_primary {
+            let is_crypto_row = i >= crypto_row_start && !(has_transient && i == rows.len() - 1);
+            if is_crypto_row && !crypto_header_emitted {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "── Crypto ──",
+                    theme.text_dim,
+                )));
+                crypto_header_emitted = true;
+            } else if !is_crypto_row && !currencies_header_emitted {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "── Currencies ──",
+                    theme.text_dim,
+                )));
+                currencies_header_emitted = true;
+            }
         }
         if has_transient && !transient_header_emitted && i == rows.len() - 1 && !is_primary {
             lines.push(Line::from(""));
@@ -1644,11 +1771,18 @@ fn build_list_row(
 }
 
 #[allow(clippy::too_many_arguments)]
+// `primary_unit` is the canonical display unit for the primary currency
+// (USD=1, JPY=100, KRW=1000, …). Rate-shaped values rendered in the
+// header and on the y-axis are multiplied by it so "1 KRW = 0.0007 USD"
+// becomes "1000 KRW = 0.7 USD" — much easier to read for currencies
+// where 1 unit is fractional cents.
+#[allow(clippy::too_many_arguments)]
 fn render_graph_panel(
     frame: &mut Frame,
     area: Rect,
     selected: Option<&str>,
     primary: &str,
+    primary_unit: f64,
     quotes: &HashMap<String, QuoteState>,
     period: Period,
     show_high_low_lines: bool,
@@ -1722,14 +1856,21 @@ fn render_graph_panel(
     } else {
         (Color::Red, '▼')
     };
+    // Scale the header's rate + absolute-change values by the
+    // primary's canonical unit so micro-rates (KRW, IDR, VND) display
+    // at a human-readable magnitude. The percentage change is a ratio
+    // and stays as-is.
+    let scaled_price = quote.price * primary_unit;
+    let scaled_chg = chg * primary_unit;
+    let unit_label = format_unit_count(primary_unit);
     let header = Line::from(vec![
         Span::styled(
-            format!("1 {primary} = {:.4} {target}", quote.price),
+            format!("{unit_label} {primary} = {:.4} {target}", scaled_price),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
-            format!("{glyph} {:+.4} ({:+.2}%) {}", chg, pct, period.label()),
+            format!("{glyph} {:+.4} ({:+.2}%) {}", scaled_chg, pct, period.label()),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
     ]);
@@ -1769,7 +1910,12 @@ fn render_graph_panel(
     }
     for row in label_rows(plot_h) {
         let frac = row as f64 / (plot_h as f64 - 1.0).max(1.0);
-        let v = max - frac * (max - min);
+        // Scale the y-axis tick value by the primary's canonical unit
+        // so it matches the header. The graph trace itself stays
+        // pinned to the raw `[min, max]` series — only the labels
+        // are scaled, which is fine since scaling is linear and the
+        // visual position of each tick is unchanged.
+        let v = (max - frac * (max - min)) * primary_unit;
         let rect = Rect {
             x: area.x,
             y: plot_top + row,
@@ -2142,11 +2288,16 @@ fn label_rows(plot_h: u16) -> Vec<u16> {
     rows
 }
 
+// `primary_unit` — same scaling factor as the graph (see
+// `render_graph_panel`). All rate-shaped stats (Rate, Prev Close, Day
+// O/H/L, Day Δ absolute, 52w H/L) get multiplied by this; ratios
+// (% change, vs-H/L, volatility) stay raw.
 fn render_stats_panel(
     frame: &mut Frame,
     area: Rect,
     selected: Option<&str>,
     primary: &str,
+    primary_unit: f64,
     quotes: &HashMap<String, QuoteState>,
     theme: &Theme,
 ) {
@@ -2181,15 +2332,20 @@ fn render_stats_panel(
     // never approach the bottom of the cell so we don't need a
     // matching bottom pad.
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("{}/{}", primary, target),
-        theme.text_focused,
-    )));
+    // Title surfaces the scaling factor when it's not 1 ("KRW/USD
+    // (per 1000)") so the reader knows the numbers below are scaled
+    // and matches what the graph header shows.
+    let title = if (primary_unit - 1.0).abs() < 1e-9 {
+        format!("{}/{}", primary, target)
+    } else {
+        format!("{}/{} (per {})", primary, target, format_unit_count(primary_unit))
+    };
+    lines.push(Line::from(Span::styled(title, theme.text_focused)));
     lines.push(Line::from(""));
-    lines.push(stat_line("Rate", &format!("{:.6}", q.price), theme));
+    lines.push(stat_line("Rate", &format!("{:.6}", q.price * primary_unit), theme));
     lines.push(stat_line(
         "Prev Close",
-        &format!("{:.6}", q.previous_close),
+        &format!("{:.6}", q.previous_close * primary_unit),
         theme,
     ));
     if let (Some(o), Some(h), Some(l)) = (
@@ -2197,14 +2353,38 @@ fn render_stats_panel(
         q.day_high,
         q.day_low,
     ) {
-        lines.push(stat_line("Day Open", &format!("{o:.4}"), theme));
-        lines.push(stat_line("Day H/L", &format!("{h:.4} / {l:.4}"), theme));
+        lines.push(stat_line(
+            "Day Open",
+            &format!("{:.4}", o * primary_unit),
+            theme,
+        ));
+        lines.push(stat_line(
+            "Day H/L",
+            &format!("{:.4} / {:.4}", h * primary_unit, l * primary_unit),
+            theme,
+        ));
     } else if let (Some(h), Some(l)) = (q.day_high, q.day_low) {
-        lines.push(stat_line("Day H/L", &format!("{h:.4} / {l:.4}"), theme));
+        lines.push(stat_line(
+            "Day H/L",
+            &format!("{:.4} / {:.4}", h * primary_unit, l * primary_unit),
+            theme,
+        ));
     }
-    lines.push(stat_line("Day Δ", &format!("{:+.4} ({:+.2}%)", q.change(), q.change_pct()), theme));
+    lines.push(stat_line(
+        "Day Δ",
+        &format!(
+            "{:+.4} ({:+.2}%)",
+            q.change() * primary_unit,
+            q.change_pct()
+        ),
+        theme,
+    ));
     if let (Some(h), Some(l)) = (q.fifty_two_week_high, q.fifty_two_week_low) {
-        lines.push(stat_line("52w H/L", &format!("{h:.4} / {l:.4}"), theme));
+        lines.push(stat_line(
+            "52w H/L",
+            &format!("{:.4} / {:.4}", h * primary_unit, l * primary_unit),
+            theme,
+        ));
         let from_h = (h - q.price) / h * 100.0;
         let from_l = (q.price - l) / l * 100.0;
         lines.push(stat_line(
@@ -2306,12 +2486,56 @@ fn rolling_volatility_30d(series: &[f64]) -> Option<f64> {
 // Small helpers
 // ─────────────────────────────────────────────────────────────────────
 
+/// Format a canonical unit count for display in the graph header.
+/// Whole-number units (1, 100, 1000) render without trailing zeros;
+/// odd values (rare — only via the `[canonical_units]` TOML override)
+/// fall back to a generic 4dp formatter.
+fn format_unit_count(unit: f64) -> String {
+    if unit.fract().abs() < 1e-9 && unit.abs() < 1e9 {
+        format!("{:.0}", unit)
+    } else {
+        format!("{:.4}", unit)
+    }
+}
+
 fn canonical_amount(config: &ForexConfig, code: &str) -> f64 {
     config
         .canonical_units
         .get(code)
         .copied()
         .unwrap_or_else(|| default_canonical_unit(code))
+}
+
+/// Combined alternates list the widget keeps: every fiat code from
+/// `watchlist` first, then every crypto code from `crypto_watchlist`,
+/// each uppercased and de-duplicated (first wins), with the
+/// `primary` code filtered out. Returns the flat list plus the
+/// index at which the crypto section starts — used by the list
+/// renderer to emit `── Currencies ──` / `── Crypto ──` headers
+/// at the right boundaries without re-classifying each code.
+fn build_alternates(
+    fiat_codes: &[String],
+    crypto_codes: &[String],
+    primary: &str,
+) -> (Vec<String>, usize) {
+    let mut out: Vec<String> = Vec::new();
+    let push = |code: &str, out: &mut Vec<String>| {
+        let upper = code.to_ascii_uppercase();
+        if upper == primary {
+            return;
+        }
+        if !out.iter().any(|c| c == &upper) {
+            out.push(upper);
+        }
+    };
+    for code in fiat_codes {
+        push(code, &mut out);
+    }
+    let crypto_start = out.len();
+    for code in crypto_codes {
+        push(code, &mut out);
+    }
+    (out, crypto_start)
 }
 
 fn format_amount(v: f64) -> String {
@@ -2462,6 +2686,33 @@ const COMMON_CURRENCIES: &[&str] = &[
 mod tests {
     use super::*;
 
+    #[test]
+    fn build_alternates_concats_lists_dedupes_filters_primary() {
+        let fiat: Vec<String> = ["EUR", "JPY", "USD", "eur"]
+            .iter().map(|s| s.to_string()).collect();
+        let crypto: Vec<String> = ["BTC", "ETH", "btc"]
+            .iter().map(|s| s.to_string()).collect();
+        let (out, cs) = build_alternates(&fiat, &crypto, "USD");
+        assert_eq!(out, vec!["EUR", "JPY", "BTC", "ETH"]);
+        assert_eq!(cs, 2, "crypto section starts after the two fiat entries");
+    }
+
+    #[test]
+    fn build_alternates_returns_empty_when_all_are_primary() {
+        let fiat = vec!["usd".into(), "USD".into()];
+        let crypto: Vec<String> = vec![];
+        let (out, cs) = build_alternates(&fiat, &crypto, "USD");
+        assert!(out.is_empty());
+        assert_eq!(cs, 0);
+    }
+
+    #[test]
+    fn build_alternates_handles_only_crypto() {
+        let (out, cs) = build_alternates(&[], &["BTC".into(), "ETH".into()], "USD");
+        assert_eq!(out, vec!["BTC", "ETH"]);
+        assert_eq!(cs, 0, "no fiat entries → crypto starts at index 0");
+    }
+
     fn build_widget(cfg: ForexConfig) -> ForexWidget {
         ForexWidget::with_config(
             "main".to_string(),
@@ -2511,6 +2762,7 @@ mod tests {
     fn initial_amount_is_canonical_for_configured_primary() {
         let cfg = ForexConfig {
             primary: "JPY".into(),
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         };
         let w = build_widget(cfg);
@@ -2523,6 +2775,7 @@ mod tests {
         let cfg = ForexConfig {
             primary: "USD".into(),
             watchlist: vec!["EUR".into(), "USD".into(), "JPY".into()],
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         };
         let w = build_widget(cfg);
@@ -2535,6 +2788,7 @@ mod tests {
         let cfg = ForexConfig {
             primary: "USD".into(),
             watchlist: vec!["EUR".into(), "JPY".into()],
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         };
         let mut w = build_widget(cfg);
@@ -2553,10 +2807,36 @@ mod tests {
     }
 
     #[test]
+    fn swap_to_crypto_primary_forces_amount_to_one() {
+        // Fiat-amount preservation is the wrong default for crypto:
+        // "1523.80 USD × 1/90,000 BTC ≈ 0.01693 BTC" buries the
+        // per-unit comparison the user actually wants from a crypto
+        // primary. We always seed crypto primaries with 1.0.
+        let mut w = build_widget(ForexConfig {
+            primary: "USD".into(),
+            watchlist: vec!["EUR".into()],
+            crypto_watchlist: vec!["BTC".into()],
+            ..Default::default()
+        });
+        w.amount = 1523.80;
+        // Seed a rate so the converted-amount path would otherwise
+        // produce a non-1.0 value; the crypto branch must override.
+        let usd_btc = rate("USD", "BTC", 1.0 / 90_000.0);
+        w.state.lock().unwrap().quotes.insert(
+            YahooForexProvider::symbol_for("USD", "BTC"),
+            QuoteState::Ready(Box::new(usd_btc)),
+        );
+        w.swap_primary("BTC");
+        assert_eq!(w.primary, "BTC");
+        assert_eq!(w.amount, 1.0, "crypto primary always seeds amount=1.0");
+    }
+
+    #[test]
     fn swap_primary_auto_selects_old_primary_row() {
         let cfg = ForexConfig {
             primary: "USD".into(),
             watchlist: vec!["EUR".into(), "JPY".into()],
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         };
         let mut w = build_widget(cfg);
@@ -2579,6 +2859,7 @@ mod tests {
         let mut w = build_widget(ForexConfig {
             primary: "USD".into(),
             watchlist: vec!["EUR".into(), "JPY".into()],
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         });
         // Seed a rate so swap_primary has something to convert through.
@@ -2600,6 +2881,7 @@ mod tests {
         let mut w = build_widget(ForexConfig {
             primary: "USD".into(),
             watchlist: vec!["EUR".into(), "JPY".into()],
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         });
         w.state.lock().unwrap().quotes.insert(
@@ -2620,6 +2902,7 @@ mod tests {
         let mut w = build_widget(ForexConfig {
             primary: "USD".into(),
             watchlist: vec![],
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         });
         let amount_before = w.amount;
@@ -2636,6 +2919,7 @@ mod tests {
         let mut w = build_widget(ForexConfig {
             primary: "USD".into(),
             watchlist: vec!["EUR".into(), "JPY".into()],
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         });
         assert_eq!(w.state.lock().unwrap().selected, 1);
@@ -2662,6 +2946,7 @@ mod tests {
     fn reset_amount_returns_to_canonical_for_current_primary() {
         let mut w = build_widget(ForexConfig {
             primary: "USD".into(),
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         });
         w.amount = 9999.0;
@@ -2727,6 +3012,7 @@ mod tests {
         let mut w = build_widget(ForexConfig {
             primary: "USD".into(),
             watchlist: vec!["EUR".into(), "JPY".into()],
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         });
         // Move selection off EUR first so we can prove the bounce works.
@@ -2757,6 +3043,7 @@ mod tests {
         let mut w = build_widget(ForexConfig {
             primary: "USD".into(),
             watchlist: vec!["EUR".into()],
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         });
         assert!(w.handle_fx_command(&["NOK"]).is_ok());
@@ -2781,6 +3068,7 @@ mod tests {
         let mut w = build_widget(ForexConfig {
             primary: "USD".into(),
             watchlist: vec!["EUR".into(), "JPY".into()],
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         });
         // Seed a rate so the amount-conversion path doesn't fall back.
@@ -2798,6 +3086,65 @@ mod tests {
     }
 
     #[test]
+    fn configured_primary_stays_anchored_across_multi_hop_swaps() {
+        // The bug: USD→BTC→ETH used to drop USD because every swap
+        // rebuilds from `config.{watchlist, crypto_watchlist}` (which
+        // never contain USD) and only the *immediately previous*
+        // primary got re-promoted. After the second hop, the
+        // previous primary became BTC and USD fell off the list.
+        let mut w = build_widget(ForexConfig {
+            primary: "USD".into(),
+            watchlist: vec!["EUR".into(), "JPY".into()],
+            crypto_watchlist: vec!["BTC".into(), "ETH".into(), "SOL".into()],
+            ..Default::default()
+        });
+        // USD → BTC
+        w.swap_primary("BTC");
+        assert!(w.alternates.contains(&"USD".to_string()), "after USD→BTC");
+        // BTC → ETH (this is the multi-hop step that used to lose USD)
+        w.swap_primary("ETH");
+        assert!(
+            w.alternates.contains(&"USD".to_string()),
+            "USD must still be in alternates after multi-hop swap"
+        );
+        // USD anchored at position 0 of its native (fiat) category.
+        assert_eq!(w.alternates[0], "USD");
+        // BTC promoted as the "just-swapped-away" primary at the top
+        // of the crypto section.
+        assert_eq!(w.alternates[w.crypto_start], "BTC");
+
+        // Another hop: ETH → SOL. USD still anchored.
+        w.swap_primary("SOL");
+        assert_eq!(w.alternates[0], "USD");
+        assert!(w.alternates.contains(&"ETH".to_string()));
+    }
+
+    #[test]
+    fn swap_to_crypto_promotes_configured_primary_into_currency_alternates() {
+        // User config: primary=USD, fiat watchlist doesn't include USD,
+        // crypto_watchlist seeds BTC. Swapping primary to BTC must
+        // surface USD in the currencies section (position 0 of fiat),
+        // otherwise USD becomes uncomparable mid-session.
+        let mut w = build_widget(ForexConfig {
+            primary: "USD".into(),
+            watchlist: vec!["EUR".into(), "JPY".into()],
+            crypto_watchlist: vec!["BTC".into(), "ETH".into()],
+            ..Default::default()
+        });
+        // Before swap, alternates carry only the configured lists
+        // (no USD, since USD is primary).
+        assert!(!w.alternates.contains(&"USD".to_string()));
+        w.swap_primary("BTC");
+        assert_eq!(w.primary, "BTC");
+        // USD lands at position 0 of fiat; crypto_start bumps to
+        // account for the inserted entry.
+        assert_eq!(w.alternates[0], "USD");
+        assert!(w.alternates.contains(&"USD".to_string()));
+        // ETH is the only remaining crypto (BTC is now primary).
+        assert_eq!(w.alternates.last().map(|s| s.as_str()), Some("ETH"));
+    }
+
+    #[test]
     fn swap_back_to_configured_primary_restores_original_alternates_order() {
         // Drift scenario: config primary = USD, alternates = [EUR, GBP, JPY].
         // Swap USD → EUR → GBP → USD. After the final swap back to
@@ -2806,6 +3153,7 @@ mod tests {
         let mut w = build_widget(ForexConfig {
             primary: "USD".into(),
             watchlist: vec!["EUR".into(), "GBP".into(), "JPY".into()],
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         });
         // Seed rates so amount-conversion doesn't fall back at each hop.
@@ -2850,6 +3198,7 @@ mod tests {
         let mut w = build_widget(ForexConfig {
             primary: "USD".into(),
             watchlist: vec!["EUR".into()],
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         });
         w.handle_fx_command(&["NOK"]).unwrap();
@@ -2868,6 +3217,7 @@ mod tests {
         let w = build_widget(ForexConfig {
             primary: "USD".into(),
             watchlist: vec!["EUR".into(), "JPY".into()],
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         });
         assert_eq!(w.state.lock().unwrap().selected, 1);
@@ -2878,6 +3228,7 @@ mod tests {
         let mut w = build_widget(ForexConfig {
             primary: "USD".into(),
             watchlist: vec!["EUR".into()],
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         });
         w.amount = 250.0;
@@ -2890,6 +3241,7 @@ mod tests {
         let mut w = build_widget(ForexConfig {
             primary: "USD".into(),
             watchlist: vec!["EUR".into()],
+            crypto_watchlist: Vec::new(),
             ..Default::default()
         });
         w.amount = 100.0;
