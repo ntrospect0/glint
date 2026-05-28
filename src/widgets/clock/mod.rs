@@ -58,6 +58,27 @@ impl Mode {
     fn all() -> &'static [Mode] {
         &[Mode::Clock, Mode::Stopwatch, Mode::Timer]
     }
+
+    /// Lowercase persistence key for the runtime-state file.
+    fn persist_key(self) -> &'static str {
+        match self {
+            Self::Clock => "clock",
+            Self::Stopwatch => "stopwatch",
+            Self::Timer => "timer",
+        }
+    }
+
+    /// Inverse of `persist_key`. Case-insensitive so the file can
+    /// be hand-edited without surprises. Unknown values yield `None`
+    /// and the caller falls back to the default.
+    fn from_persist_key(key: &str) -> Option<Self> {
+        match key.to_ascii_lowercase().as_str() {
+            "clock" => Some(Self::Clock),
+            "stopwatch" => Some(Self::Stopwatch),
+            "timer" => Some(Self::Timer),
+            _ => None,
+        }
+    }
 }
 
 // ─── stopwatch state ──────────────────────────────────────────────
@@ -637,6 +658,15 @@ impl ClockWidget {
                     state.timer.phase = TimerPhase::Paused {
                         remaining: Duration::from_secs(secs),
                     };
+                }
+            }
+            // Restore last-active mode so a relaunch lands the user
+            // back on the view they were using (Clock / Stopwatch /
+            // Timer). Unknown values fall back to `Mode::default()`,
+            // which `ClockState::default()` already set.
+            if let Some(mode_key) = entry.mode.as_deref() {
+                if let Some(m) = Mode::from_persist_key(mode_key) {
+                    state.mode = m;
                 }
             }
         }
@@ -2073,6 +2103,11 @@ impl ClockWidget {
             .map(|d| d.as_millis() as u64)
             .collect();
 
+        // Active mode — restored on next launch so the user lands
+        // back on the Clock / Stopwatch / Timer view they were
+        // using.
+        entry.mode = Some(st.mode.persist_key().to_string());
+
         drop(st);
         if let Err(err) = crate::runtime_state::save(&state) {
             tracing::warn!(error = %err, "failed to persist clock state");
@@ -2080,8 +2115,7 @@ impl ClockWidget {
     }
 
     fn switch_mode(&self, target: Mode) {
-        let mut reverted_edit = false;
-        {
+        let mode_changed = {
             let mut st = self.state.lock().expect("clock state poisoned");
             // Bailing out of Timer mode while editing implicitly
             // cancels the edit — restore the phase the user was in
@@ -2091,12 +2125,13 @@ impl ClockWidget {
             if st.mode == Mode::Timer && target != Mode::Timer {
                 if let TimerPhase::Editing { prior_phase } = st.timer.phase.clone() {
                     st.timer.phase = *prior_phase;
-                    reverted_edit = true;
                 }
             }
+            let prev = st.mode;
             st.mode = target;
-        }
-        if reverted_edit {
+            prev != target
+        };
+        if mode_changed {
             self.persist_clock_state();
         }
     }

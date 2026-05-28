@@ -356,7 +356,6 @@ impl StocksWidget {
             }
         };
         let display_mode = config.default_display_mode;
-        let period = config.default_period;
         let theme = app_theme.with_overrides(&config.colors);
         let shortcut_prefs = if config.shortcuts.is_empty() {
             vec!['s', 't', 'o', 'c', 'k']
@@ -368,6 +367,19 @@ impl StocksWidget {
         } else {
             format!("stocks@{instance}")
         };
+        // Restore period + selected symbol from the runtime-state file
+        // so a relaunch lands the user back on the ticker/period they
+        // were last looking at. Persisted values that no longer fit
+        // (unknown period label, symbol no longer in indices /
+        // watchlist) silently fall back to the configured defaults
+        // rather than refusing to load.
+        let persisted = crate::runtime_state::load();
+        let widget_entry = persisted.stocks.get(&id);
+        let period = widget_entry
+            .and_then(|e| e.period.as_deref())
+            .and_then(Period::from_label)
+            .unwrap_or(config.default_period);
+        let persisted_symbol = widget_entry.and_then(|e| e.selected_symbol.clone());
         let display_name_cache = if instance == "main" {
             "Stocks".to_string()
         } else {
@@ -393,7 +405,7 @@ impl StocksWidget {
         initial_state
             .poll
             .apply_jitter(&format!("stocks@{instance}"));
-        Self {
+        let widget = Self {
             id,
             instance,
             display_name_cache,
@@ -408,6 +420,41 @@ impl StocksWidget {
             shortcut_prefs,
             cache,
             feedback_pending: AtomicBool::new(false),
+        };
+        // Restore selection now that the symbol list is reachable
+        // via `all_symbols()`. Symbols are matched case-insensitively
+        // — Yahoo tickers are nominally uppercase but we accept the
+        // persisted casing either way.
+        if let Some(sym) = persisted_symbol {
+            let symbols = widget.all_symbols();
+            if let Some(idx) = symbols
+                .iter()
+                .position(|s| s.eq_ignore_ascii_case(&sym))
+            {
+                widget
+                    .state
+                    .lock()
+                    .expect("stocks state poisoned")
+                    .selected = idx;
+            }
+        }
+        widget
+    }
+
+    /// Snapshot the user's "last view" (selected ticker + active
+    /// period) into the runtime-state file. Called from the few
+    /// state-change paths where one of those values mutates —
+    /// `set_period`, `move_selection`, list-click, `:stock` lookup.
+    /// Failures log + return; persisting is best-effort and should
+    /// never disrupt the dashboard.
+    fn persist_runtime_state(&self) {
+        let mut payload = crate::runtime_state::load();
+        let selected = self.selected_symbol();
+        let entry = payload.stocks.entry(self.id.clone()).or_default();
+        entry.selected_symbol = selected;
+        entry.period = Some(self.period.label().to_string());
+        if let Err(err) = crate::runtime_state::save(&payload) {
+            tracing::warn!(error = %err, "failed to persist stocks runtime state");
         }
     }
 
@@ -427,6 +474,7 @@ impl StocksWidget {
         // buckets for previously-visited periods stay intact and
         // re-display instantly.
         self.mark_dirty();
+        self.persist_runtime_state();
     }
 
     /// Cycle period forward (`true`) or backward (`false`) through Period::ALL,
@@ -612,9 +660,16 @@ impl StocksWidget {
         if n == 0 {
             return;
         }
-        let mut st = self.state.lock().expect("stocks state poisoned");
-        let new = (st.selected as isize + delta).clamp(0, n as isize - 1);
-        st.selected = new as usize;
+        let changed = {
+            let mut st = self.state.lock().expect("stocks state poisoned");
+            let prev = st.selected;
+            let new = (prev as isize + delta).clamp(0, n as isize - 1) as usize;
+            st.selected = new;
+            new != prev
+        };
+        if changed {
+            self.persist_runtime_state();
+        }
     }
 
     fn selected_symbol(&self) -> Option<String> {
@@ -638,9 +693,16 @@ impl StocksWidget {
         // pointing past the end of the visible list and nothing
         // loads. Case-insensitive so `:stock aapl` works the same.
         if let Some(idx) = self.locate_displayed(&query_trim) {
-            let mut st = self.state.lock().expect("stocks state poisoned");
-            st.selected = idx;
-            st.transient_searching = None;
+            let changed = {
+                let mut st = self.state.lock().expect("stocks state poisoned");
+                let prev = st.selected;
+                st.selected = idx;
+                st.transient_searching = None;
+                idx != prev
+            };
+            if changed {
+                self.persist_runtime_state();
+            }
             return;
         }
         // If it already looks like a ticker (short, ASCII-uppercase + ^ . - =)
@@ -1590,8 +1652,15 @@ impl Widget for StocksWidget {
                             has_lookup,
                             scroll,
                         ) {
-                            let mut st = self.state.lock().expect("stocks state poisoned");
-                            st.selected = idx;
+                            let changed = {
+                                let mut st = self.state.lock().expect("stocks state poisoned");
+                                let prev = st.selected;
+                                st.selected = idx;
+                                idx != prev
+                            };
+                            if changed {
+                                self.persist_runtime_state();
+                            }
                             return EventResult::Handled;
                         }
                     }

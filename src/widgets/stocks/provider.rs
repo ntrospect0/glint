@@ -59,6 +59,25 @@ impl Period {
         }
     }
 
+    /// Parse a period label (case-insensitive). Used by the runtime-
+    /// state restore path so persisted labels round-trip through
+    /// disk. `None` for anything that doesn't match, which lets the
+    /// caller fall back to the configured default instead of panicking.
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label.to_ascii_uppercase().as_str() {
+            "1D" => Some(Period::Day),
+            "1W" => Some(Period::Week),
+            "1M" => Some(Period::Month),
+            "6M" => Some(Period::SixMonth),
+            "YTD" => Some(Period::YearToDate),
+            "1Y" => Some(Period::Year),
+            "3Y" => Some(Period::ThreeYear),
+            "5Y" => Some(Period::FiveYear),
+            "10Y" => Some(Period::TenYear),
+            _ => None,
+        }
+    }
+
     /// (interval, range) query parameters for Yahoo's v8/chart endpoint.
     /// Longer windows use coarser intervals so the series stays a sane size.
     /// Yahoo doesn't expose a native 3-year range; we request 5y and trim
@@ -819,6 +838,19 @@ pub(super) fn downsample_pairs_to_max(pairs: Vec<(i64, f64)>, max: usize) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn period_from_label_round_trips_all_labels() {
+        for p in Period::ALL {
+            assert_eq!(Period::from_label(p.label()), Some(p));
+            // Lower-case input must also work — the runtime-state
+            // file stores labels as the widget hands them out (we
+            // already emit upper-case), but a hand-edited file
+            // could lower-case them.
+            assert_eq!(Period::from_label(&p.label().to_ascii_lowercase()), Some(p));
+        }
+        assert_eq!(Period::from_label("not-a-period"), None);
+    }
 
     /// Yahoo ships `tradingPeriods` in three shapes; our deserializer
     /// has to accept all three or the whole `chart` response fails

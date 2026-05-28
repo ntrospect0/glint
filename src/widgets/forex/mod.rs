@@ -400,7 +400,18 @@ impl ForexWidget {
         };
         let primary = config.primary.to_ascii_uppercase();
         let amount = canonical_amount(&config, &primary);
-        let period = config.default_period;
+        // Restore period + selected code from the runtime-state file
+        // so a relaunch lands the user back on the currency/period
+        // they were last viewing. Unknown period labels and codes
+        // that aren't in the configured watchlists silently fall
+        // back to the defaults.
+        let persisted = crate::runtime_state::load();
+        let widget_entry = persisted.forex.get(&id);
+        let period = widget_entry
+            .and_then(|e| e.period.as_deref())
+            .and_then(Period::from_label)
+            .unwrap_or(config.default_period);
+        let persisted_code = widget_entry.and_then(|e| e.selected_code.clone());
         let poll_interval = Duration::from_secs(config.poll_interval_secs.max(60));
         // Alternates: fiat from `watchlist` then crypto from
         // `crypto_watchlist`, primary filtered out, codes normalized
@@ -431,7 +442,7 @@ impl ForexWidget {
             .poll
             .apply_jitter(&format!("forex@{instance}"));
 
-        Self {
+        let widget = Self {
             id,
             instance,
             display_name_cache,
@@ -449,6 +460,39 @@ impl ForexWidget {
             shortcut_prefs,
             cache,
             feedback_pending: AtomicBool::new(false),
+        };
+        // Restore selection after `Self` is built — `all_rows()`
+        // needs the constructed widget to compose primary +
+        // alternates + transient. Codes are matched case-
+        // insensitively. Unknown codes (e.g. a previously-pinned
+        // currency that's no longer in the watchlist) leave the
+        // auto-highlight default in place.
+        if let Some(code) = persisted_code {
+            let rows = widget.all_rows();
+            if let Some(idx) = rows.iter().position(|r| r.eq_ignore_ascii_case(&code)) {
+                widget
+                    .state
+                    .lock()
+                    .expect("forex state poisoned")
+                    .selected = idx;
+            }
+        }
+        widget
+    }
+
+    /// Snapshot the user's "last view" (selected code + active
+    /// period) into the runtime-state file. Same pattern as the
+    /// stocks widget — called from `set_period`, `move_selection`,
+    /// list-click, and lookup paths. Best-effort: logged + dropped
+    /// on failure.
+    fn persist_runtime_state(&self) {
+        let mut payload = crate::runtime_state::load();
+        let selected = self.selected_code();
+        let entry = payload.forex.entry(self.id.clone()).or_default();
+        entry.selected_code = selected;
+        entry.period = Some(self.period.label().to_string());
+        if let Err(err) = crate::runtime_state::save(&payload) {
+            tracing::warn!(error = %err, "failed to persist forex runtime state");
         }
     }
 
@@ -612,9 +656,16 @@ impl ForexWidget {
         // alternates yet, we leave selection at 0 as a safe fallback.
         let min_idx: isize = if n > 1 { 1 } else { 0 };
         let max_idx: isize = (n - 1) as isize;
-        let mut st = self.state.lock().expect("forex state poisoned");
-        let new = (st.selected as isize + delta).clamp(min_idx, max_idx);
-        st.selected = new as usize;
+        let changed = {
+            let mut st = self.state.lock().expect("forex state poisoned");
+            let prev = st.selected;
+            let new = (prev as isize + delta).clamp(min_idx, max_idx) as usize;
+            st.selected = new;
+            new != prev
+        };
+        if changed {
+            self.persist_runtime_state();
+        }
     }
 
     fn selected_code(&self) -> Option<String> {
@@ -629,6 +680,7 @@ impl ForexWidget {
         }
         self.period = period;
         self.mark_dirty();
+        self.persist_runtime_state();
     }
 
     fn cycle_period(&mut self, forward: bool) {
@@ -1661,8 +1713,15 @@ impl Widget for ForexWidget {
                     // 2d) Fallback: anywhere on the row's select range
                     //     = select that row.
                     if mouse.column >= hit.select_start && mouse.column < hit.select_end {
-                        let mut st = self.state.lock().expect("forex state poisoned");
-                        st.selected = idx;
+                        let changed = {
+                            let mut st = self.state.lock().expect("forex state poisoned");
+                            let prev = st.selected;
+                            st.selected = idx;
+                            idx != prev
+                        };
+                        if changed {
+                            self.persist_runtime_state();
+                        }
                         return EventResult::Handled;
                     }
                 }

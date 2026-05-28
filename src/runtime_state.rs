@@ -29,8 +29,13 @@ use serde::{Deserialize, Serialize};
 use crate::config::config_dir;
 
 /// Bump when the on-disk shape changes incompatibly. Old files are
-/// silently discarded (no migration in v1).
-pub const RUNTIME_STATE_VERSION: u32 = 1;
+/// silently discarded (no migration). Version 2 added the
+/// `stocks` / `forex` sections and the `clocks.mode` field; older
+/// version-1 files are still parsed as an empty state because
+/// `serde(default)` accepts the missing sections — but the version
+/// check rejects them so we don't accidentally load a v1 file with
+/// out-of-date schema assumptions baked in.
+pub const RUNTIME_STATE_VERSION: u32 = 2;
 
 /// File name (relative to the config dir). Dot-prefixed.
 pub const RUNTIME_STATE_FILENAME: &str = ".runtime_state.toml";
@@ -48,6 +53,16 @@ pub struct RuntimeState {
     /// `"clock@home"`, …). Missing entries default to empty.
     #[serde(default)]
     pub clocks: HashMap<String, ClockEntry>,
+    /// Per-stocks-instance widget state — keeps the user's selected
+    /// ticker and active period across restarts. Keyed by the widget
+    /// id (`"stocks"`, `"stocks@watch"`, …).
+    #[serde(default)]
+    pub stocks: HashMap<String, StocksEntry>,
+    /// Per-forex-instance widget state — keeps the user's selected
+    /// currency / crypto and active period across restarts. Keyed by
+    /// the widget id (`"forex"`, `"forex@crypto"`, …).
+    #[serde(default)]
+    pub forex: HashMap<String, ForexEntry>,
 }
 
 // Manual `Default` rather than `derive` so a freshly-constructed
@@ -61,6 +76,8 @@ impl Default for RuntimeState {
             version: RUNTIME_STATE_VERSION,
             stacks: HashMap::new(),
             clocks: HashMap::new(),
+            stocks: HashMap::new(),
+            forex: HashMap::new(),
         }
     }
 }
@@ -101,6 +118,45 @@ pub struct ClockEntry {
     /// across stop/restart and app shutdown.
     #[serde(default)]
     pub stopwatch_laps_ms: Vec<u64>,
+    /// Active mode at the time of last save (`"clock"`, `"stopwatch"`,
+    /// `"timer"`). `None` falls back to the configured default mode
+    /// on next launch. We persist as a string rather than the
+    /// widget's `Mode` enum so the runtime-state file stays decoupled
+    /// from the widget crate's type churn.
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+/// Per-stocks-instance persisted state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StocksEntry {
+    /// Ticker the user had highlighted when glint exited
+    /// (e.g. `"AAPL"`, `"^GSPC"`). `None` defaults to the first
+    /// row on next launch. Restored only when the symbol is still
+    /// in the configured indices / watchlist — drops the entry
+    /// silently otherwise.
+    #[serde(default)]
+    pub selected_symbol: Option<String>,
+    /// Active chart period label (`"1d"`, `"1w"`, `"1m"`, `"6m"`,
+    /// `"ytd"`, `"1y"`, `"3y"`, `"5y"`, `"10y"`). Stored as a string
+    /// so the file stays decoupled from the widget's `Period` enum;
+    /// unknown values fall back to the configured `default_period`.
+    #[serde(default)]
+    pub period: Option<String>,
+}
+
+/// Per-forex-instance persisted state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ForexEntry {
+    /// Currency / crypto code the user had highlighted at exit
+    /// (e.g. `"EUR"`, `"BTC"`, `"USD"`). `None` defaults to the
+    /// primary on next launch. Restored only when the code is still
+    /// in the configured watchlist / crypto_watchlist.
+    #[serde(default)]
+    pub selected_code: Option<String>,
+    /// Active chart period label. Same shape as `StocksEntry.period`.
+    #[serde(default)]
+    pub period: Option<String>,
 }
 
 fn default_version() -> u32 {
@@ -207,6 +263,8 @@ impl RuntimeState {
                 })
                 .collect(),
             clocks: HashMap::new(),
+            stocks: HashMap::new(),
+            forex: HashMap::new(),
         }
     }
 }
@@ -268,6 +326,64 @@ mod tests {
         let s = RuntimeState::default();
         assert_eq!(s.version, RUNTIME_STATE_VERSION);
         assert!(s.stacks.is_empty());
+        assert!(s.stocks.is_empty());
+        assert!(s.forex.is_empty());
+        assert!(s.clocks.is_empty());
+    }
+
+    #[test]
+    fn stocks_and_forex_entries_round_trip_through_toml() {
+        let mut state = RuntimeState::default();
+        state.stocks.insert(
+            "stocks".into(),
+            StocksEntry {
+                selected_symbol: Some("NVDA".into()),
+                period: Some("1W".into()),
+            },
+        );
+        state.forex.insert(
+            "forex".into(),
+            ForexEntry {
+                selected_code: Some("EUR".into()),
+                period: Some("1M".into()),
+            },
+        );
+        let text = toml::to_string_pretty(&state).unwrap();
+        let parsed: RuntimeState = toml::from_str(&text).unwrap();
+        assert_eq!(
+            parsed.stocks.get("stocks").and_then(|e| e.selected_symbol.as_deref()),
+            Some("NVDA")
+        );
+        assert_eq!(
+            parsed.stocks.get("stocks").and_then(|e| e.period.as_deref()),
+            Some("1W")
+        );
+        assert_eq!(
+            parsed.forex.get("forex").and_then(|e| e.selected_code.as_deref()),
+            Some("EUR")
+        );
+        assert_eq!(
+            parsed.forex.get("forex").and_then(|e| e.period.as_deref()),
+            Some("1M")
+        );
+    }
+
+    #[test]
+    fn clock_mode_round_trips_through_toml() {
+        let mut state = RuntimeState::default();
+        state.clocks.insert(
+            "clock".into(),
+            ClockEntry {
+                mode: Some("stopwatch".into()),
+                ..Default::default()
+            },
+        );
+        let text = toml::to_string_pretty(&state).unwrap();
+        let parsed: RuntimeState = toml::from_str(&text).unwrap();
+        assert_eq!(
+            parsed.clocks.get("clock").and_then(|e| e.mode.as_deref()),
+            Some("stopwatch")
+        );
     }
 
     #[test]
@@ -276,6 +392,8 @@ mod tests {
             version: RUNTIME_STATE_VERSION,
             stacks: HashMap::new(),
             clocks: HashMap::new(),
+            stocks: HashMap::new(),
+            forex: HashMap::new(),
         };
         state
             .stacks
