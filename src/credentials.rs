@@ -4,12 +4,12 @@
 //! On-disk credentials store — one home for every "load a TOML file
 //! holding a secret" / "write one with chmod 0600" pattern.
 //!
-//! Before this module the dance was open-coded in at least four
-//! places: `auth/google/store.rs`, `auth/microsoft/store.rs`,
-//! `auth/registry.rs`, and (for a while) the WSJ widget. Each
-//! re-implemented atomic write + `chmod 0600` independently, which
-//! is exactly the kind of security-relevant duplication that
-//! eventually ships a 0644 token file by accident.
+//! Before this module the dance was open-coded across
+//! `auth/google/store.rs`, `auth/microsoft/store.rs`, and
+//! `auth/registry.rs`. Each re-implemented atomic write +
+//! `chmod 0600` independently, which is exactly the kind of
+//! security-relevant duplication that eventually ships a 0644
+//! token file by accident.
 //!
 //! All files live under `~/.config/glint/credentials/`. The
 //! directory is created with mode `0700` on first use. Save paths
