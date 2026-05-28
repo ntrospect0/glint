@@ -1818,10 +1818,23 @@ impl Widget for FeedsWidget {
                 {
                     let new_idx = *idx;
                     let mut st = self.state.lock().expect("feeds state poisoned");
-                    if new_idx != st.selected {
+                    if new_idx == st.selected {
+                        // Second click on the already-selected article
+                        // toggles its expanded state — mirrors the `e`
+                        // / Enter / Space key behavior so a pointer-
+                        // only user can collapse / expand without
+                        // reaching for the keyboard.
+                        st.expanded = !st.expanded;
+                    } else {
+                        st.selected = new_idx;
+                        // Different article → reset the expanded-
+                        // panel scroll so a long previous summary
+                        // doesn't strand the new article off-screen.
+                        // We deliberately keep `expanded` as-is so a
+                        // user navigating through articles in
+                        // expanded mode stays in expanded mode.
                         st.expanded_scroll = 0;
                     }
-                    st.selected = new_idx;
                     EventResult::Handled
                 } else {
                     EventResult::Ignored
