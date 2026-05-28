@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 ntrospect0
 
+pub mod catalogue;
 pub mod provider;
 
 use std::{
@@ -2025,228 +2026,6 @@ fn age_label(now: chrono::DateTime<Utc>, published: chrono::DateTime<Utc>) -> St
 
 pub const KIND: &str = "news";
 
-/// Curated catalogue of major news topic categories surfaced as
-/// checkboxes in the wizard. Each entry pairs a label with a default
-/// keyword list — articles whose title or summary contains any keyword
-/// (case-insensitive substring) are tagged with that topic at runtime.
-/// Users can edit individual keyword lists in news.toml; the wizard
-/// preserves their edits when the same label stays ticked.
-pub const TOPIC_CATALOGUE: &[(&str, &[&str])] = &[
-    (
-        "Tech",
-        &[
-            "AI",
-            "OpenAI",
-            "Anthropic",
-            "LLM",
-            "GPU",
-            "developer",
-            "Linux",
-            "Rust",
-            "Apple",
-            "Google",
-            "Microsoft",
-            "Meta",
-            "chip",
-            "software",
-            "startup",
-            "open source",
-            "GitHub",
-        ],
-    ),
-    (
-        "Business",
-        &[
-            "CEO",
-            "merger",
-            "acquisition",
-            "IPO",
-            "revenue",
-            "earnings",
-            "quarterly",
-            "Wall Street",
-            "market",
-            "Fed",
-            "inflation",
-            "interest rate",
-            "Bitcoin",
-            "crypto",
-            "yield",
-            "treasury",
-            "stocks",
-            "bonds",
-            "dividend",
-            "trader",
-        ],
-    ),
-    (
-        "World",
-        &[
-            "Ukraine",
-            "Russia",
-            "China",
-            "EU",
-            "UN",
-            "climate",
-            "war",
-            "election",
-            "summit",
-            "treaty",
-            "Israel",
-            "Gaza",
-            "Iran",
-            "NATO",
-            "global",
-            "Brussels",
-            "international",
-        ],
-    ),
-    (
-        "US",
-        &[
-            "United States",
-            "U.S.",
-            "America",
-            "American",
-            "Washington",
-            "Biden",
-            "Trump",
-            "Harris",
-            "Congress",
-            "Senate",
-            "GOP",
-            "Republican",
-            "Democrat",
-            "Supreme Court",
-            "SCOTUS",
-            "White House",
-            "Pentagon",
-            "FBI",
-            "CIA",
-            "DOJ",
-            "Capitol Hill",
-            "California",
-            "New York",
-            "Texas",
-            "Florida",
-        ],
-    ),
-    (
-        "Canada",
-        &[
-            "Canada",
-            "Canadian",
-            "Ottawa",
-            "Toronto",
-            "Vancouver",
-            "Montreal",
-            "Quebec",
-            "Alberta",
-            "B.C.",
-            "Trudeau",
-            "Carney",
-            "CBC",
-            "Bank of Canada",
-            "Loonie",
-        ],
-    ),
-    (
-        "Entertainment",
-        &[
-            "movie",
-            "film",
-            "actor",
-            "actress",
-            "Hollywood",
-            "Netflix",
-            "HBO",
-            "Disney",
-            "Oscar",
-            "Grammy",
-            "Emmy",
-            "show",
-            "series",
-            "trailer",
-            "album",
-            "song",
-            "single",
-            "artist",
-            "band",
-            "concert",
-            "tour",
-            "music",
-            "EP",
-            "soundtrack",
-        ],
-    ),
-];
-
-/// Curated catalogue of well-known RSS / Atom feeds surfaced as
-/// checkboxes in the wizard. `(label, url)` pairs are `&'static str` so
-/// they can drop straight into `ChoiceOption`. Users with custom feeds
-/// add `[[feeds]]` blocks in news.toml after the wizard runs — those
-/// are preserved across `--setup` re-runs.
-pub const FEED_CATALOGUE: &[(&str, &str)] = &[
-    // Tech
-    ("Hacker News", "https://hnrss.org/frontpage"),
-    (
-        "Ars Technica",
-        "https://feeds.arstechnica.com/arstechnica/index",
-    ),
-    ("The Verge", "https://www.theverge.com/rss/index.xml"),
-    ("Engadget", "https://www.engadget.com/rss.xml"),
-    ("Phoronix", "https://www.phoronix.com/rss.php"),
-    // World
-    ("BBC News", "http://feeds.bbci.co.uk/news/rss.xml"),
-    ("BBC World", "http://feeds.bbci.co.uk/news/world/rss.xml"),
-    ("Guardian World", "https://www.theguardian.com/world/rss"),
-    ("NPR World", "https://feeds.npr.org/1004/rss.xml"),
-    // US — non-paywalled public-broadcasting / network outlets so a
-    // fresh install gets a credible US news mix without nudging users
-    // toward subscription-gated sources.
-    ("NPR Top Stories", "https://feeds.npr.org/1001/rss.xml"),
-    (
-        "PBS NewsHour",
-        "https://www.pbs.org/newshour/feeds/rss/headlines",
-    ),
-    ("CBS News", "https://www.cbsnews.com/latest/rss/main"),
-    ("The Hill", "https://thehill.com/news/feed/"),
-    ("ABC News", "https://abcnews.go.com/abcnews/topstories"),
-    // Business / Markets
-    (
-        "BBC Business",
-        "http://feeds.bbci.co.uk/news/business/rss.xml",
-    ),
-    ("Yahoo Finance", "https://finance.yahoo.com/news/rssindex"),
-    (
-        "MarketWatch",
-        "http://feeds.marketwatch.com/marketwatch/topstories/",
-    ),
-    (
-        "CNBC Top",
-        "https://www.cnbc.com/id/100003114/device/rss/rss.html",
-    ),
-    // Canada
-    ("CBC News", "https://www.cbc.ca/webfeed/rss/rss-topstories"),
-    (
-        "CBC Politics",
-        "https://www.cbc.ca/webfeed/rss/rss-politics",
-    ),
-    (
-        "CBC Business",
-        "https://www.cbc.ca/webfeed/rss/rss-business",
-    ),
-    (
-        "CTV News",
-        "https://www.ctvnews.ca/rss/ctvnews-ca-top-stories-public-rss-1.822009",
-    ),
-    // Culture
-    ("Pitchfork", "https://pitchfork.com/rss/news/"),
-    (
-        "Hollywood Reporter",
-        "https://www.hollywoodreporter.com/feed/",
-    ),
-];
 
 /// Wizard descriptor. Surfaces a checkbox list of common feeds the user
 /// can toggle, plus the four common scalar toggles. The feed catalogue
@@ -2254,11 +2033,25 @@ pub const FEED_CATALOGUE: &[(&str, &str)] = &[
 /// outside this list are preserved verbatim across `--setup` re-runs.
 pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
     use crate::wizard::descriptor::{ChoiceOption, WizardDescriptor, WizardField, WizardFieldKind};
-    let feed_options: Vec<ChoiceOption> = FEED_CATALOGUE
+    // ChoiceOption holds `&'static str` for value/label; the catalogue
+    // comes back from TOML as owned Strings, so leak once per wizard
+    // invocation (cold-path, bounded by the catalogue size — fine).
+    let cat = catalogue::load();
+    let feed_options: Vec<ChoiceOption> = cat
+        .feeds
         .iter()
-        .map(|(label, url)| ChoiceOption {
-            value: *url,
-            label,
+        .map(|f| ChoiceOption {
+            value: Box::leak(f.url.clone().into_boxed_str()),
+            label: Box::leak(f.label.clone().into_boxed_str()),
+            help: None,
+        })
+        .collect();
+    let topic_options: Vec<ChoiceOption> = cat
+        .topics
+        .iter()
+        .map(|t| ChoiceOption {
+            value: Box::leak(t.label.clone().into_boxed_str()),
+            label: Box::leak(t.label.clone().into_boxed_str()),
             help: None,
         })
         .collect();
@@ -2288,14 +2081,7 @@ pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
                        live in news.toml — hand-edits survive re-runs.",
                 required: false,
                 kind: WizardFieldKind::MultiChoice {
-                    options: TOPIC_CATALOGUE
-                        .iter()
-                        .map(|(label, _)| ChoiceOption {
-                            value: label,
-                            label,
-                            help: None,
-                        })
-                        .collect(),
+                    options: topic_options,
                     defaults: vec!["Tech", "World", "Business"],
                 },
                 validate: None,
@@ -2388,9 +2174,10 @@ fn load_news_from_toml(
     {
         out.insert("horizontal_scroll_filters".into(), WizardValue::Bool(b));
     }
+    let cat = catalogue::load();
     if let Some(arr) = doc.get("feeds").and_then(|v| v.as_array()) {
-        let catalogue_urls: std::collections::HashSet<&'static str> =
-            FEED_CATALOGUE.iter().map(|(_, url)| *url).collect();
+        let catalogue_urls: std::collections::HashSet<&str> =
+            cat.feeds.iter().map(|f| f.url.as_str()).collect();
         let selected: Vec<String> = arr
             .iter()
             .filter_map(|entry| entry.get("url").and_then(|v| v.as_str()))
@@ -2400,8 +2187,8 @@ fn load_news_from_toml(
         out.insert("feeds".into(), WizardValue::MultiChoice(selected));
     }
     if let Some(arr) = doc.get("topics").and_then(|v| v.as_array()) {
-        let catalogue_labels: std::collections::HashSet<&'static str> =
-            TOPIC_CATALOGUE.iter().map(|(label, _)| *label).collect();
+        let catalogue_labels: std::collections::HashSet<&str> =
+            cat.topics.iter().map(|t| t.label.as_str()).collect();
         let selected: Vec<String> = arr
             .iter()
             .filter_map(|entry| entry.get("label").and_then(|v| v.as_str()))
@@ -2459,21 +2246,23 @@ fn render_news_toml(
         ),
     ];
 
+    let cat = catalogue::load();
+
     // Build the new [[feeds]] list.
     let selected_urls: Vec<&str> = match values.get("feeds") {
         Some(WizardValue::MultiChoice(items)) => items.iter().map(String::as_str).collect(),
         _ => Vec::new(),
     };
-    let catalogue_urls: std::collections::HashSet<&'static str> =
-        FEED_CATALOGUE.iter().map(|(_, url)| *url).collect();
+    let catalogue_urls: std::collections::HashSet<&str> =
+        cat.feeds.iter().map(|f| f.url.as_str()).collect();
     let mut feed_blocks = String::new();
     let mut emitted_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
     for url in &selected_urls {
-        let Some((label, _)) = FEED_CATALOGUE.iter().find(|(_, u)| u == url) else {
+        let Some(feed) = cat.feeds.iter().find(|f| f.url == *url) else {
             continue;
         };
         feed_blocks.push_str("\n[[feeds]]\n");
-        feed_blocks.push_str(&format!("label = {}\n", toml_quote(label)));
+        feed_blocks.push_str(&format!("label = {}\n", toml_quote(&feed.label)));
         feed_blocks.push_str(&format!("url = {}\n", toml_quote(url)));
         emitted_urls.insert((*url).to_string());
     }
@@ -2507,8 +2296,8 @@ fn render_news_toml(
         Some(WizardValue::MultiChoice(items)) => items.iter().map(String::as_str).collect(),
         _ => Vec::new(),
     };
-    let catalogue_topic_labels: std::collections::HashSet<&'static str> =
-        TOPIC_CATALOGUE.iter().map(|(label, _)| *label).collect();
+    let catalogue_topic_labels: std::collections::HashSet<&str> =
+        cat.topics.iter().map(|t| t.label.as_str()).collect();
     let existing_topics: std::collections::HashMap<String, Vec<String>> = existing
         .and_then(|t| toml::from_str::<toml::Value>(t).ok())
         .and_then(|doc| doc.get("topics").and_then(|v| v.as_array()).cloned())
@@ -2539,10 +2328,10 @@ fn render_news_toml(
             existing_kws.clone()
         } else {
             // First time we've seen this topic — use the catalogue default.
-            TOPIC_CATALOGUE
+            cat.topics
                 .iter()
-                .find(|(l, _)| l == label)
-                .map(|(_, kws)| kws.iter().map(|s| (*s).to_string()).collect())
+                .find(|t| t.label == *label)
+                .map(|t| t.keywords.clone())
                 .unwrap_or_default()
         };
         topic_blocks.push_str("\n[[topics]]\n");

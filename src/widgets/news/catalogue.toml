@@ -1,0 +1,175 @@
+# News widget catalogue.
+#
+# Curated topics + RSS/Atom feeds the wizard offers as checkboxes
+# on `--setup news`. Embedded into the binary at build time via
+# `include_str!`. Editing this file requires a rebuild; user-side
+# additions go directly into `~/.config/glint/news.toml` as
+# `[[topics]]` / `[[feeds]]` blocks (the wizard preserves
+# hand-added entries across re-runs).
+#
+# Each `[[topics]]` entry pairs a label with a default keyword
+# list. Articles whose title or summary contains any keyword
+# (case-insensitive substring) are tagged with that topic at
+# runtime.
+
+[[topics]]
+label = "Tech"
+keywords = [
+  "AI", "OpenAI", "Anthropic", "LLM", "GPU", "developer",
+  "Linux", "Rust", "Apple", "Google", "Microsoft", "Meta",
+  "chip", "software", "startup", "open source", "GitHub",
+]
+
+[[topics]]
+label = "Business"
+keywords = [
+  "CEO", "merger", "acquisition", "IPO", "revenue", "earnings",
+  "quarterly", "Wall Street", "market", "Fed", "inflation",
+  "interest rate", "Bitcoin", "crypto", "yield", "treasury",
+  "stocks", "bonds", "dividend", "trader",
+]
+
+[[topics]]
+label = "World"
+keywords = [
+  "Ukraine", "Russia", "China", "EU", "UN", "climate", "war",
+  "election", "summit", "treaty", "Israel", "Gaza", "Iran",
+  "NATO", "global", "Brussels", "international",
+]
+
+[[topics]]
+label = "US"
+keywords = [
+  "United States", "U.S.", "America", "American", "Washington",
+  "Biden", "Trump", "Harris", "Congress", "Senate", "GOP",
+  "Republican", "Democrat", "Supreme Court", "SCOTUS",
+  "White House", "Pentagon", "FBI", "CIA", "DOJ",
+  "Capitol Hill", "California", "New York", "Texas", "Florida",
+]
+
+[[topics]]
+label = "Canada"
+keywords = [
+  "Canada", "Canadian", "Ottawa", "Toronto", "Vancouver",
+  "Montreal", "Quebec", "Alberta", "B.C.", "Trudeau", "Carney",
+  "CBC", "Bank of Canada", "Loonie",
+]
+
+[[topics]]
+label = "Entertainment"
+keywords = [
+  "movie", "film", "actor", "actress", "Hollywood", "Netflix",
+  "HBO", "Disney", "Oscar", "Grammy", "Emmy", "show", "series",
+  "trailer", "album", "song", "single", "artist", "band",
+  "concert", "tour", "music", "EP", "soundtrack",
+]
+
+# Feeds — `(label, url)` pairs surfaced as wizard checkboxes.
+# Grouped by section for readability; the runtime treats this as
+# a flat list. Users with custom feeds add `[[feeds]]` blocks
+# directly to `news.toml`; the wizard preserves them on re-run.
+
+# --- Tech ---
+[[feeds]]
+label = "Hacker News"
+url = "https://hnrss.org/frontpage"
+
+[[feeds]]
+label = "Ars Technica"
+url = "https://feeds.arstechnica.com/arstechnica/index"
+
+[[feeds]]
+label = "The Verge"
+url = "https://www.theverge.com/rss/index.xml"
+
+[[feeds]]
+label = "Engadget"
+url = "https://www.engadget.com/rss.xml"
+
+[[feeds]]
+label = "Phoronix"
+url = "https://www.phoronix.com/rss.php"
+
+# --- World ---
+[[feeds]]
+label = "BBC News"
+url = "http://feeds.bbci.co.uk/news/rss.xml"
+
+[[feeds]]
+label = "BBC World"
+url = "http://feeds.bbci.co.uk/news/world/rss.xml"
+
+[[feeds]]
+label = "Guardian World"
+url = "https://www.theguardian.com/world/rss"
+
+[[feeds]]
+label = "NPR World"
+url = "https://feeds.npr.org/1004/rss.xml"
+
+# --- US ---
+# Non-paywalled public-broadcasting / network outlets so a fresh
+# install gets a credible US news mix without nudging users
+# toward subscription-gated sources.
+[[feeds]]
+label = "NPR Top Stories"
+url = "https://feeds.npr.org/1001/rss.xml"
+
+[[feeds]]
+label = "PBS NewsHour"
+url = "https://www.pbs.org/newshour/feeds/rss/headlines"
+
+[[feeds]]
+label = "CBS News"
+url = "https://www.cbsnews.com/latest/rss/main"
+
+[[feeds]]
+label = "The Hill"
+url = "https://thehill.com/news/feed/"
+
+[[feeds]]
+label = "ABC News"
+url = "https://abcnews.go.com/abcnews/topstories"
+
+# --- Business / Markets ---
+[[feeds]]
+label = "BBC Business"
+url = "http://feeds.bbci.co.uk/news/business/rss.xml"
+
+[[feeds]]
+label = "Yahoo Finance"
+url = "https://finance.yahoo.com/news/rssindex"
+
+[[feeds]]
+label = "MarketWatch"
+url = "http://feeds.marketwatch.com/marketwatch/topstories/"
+
+[[feeds]]
+label = "CNBC Top"
+url = "https://www.cnbc.com/id/100003114/device/rss/rss.html"
+
+# --- Canada ---
+[[feeds]]
+label = "CBC News"
+url = "https://www.cbc.ca/webfeed/rss/rss-topstories"
+
+[[feeds]]
+label = "CBC Politics"
+url = "https://www.cbc.ca/webfeed/rss/rss-politics"
+
+[[feeds]]
+label = "CBC Business"
+url = "https://www.cbc.ca/webfeed/rss/rss-business"
+
+[[feeds]]
+label = "CTV News"
+url = "https://www.ctvnews.ca/rss/ctvnews-ca-top-stories-public-rss-1.822009"
+
+# --- Culture ---
+[[feeds]]
+label = "Pitchfork"
+url = "https://pitchfork.com/rss/news/"
+
+[[feeds]]
+label = "Hollywood Reporter"
+url = "https://www.hollywoodreporter.com/feed/"
