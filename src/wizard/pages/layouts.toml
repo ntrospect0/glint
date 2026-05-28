@@ -1,0 +1,902 @@
+# Layout presets surfaced by the wizard's Layout page.
+#
+# Each `[[presets]]` block defines one named layout the user can pick
+# when seeding their dashboard. Embedded into the binary at build
+# time via `include_str!` and parsed once at first wizard step.
+# Editing requires a rebuild; adding a new layout is one new block.
+#
+# Fields:
+#   id           — stable slug used in commit telemetry.
+#   label        — header shown on the preset list.
+#   description  — one-line explainer rendered next to the label.
+#   cells        — total number of cells the layout produces.
+#   grid_cols    — width of the grid the Assign page renders against.
+#   grid_rows    — height of that grid.
+#   ascii        — multi-line preview painted on the picker.
+#   grid_def     — `[col, row, col_span, row_span]` per cell, in
+#                  registration order. Cell 0 in this array maps to
+#                  `assignments[0]` on the Assign page.
+
+[[presets]]
+id = "single"
+label = "Single pane (full screen)"
+description = "One widget filling the entire terminal. Useful for a focused tool view."
+cells = 1
+grid_cols = 1
+grid_rows = 1
+ascii = [
+  "┌──────────────┐",
+  "│              │",
+  "│              │",
+  "│              │",
+  "└──────────────┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+]
+
+[[presets]]
+id = "split_vertical"
+label = "Two columns"
+description = "Side-by-side full-height panes — good for a feed + tool combo."
+cells = 2
+grid_cols = 2
+grid_rows = 1
+ascii = [
+  "┌──────┬───────┐",
+  "│      │       │",
+  "│      │       │",
+  "│      │       │",
+  "└──────┴───────┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [1, 0, 1, 1],
+]
+
+[[presets]]
+id = "split_horizontal"
+label = "Two rows"
+description = "Stacked full-width panes — top headline + bottom detail."
+cells = 2
+grid_cols = 1
+grid_rows = 2
+ascii = [
+  "┌──────────────┐",
+  "│              │",
+  "├──────────────┤",
+  "│              │",
+  "└──────────────┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [0, 1, 1, 1],
+]
+
+[[presets]]
+id = "three_column"
+label = "Three columns"
+description = "Three equal vertical strips — full-height panels."
+cells = 3
+grid_cols = 3
+grid_rows = 1
+ascii = [
+  "┌────┬─────┬───┐",
+  "│    │     │   │",
+  "│    │     │   │",
+  "└────┴─────┴───┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [1, 0, 1, 1],
+  [2, 0, 1, 1],
+]
+
+[[presets]]
+id = "three_row"
+label = "Three rows"
+description = "Three stacked full-width panes."
+cells = 3
+grid_cols = 1
+grid_rows = 3
+ascii = [
+  "┌──────────────┐",
+  "│              │",
+  "├──────────────┤",
+  "│              │",
+  "├──────────────┤",
+  "│              │",
+  "└──────────────┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [0, 1, 1, 1],
+  [0, 2, 1, 1],
+]
+
+[[presets]]
+id = "sidebar_main"
+label = "Sidebar + main"
+description = "Narrow side panel with two stacked cells; large main area on the right."
+cells = 3
+grid_cols = 2
+grid_rows = 2
+ascii = [
+  "┌────┬─────────┐",
+  "│    │         │",
+  "├────┤         │",
+  "│    │         │",
+  "└────┴─────────┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [0, 1, 1, 1],
+  [1, 0, 1, 2],
+]
+
+[[presets]]
+id = "main_sidebar"
+label = "Main + sidebar"
+description = "Large main pane on the left, two stacked side cells on the right — mirror of Sidebar + main."
+cells = 3
+grid_cols = 2
+grid_rows = 2
+ascii = [
+  "┌─────────┬────┐",
+  "│         │    │",
+  "│         ├────┤",
+  "│         │    │",
+  "└─────────┴────┘",
+]
+grid_def = [
+  [0, 0, 1, 2],
+  [1, 0, 1, 1],
+  [1, 1, 1, 1],
+]
+
+[[presets]]
+id = "two_by_two"
+label = "2 × 2 grid"
+description = "Four equal cells. Compact, balanced."
+cells = 4
+grid_cols = 2
+grid_rows = 2
+ascii = [
+  "┌──────┬───────┐",
+  "│      │       │",
+  "├──────┼───────┤",
+  "│      │       │",
+  "└──────┴───────┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [1, 0, 1, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+]
+
+[[presets]]
+id = "four_row"
+label = "Four rows"
+description = "Four full-width stacked panes."
+cells = 4
+grid_cols = 1
+grid_rows = 4
+ascii = [
+  "┌──────────────┐",
+  "├──────────────┤",
+  "├──────────────┤",
+  "├──────────────┤",
+  "└──────────────┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [0, 1, 1, 1],
+  [0, 2, 1, 1],
+  [0, 3, 1, 1],
+]
+
+[[presets]]
+id = "four_column"
+label = "Four columns"
+description = "Four equal vertical strips — full-height panels."
+cells = 4
+grid_cols = 4
+grid_rows = 1
+ascii = [
+  "┌──┬──┬──┬──┐",
+  "│  │  │  │  │",
+  "│  │  │  │  │",
+  "└──┴──┴──┴──┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [1, 0, 1, 1],
+  [2, 0, 1, 1],
+  [3, 0, 1, 1],
+]
+
+[[presets]]
+id = "sidebar_three_stack"
+label = "Sidebar + 3 stacked"
+description = "Tall sidebar with three stacked cells on the right."
+cells = 4
+grid_cols = 2
+grid_rows = 3
+ascii = [
+  "┌────┬─────────┐",
+  "│    ├─────────┤",
+  "│    ├─────────┤",
+  "└────┴─────────┘",
+]
+grid_def = [
+  [0, 0, 1, 3],
+  [1, 0, 1, 1],
+  [1, 1, 1, 1],
+  [1, 2, 1, 1],
+]
+
+[[presets]]
+id = "three_stack_sidebar"
+label = "3 stacked + sidebar"
+description = "Three full-width cells stacked on the left, tall sidebar on the right — mirror of Sidebar + 3 stacked."
+cells = 4
+grid_cols = 2
+grid_rows = 3
+ascii = [
+  "┌─────────┬────┐",
+  "├─────────┤    │",
+  "├─────────┤    │",
+  "└─────────┴────┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [0, 1, 1, 1],
+  [0, 2, 1, 1],
+  [1, 0, 1, 3],
+]
+
+[[presets]]
+id = "dual_sidebar_stack"
+label = "Sidebar + 2 stacked + sidebar"
+description = "Two tall sidebars flanking a pair of stacked middle cells."
+cells = 4
+grid_cols = 3
+grid_rows = 2
+ascii = [
+  "┌────┬──────┬────┐",
+  "│    │      │    │",
+  "│    ├──────┤    │",
+  "│    │      │    │",
+  "└────┴──────┴────┘",
+]
+grid_def = [
+  [0, 0, 1, 2],
+  [1, 0, 1, 1],
+  [1, 1, 1, 1],
+  [2, 0, 1, 2],
+]
+
+[[presets]]
+id = "magazine"
+label = "Magazine (5 cells)"
+description = "Two rows on top, full-width stocks-style row at the bottom — glint's default seed."
+cells = 5
+grid_cols = 2
+grid_rows = 3
+ascii = [
+  "┌────┬─────────┐",
+  "│    │         │",
+  "├────┼─────────┤",
+  "│    │         │",
+  "├────┴─────────┤",
+  "│              │",
+  "└──────────────┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [1, 0, 1, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [0, 2, 2, 1],
+]
+
+[[presets]]
+id = "five_column"
+label = "Five columns"
+description = "Five equal vertical strips — full-height panels."
+cells = 5
+grid_cols = 5
+grid_rows = 1
+ascii = [
+  "┌──┬──┬──┬──┬──┐",
+  "│  │  │  │  │  │",
+  "└──┴──┴──┴──┴──┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [1, 0, 1, 1],
+  [2, 0, 1, 1],
+  [3, 0, 1, 1],
+  [4, 0, 1, 1],
+]
+
+[[presets]]
+id = "hero_two_by_two"
+label = "Hero + 2 × 2 grid"
+description = "Full-width hero on top with four equal cells in a grid below."
+cells = 5
+grid_cols = 2
+grid_rows = 3
+ascii = [
+  "┌──────────────┐",
+  "├──────┬───────┤",
+  "├──────┼───────┤",
+  "└──────┴───────┘",
+]
+grid_def = [
+  [0, 0, 2, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [0, 2, 1, 1],
+  [1, 2, 1, 1],
+]
+
+[[presets]]
+id = "five_row"
+label = "Five rows"
+description = "Five full-width stacked panes."
+cells = 5
+grid_cols = 1
+grid_rows = 5
+ascii = [
+  "┌──────────────┐",
+  "├──────────────┤",
+  "├──────────────┤",
+  "├──────────────┤",
+  "├──────────────┤",
+  "└──────────────┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [0, 1, 1, 1],
+  [0, 2, 1, 1],
+  [0, 3, 1, 1],
+  [0, 4, 1, 1],
+]
+
+[[presets]]
+id = "sidebar_quad"
+label = "Sidebar + 2 × 2"
+description = "Tall sidebar with a 2 × 2 grid of four cells on the right."
+cells = 5
+grid_cols = 3
+grid_rows = 2
+ascii = [
+  "┌────┬────┬────┐",
+  "│    │    │    │",
+  "│    ├────┼────┤",
+  "│    │    │    │",
+  "└────┴────┴────┘",
+]
+grid_def = [
+  [0, 0, 1, 2],
+  [1, 0, 1, 1],
+  [2, 0, 1, 1],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+]
+
+[[presets]]
+id = "hero_four_column"
+label = "Hero + four columns"
+description = "Full-width hero on top with four equal columns beneath."
+cells = 5
+grid_cols = 4
+grid_rows = 2
+ascii = [
+  "┌───────────────┐",
+  "├───┬───┬───┬───┤",
+  "│   │   │   │   │",
+  "└───┴───┴───┴───┘",
+]
+grid_def = [
+  [0, 0, 4, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+  [3, 1, 1, 1],
+]
+
+[[presets]]
+id = "two_by_three"
+label = "2 × 3 grid"
+description = "Two columns, three rows — six equal cells."
+cells = 6
+grid_cols = 2
+grid_rows = 3
+ascii = [
+  "┌──────┬───────┐",
+  "├──────┼───────┤",
+  "├──────┼───────┤",
+  "└──────┴───────┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [1, 0, 1, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [0, 2, 1, 1],
+  [1, 2, 1, 1],
+]
+
+[[presets]]
+id = "three_by_two"
+label = "3 × 2 grid"
+description = "Three columns, two rows — six equal cells."
+cells = 6
+grid_cols = 3
+grid_rows = 2
+ascii = [
+  "┌────┬────┬────┐",
+  "├────┼────┼────┤",
+  "└────┴────┴────┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [1, 0, 1, 1],
+  [2, 0, 1, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+]
+
+[[presets]]
+id = "hero_five_column"
+label = "Hero + five columns"
+description = "Full-width hero on top with five equal columns beneath."
+cells = 6
+grid_cols = 5
+grid_rows = 2
+ascii = [
+  "┌──────────────┐",
+  "├──┬──┬──┬──┬──┤",
+  "│  │  │  │  │  │",
+  "└──┴──┴──┴──┴──┘",
+]
+grid_def = [
+  [0, 0, 5, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+  [3, 1, 1, 1],
+  [4, 1, 1, 1],
+]
+
+[[presets]]
+id = "header_quad_footer"
+label = "Header + 2 × 2 + footer"
+description = "Full-width header, 2 × 2 grid in the middle, full-width footer."
+cells = 6
+grid_cols = 2
+grid_rows = 4
+ascii = [
+  "┌──────────────┐",
+  "├──────┬───────┤",
+  "├──────┼───────┤",
+  "├──────┴───────┤",
+  "└──────────────┘",
+]
+grid_def = [
+  [0, 0, 2, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [0, 2, 1, 1],
+  [1, 2, 1, 1],
+  [0, 3, 2, 1],
+]
+
+[[presets]]
+id = "sidebar_hero_quad"
+label = "Sidebar + hero + 2 × 2"
+description = "Tall sidebar with a hero band atop a 2 × 2 grid on its right."
+cells = 6
+grid_cols = 3
+grid_rows = 3
+ascii = [
+  "┌────┬─────────┐",
+  "│    │         │",
+  "│    ├────┬────┤",
+  "│    ├────┼────┤",
+  "└────┴────┴────┘",
+]
+grid_def = [
+  [0, 0, 1, 3],
+  [1, 0, 2, 1],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+  [1, 2, 1, 1],
+  [2, 2, 1, 1],
+]
+
+[[presets]]
+id = "column_quad_column"
+label = "Column + 2 × 2 + column"
+description = "Two full-height side columns bracketing a 2 × 2 grid."
+cells = 6
+grid_cols = 4
+grid_rows = 2
+ascii = [
+  "┌───┬─────┬─────┬───┐",
+  "│   │     │     │   │",
+  "│   ├─────┼─────┤   │",
+  "│   │     │     │   │",
+  "└───┴─────┴─────┴───┘",
+]
+grid_def = [
+  [0, 0, 1, 2],
+  [1, 0, 1, 1],
+  [2, 0, 1, 1],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+  [3, 0, 1, 2],
+]
+
+[[presets]]
+id = "quad_two_columns"
+label = "2 × 2 + two columns"
+description = "2 × 2 grid on the left, two full-height columns on the right."
+cells = 6
+grid_cols = 4
+grid_rows = 2
+ascii = [
+  "┌─────┬─────┬───┬───┐",
+  "│     │     │   │   │",
+  "├─────┼─────┤   │   │",
+  "│     │     │   │   │",
+  "└─────┴─────┴───┴───┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [1, 0, 1, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [2, 0, 1, 2],
+  [3, 0, 1, 2],
+]
+
+[[presets]]
+id = "two_columns_quad"
+label = "Two columns + 2 × 2"
+description = "Two full-height columns on the left, 2 × 2 grid on the right."
+cells = 6
+grid_cols = 4
+grid_rows = 2
+ascii = [
+  "┌───┬───┬─────┬─────┐",
+  "│   │   │     │     │",
+  "│   │   ├─────┼─────┤",
+  "│   │   │     │     │",
+  "└───┴───┴─────┴─────┘",
+]
+grid_def = [
+  [0, 0, 1, 2],
+  [1, 0, 1, 2],
+  [2, 0, 1, 1],
+  [3, 0, 1, 1],
+  [2, 1, 1, 1],
+  [3, 1, 1, 1],
+]
+
+[[presets]]
+id = "hero_two_rows"
+label = "Hero + two rows of three"
+description = "Full-width hero on top with two rows of three cells beneath."
+cells = 7
+grid_cols = 3
+grid_rows = 3
+ascii = [
+  "┌──────────────┐",
+  "├────┬────┬────┤",
+  "├────┼────┼────┤",
+  "└────┴────┴────┘",
+]
+grid_def = [
+  [0, 0, 3, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+  [0, 2, 1, 1],
+  [1, 2, 1, 1],
+  [2, 2, 1, 1],
+]
+
+[[presets]]
+id = "sidebar_three_by_two"
+label = "Sidebar + 3 × 2"
+description = "Tall sidebar on the left with a 3 × 2 grid of six cells to its right."
+cells = 7
+grid_cols = 4
+grid_rows = 2
+ascii = [
+  "┌────┬───┬───┬───┐",
+  "│    ├───┼───┼───┤",
+  "└────┴───┴───┴───┘",
+]
+grid_def = [
+  [0, 0, 1, 2],
+  [1, 0, 1, 1],
+  [2, 0, 1, 1],
+  [3, 0, 1, 1],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+  [3, 1, 1, 1],
+]
+
+[[presets]]
+id = "magazine_seven"
+label = "Magazine + footer (7 cells)"
+description = "Three rows of paired left/right cells with a full-width footer underneath."
+cells = 7
+grid_cols = 2
+grid_rows = 4
+ascii = [
+  "┌────┬─────────┐",
+  "├────┼─────────┤",
+  "├────┼─────────┤",
+  "├────┴─────────┤",
+  "└──────────────┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [1, 0, 1, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [0, 2, 1, 1],
+  [1, 2, 1, 1],
+  [0, 3, 2, 1],
+]
+
+[[presets]]
+id = "header_five_footer"
+label = "Header + 5 columns + footer"
+description = "Full-width header, five equal columns in the middle, full-width footer."
+cells = 7
+grid_cols = 5
+grid_rows = 3
+ascii = [
+  "┌──────────────┐",
+  "├──┬──┬──┬──┬──┤",
+  "│  │  │  │  │  │",
+  "├──┴──┴──┴──┴──┤",
+  "└──────────────┘",
+]
+grid_def = [
+  [0, 0, 5, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+  [3, 1, 1, 1],
+  [4, 1, 1, 1],
+  [0, 2, 5, 1],
+]
+
+[[presets]]
+id = "header_four_dual_footer"
+label = "Header + 4 columns + 2 wide footers"
+description = "Full-width header, four columns in the middle, two wide footers each spanning two columns."
+cells = 7
+grid_cols = 4
+grid_rows = 3
+ascii = [
+  "┌───────────────────┐",
+  "├────┬────┬────┬────┤",
+  "│    │    │    │    │",
+  "├────┴────┼────┴────┤",
+  "└─────────┴─────────┘",
+]
+grid_def = [
+  [0, 0, 4, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+  [3, 1, 1, 1],
+  [0, 2, 2, 1],
+  [2, 2, 2, 1],
+]
+
+[[presets]]
+id = "dashboard_seven"
+label = "Dashboard (2 × 3 + hero footer)"
+description = "Two rows of three cells with a full-width hero footer below — summary-at-the-bottom style."
+cells = 7
+grid_cols = 3
+grid_rows = 3
+ascii = [
+  "┌────┬────┬────┐",
+  "├────┼────┼────┤",
+  "├────┴────┴────┤",
+  "└──────────────┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [1, 0, 1, 1],
+  [2, 0, 1, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+  [0, 2, 3, 1],
+]
+
+[[presets]]
+id = "four_by_two"
+label = "4 × 2 grid"
+description = "Four columns, two rows — eight equal cells."
+cells = 8
+grid_cols = 4
+grid_rows = 2
+ascii = [
+  "┌───┬───┬───┬───┐",
+  "├───┼───┼───┼───┤",
+  "└───┴───┴───┴───┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [1, 0, 1, 1],
+  [2, 0, 1, 1],
+  [3, 0, 1, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+  [3, 1, 1, 1],
+]
+
+[[presets]]
+id = "two_by_four"
+label = "2 × 4 grid"
+description = "Two columns, four rows — eight equal cells."
+cells = 8
+grid_cols = 2
+grid_rows = 4
+ascii = [
+  "┌──────┬───────┐",
+  "├──────┼───────┤",
+  "├──────┼───────┤",
+  "├──────┼───────┤",
+  "└──────┴───────┘",
+]
+grid_def = [
+  [0, 0, 1, 1],
+  [1, 0, 1, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [0, 2, 1, 1],
+  [1, 2, 1, 1],
+  [0, 3, 1, 1],
+  [1, 3, 1, 1],
+]
+
+[[presets]]
+id = "sidebar_3x2_footer"
+label = "Sidebar + 3 × 2 + footer"
+description = "Tall sidebar, a 3 × 2 grid of six cells to its right, and a full-width footer beneath."
+cells = 8
+grid_cols = 4
+grid_rows = 3
+ascii = [
+  "┌────┬───┬───┬───┐",
+  "│    ├───┼───┼───┤",
+  "├────┴───┴───┴───┤",
+  "└────────────────┘",
+]
+grid_def = [
+  [0, 0, 1, 2],
+  [1, 0, 1, 1],
+  [2, 0, 1, 1],
+  [3, 0, 1, 1],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+  [3, 1, 1, 1],
+  [0, 2, 4, 1],
+]
+
+[[presets]]
+id = "dual_band_three"
+label = "Stripes (1 + 3 + 1 + 3)"
+description = "Alternating full-width band and three-column row, twice — two summary bars over two trios of cells."
+cells = 8
+grid_cols = 3
+grid_rows = 4
+ascii = [
+  "┌──────────────┐",
+  "├────┬────┬────┤",
+  "├────┴────┴────┤",
+  "├────┬────┬────┤",
+  "└────┴────┴────┘",
+]
+grid_def = [
+  [0, 0, 3, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+  [0, 2, 3, 1],
+  [0, 3, 1, 1],
+  [1, 3, 1, 1],
+  [2, 3, 1, 1],
+]
+
+[[presets]]
+id = "header_grid_footer"
+label = "Header + 2 × 3 + footer"
+description = "Full-width header, six cells as two rows of three, full-width footer."
+cells = 8
+grid_cols = 3
+grid_rows = 4
+ascii = [
+  "┌──────────────┐",
+  "├────┬────┬────┤",
+  "├────┼────┼────┤",
+  "├────┴────┴────┤",
+  "└──────────────┘",
+]
+grid_def = [
+  [0, 0, 3, 1],
+  [0, 1, 1, 1],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+  [0, 2, 1, 1],
+  [1, 2, 1, 1],
+  [2, 2, 1, 1],
+  [0, 3, 3, 1],
+]
+
+[[presets]]
+id = "header_sidebar_grid"
+label = "Header + sidebar + 2 × 3"
+description = "Full-width header on top with a tall sidebar and 2 × 3 grid beneath."
+cells = 8
+grid_cols = 3
+grid_rows = 4
+ascii = [
+  "┌──────────────────┐",
+  "├────┬──────┬──────┤",
+  "│    ├──────┼──────┤",
+  "│    ├──────┼──────┤",
+  "└────┴──────┴──────┘",
+]
+grid_def = [
+  [0, 0, 3, 1],
+  [0, 1, 1, 3],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+  [1, 2, 1, 1],
+  [2, 2, 1, 1],
+  [1, 3, 1, 1],
+  [2, 3, 1, 1],
+]
+
+[[presets]]
+id = "sidebar_grid_footer"
+label = "Sidebar + 2 × 3 + footer"
+description = "Tall sidebar with a 2 × 3 grid of six cells to its right, plus a full-width footer."
+cells = 8
+grid_cols = 3
+grid_rows = 4
+ascii = [
+  "┌────┬──────┬──────┐",
+  "│    ├──────┼──────┤",
+  "│    ├──────┼──────┤",
+  "├────┴──────┴──────┤",
+  "└──────────────────┘",
+]
+grid_def = [
+  [0, 0, 1, 3],
+  [1, 0, 1, 1],
+  [2, 0, 1, 1],
+  [1, 1, 1, 1],
+  [2, 1, 1, 1],
+  [1, 2, 1, 1],
+  [2, 2, 1, 1],
+  [0, 3, 3, 1],
+]
+

@@ -23,886 +23,69 @@ use crate::wizard::{
 };
 
 /// A named layout offered on this page.
+///
+/// Loaded once from the embedded `layouts.toml` data file and cached
+/// in a `OnceLock`. Field types are owned (rather than the previous
+/// `&'static str` / `&'static [..]`) so they can carry parsed data;
+/// callers that previously held `&'static Preset` still work because
+/// the cache itself lives for the program's lifetime.
+#[derive(Debug, serde::Deserialize)]
 pub struct Preset {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub description: &'static str,
+    pub id: String,
+    pub label: String,
+    pub description: String,
     /// Number of cells the assign page will produce.
     pub cells: usize,
     /// ASCII preview rendered next to the description on the preset
-    /// picker. Static art; the dynamic per-cell preview rendered on the
-    /// Assign + per-widget pages uses [`grid_def`] instead.
-    pub ascii: &'static [&'static str],
+    /// picker. Static art; the dynamic per-cell preview rendered on
+    /// the Assign + per-widget pages uses [`grid_def`] instead.
+    pub ascii: Vec<String>,
     /// Grid dimensions for the dynamic preview.
     pub grid_cols: usize,
     pub grid_rows: usize,
-    /// One `(col, row, col_span, row_span)` per cell, in registration
-    /// order. The Assign page assigns widgets to cells using this same
-    /// order, so cell 0 in `grid_def` matches `assignments[0]`.
-    pub grid_def: &'static [(usize, usize, usize, usize)],
+    /// One `[col, row, col_span, row_span]` per cell, in registration
+    /// order. The Assign page assigns widgets to cells using this
+    /// same order, so cell 0 in `grid_def` maps to `assignments[0]`.
+    /// TOML carries these as four-element arrays; deserialization
+    /// converts to the 4-tuple form code consumes.
+    #[serde(deserialize_with = "deserialize_grid_def")]
+    pub grid_def: Vec<(usize, usize, usize, usize)>,
 }
 
-pub const PRESETS: &[Preset] = &[
-    Preset {
-        id: "single",
-        label: "Single pane (full screen)",
-        description: "One widget filling the entire terminal. Useful for a focused tool view.",
-        cells: 1,
-        ascii: &[
-            "┌──────────────┐",
-            "│              │",
-            "│              │",
-            "│              │",
-            "└──────────────┘",
-        ],
-        grid_cols: 1,
-        grid_rows: 1,
-        grid_def: &[(0, 0, 1, 1)],
-    },
-    Preset {
-        id: "split_vertical",
-        label: "Two columns",
-        description: "Side-by-side full-height panes — good for a feed + tool combo.",
-        cells: 2,
-        ascii: &[
-            "┌──────┬───────┐",
-            "│      │       │",
-            "│      │       │",
-            "│      │       │",
-            "└──────┴───────┘",
-        ],
-        grid_cols: 2,
-        grid_rows: 1,
-        grid_def: &[(0, 0, 1, 1), (1, 0, 1, 1)],
-    },
-    Preset {
-        id: "split_horizontal",
-        label: "Two rows",
-        description: "Stacked full-width panes — top headline + bottom detail.",
-        cells: 2,
-        ascii: &[
-            "┌──────────────┐",
-            "│              │",
-            "├──────────────┤",
-            "│              │",
-            "└──────────────┘",
-        ],
-        grid_cols: 1,
-        grid_rows: 2,
-        grid_def: &[(0, 0, 1, 1), (0, 1, 1, 1)],
-    },
-    Preset {
-        id: "three_column",
-        label: "Three columns",
-        description: "Three equal vertical strips — full-height panels.",
-        cells: 3,
-        ascii: &[
-            "┌────┬─────┬───┐",
-            "│    │     │   │",
-            "│    │     │   │",
-            "└────┴─────┴───┘",
-        ],
-        grid_cols: 3,
-        grid_rows: 1,
-        grid_def: &[(0, 0, 1, 1), (1, 0, 1, 1), (2, 0, 1, 1)],
-    },
-    Preset {
-        id: "three_row",
-        label: "Three rows",
-        description: "Three stacked full-width panes.",
-        cells: 3,
-        ascii: &[
-            "┌──────────────┐",
-            "│              │",
-            "├──────────────┤",
-            "│              │",
-            "├──────────────┤",
-            "│              │",
-            "└──────────────┘",
-        ],
-        grid_cols: 1,
-        grid_rows: 3,
-        grid_def: &[(0, 0, 1, 1), (0, 1, 1, 1), (0, 2, 1, 1)],
-    },
-    Preset {
-        id: "sidebar_main",
-        label: "Sidebar + main",
-        description: "Narrow side panel with two stacked cells; large main area on the right.",
-        cells: 3,
-        ascii: &[
-            "┌────┬─────────┐",
-            "│    │         │",
-            "├────┤         │",
-            "│    │         │",
-            "└────┴─────────┘",
-        ],
-        grid_cols: 2,
-        grid_rows: 2,
-        grid_def: &[(0, 0, 1, 1), (0, 1, 1, 1), (1, 0, 1, 2)],
-    },
-    Preset {
-        id: "main_sidebar",
-        label: "Main + sidebar",
-        description: "Large main pane on the left, two stacked side cells on the right — mirror of Sidebar + main.",
-        cells: 3,
-        ascii: &[
-            "┌─────────┬────┐",
-            "│         │    │",
-            "│         ├────┤",
-            "│         │    │",
-            "└─────────┴────┘",
-        ],
-        grid_cols: 2,
-        grid_rows: 2,
-        grid_def: &[(0, 0, 1, 2), (1, 0, 1, 1), (1, 1, 1, 1)],
-    },
-    Preset {
-        id: "two_by_two",
-        label: "2 × 2 grid",
-        description: "Four equal cells. Compact, balanced.",
-        cells: 4,
-        ascii: &[
-            "┌──────┬───────┐",
-            "│      │       │",
-            "├──────┼───────┤",
-            "│      │       │",
-            "└──────┴───────┘",
-        ],
-        grid_cols: 2,
-        grid_rows: 2,
-        grid_def: &[
-            (0, 0, 1, 1),
-            (1, 0, 1, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-        ],
-    },
-    Preset {
-        id: "four_row",
-        label: "Four rows",
-        description: "Four full-width stacked panes.",
-        cells: 4,
-        ascii: &[
-            "┌──────────────┐",
-            "├──────────────┤",
-            "├──────────────┤",
-            "├──────────────┤",
-            "└──────────────┘",
-        ],
-        grid_cols: 1,
-        grid_rows: 4,
-        grid_def: &[
-            (0, 0, 1, 1),
-            (0, 1, 1, 1),
-            (0, 2, 1, 1),
-            (0, 3, 1, 1),
-        ],
-    },
-    Preset {
-        id: "four_column",
-        label: "Four columns",
-        description: "Four equal vertical strips — full-height panels.",
-        cells: 4,
-        ascii: &[
-            "┌──┬──┬──┬──┐",
-            "│  │  │  │  │",
-            "│  │  │  │  │",
-            "└──┴──┴──┴──┘",
-        ],
-        grid_cols: 4,
-        grid_rows: 1,
-        grid_def: &[
-            (0, 0, 1, 1),
-            (1, 0, 1, 1),
-            (2, 0, 1, 1),
-            (3, 0, 1, 1),
-        ],
-    },
-    Preset {
-        id: "sidebar_three_stack",
-        label: "Sidebar + 3 stacked",
-        description: "Tall sidebar with three stacked cells on the right.",
-        cells: 4,
-        ascii: &[
-            "┌────┬─────────┐",
-            "│    ├─────────┤",
-            "│    ├─────────┤",
-            "└────┴─────────┘",
-        ],
-        grid_cols: 2,
-        grid_rows: 3,
-        grid_def: &[
-            (0, 0, 1, 3),
-            (1, 0, 1, 1),
-            (1, 1, 1, 1),
-            (1, 2, 1, 1),
-        ],
-    },
-    Preset {
-        id: "three_stack_sidebar",
-        label: "3 stacked + sidebar",
-        description: "Three full-width cells stacked on the left, tall sidebar on the right — mirror of Sidebar + 3 stacked.",
-        cells: 4,
-        ascii: &[
-            "┌─────────┬────┐",
-            "├─────────┤    │",
-            "├─────────┤    │",
-            "└─────────┴────┘",
-        ],
-        grid_cols: 2,
-        grid_rows: 3,
-        grid_def: &[
-            (0, 0, 1, 1),
-            (0, 1, 1, 1),
-            (0, 2, 1, 1),
-            (1, 0, 1, 3),
-        ],
-    },
-    Preset {
-        id: "dual_sidebar_stack",
-        label: "Sidebar + 2 stacked + sidebar",
-        description: "Two tall sidebars flanking a pair of stacked middle cells.",
-        cells: 4,
-        ascii: &[
-            "┌────┬──────┬────┐",
-            "│    │      │    │",
-            "│    ├──────┤    │",
-            "│    │      │    │",
-            "└────┴──────┴────┘",
-        ],
-        grid_cols: 3,
-        grid_rows: 2,
-        grid_def: &[
-            (0, 0, 1, 2),
-            (1, 0, 1, 1),
-            (1, 1, 1, 1),
-            (2, 0, 1, 2),
-        ],
-    },
-    Preset {
-        id: "magazine",
-        label: "Magazine (5 cells)",
-        description: "Two rows on top, full-width stocks-style row at the bottom — glint's default seed.",
-        cells: 5,
-        ascii: &[
-            "┌────┬─────────┐",
-            "│    │         │",
-            "├────┼─────────┤",
-            "│    │         │",
-            "├────┴─────────┤",
-            "│              │",
-            "└──────────────┘",
-        ],
-        grid_cols: 2,
-        grid_rows: 3,
-        grid_def: &[
-            (0, 0, 1, 1),
-            (1, 0, 1, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (0, 2, 2, 1),
-        ],
-    },
-    Preset {
-        id: "five_column",
-        label: "Five columns",
-        description: "Five equal vertical strips — full-height panels.",
-        cells: 5,
-        ascii: &[
-            "┌──┬──┬──┬──┬──┐",
-            "│  │  │  │  │  │",
-            "└──┴──┴──┴──┴──┘",
-        ],
-        grid_cols: 5,
-        grid_rows: 1,
-        grid_def: &[
-            (0, 0, 1, 1),
-            (1, 0, 1, 1),
-            (2, 0, 1, 1),
-            (3, 0, 1, 1),
-            (4, 0, 1, 1),
-        ],
-    },
-    Preset {
-        id: "hero_two_by_two",
-        label: "Hero + 2 × 2 grid",
-        description: "Full-width hero on top with four equal cells in a grid below.",
-        cells: 5,
-        ascii: &[
-            "┌──────────────┐",
-            "├──────┬───────┤",
-            "├──────┼───────┤",
-            "└──────┴───────┘",
-        ],
-        grid_cols: 2,
-        grid_rows: 3,
-        grid_def: &[
-            (0, 0, 2, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (0, 2, 1, 1),
-            (1, 2, 1, 1),
-        ],
-    },
-    Preset {
-        id: "five_row",
-        label: "Five rows",
-        description: "Five full-width stacked panes.",
-        cells: 5,
-        ascii: &[
-            "┌──────────────┐",
-            "├──────────────┤",
-            "├──────────────┤",
-            "├──────────────┤",
-            "├──────────────┤",
-            "└──────────────┘",
-        ],
-        grid_cols: 1,
-        grid_rows: 5,
-        grid_def: &[
-            (0, 0, 1, 1),
-            (0, 1, 1, 1),
-            (0, 2, 1, 1),
-            (0, 3, 1, 1),
-            (0, 4, 1, 1),
-        ],
-    },
-    Preset {
-        id: "sidebar_quad",
-        label: "Sidebar + 2 × 2",
-        description: "Tall sidebar with a 2 × 2 grid of four cells on the right.",
-        cells: 5,
-        ascii: &[
-            "┌────┬────┬────┐",
-            "│    │    │    │",
-            "│    ├────┼────┤",
-            "│    │    │    │",
-            "└────┴────┴────┘",
-        ],
-        grid_cols: 3,
-        grid_rows: 2,
-        grid_def: &[
-            (0, 0, 1, 2),
-            (1, 0, 1, 1),
-            (2, 0, 1, 1),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-        ],
-    },
-    Preset {
-        id: "hero_four_column",
-        label: "Hero + four columns",
-        description: "Full-width hero on top with four equal columns beneath.",
-        cells: 5,
-        ascii: &[
-            "┌───────────────┐",
-            "├───┬───┬───┬───┤",
-            "│   │   │   │   │",
-            "└───┴───┴───┴───┘",
-        ],
-        grid_cols: 4,
-        grid_rows: 2,
-        grid_def: &[
-            (0, 0, 4, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-            (3, 1, 1, 1),
-        ],
-    },
-    Preset {
-        id: "two_by_three",
-        label: "2 × 3 grid",
-        description: "Two columns, three rows — six equal cells.",
-        cells: 6,
-        ascii: &[
-            "┌──────┬───────┐",
-            "├──────┼───────┤",
-            "├──────┼───────┤",
-            "└──────┴───────┘",
-        ],
-        grid_cols: 2,
-        grid_rows: 3,
-        grid_def: &[
-            (0, 0, 1, 1),
-            (1, 0, 1, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (0, 2, 1, 1),
-            (1, 2, 1, 1),
-        ],
-    },
-    Preset {
-        id: "three_by_two",
-        label: "3 × 2 grid",
-        description: "Three columns, two rows — six equal cells.",
-        cells: 6,
-        ascii: &[
-            "┌────┬────┬────┐",
-            "├────┼────┼────┤",
-            "└────┴────┴────┘",
-        ],
-        grid_cols: 3,
-        grid_rows: 2,
-        grid_def: &[
-            (0, 0, 1, 1),
-            (1, 0, 1, 1),
-            (2, 0, 1, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-        ],
-    },
-    Preset {
-        id: "hero_five_column",
-        label: "Hero + five columns",
-        description: "Full-width hero on top with five equal columns beneath.",
-        cells: 6,
-        ascii: &[
-            "┌──────────────┐",
-            "├──┬──┬──┬──┬──┤",
-            "│  │  │  │  │  │",
-            "└──┴──┴──┴──┴──┘",
-        ],
-        grid_cols: 5,
-        grid_rows: 2,
-        grid_def: &[
-            (0, 0, 5, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-            (3, 1, 1, 1),
-            (4, 1, 1, 1),
-        ],
-    },
-    Preset {
-        id: "header_quad_footer",
-        label: "Header + 2 × 2 + footer",
-        description: "Full-width header, 2 × 2 grid in the middle, full-width footer.",
-        cells: 6,
-        ascii: &[
-            "┌──────────────┐",
-            "├──────┬───────┤",
-            "├──────┼───────┤",
-            "├──────┴───────┤",
-            "└──────────────┘",
-        ],
-        grid_cols: 2,
-        grid_rows: 4,
-        grid_def: &[
-            (0, 0, 2, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (0, 2, 1, 1),
-            (1, 2, 1, 1),
-            (0, 3, 2, 1),
-        ],
-    },
-    Preset {
-        id: "sidebar_hero_quad",
-        label: "Sidebar + hero + 2 × 2",
-        description: "Tall sidebar with a hero band atop a 2 × 2 grid on its right.",
-        cells: 6,
-        ascii: &[
-            "┌────┬─────────┐",
-            "│    │         │",
-            "│    ├────┬────┤",
-            "│    ├────┼────┤",
-            "└────┴────┴────┘",
-        ],
-        grid_cols: 3,
-        grid_rows: 3,
-        grid_def: &[
-            (0, 0, 1, 3),
-            (1, 0, 2, 1),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-            (1, 2, 1, 1),
-            (2, 2, 1, 1),
-        ],
-    },
-    Preset {
-        id: "column_quad_column",
-        label: "Column + 2 × 2 + column",
-        description: "Two full-height side columns bracketing a 2 × 2 grid.",
-        cells: 6,
-        ascii: &[
-            "┌───┬─────┬─────┬───┐",
-            "│   │     │     │   │",
-            "│   ├─────┼─────┤   │",
-            "│   │     │     │   │",
-            "└───┴─────┴─────┴───┘",
-        ],
-        grid_cols: 4,
-        grid_rows: 2,
-        grid_def: &[
-            (0, 0, 1, 2),
-            (1, 0, 1, 1),
-            (2, 0, 1, 1),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-            (3, 0, 1, 2),
-        ],
-    },
-    Preset {
-        id: "quad_two_columns",
-        label: "2 × 2 + two columns",
-        description: "2 × 2 grid on the left, two full-height columns on the right.",
-        cells: 6,
-        ascii: &[
-            "┌─────┬─────┬───┬───┐",
-            "│     │     │   │   │",
-            "├─────┼─────┤   │   │",
-            "│     │     │   │   │",
-            "└─────┴─────┴───┴───┘",
-        ],
-        grid_cols: 4,
-        grid_rows: 2,
-        grid_def: &[
-            (0, 0, 1, 1),
-            (1, 0, 1, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (2, 0, 1, 2),
-            (3, 0, 1, 2),
-        ],
-    },
-    Preset {
-        id: "two_columns_quad",
-        label: "Two columns + 2 × 2",
-        description: "Two full-height columns on the left, 2 × 2 grid on the right.",
-        cells: 6,
-        ascii: &[
-            "┌───┬───┬─────┬─────┐",
-            "│   │   │     │     │",
-            "│   │   ├─────┼─────┤",
-            "│   │   │     │     │",
-            "└───┴───┴─────┴─────┘",
-        ],
-        grid_cols: 4,
-        grid_rows: 2,
-        grid_def: &[
-            (0, 0, 1, 2),
-            (1, 0, 1, 2),
-            (2, 0, 1, 1),
-            (3, 0, 1, 1),
-            (2, 1, 1, 1),
-            (3, 1, 1, 1),
-        ],
-    },
-    Preset {
-        id: "hero_two_rows",
-        label: "Hero + two rows of three",
-        description: "Full-width hero on top with two rows of three cells beneath.",
-        cells: 7,
-        ascii: &[
-            "┌──────────────┐",
-            "├────┬────┬────┤",
-            "├────┼────┼────┤",
-            "└────┴────┴────┘",
-        ],
-        grid_cols: 3,
-        grid_rows: 3,
-        grid_def: &[
-            (0, 0, 3, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-            (0, 2, 1, 1),
-            (1, 2, 1, 1),
-            (2, 2, 1, 1),
-        ],
-    },
-    Preset {
-        id: "sidebar_three_by_two",
-        label: "Sidebar + 3 × 2",
-        description: "Tall sidebar on the left with a 3 × 2 grid of six cells to its right.",
-        cells: 7,
-        ascii: &[
-            "┌────┬───┬───┬───┐",
-            "│    ├───┼───┼───┤",
-            "└────┴───┴───┴───┘",
-        ],
-        grid_cols: 4,
-        grid_rows: 2,
-        grid_def: &[
-            (0, 0, 1, 2),
-            (1, 0, 1, 1),
-            (2, 0, 1, 1),
-            (3, 0, 1, 1),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-            (3, 1, 1, 1),
-        ],
-    },
-    Preset {
-        id: "magazine_seven",
-        label: "Magazine + footer (7 cells)",
-        description: "Three rows of paired left/right cells with a full-width footer underneath.",
-        cells: 7,
-        ascii: &[
-            "┌────┬─────────┐",
-            "├────┼─────────┤",
-            "├────┼─────────┤",
-            "├────┴─────────┤",
-            "└──────────────┘",
-        ],
-        grid_cols: 2,
-        grid_rows: 4,
-        grid_def: &[
-            (0, 0, 1, 1),
-            (1, 0, 1, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (0, 2, 1, 1),
-            (1, 2, 1, 1),
-            (0, 3, 2, 1),
-        ],
-    },
-    Preset {
-        id: "header_five_footer",
-        label: "Header + 5 columns + footer",
-        description: "Full-width header, five equal columns in the middle, full-width footer.",
-        cells: 7,
-        ascii: &[
-            "┌──────────────┐",
-            "├──┬──┬──┬──┬──┤",
-            "│  │  │  │  │  │",
-            "├──┴──┴──┴──┴──┤",
-            "└──────────────┘",
-        ],
-        grid_cols: 5,
-        grid_rows: 3,
-        grid_def: &[
-            (0, 0, 5, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-            (3, 1, 1, 1),
-            (4, 1, 1, 1),
-            (0, 2, 5, 1),
-        ],
-    },
-    Preset {
-        id: "header_four_dual_footer",
-        label: "Header + 4 columns + 2 wide footers",
-        description: "Full-width header, four columns in the middle, two wide footers each spanning two columns.",
-        cells: 7,
-        ascii: &[
-            "┌───────────────────┐",
-            "├────┬────┬────┬────┤",
-            "│    │    │    │    │",
-            "├────┴────┼────┴────┤",
-            "└─────────┴─────────┘",
-        ],
-        grid_cols: 4,
-        grid_rows: 3,
-        grid_def: &[
-            (0, 0, 4, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-            (3, 1, 1, 1),
-            (0, 2, 2, 1),
-            (2, 2, 2, 1),
-        ],
-    },
-    Preset {
-        id: "dashboard_seven",
-        label: "Dashboard (2 × 3 + hero footer)",
-        description: "Two rows of three cells with a full-width hero footer below — summary-at-the-bottom style.",
-        cells: 7,
-        ascii: &[
-            "┌────┬────┬────┐",
-            "├────┼────┼────┤",
-            "├────┴────┴────┤",
-            "└──────────────┘",
-        ],
-        grid_cols: 3,
-        grid_rows: 3,
-        grid_def: &[
-            (0, 0, 1, 1),
-            (1, 0, 1, 1),
-            (2, 0, 1, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-            (0, 2, 3, 1),
-        ],
-    },
-    Preset {
-        id: "four_by_two",
-        label: "4 × 2 grid",
-        description: "Four columns, two rows — eight equal cells.",
-        cells: 8,
-        ascii: &[
-            "┌───┬───┬───┬───┐",
-            "├───┼───┼───┼───┤",
-            "└───┴───┴───┴───┘",
-        ],
-        grid_cols: 4,
-        grid_rows: 2,
-        grid_def: &[
-            (0, 0, 1, 1),
-            (1, 0, 1, 1),
-            (2, 0, 1, 1),
-            (3, 0, 1, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-            (3, 1, 1, 1),
-        ],
-    },
-    Preset {
-        id: "two_by_four",
-        label: "2 × 4 grid",
-        description: "Two columns, four rows — eight equal cells.",
-        cells: 8,
-        ascii: &[
-            "┌──────┬───────┐",
-            "├──────┼───────┤",
-            "├──────┼───────┤",
-            "├──────┼───────┤",
-            "└──────┴───────┘",
-        ],
-        grid_cols: 2,
-        grid_rows: 4,
-        grid_def: &[
-            (0, 0, 1, 1),
-            (1, 0, 1, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (0, 2, 1, 1),
-            (1, 2, 1, 1),
-            (0, 3, 1, 1),
-            (1, 3, 1, 1),
-        ],
-    },
-    Preset {
-        id: "sidebar_3x2_footer",
-        label: "Sidebar + 3 × 2 + footer",
-        description: "Tall sidebar, a 3 × 2 grid of six cells to its right, and a full-width footer beneath.",
-        cells: 8,
-        ascii: &[
-            "┌────┬───┬───┬───┐",
-            "│    ├───┼───┼───┤",
-            "├────┴───┴───┴───┤",
-            "└────────────────┘",
-        ],
-        grid_cols: 4,
-        grid_rows: 3,
-        grid_def: &[
-            (0, 0, 1, 2),
-            (1, 0, 1, 1),
-            (2, 0, 1, 1),
-            (3, 0, 1, 1),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-            (3, 1, 1, 1),
-            (0, 2, 4, 1),
-        ],
-    },
-    Preset {
-        id: "dual_band_three",
-        label: "Stripes (1 + 3 + 1 + 3)",
-        description: "Alternating full-width band and three-column row, twice — two summary bars over two trios of cells.",
-        cells: 8,
-        ascii: &[
-            "┌──────────────┐",
-            "├────┬────┬────┤",
-            "├────┴────┴────┤",
-            "├────┬────┬────┤",
-            "└────┴────┴────┘",
-        ],
-        grid_cols: 3,
-        grid_rows: 4,
-        grid_def: &[
-            (0, 0, 3, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-            (0, 2, 3, 1),
-            (0, 3, 1, 1),
-            (1, 3, 1, 1),
-            (2, 3, 1, 1),
-        ],
-    },
-    Preset {
-        id: "header_grid_footer",
-        label: "Header + 2 × 3 + footer",
-        description: "Full-width header, six cells as two rows of three, full-width footer.",
-        cells: 8,
-        ascii: &[
-            "┌──────────────┐",
-            "├────┬────┬────┤",
-            "├────┼────┼────┤",
-            "├────┴────┴────┤",
-            "└──────────────┘",
-        ],
-        grid_cols: 3,
-        grid_rows: 4,
-        grid_def: &[
-            (0, 0, 3, 1),
-            (0, 1, 1, 1),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-            (0, 2, 1, 1),
-            (1, 2, 1, 1),
-            (2, 2, 1, 1),
-            (0, 3, 3, 1),
-        ],
-    },
-    Preset {
-        id: "header_sidebar_grid",
-        label: "Header + sidebar + 2 × 3",
-        description: "Full-width header on top with a tall sidebar and 2 × 3 grid beneath.",
-        cells: 8,
-        ascii: &[
-            "┌──────────────────┐",
-            "├────┬──────┬──────┤",
-            "│    ├──────┼──────┤",
-            "│    ├──────┼──────┤",
-            "└────┴──────┴──────┘",
-        ],
-        grid_cols: 3,
-        grid_rows: 4,
-        grid_def: &[
-            (0, 0, 3, 1),
-            (0, 1, 1, 3),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-            (1, 2, 1, 1),
-            (2, 2, 1, 1),
-            (1, 3, 1, 1),
-            (2, 3, 1, 1),
-        ],
-    },
-    Preset {
-        id: "sidebar_grid_footer",
-        label: "Sidebar + 2 × 3 + footer",
-        description: "Tall sidebar with a 2 × 3 grid of six cells to its right, plus a full-width footer.",
-        cells: 8,
-        ascii: &[
-            "┌────┬──────┬──────┐",
-            "│    ├──────┼──────┤",
-            "│    ├──────┼──────┤",
-            "├────┴──────┴──────┤",
-            "└──────────────────┘",
-        ],
-        grid_cols: 3,
-        grid_rows: 4,
-        grid_def: &[
-            (0, 0, 1, 3),
-            (1, 0, 1, 1),
-            (2, 0, 1, 1),
-            (1, 1, 1, 1),
-            (2, 1, 1, 1),
-            (1, 2, 1, 1),
-            (2, 2, 1, 1),
-            (0, 3, 3, 1),
-        ],
-    },
-];
+fn deserialize_grid_def<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<Vec<(usize, usize, usize, usize)>, D::Error> {
+    use serde::de::Error;
+    let raw: Vec<Vec<usize>> = serde::Deserialize::deserialize(de)?;
+    raw.into_iter()
+        .map(|v| match v.as_slice() {
+            [a, b, c, d] => Ok((*a, *b, *c, *d)),
+            other => Err(D::Error::custom(format!(
+                "grid_def entry must be a 4-element [col, row, col_span, row_span] array; got {} elements",
+                other.len()
+            ))),
+        })
+        .collect()
+}
+
+#[derive(serde::Deserialize)]
+struct RawPresetFile {
+    presets: Vec<Preset>,
+}
+
+const PRESETS_TOML: &str = include_str!("layouts.toml");
+
+/// Every layout preset, parsed once from `layouts.toml`. Panics on a
+/// malformed embedded TOML — that's a programmer error caught by the
+/// test below, not user-supplied data.
+pub fn all_presets() -> &'static [Preset] {
+    static CACHE: std::sync::OnceLock<Vec<Preset>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let parsed: RawPresetFile = toml::from_str(PRESETS_TOML)
+            .unwrap_or_else(|err| panic!("layouts.toml: parse failed: {err}"));
+        parsed.presets
+    })
+}
 
 const MIN_PANES: usize = 1;
 const MAX_PANES: usize = 8;
@@ -998,7 +181,7 @@ fn handle_preset_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
 
 fn commit_preset(app: &mut WizardApp, preset: &Preset) {
     let choice = LayoutChoice::Preset {
-        name: preset.id.into(),
+        name: preset.id.clone(),
     };
     seed_assignments(&mut app.state, &choice);
     app.state.layout = choice;
@@ -1012,9 +195,9 @@ fn commit_keep_existing(app: &mut WizardApp) {
 /// the Assign page can iterate cells without computing them itself.
 fn seed_assignments(state: &mut WizardState, choice: &LayoutChoice) {
     let want = match choice {
-        LayoutChoice::Preset { name } => PRESETS
+        LayoutChoice::Preset { name } => all_presets()
             .iter()
-            .find(|p| p.id == name)
+            .find(|p| &p.id == name)
             .map(|p| p.cells)
             .unwrap_or(0),
         LayoutChoice::KeepExisting => return,
@@ -1043,9 +226,9 @@ fn default_count(app: &WizardApp) -> usize {
     // config.toml so the count picker starts on the user's actual layout
     // size rather than an arbitrary fallback.
     match &app.state.layout {
-        LayoutChoice::Preset { name } => PRESETS
+        LayoutChoice::Preset { name } => all_presets()
             .iter()
-            .find(|p| p.id == name)
+            .find(|p| &p.id == name)
             .map(|p| p.cells)
             .unwrap_or(4),
         LayoutChoice::KeepExisting => app.state.assignments.len().clamp(MIN_PANES, MAX_PANES),
@@ -1053,7 +236,7 @@ fn default_count(app: &WizardApp) -> usize {
 }
 
 fn presets_for(count: usize) -> impl Iterator<Item = &'static Preset> {
-    PRESETS.iter().filter(move |p| p.cells == count)
+    all_presets().iter().filter(move |p| p.cells == count)
 }
 
 pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp) {
@@ -1189,9 +372,9 @@ fn render_preset_preview(frame: &mut Frame, area: Rect, preset: &Preset) {
         style::section_header(),
     )));
     lines.push(Line::from(""));
-    for row in preset.ascii {
+    for row in &preset.ascii {
         lines.push(Line::from(Span::styled(
-            row.to_string(),
+            row.clone(),
             style::value_idle(),
         )));
     }
@@ -1224,14 +407,14 @@ mod tests {
     #[test]
     fn preset_ids_are_unique() {
         let mut seen = std::collections::HashSet::new();
-        for p in PRESETS {
-            assert!(seen.insert(p.id), "duplicate preset id: {}", p.id);
+        for p in all_presets() {
+            assert!(seen.insert(&p.id), "duplicate preset id: {}", p.id);
         }
     }
 
     #[test]
     fn preset_grid_def_matches_cell_count() {
-        for p in PRESETS {
+        for p in all_presets() {
             assert_eq!(
                 p.grid_def.len(),
                 p.cells,

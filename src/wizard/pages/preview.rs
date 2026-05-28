@@ -20,7 +20,7 @@ use ratatui::{
 };
 
 use crate::wizard::{
-    pages::layout::{Preset, PRESETS},
+    pages::layout::{all_presets, Preset},
     state::{CellAssignment, LayoutChoice},
     style,
 };
@@ -74,7 +74,7 @@ pub fn render(
     }
 
     let preset = match layout {
-        LayoutChoice::Preset { name } => PRESETS.iter().find(|p| p.id == name.as_str()),
+        LayoutChoice::Preset { name } => all_presets().iter().find(|p| p.id == name.as_str()),
         LayoutChoice::KeepExisting => None,
     };
     let Some(preset) = preset else {

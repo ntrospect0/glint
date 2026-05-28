@@ -397,10 +397,10 @@ fn atomic_write(path: &Path, contents: &str) -> Result<()> {
 /// Falls back to the first preset (`single`) if the name doesn't match,
 /// which keeps a working dashboard rather than corrupting the file.
 fn render_preset_layout(name: &str) -> String {
-    let preset = layout_page::PRESETS
+    let preset = layout_page::all_presets()
         .iter()
         .find(|p| p.id == name)
-        .unwrap_or(&layout_page::PRESETS[0]);
+        .unwrap_or(&layout_page::all_presets()[0]);
 
     let mut out = String::new();
     out.push_str("[layout]\n");
@@ -822,10 +822,10 @@ mod tests {
         // Walks every preset in the picker. Each one, fully populated
         // with concrete widget kinds, should emit exactly `preset.cells`
         // `[[layout.cells]]` blocks — no more, no less.
-        for preset in layout_page::PRESETS {
+        for preset in layout_page::all_presets() {
             let assignments: Vec<(usize, &str)> = (0..preset.cells).map(|i| (i, "clock")).collect();
-            let state = state_for(preset.id, assignments);
-            let layout = substitute_assignments(render_preset_layout(preset.id), &state);
+            let state = state_for(&preset.id, assignments);
+            let layout = substitute_assignments(render_preset_layout(&preset.id), &state);
             assert_eq!(
                 cell_block_count(&layout),
                 preset.cells,
