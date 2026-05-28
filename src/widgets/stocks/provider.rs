@@ -111,8 +111,42 @@ pub struct StockQuote {
     pub currency: Option<String>,
     /// Closing-price intraday series for graphing (5-minute bars by default).
     pub intraday: Vec<f64>,
+    /// Unix-second timestamps parallel to `intraday`. Populated only on 1D
+    /// (where bars are timestamped); empty on longer periods. The renderer
+    /// uses these to draw vertical cutoff lines at the pre/regular and
+    /// regular/post session boundaries on the 1D chart.
+    #[serde(default)]
+    pub intraday_timestamps: Vec<i64>,
+    /// Unix-second bounds of the *regular* trading session for the day
+    /// `intraday` describes, taken from `meta.currentTradingPeriod.regular`.
+    /// `None` when Yahoo didn't return the field (e.g. indices on long
+    /// ranges) or when the period isn't 1D.
+    #[serde(default)]
+    pub regular_session_start_ts: Option<i64>,
+    #[serde(default)]
+    pub regular_session_end_ts: Option<i64>,
     #[allow(dead_code)] // surfaced in status bar / staleness label in a follow-up.
     pub fetched_at: chrono::DateTime<chrono::Local>,
+    /// Extended-hours quote fields straight from `chart.meta`. Populated for
+    /// equities outside regular trading hours; absent for indices and during
+    /// the regular session. The graph header renders these on the 1D view as
+    /// the `AH` / `PRE` segment.
+    #[serde(default)]
+    pub post_market_price: Option<f64>,
+    #[serde(default)]
+    pub post_market_change: Option<f64>,
+    #[serde(default)]
+    pub post_market_change_percent: Option<f64>,
+    #[serde(default)]
+    pub pre_market_price: Option<f64>,
+    #[serde(default)]
+    pub pre_market_change: Option<f64>,
+    #[serde(default)]
+    pub pre_market_change_percent: Option<f64>,
+    /// Yahoo's `marketState` — "REGULAR", "PRE", "PREPRE", "POST", "POSTPOST",
+    /// "CLOSED". Used to pick which extended-hours session is most recent.
+    #[serde(default)]
+    pub market_state: Option<String>,
 }
 
 impl StockQuote {
@@ -226,8 +260,16 @@ impl YahooFinanceProvider {
 
     async fn fetch_chart(&self, symbol: &str, period: Period) -> Result<StockQuote> {
         let (interval, range) = period.yahoo_params();
+        // On 1D we ask Yahoo to include pre-market and post-market bars so
+        // the graph can render the full 04:00–20:00 ET window. Longer
+        // ranges don't benefit and the param just bloats the response.
+        let prepost_q = if matches!(period, Period::Day) {
+            "&includePrePost=true"
+        } else {
+            ""
+        };
         let url = format!(
-            "{base}/v8/finance/chart/{sym}?interval={interval}&range={range}",
+            "{base}/v8/finance/chart/{sym}?interval={interval}&range={range}{prepost_q}",
             base = self.base_url.trim_end_matches('/'),
             sym = urlencoding::encode(symbol)
         );
@@ -252,28 +294,53 @@ impl YahooFinanceProvider {
             .and_then(|mut r| r.pop())
             .with_context(|| format!("Yahoo returned no result for {symbol}"))?;
         let meta = result.meta;
-        let intraday: Vec<f64> = result
+        // Pair each close-price bar with its source timestamp before dropping
+        // null bars. Yahoo returns `null` close values for many extended-hours
+        // bars (low volume); we collapse to "(ts, price)" only for finite
+        // values so timestamps line up with the rendered series.
+        let timestamps_raw: Vec<i64> = result.timestamp.unwrap_or_default();
+        let closes_raw: Vec<Option<f64>> = result
             .indicators
             .and_then(|i| i.quote.into_iter().next())
-            .map(|q| q.close.into_iter().flatten().collect())
+            .map(|q| q.close)
             .unwrap_or_default();
+        let mut paired: Vec<(i64, f64)> = timestamps_raw
+            .iter()
+            .copied()
+            .zip(closes_raw.into_iter())
+            .filter_map(|(ts, v)| v.filter(|x| x.is_finite()).map(|v| (ts, v)))
+            .collect();
 
         // 3-year approximation: Yahoo gave us 5y of daily bars, keep the last
         // ~60% (~3 of the 5 years).
-        let intraday: Vec<f64> = if matches!(period, Period::ThreeYear) {
-            let keep = (intraday.len() * 3) / 5;
-            let skip = intraday.len().saturating_sub(keep);
-            intraday.into_iter().skip(skip).collect()
-        } else {
-            intraday
-        };
+        if matches!(period, Period::ThreeYear) {
+            let keep = (paired.len() * 3) / 5;
+            let skip = paired.len().saturating_sub(keep);
+            paired = paired.into_iter().skip(skip).collect();
+        }
 
         // Downsample multi-year series before they hit memory + disk cache.
         // The chart renderer interpolates the series across `trace_w` columns
         // (typically 40–160), so 240 source points is well above the
         // visible resolution. 5Y/10Y daily bars compress 6–12× with no
-        // perceptible chart-quality loss.
-        let intraday = downsample_to_max(intraday, 240);
+        // perceptible chart-quality loss. We downsample (timestamp, value)
+        // pairs together so the parallel arrays stay aligned.
+        let paired = downsample_pairs_to_max(paired, 240);
+        let intraday: Vec<f64> = paired.iter().map(|(_, v)| *v).collect();
+        let intraday_timestamps: Vec<i64> = paired.iter().map(|(ts, _)| *ts).collect();
+
+        let (regular_session_start_ts, regular_session_end_ts) = match (
+            meta.current_trading_period.as_ref().and_then(|p| p.regular.as_ref()),
+            matches!(period, Period::Day),
+        ) {
+            // Session bounds are only meaningful for 1D — they describe
+            // today's regular trading window, which the renderer uses to
+            // filter the chart to regular-session bars (extended-hours
+            // bars stay in `intraday` so the AH/PRE header can derive
+            // from them, but the chart paints regular session only).
+            (Some(reg), true) => (reg.start, reg.end),
+            _ => (None, None),
+        };
 
         Ok(StockQuote {
             symbol: meta.symbol.unwrap_or_else(|| symbol.to_string()),
@@ -302,7 +369,17 @@ impl YahooFinanceProvider {
             beta: None,
             currency: meta.currency,
             intraday,
+            intraday_timestamps,
+            regular_session_start_ts,
+            regular_session_end_ts,
             fetched_at: chrono::Local::now(),
+            post_market_price: meta.post_market_price,
+            post_market_change: meta.post_market_change,
+            post_market_change_percent: meta.post_market_change_percent,
+            pre_market_price: meta.pre_market_price,
+            pre_market_change: meta.pre_market_change,
+            pre_market_change_percent: meta.pre_market_change_percent,
+            market_state: meta.market_state,
         })
     }
 }
@@ -507,6 +584,8 @@ struct ChartError {
 struct ChartResult {
     meta: ChartMeta,
     #[serde(default)]
+    timestamp: Option<Vec<i64>>,
+    #[serde(default)]
     indicators: Option<ChartIndicators>,
 }
 
@@ -541,6 +620,37 @@ struct ChartMeta {
     average_daily_volume_10_day: Option<u64>,
     #[serde(default)]
     market_cap: Option<u64>,
+    #[serde(default)]
+    post_market_price: Option<f64>,
+    #[serde(default)]
+    post_market_change: Option<f64>,
+    #[serde(default)]
+    post_market_change_percent: Option<f64>,
+    #[serde(default)]
+    pre_market_price: Option<f64>,
+    #[serde(default)]
+    pre_market_change: Option<f64>,
+    #[serde(default)]
+    pre_market_change_percent: Option<f64>,
+    #[serde(default)]
+    market_state: Option<String>,
+    #[serde(default)]
+    current_trading_period: Option<CurrentTradingPeriod>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentTradingPeriod {
+    #[serde(default)]
+    regular: Option<TradingPeriod>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TradingPeriod {
+    #[serde(default)]
+    start: Option<i64>,
+    #[serde(default)]
+    end: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -555,20 +665,21 @@ struct QuoteBars {
     close: Vec<Option<f64>>,
 }
 
-/// Trim `series` to at most `max` evenly-spaced points, preserving the
-/// first and last samples. Used to keep multi-year daily series from
-/// holding thousands of points in memory + disk cache when the chart
-/// can only show ~200 columns at the widest.
-pub(super) fn downsample_to_max(series: Vec<f64>, max: usize) -> Vec<f64> {
-    if max == 0 || series.len() <= max {
-        return series;
+/// Trim `(timestamp, value)` pairs to at most `max` evenly-spaced points,
+/// preserving the first and last samples. Used to keep multi-year daily
+/// series from holding thousands of points in memory + disk cache when
+/// the chart can only show ~200 columns at the widest. Timestamps follow
+/// values through the downsample so the renderer can still find the
+/// column position of a specific date.
+pub(super) fn downsample_pairs_to_max(pairs: Vec<(i64, f64)>, max: usize) -> Vec<(i64, f64)> {
+    if max == 0 || pairs.len() <= max {
+        return pairs;
     }
-    let n = series.len();
+    let n = pairs.len();
     let mut out = Vec::with_capacity(max);
     for i in 0..max {
-        // Map output index 0..max-1 → input 0..n-1, preserving endpoints.
         let idx = (i * (n - 1)) / (max - 1);
-        out.push(series[idx]);
+        out.push(pairs[idx]);
     }
     out
 }
@@ -598,33 +709,47 @@ mod tests {
             beta: None,
             currency: None,
             intraday: vec![],
+            intraday_timestamps: vec![],
+            regular_session_start_ts: None,
+            regular_session_end_ts: None,
             fetched_at: chrono::Local::now(),
+            post_market_price: None,
+            post_market_change: None,
+            post_market_change_percent: None,
+            pre_market_price: None,
+            pre_market_change: None,
+            pre_market_change_percent: None,
+            market_state: None,
         };
         assert!((q.change() - 4.0).abs() < 1e-9);
         assert!((q.change_pct() - 2.040_816).abs() < 1e-3);
     }
 
     #[test]
-    fn downsample_returns_input_when_already_under_cap() {
-        let s = vec![1.0, 2.0, 3.0, 4.0];
-        assert_eq!(downsample_to_max(s.clone(), 10), s);
-        assert_eq!(downsample_to_max(s.clone(), 4), s);
+    fn downsample_pairs_returns_input_when_already_under_cap() {
+        let s: Vec<(i64, f64)> =
+            vec![(100, 1.0), (200, 2.0), (300, 3.0), (400, 4.0)];
+        assert_eq!(downsample_pairs_to_max(s.clone(), 10), s);
+        assert_eq!(downsample_pairs_to_max(s.clone(), 4), s);
     }
 
     #[test]
-    fn downsample_preserves_endpoints_and_caps_length() {
-        let s: Vec<f64> = (0..1000).map(|i| i as f64).collect();
-        let out = downsample_to_max(s, 240);
+    fn downsample_pairs_preserves_endpoints_and_caps_length() {
+        let s: Vec<(i64, f64)> = (0..1000).map(|i| (i as i64, i as f64)).collect();
+        let out = downsample_pairs_to_max(s, 240);
         assert_eq!(out.len(), 240);
-        assert_eq!(out[0], 0.0);
-        assert_eq!(out[239], 999.0);
+        assert_eq!(out[0], (0, 0.0));
+        assert_eq!(out[239], (999, 999.0));
     }
 
     #[test]
-    fn downsample_handles_empty_and_zero_max() {
-        assert_eq!(downsample_to_max(vec![], 100), Vec::<f64>::new());
-        let s = vec![1.0, 2.0, 3.0];
-        assert_eq!(downsample_to_max(s.clone(), 0), s);
+    fn downsample_pairs_handles_empty_and_zero_max() {
+        assert_eq!(
+            downsample_pairs_to_max(Vec::new(), 100),
+            Vec::<(i64, f64)>::new()
+        );
+        let s: Vec<(i64, f64)> = vec![(1, 1.0), (2, 2.0), (3, 3.0)];
+        assert_eq!(downsample_pairs_to_max(s.clone(), 0), s);
     }
 
     #[test]
@@ -648,7 +773,17 @@ mod tests {
             beta: None,
             currency: None,
             intraday: vec![],
+            intraday_timestamps: vec![],
+            regular_session_start_ts: None,
+            regular_session_end_ts: None,
             fetched_at: chrono::Local::now(),
+            post_market_price: None,
+            post_market_change: None,
+            post_market_change_percent: None,
+            pre_market_price: None,
+            pre_market_change: None,
+            pre_market_change_percent: None,
+            market_state: None,
         };
         assert_eq!(q.change_pct(), 0.0);
     }

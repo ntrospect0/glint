@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc, Weekday};
+use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Timelike, Utc, Weekday};
 use chrono_tz::Tz;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -161,7 +161,6 @@ enum QuoteState {
     Failed,
 }
 
-#[derive(Default)]
 struct StocksState {
     quotes: HashMap<String, QuoteState>,
     selected: usize,
@@ -189,6 +188,30 @@ struct StocksState {
     /// (handle_key / handle_mouse) don't need to set it — non-tick
     /// events always redraw at the App level.
     dirty: bool,
+    /// One-shot "bypass the market-hours fetch gate on the next due
+    /// check" flag. Set true at construction (cold start always allows
+    /// at least one refresh so a sleeping-overnight reopen gets fresh
+    /// data) and by `mark_dirty()` (user-triggered `r` / `:refresh`).
+    /// Consumed by `is_due()` after the bypass fires.
+    force_next_refresh: bool,
+}
+
+impl Default for StocksState {
+    fn default() -> Self {
+        Self {
+            quotes: HashMap::new(),
+            selected: 0,
+            list_scroll: 0,
+            transient_ticker: None,
+            transient_searching: None,
+            poll: crate::polling::PollTracker::default(),
+            any_inflight: false,
+            confirm_remove: None,
+            status: None,
+            dirty: false,
+            force_next_refresh: true,
+        }
+    }
 }
 
 /// How long the status feedback line stays on screen after an
@@ -367,11 +390,34 @@ impl StocksWidget {
     }
 
     fn is_due(&self) -> bool {
-        let st = self.state.lock().expect("stocks state poisoned");
+        // Compute the "first fetch needed" flag outside the state lock so
+        // we don't double-lock via all_symbols().
+        let symbols = self.all_symbols();
+        let mut st = self.state.lock().expect("stocks state poisoned");
         if st.any_inflight {
             return false;
         }
-        st.poll.is_due()
+        if !st.poll.is_due() {
+            return false;
+        }
+        // Bypass the market-hours gate when:
+        //   1. Cold start / cache miss — any symbol still without Ready data.
+        //   2. The force_next_refresh one-shot flag is set (cold-start
+        //      catch-up fetch, or user-triggered `r` / `:refresh`).
+        // Consume the flag so subsequent ticks fall back to the gate.
+        let need_first_fetch = symbols
+            .iter()
+            .any(|s| !matches!(st.quotes.get(s), Some(QuoteState::Ready(_))));
+        if st.force_next_refresh || need_first_fetch {
+            st.force_next_refresh = false;
+            return true;
+        }
+        // Otherwise: only refresh during pre-market / regular / post-market
+        // (04:00–20:00 America/New_York on a non-weekend, non-holiday day).
+        // Yahoo's quote doesn't change outside those windows, so polling
+        // through the overnight just burns rate-limit budget and chews
+        // through the cached crumb.
+        is_extended_market_hours(Utc::now())
     }
 
     fn spawn_refresh(&self) {
@@ -405,7 +451,17 @@ impl StocksWidget {
             });
             let results = futures::future::join_all(futs).await;
             let mut st = state.lock().expect("stocks state poisoned");
-            let mut snapshot: HashMap<String, StockQuote> = HashMap::new();
+            // Seed the cache snapshot from existing Ready entries so a partial
+            // failure (e.g. one symbol's request errors) doesn't wipe the
+            // on-disk snapshot for the symbols that *did* succeed previously.
+            let mut snapshot: HashMap<String, StockQuote> = st
+                .quotes
+                .iter()
+                .filter_map(|(k, v)| match v {
+                    QuoteState::Ready(q) => Some((k.clone(), (**q).clone())),
+                    _ => None,
+                })
+                .collect();
             for (sym, result) in results {
                 match result {
                     Ok(q) => {
@@ -414,7 +470,19 @@ impl StocksWidget {
                     }
                     Err(err) => {
                         tracing::warn!(symbol = %sym, error = %err, "stock fetch failed");
-                        st.quotes.insert(sym, QuoteState::Failed);
+                        // Keep the last known-good quote if we have one — the
+                        // user sees the prior price instead of `err` through
+                        // transient network outages (e.g. wake-from-sleep).
+                        // Only flip to `Failed` if we never had a successful
+                        // fetch for this symbol.
+                        st.quotes
+                            .entry(sym)
+                            .and_modify(|e| {
+                                if !matches!(e, QuoteState::Ready(_)) {
+                                    *e = QuoteState::Failed;
+                                }
+                            })
+                            .or_insert(QuoteState::Failed);
                     }
                 }
             }
@@ -432,6 +500,10 @@ impl StocksWidget {
     fn mark_dirty(&self) {
         let mut st = self.state.lock().expect("stocks state poisoned");
         st.poll.mark_dirty();
+        // User-triggered refreshes (`r`, `:refresh`, period changes) must
+        // override the market-hours fetch gate so the user always gets
+        // an immediate response to their explicit action.
+        st.force_next_refresh = true;
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -1586,14 +1658,14 @@ fn render_graph_panel(
         (Color::Red, '▼')
     };
     let currency = q.currency.as_deref().unwrap_or("");
-    let header = Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(
             q.symbol.clone(),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
-            format!("{:>10.2} {currency}", q.price),
+            format!("{:.2} {currency}", q.price),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
@@ -1601,7 +1673,26 @@ fn render_graph_panel(
             format!("{glyph} {:+.2} ({:+.2}%) {}", chg, pct, period.label()),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-    ]);
+    ];
+
+    // Extended-hours segment — only on 1D. Picks the most recent session via
+    // Yahoo's `marketState`, falling back to post-market when present and pre
+    // otherwise. Hidden when the change is exactly zero (no movement yet).
+    if matches!(period, Period::Day) {
+        if let Some((label, ah_chg, ah_pct)) = extended_hours_segment(q) {
+            let (ah_color, ah_glyph) = if ah_chg >= 0.0 {
+                (Color::Green, '▲')
+            } else {
+                (Color::Red, '▼')
+            };
+            header_spans.push(Span::raw("  "));
+            header_spans.push(Span::styled(
+                format!("{ah_glyph} {:+.2} ({:+.2}%) {label}", ah_chg, ah_pct),
+                Style::default().fg(ah_color).add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    let header = Line::from(header_spans);
     frame.render_widget(
         Paragraph::new(header),
         Rect {
@@ -1665,16 +1756,49 @@ fn render_graph_panel(
         frame.render_widget(Paragraph::new(Span::styled(label, theme.text_dim)), rect);
     }
 
-    // For 1D in "trading-day progress" mode, render the trace at a
-    // fraction of plot_w proportional to how much of the regular session
-    // has elapsed (estimated by intraday bar count vs. TRADING_DAY_BARS).
-    // For YTD, do the analogous thing across the calendar year: the
-    // x-axis labels span Jan…Nov (the full year) and the trace fills
-    // only the elapsed fraction so the May data doesn't get stretched
-    // out to look like it spans through November.
-    // Other periods fill the full width.
+    // === Trace rendering ===
+    //
+    // For 1D, the chart shows only the regular trading session bars
+    // (09:30–16:00 ET). Yahoo's `1d` response still contains the full
+    // extended-hours window (we keep `includePrePost=true` so the
+    // AH/PRE header has data to derive from) — we just filter to the
+    // regular session here. If the filter returns empty (early
+    // pre-market on a new day before any regular bars), we render the
+    // full sparse data so the chart isn't blank.
+    let filtered: Option<(Vec<f64>, Vec<i64>)> = if matches!(period, Period::Day)
+        && q.intraday.len() == q.intraday_timestamps.len()
+        && q.regular_session_start_ts.is_some()
+        && q.regular_session_end_ts.is_some()
+    {
+        let start = q.regular_session_start_ts.unwrap();
+        let end = q.regular_session_end_ts.unwrap();
+        let (vs, ts): (Vec<f64>, Vec<i64>) = q
+            .intraday
+            .iter()
+            .zip(q.intraday_timestamps.iter())
+            .filter(|(_, t)| **t >= start && **t <= end)
+            .map(|(v, t)| (*v, *t))
+            .unzip();
+        if vs.is_empty() {
+            None
+        } else {
+            Some((vs, ts))
+        }
+    } else {
+        None
+    };
+    let (intraday_render, timestamps_render): (&[f64], &[i64]) = match &filtered {
+        Some((vs, ts)) => (vs.as_slice(), ts.as_slice()),
+        None => (q.intraday.as_slice(), q.intraday_timestamps.as_slice()),
+    };
+
+    // trace_w = how many columns the actual trace fills.
+    //   - 1D pad mode: elapsed regular-session bars vs. TRADING_DAY_BARS
+    //     (regular session = 78 bars at 5-min interval).
+    //   - YTD: day-of-year / days-in-year × plot_w.
+    //   - other periods / non-pad: full plot_w.
     let trace_w = if pad_intraday_to_full_day && matches!(period, Period::Day) {
-        let frac = (q.intraday.len() as f64 / TRADING_DAY_BARS as f64).clamp(0.0, 1.0);
+        let frac = (intraday_render.len() as f64 / TRADING_DAY_BARS as f64).clamp(0.0, 1.0);
         let w = (plot_w as f64 * frac).round() as u16;
         w.clamp(2, plot_w)
     } else if matches!(period, Period::YearToDate) {
@@ -1691,7 +1815,7 @@ fn render_graph_panel(
     } else {
         plot_w
     };
-    let rows = graph::render_series(&q.intraday, plot_h, trace_w, plot_min, plot_max);
+    let rows = graph::render_series(intraday_render, plot_h, trace_w, plot_min, plot_max);
     for (i, row) in rows.iter().enumerate() {
         let rect = Rect {
             x: plot_x,
@@ -1710,6 +1834,31 @@ fn render_graph_panel(
             )),
             rect,
         );
+    }
+
+    // Calendar-aligned vertical guides for periods 1W and longer. Each
+    // guide marks the start of the natural unit appropriate to the
+    // period (day, week, month, quarter, year, or biennium). The same
+    // (column, label) pairs drive both the guides and the x-axis labels
+    // so they line up vertically.
+    let annotations = period_annotations(period, timestamps_render);
+    if !annotations.is_empty() && timestamps_render.len() >= 2 {
+        let n = timestamps_render.len();
+        let faint = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM);
+        for ann in &annotations {
+            // Skip column 0 — the left edge of the chart is implicitly
+            // the start of the first unit; drawing a guide there would
+            // overlay the y-axis labels and look noisy.
+            if ann.bar_index == 0 {
+                continue;
+            }
+            let frac = ann.bar_index as f64 / (n - 1) as f64;
+            let col = (frac * (trace_w as f64 - 1.0)).round() as u16;
+            let col = col.min(trace_w.saturating_sub(1));
+            draw_vertical_guide(frame, plot_x + col, plot_top, plot_h, &rows, col, faint);
+        }
     }
 
     // Reference lines: drawn AFTER the trace so we can overlay only on cells
@@ -1765,21 +1914,49 @@ fn render_graph_panel(
     // `Jan Mar May Jul Sep Nov` would mis-represent any 1Y graph that
     // doesn't happen to start in January. YTD adds a trailing `Dec`
     // so the year visibly spans Jan→Dec across the plot.
-    let labels: Vec<String> = match period {
-        Period::Day => str_labels(&["9:30", "10:45", "12:00", "13:15", "14:30", "15:45"]),
-        Period::Week => str_labels(&["Mon", "Tue", "Wed", "Thu", "Fri"]),
-        Period::Month => str_labels(&["wk1", "wk2", "wk3", "wk4"]),
-        Period::SixMonth => str_labels(&["1mo", "2mo", "3mo", "4mo", "5mo", "6mo"]),
-        Period::YearToDate => str_labels(&["Jan", "Mar", "May", "Jul", "Sep", "Nov", "Dec"]),
-        Period::Year => rolling_year_month_labels(chrono::Local::now().date_naive()),
-        Period::ThreeYear => str_labels(&["-3y", "-2y", "-1y", "now"]),
-        Period::FiveYear => str_labels(&["-5y", "-4y", "-3y", "-2y", "-1y", "now"]),
-        Period::TenYear => str_labels(&["-10y", "-8y", "-6y", "-4y", "-2y", "now"]),
+    // 1D keeps the legacy even-distribution labels (the regular session
+    // is a uniform 6h 15m window, so even spacing maps cleanly to time).
+    // Longer periods drive labels from the same annotation list as the
+    // vertical guides so the labels line up directly under their guides.
+    let line = if matches!(period, Period::Day) || annotations.is_empty() {
+        let labels: Vec<String> = match period {
+            Period::Day => {
+                str_labels(&["9:30", "10:45", "12:00", "13:15", "14:30", "15:45"])
+            }
+            Period::Week => str_labels(&["Mon", "Tue", "Wed", "Thu", "Fri"]),
+            Period::Month => str_labels(&["wk1", "wk2", "wk3", "wk4"]),
+            Period::SixMonth => str_labels(&["1mo", "2mo", "3mo", "4mo", "5mo", "6mo"]),
+            Period::YearToDate => str_labels(&["Jan", "Mar", "May", "Jul", "Sep", "Nov", "Dec"]),
+            Period::Year => rolling_year_month_labels(chrono::Local::now().date_naive()),
+            Period::ThreeYear => str_labels(&["-3y", "-2y", "-1y", "now"]),
+            Period::FiveYear => str_labels(&["-5y", "-4y", "-3y", "-2y", "-1y", "now"]),
+            Period::TenYear => str_labels(&["-10y", "-8y", "-6y", "-4y", "-2y", "now"]),
+        };
+        let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+        lay_out_x_axis_labels(&label_refs, plot_w as usize)
+    } else {
+        // Place each annotation's label at the column matching its
+        // vertical guide. The first annotation (always at bar_index 0)
+        // is dropped — labeling the chart's left edge crowds the next
+        // label and looks awkward, since there's no guide line there
+        // anyway. Overlap collisions resolve in favor of the earlier
+        // label.
+        let cols: Vec<(usize, &str)> = annotations
+            .iter()
+            .filter(|ann| ann.bar_index > 0)
+            .map(|ann| {
+                let n = timestamps_render.len();
+                let frac = if n <= 1 {
+                    0.0
+                } else {
+                    ann.bar_index as f64 / (n - 1) as f64
+                };
+                let col = (frac * (trace_w as f64 - 1.0)).round() as usize;
+                (col.min(trace_w.saturating_sub(1) as usize), ann.label.as_str())
+            })
+            .collect();
+        lay_out_x_axis_labels_at_cols(&cols, plot_w as usize)
     };
-    let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
-    // Distribute labels so the first one's left edge is at column 0
-    // and the last one's right edge anchors at the plot's right edge.
-    let line = lay_out_x_axis_labels(&label_refs, plot_w as usize);
     frame.render_widget(
         Paragraph::new(Span::styled(line, theme.text_dim)),
         xaxis_rect,
@@ -1912,6 +2089,230 @@ fn draw_reference_line(
     }
 }
 
+/// Annotation for the calendar-aligned vertical guides + x-axis labels.
+/// Each entry pins a label to a specific bar index; the renderer maps
+/// that bar's column position to draw both the guide and the label so
+/// they share an x-coordinate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeriodAnnotation {
+    bar_index: usize,
+    label: String,
+}
+
+/// Compute the calendar-boundary annotations for `period` from a slice of
+/// bar timestamps (unix seconds, UTC). Each annotation pins a short label
+/// to the first bar of a new natural unit:
+///   - 1W → start of each new ET trading day (Mon/Tue/Wed/Thu/Fri).
+///   - 1M → start of each new ISO week (Mon).
+///   - 6M / YTD → start of each new month.
+///   - 1Y → start of each new calendar quarter.
+///   - 3Y / 5Y → start of each new calendar year.
+///   - 10Y → every second calendar year boundary.
+/// 1D returns an empty list — the regular session is one unit, so the
+/// only useful x-axis markers are the legacy time-of-day labels.
+fn period_annotations(period: Period, timestamps: &[i64]) -> Vec<PeriodAnnotation> {
+    if timestamps.is_empty() {
+        return Vec::new();
+    }
+    let to_local = |ts: i64| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+            .map(|dt| dt.with_timezone(&chrono::Local))
+    };
+    // Resolve every timestamp once so the boundary-iteration loops below
+    // don't redo the chrono conversion.
+    let local: Vec<chrono::DateTime<chrono::Local>> =
+        timestamps.iter().filter_map(|t| to_local(*t)).collect();
+    if local.len() != timestamps.len() || local.is_empty() {
+        return Vec::new();
+    }
+    match period {
+        Period::Day => Vec::new(),
+        Period::Week => annotate_when_changes(&local, |dt| dt.date_naive().ordinal0() as i32, |dt| {
+            // Mon/Tue/Wed/Thu/Fri abbreviation from the weekday.
+            match dt.weekday() {
+                Weekday::Mon => "Mon",
+                Weekday::Tue => "Tue",
+                Weekday::Wed => "Wed",
+                Weekday::Thu => "Thu",
+                Weekday::Fri => "Fri",
+                Weekday::Sat => "Sat",
+                Weekday::Sun => "Sun",
+            }
+            .to_string()
+        }),
+        Period::Month => annotate_when_changes(
+            &local,
+            |dt| dt.iso_week().week() as i32 * 100 + (dt.iso_week().year() % 100),
+            |dt| format!("wk{}", iso_week_of_month_or_zero(*dt) + 1),
+        ),
+        Period::SixMonth | Period::YearToDate => annotate_when_changes(
+            &local,
+            |dt| dt.year() * 100 + dt.month() as i32,
+            |dt| short_month_name(dt.month()).to_string(),
+        ),
+        Period::Year => annotate_when_changes(
+            &local,
+            |dt| dt.year() * 10 + ((dt.month() as i32 - 1) / 3),
+            |dt| short_month_name(dt.month()).to_string(),
+        ),
+        Period::ThreeYear | Period::FiveYear => {
+            annotate_when_changes(&local, |dt| dt.year(), |dt| format!("{}", dt.year()))
+        }
+        Period::TenYear => {
+            // Year-changes filtered to even years (every-other-year guides).
+            let mut anns = annotate_when_changes(
+                &local,
+                |dt| dt.year(),
+                |dt| format!("{}", dt.year()),
+            );
+            anns.retain(|ann| {
+                ann.label
+                    .parse::<i32>()
+                    .map(|y| y % 2 == 0)
+                    .unwrap_or(true)
+            });
+            anns
+        }
+    }
+}
+
+/// Iterate `local` in order, emitting an annotation each time `key(dt)`
+/// changes between consecutive bars. The annotation is pinned to the
+/// *first* bar of the new value of `key` and the label comes from
+/// `label_of` applied to that same bar.
+fn annotate_when_changes<K, L>(
+    local: &[chrono::DateTime<chrono::Local>],
+    key: K,
+    label_of: L,
+) -> Vec<PeriodAnnotation>
+where
+    K: Fn(&chrono::DateTime<chrono::Local>) -> i32,
+    L: Fn(&chrono::DateTime<chrono::Local>) -> String,
+{
+    if local.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut last_key = key(&local[0]);
+    out.push(PeriodAnnotation {
+        bar_index: 0,
+        label: label_of(&local[0]),
+    });
+    for (i, dt) in local.iter().enumerate().skip(1) {
+        let k = key(dt);
+        if k != last_key {
+            out.push(PeriodAnnotation {
+                bar_index: i,
+                label: label_of(dt),
+            });
+            last_key = k;
+        }
+    }
+    out
+}
+
+fn short_month_name(month: u32) -> &'static str {
+    match month {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "—",
+    }
+}
+
+/// 0-indexed ISO-week ordinal within the month containing `dt`. Used by
+/// the 1M period to label week boundaries as `wk1`, `wk2`, etc., where
+/// `wk1` is the week containing the 1st of the month. Falls back to 0
+/// if the chrono calculation produces something nonsensical (shouldn't
+/// happen in practice).
+fn iso_week_of_month_or_zero(dt: chrono::DateTime<chrono::Local>) -> u32 {
+    let day = dt.day();
+    // Approximate "week of month" as `(day-1)/7` — close enough for
+    // labeling, doesn't need to match ISO week boundaries exactly.
+    (day.saturating_sub(1)) / 7
+}
+
+/// Place `(col, label)` pairs into a `width`-cell line so each label
+/// starts at its requested column. Labels rendered in input order; an
+/// earlier label wins any overlap with a later one. Trailing labels
+/// that would extend past `width` are truncated.
+fn lay_out_x_axis_labels_at_cols(items: &[(usize, &str)], width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut buf: Vec<char> = vec![' '; width];
+    for (col, label) in items {
+        let start = (*col).min(width.saturating_sub(1));
+        let chars: Vec<char> = label.chars().collect();
+        // Center the label on `col` so it visually anchors on the guide.
+        // Right edge would overflow off the chart for the rightmost label —
+        // clamp so the last label's right edge sits at width-1.
+        let half = chars.len() / 2;
+        let mut left = start.saturating_sub(half);
+        if left + chars.len() > width {
+            left = width.saturating_sub(chars.len());
+        }
+        // Skip if the slot is already painted (earlier label wins).
+        if buf[left..(left + chars.len()).min(width)]
+            .iter()
+            .any(|c| *c != ' ')
+        {
+            continue;
+        }
+        for (i, ch) in chars.iter().enumerate() {
+            if left + i >= width {
+                break;
+            }
+            buf[left + i] = *ch;
+        }
+    }
+    buf.iter().collect()
+}
+
+/// Draw a faint vertical guide line at a fixed column inside the plot.
+/// Skips rows where the trace already painted a glyph at that column so the
+/// guide reads as "behind" the trace where they overlap. Used for 1D
+/// pre-market / post-market cutoffs.
+#[allow(clippy::too_many_arguments)]
+fn draw_vertical_guide(
+    frame: &mut Frame,
+    x: u16,
+    plot_top: u16,
+    plot_h: u16,
+    trace_rows: &[String],
+    trace_col: u16,
+    style: Style,
+) {
+    if plot_h == 0 {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    for row in 0..plot_h as usize {
+        let trace_owns_cell = trace_rows
+            .get(row)
+            .and_then(|s| s.chars().nth(trace_col as usize))
+            .map(|c| c != ' ')
+            .unwrap_or(false);
+        if trace_owns_cell {
+            continue;
+        }
+        let y = plot_top + row as u16;
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_char('│');
+            cell.set_style(style);
+        }
+    }
+}
+
 /// Gregorian leap-year predicate. Inlined so the YTD x-axis math
 /// doesn't need a chrono detour for one ternary.
 fn is_leap_year(year: i32) -> bool {
@@ -1921,6 +2322,124 @@ fn is_leap_year(year: i32) -> bool {
 /// Returns (change_abs, change_pct) for the given period. 1D uses the
 /// previous-close convention (standard ticker change); longer windows use
 /// the first sample in the series as the baseline.
+/// Pick which extended-hours segment (if any) to render in the 1D header.
+/// Returns `(label, change, change_pct)` where `label` is "AH" for the
+/// post-market session and "PRE" for the pre-market session.
+///
+/// Source-of-truth ranking:
+///   1. The 1D intraday bars themselves — most accurate, naturally
+///      persists through the overnight gap (Yahoo's `1d` response still
+///      contains today's post-market bars until tomorrow's pre-market
+///      opens), and reflects exactly what the chart is showing.
+///   2. Yahoo's `meta.postMarket*` / `preMarket*` fields — fallback for
+///      old cached quotes without timestamps, or non-1D periods.
+///
+/// Returns `None` during the regular session (no extended movement to
+/// surface) or when the change is exactly zero (no movement yet).
+fn extended_hours_segment(q: &StockQuote) -> Option<(&'static str, f64, f64)> {
+    if let Some(seg) = extended_hours_from_bars(q) {
+        return Some(seg);
+    }
+    extended_hours_from_meta(q)
+}
+
+/// Derive AH/PRE from the intraday timestamps + the regular-session
+/// boundaries. Picks AH when the latest bar is past `regular_session_end_ts`
+/// (post-market is happening, just finished, or we're in the overnight
+/// gap), and PRE when the latest bar is before `regular_session_start_ts`
+/// (next morning's pre-market session). Returns `None` during the regular
+/// session.
+fn extended_hours_from_bars(q: &StockQuote) -> Option<(&'static str, f64, f64)> {
+    if q.intraday.is_empty() || q.intraday_timestamps.is_empty() {
+        return None;
+    }
+    if q.intraday.len() != q.intraday_timestamps.len() {
+        return None;
+    }
+    let reg_end = q.regular_session_end_ts?;
+    let reg_start = q.regular_session_start_ts?;
+
+    let last_idx = q.intraday.len() - 1;
+    let last_ts = q.intraday_timestamps[last_idx];
+    let last_price = q.intraday[last_idx];
+
+    if last_ts > reg_end {
+        // Post-market session or overnight. Baseline is the regular close:
+        // the latest bar whose timestamp is at or before regular_session_end.
+        let regular_close = q
+            .intraday_timestamps
+            .iter()
+            .zip(q.intraday.iter())
+            .rev()
+            .find(|(ts, _)| **ts <= reg_end)
+            .map(|(_, v)| *v)?;
+        if regular_close == 0.0 {
+            return None;
+        }
+        let chg = last_price - regular_close;
+        if chg == 0.0 {
+            return None;
+        }
+        let pct = chg / regular_close * 100.0;
+        Some(("AH", chg, pct))
+    } else if last_ts < reg_start {
+        // Pre-market session (no regular bars yet today). Baseline is
+        // yesterday's regular close, which Yahoo returns as previous_close.
+        if q.previous_close == 0.0 {
+            return None;
+        }
+        let chg = last_price - q.previous_close;
+        if chg == 0.0 {
+            return None;
+        }
+        let pct = chg / q.previous_close * 100.0;
+        Some(("PRE", chg, pct))
+    } else {
+        // Latest bar sits inside the regular session — no extended-hours
+        // segment makes sense right now.
+        None
+    }
+}
+
+/// Fallback: read Yahoo's `meta` post/pre fields directly. Used when bars
+/// aren't available (e.g., older cached quotes that pre-date the
+/// timestamp+session-bounds plumbing). Less reliable: Yahoo nulls these
+/// out during the regular session and in the overnight gap on some
+/// symbols.
+fn extended_hours_from_meta(q: &StockQuote) -> Option<(&'static str, f64, f64)> {
+    let post = match (q.post_market_change, q.post_market_change_percent) {
+        (Some(c), Some(p)) => Some((c, p)),
+        _ => None,
+    };
+    let pre = match (q.pre_market_change, q.pre_market_change_percent) {
+        (Some(c), Some(p)) => Some((c, p)),
+        _ => None,
+    };
+    let prefer_pre = matches!(
+        q.market_state.as_deref(),
+        Some("PRE") | Some("PREPRE")
+    );
+    let (label, chg, pct) = if prefer_pre {
+        let (c, p) = pre.or(post)?;
+        if pre.is_some() {
+            ("PRE", c, p)
+        } else {
+            ("AH", c, p)
+        }
+    } else {
+        let (c, p) = post.or(pre)?;
+        if post.is_some() {
+            ("AH", c, p)
+        } else {
+            ("PRE", c, p)
+        }
+    };
+    if chg == 0.0 && pct == 0.0 {
+        return None;
+    }
+    Some((label, chg, pct))
+}
+
 fn period_change(q: &StockQuote, period: Period) -> (f64, f64) {
     match period {
         Period::Day => (q.change(), q.change_pct()),
@@ -2331,6 +2850,33 @@ const MARKET_OPEN_HOUR: u32 = 9;
 const MARKET_OPEN_MINUTE: u32 = 30;
 const MARKET_CLOSE_HOUR: u32 = 16;
 const MARKET_EARLY_CLOSE_HOUR: u32 = 13;
+/// Pre-market opens 04:00 ET and post-market closes 20:00 ET. Used by the
+/// poll gate so we don't pound Yahoo overnight or on weekends.
+const EXTENDED_OPEN_HOUR: u32 = 4;
+const EXTENDED_CLOSE_HOUR: u32 = 20;
+
+/// True while `now_utc` sits inside the extended-hours window
+/// (pre-market + regular + post-market) on a trading day. False on
+/// weekends, holidays, and overnight (20:00–04:00 ET). Used as the
+/// quotes-poll gate so the widget doesn't burn rate-limit budget when
+/// Yahoo's quote can't change.
+fn is_extended_market_hours(now_utc: chrono::DateTime<Utc>) -> bool {
+    let Ok(tz) = MARKET_TZ.parse::<Tz>() else {
+        // If the tz lookup ever fails, default to "always poll" rather
+        // than silently strand the widget.
+        return true;
+    };
+    let now = now_utc.with_timezone(&tz);
+    let date = now.date_naive();
+    if matches!(date.weekday(), Weekday::Sat | Weekday::Sun) {
+        return false;
+    }
+    if is_market_holiday(date) {
+        return false;
+    }
+    let hour = now.hour();
+    hour >= EXTENDED_OPEN_HOUR && hour < EXTENDED_CLOSE_HOUR
+}
 
 fn market_status_line(now_utc: chrono::DateTime<Utc>) -> MarketStatus {
     let Ok(tz) = MARKET_TZ.parse::<Tz>() else {
@@ -2782,7 +3328,17 @@ mod tests {
             beta: None,
             currency: None,
             intraday: vec![],
+            intraday_timestamps: vec![],
+            regular_session_start_ts: None,
+            regular_session_end_ts: None,
             fetched_at: chrono::Local::now(),
+            post_market_price: None,
+            post_market_change: None,
+            post_market_change_percent: None,
+            pre_market_price: None,
+            pre_market_change: None,
+            pre_market_change_percent: None,
+            market_state: None,
         }
     }
 
@@ -2962,6 +3518,210 @@ mod tests {
             .single()
             .expect("valid local time");
         local.with_timezone(&Utc)
+    }
+
+    #[test]
+    fn extended_market_hours_covers_premarket_through_postmarket() {
+        // 04:00 ET Monday → in window.
+        assert!(is_extended_market_hours(et_to_utc(2026, 5, 18, 4, 0)));
+        // 09:30 ET (regular open) → in window.
+        assert!(is_extended_market_hours(et_to_utc(2026, 5, 18, 9, 30)));
+        // 19:59 ET → still in window (post-market closes at 20:00).
+        assert!(is_extended_market_hours(et_to_utc(2026, 5, 18, 19, 59)));
+        // 20:00 ET → out of window.
+        assert!(!is_extended_market_hours(et_to_utc(2026, 5, 18, 20, 0)));
+        // 03:00 ET → before pre-market open.
+        assert!(!is_extended_market_hours(et_to_utc(2026, 5, 18, 3, 0)));
+        // Saturday → never in window even during pre/post hours.
+        assert!(!is_extended_market_hours(et_to_utc(2026, 5, 16, 10, 0)));
+    }
+
+    #[test]
+    fn extended_hours_segment_meta_fallback_prefers_post_after_close() {
+        // No bars/timestamps populated → falls back to Yahoo's meta fields.
+        let mut q = quote("AAPL", 200.0, 196.0);
+        q.market_state = Some("POST".into());
+        q.post_market_change = Some(0.42);
+        q.post_market_change_percent = Some(0.21);
+        let seg = extended_hours_segment(&q).expect("AH segment present");
+        assert_eq!(seg.0, "AH");
+        assert!((seg.1 - 0.42).abs() < 1e-9);
+    }
+
+    #[test]
+    fn extended_hours_segment_meta_fallback_uses_pre_in_morning() {
+        let mut q = quote("AAPL", 200.0, 196.0);
+        q.market_state = Some("PRE".into());
+        q.pre_market_change = Some(-0.15);
+        q.pre_market_change_percent = Some(-0.08);
+        let seg = extended_hours_segment(&q).expect("PRE segment present");
+        assert_eq!(seg.0, "PRE");
+        assert!(seg.1 < 0.0);
+    }
+
+    #[test]
+    fn extended_hours_segment_hidden_when_change_is_zero() {
+        let mut q = quote("AAPL", 200.0, 196.0);
+        q.market_state = Some("POST".into());
+        q.post_market_change = Some(0.0);
+        q.post_market_change_percent = Some(0.0);
+        assert!(extended_hours_segment(&q).is_none());
+    }
+
+    #[test]
+    fn extended_hours_from_bars_shows_ah_when_latest_bar_is_post_market() {
+        // Mock a 1D quote with: 3 regular-session bars closing at 196,
+        // then 2 post-market bars closing at 198. Yahoo's "AH" should
+        // report +2.00 (+1.02%).
+        let mut q = quote("AAPL", 198.0, 195.0);
+        // Regular session 09:30–16:00 ET; bars at 15:50, 15:55, 16:00, 16:05, 16:10.
+        q.regular_session_start_ts = Some(1_700_000_000); // arbitrary anchor
+        q.regular_session_end_ts = Some(1_700_023_400); // anchor + 6.5h
+        q.intraday_timestamps = vec![
+            1_700_023_100, // 5m before close
+            1_700_023_400, // exactly close
+            1_700_023_700, // 5m after close (post-market)
+            1_700_024_000, // 10m after close (post-market)
+        ];
+        q.intraday = vec![196.0, 196.0, 197.0, 198.0];
+        let seg = extended_hours_segment(&q).expect("AH from bars");
+        assert_eq!(seg.0, "AH");
+        assert!((seg.1 - 2.0).abs() < 1e-9, "got {}", seg.1);
+        assert!((seg.2 - (2.0 / 196.0 * 100.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn extended_hours_from_bars_persists_after_post_market_closes() {
+        // 21:22 ET scenario: post-market closed at 20:00 ET, no new bars
+        // are coming. The latest bar is still post-market, so AH stays.
+        let mut q = quote("AAPL", 198.0, 195.0);
+        q.regular_session_start_ts = Some(1_700_000_000);
+        q.regular_session_end_ts = Some(1_700_023_400);
+        // Last bar is well past regular_session_end (4h after close).
+        q.intraday_timestamps = vec![1_700_023_400, 1_700_037_800];
+        q.intraday = vec![196.0, 198.0];
+        let seg = extended_hours_segment(&q).expect("AH persists overnight");
+        assert_eq!(seg.0, "AH");
+        assert!((seg.1 - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn extended_hours_from_bars_shows_pre_when_latest_bar_is_premarket() {
+        // Next morning: pre-market bars exist, no regular bars yet.
+        let mut q = quote("AAPL", 199.0, 196.0);
+        // Regular session today 09:30 ET = anchor; bar at 06:00 ET (pre).
+        q.regular_session_start_ts = Some(1_700_100_000);
+        q.regular_session_end_ts = Some(1_700_123_400);
+        q.intraday_timestamps = vec![1_700_086_000, 1_700_087_800]; // both before reg_start
+        q.intraday = vec![198.0, 199.0];
+        let seg = extended_hours_segment(&q).expect("PRE from bars");
+        assert_eq!(seg.0, "PRE");
+        // PRE baseline is previous_close (196), so chg = 199 - 196 = +3.
+        assert!((seg.1 - 3.0).abs() < 1e-9, "got {}", seg.1);
+    }
+
+    #[test]
+    fn period_annotations_1d_returns_empty() {
+        // 1D suppresses annotation-driven labels (the regular session is a
+        // single uniform block; the legacy 9:30/10:45/... labels work fine).
+        let ts: Vec<i64> = (0..78).map(|i| 1_700_000_000 + i * 300).collect();
+        assert!(period_annotations(Period::Day, &ts).is_empty());
+    }
+
+    #[test]
+    fn period_annotations_six_month_marks_month_boundaries() {
+        // Use mid-month noon-UTC timestamps to dodge TZ-boundary ambiguity:
+        // mid-Mar / mid-Apr / mid-May land in their named month in any
+        // local TZ, so we should see three distinct month annotations.
+        let ts = vec![
+            1_773_172_800, // 2026-03-15 12:00 UTC
+            1_775_851_200, // 2026-04-15 12:00 UTC
+            1_778_443_200, // 2026-05-15 12:00 UTC
+        ];
+        let anns = period_annotations(Period::SixMonth, &ts);
+        assert_eq!(anns.len(), 3);
+        for ann in &anns {
+            assert_eq!(ann.label.len(), 3, "label {:?}", ann.label);
+        }
+    }
+
+    #[test]
+    fn period_annotations_year_uses_quarter_boundaries() {
+        // Months 1, 2, 3 (same quarter), 4 (new quarter), 7 (new quarter)
+        // — expect 3 annotations (Q1, Q2, Q3).
+        let ts = vec![
+            1_767_225_600, // Jan 1 2026
+            1_769_904_000, // Feb 1 2026
+            1_772_323_200, // Mar 1 2026
+            1_775_001_600, // Apr 1 2026
+            1_783_036_800, // Jul 1 2026
+        ];
+        let anns = period_annotations(Period::Year, &ts);
+        assert_eq!(anns.len(), 3);
+    }
+
+    #[test]
+    fn period_annotations_five_year_uses_year_boundaries() {
+        // Jan 1 of 2022, 2023, 2024, 2025, 2026.
+        let ts = vec![
+            1_640_995_200, // 2022-01-01 UTC
+            1_672_531_200, // 2023-01-01 UTC
+            1_704_067_200, // 2024-01-01 UTC
+            1_735_689_600, // 2025-01-01 UTC
+            1_767_225_600, // 2026-01-01 UTC
+        ];
+        let anns = period_annotations(Period::FiveYear, &ts);
+        assert_eq!(anns.len(), 5);
+    }
+
+    #[test]
+    fn period_annotations_ten_year_keeps_only_even_years() {
+        let ts = vec![
+            1_577_836_800, // 2020-01-01 UTC
+            1_609_459_200, // 2021-01-01 UTC
+            1_640_995_200, // 2022-01-01 UTC
+            1_672_531_200, // 2023-01-01 UTC
+            1_704_067_200, // 2024-01-01 UTC
+        ];
+        let anns = period_annotations(Period::TenYear, &ts);
+        let years: Vec<i32> = anns.iter().filter_map(|a| a.label.parse().ok()).collect();
+        assert!(years.iter().all(|y| y % 2 == 0), "got {:?}", years);
+    }
+
+    #[test]
+    fn lay_out_x_axis_labels_at_cols_places_labels_around_target_columns() {
+        // 30-wide line, three labels at cols 0, 14, 29. The middle label
+        // is centered: a 3-char label centered on col 14 occupies cols
+        // 13..16 (left = col - len/2).
+        let items = vec![(0, "Jan"), (14, "May"), (29, "Dec")];
+        let line = lay_out_x_axis_labels_at_cols(&items, 30);
+        assert_eq!(line.len(), 30);
+        assert!(line.starts_with("Jan"));
+        assert!(line.ends_with("Dec"));
+        let chars: Vec<char> = line.chars().collect();
+        let mid: String = chars[13..16].iter().collect();
+        assert_eq!(mid, "May");
+    }
+
+    #[test]
+    fn lay_out_x_axis_labels_at_cols_skips_overlaps() {
+        // Two labels too close to fit — second one collides with the first
+        // and gets dropped.
+        let items = vec![(0, "Jan"), (1, "Feb")];
+        let line = lay_out_x_axis_labels_at_cols(&items, 10);
+        assert!(line.starts_with("Jan"));
+        assert!(!line.contains("Feb"));
+    }
+
+    #[test]
+    fn extended_hours_from_bars_hidden_during_regular_session() {
+        // Latest bar is mid-day regular session — no AH/PRE segment.
+        let mut q = quote("AAPL", 197.0, 196.0);
+        q.regular_session_start_ts = Some(1_700_000_000);
+        q.regular_session_end_ts = Some(1_700_023_400);
+        q.intraday_timestamps = vec![1_700_005_000, 1_700_010_000]; // both inside session
+        q.intraday = vec![196.5, 197.0];
+        assert!(extended_hours_segment(&q).is_none());
     }
 
     #[test]
