@@ -8,7 +8,7 @@
 //! * [`relative_time_label`] — "how long ago" for timestamps. Falls
 //!   back to absolute `MMM DD` once you're past a few weeks, which
 //!   conveys time-of-year better than `8w`. Used by widgets that
-//!   display article / event timestamps (news, wsj).
+//!   display article / event timestamps (news, feeds).
 //!
 //! * [`short_duration_label`] — compact `Ns / Nm / Nh / Nd / Nmo`
 //!   for cumulative durations or short ages. Useful for "data age"

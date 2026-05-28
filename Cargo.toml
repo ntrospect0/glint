@@ -41,8 +41,9 @@ widget-email = []
 widget-resources = []
 widget-gallery = []
 widget-notes = []
-# WSJ depends on news's RssProvider + sanitize_summary helper.
-widget-wsj = ["widget-news"]
+# Feeds depends on news's sanitize_summary helper. Hosts the tabbed
+# single-source RSS reader (WSJ, Barron's, MarketWatch, …).
+widget-feeds = ["widget-news"]
 widgets-all = [
   "widget-clock",
   "widget-weather",
@@ -54,7 +55,7 @@ widgets-all = [
   "widget-resources",
   "widget-gallery",
   "widget-notes",
-  "widget-wsj",
+  "widget-feeds",
 ]
 
 [dependencies]

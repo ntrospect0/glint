@@ -150,18 +150,13 @@ pub const WIDGETS: &[WidgetDescriptor] = &[
         auth_requirements: &[],
         wizard: super::notes::wizard_descriptor,
     },
-    #[cfg(feature = "widget-wsj")]
+    #[cfg(feature = "widget-feeds")]
     WidgetDescriptor {
-        kind: super::wsj::KIND,
-        factory: super::wsj::build,
+        kind: super::feeds::KIND,
+        factory: super::feeds::build,
         default_in_first_run: false,
-        // WSJ stores its session cookie in a widget-local credentials
-        // file rather than going through OAuth. No auth_requirements
-        // entry means the wizard's auth-prompt step skips us, which is
-        // intentional — the cookie is captured at runtime via the
-        // widget's own `a` (authorize) modal.
         auth_requirements: &[],
-        wizard: super::wsj::wizard_descriptor,
+        wizard: super::feeds::wizard_descriptor,
     },
 ];
 

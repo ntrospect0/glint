@@ -1504,7 +1504,7 @@ impl Widget for ForexWidget {
             // browser. Per the platform convention `Enter` belongs
             // to the in-place primary action (swap, above); the
             // external-jump gesture lives on `o` here just like in
-            // stocks / news / wsj.
+            // stocks / news / feeds.
             KeyCode::Char('o') => {
                 self.jump_to_external();
                 EventResult::Handled

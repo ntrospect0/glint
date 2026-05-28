@@ -23,8 +23,8 @@ pub mod stack;
 pub mod stocks;
 #[cfg(feature = "widget-weather")]
 pub mod weather;
-#[cfg(feature = "widget-wsj")]
-pub mod wsj;
+#[cfg(feature = "widget-feeds")]
+pub mod feeds;
 
 use std::{collections::HashMap, sync::Arc};
 

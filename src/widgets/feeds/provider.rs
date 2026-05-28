@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 ntrospect0
 
-//! WSJ-specific RSS provider. Mostly mirrors `news::provider::RssProvider`
-//! but extracts hero-image URLs from `<media:content>` elements (the
-//! news widget's `Article` struct doesn't carry these) and tags each
-//! article with the feed's topic label directly — no keyword matching.
-//! WSJ already groups articles by topic in their RSS structure, so we
-//! honor that grouping verbatim.
+//! Single-source RSS provider for the feeds widget. Mirrors
+//! `news::provider::RssProvider` but extracts hero-image URLs from
+//! `<media:content>` / `<media:thumbnail>` elements (the news
+//! widget's `Article` struct doesn't carry these) and tags each
+//! article with the feed's topic label directly — no keyword
+//! matching. Dow Jones-style sites already group articles by topic
+//! in their RSS structure, so we honor that grouping verbatim.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -20,12 +21,12 @@ fn sanitize_summary(raw: &str) -> String {
     crate::text::sanitize_html(raw)
 }
 
-/// One WSJ article. Subset of `news::Article` plus the hero image
-/// URL pulled from RSS media elements. Serialized into the widget's
-/// cache so a fresh launch can paint immediately while the next fetch
-/// completes in the background.
+/// One article. Subset of `news::Article` plus the hero image URL
+/// pulled from RSS media elements. Serialized into the widget's
+/// cache so a fresh launch can paint immediately while the next
+/// fetch completes in the background.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WsjArticle {
+pub struct FeedArticle {
     pub title: String,
     pub url: String,
     pub topic: String,
@@ -33,69 +34,28 @@ pub struct WsjArticle {
     pub published: DateTime<Utc>,
     pub summary: Option<String>,
     /// First media URL found in `<media:content>` / `<media:thumbnail>`,
-    /// if any. WSJ consistently provides one per article on
-    /// `images.wsj.net`. Empty for feeds that omit media (rare for WSJ).
+    /// if any. Empty for feeds that omit media (rare for the major
+    /// Dow Jones sources).
     pub hero_image_url: Option<String>,
     pub authors: Vec<String>,
 }
 
-/// A single (topic, feed URL) pair the user has activated.
+/// A single (topic, feed URL) pair the user has activated. Owned
+/// `String`s — sourced from the per-instance TOML's `[[feeds]]`
+/// blocks at construction time.
 #[derive(Debug, Clone)]
-pub struct WsjFeed {
-    pub topic: &'static str,
-    pub url: &'static str,
+pub struct FeedDefinition {
+    pub topic: String,
+    pub url: String,
 }
 
-/// WSJ's curated catalogue. Each entry: (topic, feed URL). Verified
-/// reachable as of May 2026 — `feeds.content.dowjones.io` returns the
-/// long-form feed (50-100 items) versus `feeds.a.dj.com` which only
-/// surfaces the 20 most-recent. We use the longer form.
-pub const WSJ_CATALOGUE: &[(&str, &str)] = &[
-    (
-        "World",
-        "https://feeds.content.dowjones.io/public/rss/RSSWorldNews",
-    ),
-    (
-        "US",
-        "https://feeds.content.dowjones.io/public/rss/RSSUSNews",
-    ),
-    (
-        "Business",
-        "https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness",
-    ),
-    (
-        "Markets",
-        "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
-    ),
-    (
-        "Tech",
-        "https://feeds.content.dowjones.io/public/rss/RSSWSJD",
-    ),
-    (
-        "Opinion",
-        "https://feeds.content.dowjones.io/public/rss/RSSOpinion",
-    ),
-    (
-        "Politics",
-        "https://feeds.content.dowjones.io/public/rss/socialpoliticsfeed",
-    ),
-    (
-        "Economy",
-        "https://feeds.content.dowjones.io/public/rss/socialeconomyfeed",
-    ),
-    (
-        "Life",
-        "https://feeds.content.dowjones.io/public/rss/RSSLifestyle",
-    ),
-];
-
-pub struct WsjProvider {
+pub struct FeedsRssProvider {
     http: reqwest::Client,
-    feeds: Vec<WsjFeed>,
+    feeds: Vec<FeedDefinition>,
 }
 
-impl WsjProvider {
-    pub fn new(feeds: Vec<WsjFeed>) -> Self {
+impl FeedsRssProvider {
+    pub fn new(feeds: Vec<FeedDefinition>) -> Self {
         Self {
             http: crate::http::shared(),
             feeds,
@@ -105,7 +65,7 @@ impl WsjProvider {
     /// Fan-out RSS fetch across every activated feed. Per-feed errors
     /// are logged + skipped; surviving articles are deduplicated by
     /// URL and sorted newest-first.
-    pub async fn fetch(&self) -> Vec<WsjArticle> {
+    pub async fn fetch(&self) -> Vec<FeedArticle> {
         let futs = self.feeds.iter().map(|feed| async move {
             match self.fetch_feed(feed).await {
                 Ok(chunk) => chunk,
@@ -114,23 +74,23 @@ impl WsjProvider {
                         topic = %feed.topic,
                         url = %feed.url,
                         error = format!("{err:#}"),
-                        "wsj feed fetch failed"
+                        "feeds: rss feed fetch failed"
                     );
                     Vec::new()
                 }
             }
         });
         let chunks = futures::future::join_all(futs).await;
-        let mut all: Vec<WsjArticle> = chunks.into_iter().flatten().collect();
+        let mut all: Vec<FeedArticle> = chunks.into_iter().flatten().collect();
         dedup_by_url(&mut all);
         all.sort_by_key(|a| std::cmp::Reverse(a.published));
         all
     }
 
-    async fn fetch_feed(&self, feed: &WsjFeed) -> Result<Vec<WsjArticle>> {
+    async fn fetch_feed(&self, feed: &FeedDefinition) -> Result<Vec<FeedArticle>> {
         let bytes = self
             .http
-            .get(feed.url)
+            .get(&feed.url)
             .header(
                 reqwest::header::USER_AGENT,
                 concat!(
@@ -158,10 +118,10 @@ impl WsjProvider {
             .title
             .as_ref()
             .map(|t| t.content.clone())
-            .unwrap_or_else(|| format!("WSJ: {}", feed.topic));
+            .unwrap_or_else(|| feed.topic.clone());
         let mut articles = Vec::with_capacity(parsed.entries.len());
         for entry in parsed.entries {
-            if let Some(a) = entry_to_article(entry, feed.topic, &source) {
+            if let Some(a) = entry_to_article(entry, &feed.topic, &source) {
                 articles.push(a);
             }
         }
@@ -169,7 +129,11 @@ impl WsjProvider {
     }
 }
 
-fn entry_to_article(entry: feed_rs::model::Entry, topic: &str, source: &str) -> Option<WsjArticle> {
+fn entry_to_article(
+    entry: feed_rs::model::Entry,
+    topic: &str,
+    source: &str,
+) -> Option<FeedArticle> {
     let title = entry.title.map(|t| t.content).unwrap_or_default();
     if title.is_empty() {
         return None;
@@ -185,9 +149,6 @@ fn entry_to_article(entry: feed_rs::model::Entry, topic: &str, source: &str) -> 
         .map(|s| s.content)
         .filter(|s| !s.trim().is_empty())
         .map(|s| sanitize_summary(&s));
-    // Hero image: walk every MediaObject's content list and grab the
-    // first URL we find. WSJ puts one `<media:content>` per item and
-    // it's always the article hero on `images.wsj.net`.
     let hero_image_url = entry
         .media
         .iter()
@@ -205,7 +166,7 @@ fn entry_to_article(entry: feed_rs::model::Entry, topic: &str, source: &str) -> 
             }
         })
         .collect();
-    Some(WsjArticle {
+    Some(FeedArticle {
         title,
         url,
         topic: topic.to_string(),
@@ -217,12 +178,12 @@ fn entry_to_article(entry: feed_rs::model::Entry, topic: &str, source: &str) -> 
     })
 }
 
-fn dedup_by_url(articles: &mut Vec<WsjArticle>) {
-    // WSJ syndicates the same article across multiple topic feeds
-    // (e.g. an AI piece lands in both World and Tech) sometimes with
-    // tracking query strings differing per feed. Strip query + fragment
-    // before comparing so the same article doesn't show up twice with
-    // different `?mod=` suffixes.
+fn dedup_by_url(articles: &mut Vec<FeedArticle>) {
+    // Sources commonly syndicate the same article across multiple
+    // topic feeds (e.g. an AI piece lands in both World and Tech)
+    // sometimes with tracking query strings differing per feed. Strip
+    // query + fragment before comparing so the same article doesn't
+    // show up twice with different `?mod=` suffixes.
     let mut seen = std::collections::HashSet::new();
     articles.retain(|a| seen.insert(normalize_url(&a.url)));
 }
@@ -233,8 +194,6 @@ fn dedup_by_url(articles: &mut Vec<WsjArticle>) {
 fn normalize_url(raw: &str) -> String {
     let no_frag = raw.split('#').next().unwrap_or(raw);
     let no_query = no_frag.split('?').next().unwrap_or(no_frag);
-    // Lowercase scheme + host for case-insensitive dedup; preserve
-    // path case since some CMSes are path-case-sensitive.
     match no_query.split_once("://") {
         Some((scheme, rest)) => {
             let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
@@ -254,17 +213,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalogue_has_no_duplicate_topic_labels() {
-        let mut seen = std::collections::HashSet::new();
-        for (label, _) in WSJ_CATALOGUE {
-            assert!(seen.insert(*label), "duplicate topic label: {label}");
-        }
-    }
-
-    #[test]
     fn dedup_drops_repeats_by_url() {
         let mut v = vec![
-            WsjArticle {
+            FeedArticle {
                 title: "a".into(),
                 url: "https://x".into(),
                 topic: "World".into(),
@@ -274,7 +225,7 @@ mod tests {
                 hero_image_url: None,
                 authors: vec![],
             },
-            WsjArticle {
+            FeedArticle {
                 title: "b".into(),
                 url: "https://x".into(),
                 topic: "Business".into(),
@@ -292,13 +243,12 @@ mod tests {
 
     #[test]
     fn dedup_treats_syndicated_articles_as_one() {
-        // WSJ adds `?mod=hp_lead_pos1` / `?mod=djemRSS` etc. for the
-        // same article across different feeds. Without query-string
-        // stripping the article would render twice in the list.
+        // Same article URL with different `?mod=` query suffixes
+        // (Dow Jones' per-feed tracking params) should dedup to one.
         let url_world = "https://www.wsj.com/world/pope-leo-ai-c5e1af6c?mod=hp_lead_pos1";
         let url_tech = "https://www.wsj.com/world/pope-leo-ai-c5e1af6c?mod=djemRSS";
         let mut v = vec![
-            WsjArticle {
+            FeedArticle {
                 title: "Pope".into(),
                 url: url_world.into(),
                 topic: "World".into(),
@@ -308,7 +258,7 @@ mod tests {
                 hero_image_url: None,
                 authors: vec![],
             },
-            WsjArticle {
+            FeedArticle {
                 title: "Pope".into(),
                 url: url_tech.into(),
                 topic: "Tech".into(),

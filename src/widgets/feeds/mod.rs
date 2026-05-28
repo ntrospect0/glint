@@ -1,22 +1,28 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 ntrospect0
 
-//! WSJ widget — Wall Street Journal headline reader.
+//! Feeds widget — tabbed single-source RSS reader.
 //!
-//! Walks WSJ's official RSS feeds (`feeds.content.dowjones.io`),
-//! filters by topic tabs the user activated in the wizard, and
-//! optionally summarises headlines via the configured LLM at user
-//! request. Hero images render inline when an article is expanded.
-//! Everything we read is public — RSS feeds and `images.wsj.net`
-//! don't require a logged-in session.
+//! One widget kind, many instances. Each instance picks a built-in
+//! source preset (`source = "wsj"` / `"barrons"` / `"marketwatch"`)
+//! which supplies the catalogue of `(topic, URL)` pairs, the
+//! default display name, the LLM summarizer's source label, and
+//! the preferred shortcut letters. Per-instance TOML can override
+//! the display name and shortcut letters, and selects which topics
+//! become tabs inside the widget.
 //!
-//! Framework note: this widget intentionally lives entirely under
-//! `src/widgets/wsj/`. The only central edit is the
+//! Hero images render inline when an article is expanded.
+//! Everything we read is public — RSS feeds and the corresponding
+//! image CDNs don't require a logged-in session.
+//!
+//! Framework note: this widget lives entirely under
+//! `src/widgets/feeds/`. The only central edit is the
 //! `WidgetDescriptor` entry in `widgets/registry.rs` and the feature
 //! gate.
 
 pub mod image;
 pub mod provider;
+pub mod templates;
 
 use std::{
     collections::HashMap,
@@ -45,18 +51,27 @@ use crate::ui::{apply_title_row, MetadataEmphasis};
 use super::{AppContext, EventResult, Widget, WidgetCtx};
 
 use image::HeroImageStore;
-use provider::{WsjArticle, WsjFeed, WsjProvider, WSJ_CATALOGUE};
+use provider::{FeedArticle, FeedDefinition, FeedsRssProvider};
 
-pub const KIND: &str = "wsj";
+pub const KIND: &str = "feeds";
 
-/// Loaded from `~/.config/glint/wsj.toml`.
+/// Loaded from `~/.config/glint/feeds.toml` (or
+/// `feeds@<instance>.toml`).
+///
+/// The catalogue lives directly inside this file as `[[feeds]]`
+/// blocks — no separate "source preset" indirection. Built-in
+/// starter catalogues (WSJ, MarketWatch) live under
+/// `src/widgets/feeds/templates/` and are surfaced by the
+/// `--setup` wizard, but at runtime the per-instance TOML is the
+/// sole source of truth.
 #[derive(Debug, Clone, Deserialize)]
-pub struct WsjConfig {
-    /// Topics the user opted into during the wizard. Each name must
-    /// appear in [`WSJ_CATALOGUE`]; unknown entries are warned about
-    /// and dropped at construction time.
-    #[serde(default = "default_topics")]
-    pub topics: Vec<String>,
+pub struct FeedsConfig {
+    /// Title-bar / dashboard label and the LLM summarizer's
+    /// "house-style" label. When unset (or empty), falls back to
+    /// the instance name (or "Feeds" for the default `main`
+    /// instance).
+    #[serde(default)]
+    pub display_name: Option<String>,
 
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
@@ -69,31 +84,54 @@ pub struct WsjConfig {
     #[serde(default)]
     pub colors: ColorScheme,
 
+    /// Preferred `Shift+<letter>` shortcut keys. The app's first-fit
+    /// dispatcher walks this list and claims the first letter not
+    /// already taken by another widget. Empty list opts out of the
+    /// shortcut dispatcher entirely (widget still reachable via Tab
+    /// and mouse).
     #[serde(default)]
     pub shortcuts: Vec<char>,
+
+    /// Per-instance command aliases. The kind-level commands
+    /// (`:feeds <terms>`, `:feeds-summary`, `:feeds-refresh`) are
+    /// always available; entries here add additional aliases so
+    /// instances can be addressed by their source name (e.g.
+    /// `commands = ["wsj"]` makes `:wsj <terms>`, `:wsj-summary`,
+    /// and `:wsj-refresh` route to this instance).
+    #[serde(default)]
+    pub commands: Vec<String>,
+
+    /// One `[[feeds]]` block per active tab. The runtime catalogue
+    /// is exactly this list — no preset/template lookup. Empty list
+    /// triggers a one-time fallback to the WSJ starter template so a
+    /// fresh install still paints content; the fallback emits a
+    /// warning into the log so the user notices and edits their
+    /// TOML.
+    #[serde(default)]
+    pub feeds: Vec<FeedSpec>,
 }
 
-fn default_topics() -> Vec<String> {
-    vec![
-        "World".into(),
-        "Business".into(),
-        "Markets".into(),
-        "Tech".into(),
-    ]
+/// One `[[feeds]]` entry from the per-instance TOML.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FeedSpec {
+    pub topic: String,
+    pub url: String,
 }
 
 fn default_poll_interval() -> u64 {
     900
 }
 
-impl Default for WsjConfig {
+impl Default for FeedsConfig {
     fn default() -> Self {
         Self {
-            topics: default_topics(),
+            display_name: None,
             poll_interval_secs: default_poll_interval(),
             default_summary_length: SummaryLength::default(),
             colors: ColorScheme::default(),
             shortcuts: Vec::new(),
+            commands: Vec::new(),
+            feeds: Vec::new(),
         }
     }
 }
@@ -127,30 +165,33 @@ impl SummaryLength {
             Self::Long => "long",
         }
     }
-    /// System prompt tuned to the requested paragraph count.
-    fn system_prompt(self) -> &'static str {
+    /// System prompt tuned to the requested paragraph count. The
+    /// `source_label` (e.g. "WSJ", "Barron's", "MarketWatch") is
+    /// inlined so the LLM knows which publication's house style to
+    /// echo back.
+    fn system_prompt(self, source_label: &str) -> String {
         match self {
-            Self::Short => {
-                "You are a concise WSJ news summarizer. Given a \
+            Self::Short => format!(
+                "You are a concise {source_label} news summarizer. Given a \
                 headline and a short excerpt, return a neutral ONE-paragraph \
                 summary (3-5 sentences) capturing the key facts. No \
                 editorializing, no preamble, no markdown."
-            }
-            Self::Medium => {
-                "You are a concise WSJ news summarizer. Given a \
+            ),
+            Self::Medium => format!(
+                "You are a concise {source_label} news summarizer. Given a \
                 headline and a short excerpt, return a neutral TWO-paragraph \
                 summary capturing the key facts and any direct quotes. \
                 Separate paragraphs with a blank line. No editorializing, \
                 no preamble, no markdown."
-            }
-            Self::Long => {
-                "You are a thorough WSJ news summarizer. Given a \
+            ),
+            Self::Long => format!(
+                "You are a thorough {source_label} news summarizer. Given a \
                 headline and a short excerpt, return a neutral THREE-paragraph \
                 summary: paragraph 1 covers the lead facts; paragraph 2 covers \
                 context or quotes; paragraph 3 covers implications or \
                 outlook. Separate paragraphs with a blank line. No \
                 editorializing, no preamble, no markdown."
-            }
+            ),
         }
     }
     fn max_tokens(self) -> u32 {
@@ -176,14 +217,28 @@ enum SummaryState {
     Failed(String),
 }
 
-/// Free-text search built by `:wsj <terms>`. Articles match if any
+/// Decoded shape of a `:<word>` command for this widget. The
+/// dispatcher accepts both the kind-level `feeds*` triple and any
+/// per-instance alias declared in `FeedsConfig.commands`
+/// (`<alias>`, `<alias>-summary`, `<alias>-refresh`).
+#[derive(Debug, Clone, Copy)]
+enum CommandAction {
+    /// `:<root> <terms>` — keyword search; bare `:<root>` clears.
+    Search,
+    /// `:<root>-summary <short|medium|long>` — set summary length.
+    SummaryLength,
+    /// `:<root>-refresh` — force a refresh.
+    Refresh,
+}
+
+/// Free-text search built by `:feeds <terms>`. Articles match if any
 /// term appears (case-insensitive substring) in the title, topic, or
 /// summary; results are ranked by total occurrence count so the most
 /// densely-matching headline floats to the top.
 ///
 /// Tokenization is aggressive: any non-alphanumeric character is
-/// treated as a separator, so `:wsj climate, change; AI/tech` and
-/// `:wsj climate change AI tech` produce the same four terms. Apostrophes
+/// treated as a separator, so `:feeds climate, change; AI/tech` and
+/// `:feeds climate change AI tech` produce the same four terms. Apostrophes
 /// and other punctuation inside a token are *also* split — a small wart
 /// for words like "don't" but in exchange the user never has to think
 /// about how to delimit their query.
@@ -216,7 +271,7 @@ impl SearchFilter {
     /// Total case-insensitive substring matches across title, topic,
     /// and (if present) summary. Used both as the "include?" predicate
     /// (>0 means include) and as the sort key (higher wins).
-    fn hit_count(&self, article: &WsjArticle) -> usize {
+    fn hit_count(&self, article: &FeedArticle) -> usize {
         let title = article.title.to_lowercase();
         let topic = article.topic.to_lowercase();
         let summary = article
@@ -248,8 +303,8 @@ fn count_substring(haystack: &str, needle: &str) -> usize {
 }
 
 #[derive(Default)]
-struct WsjState {
-    articles: Vec<WsjArticle>,
+struct FeedsState {
+    articles: Vec<FeedArticle>,
     /// Index into the *filtered* article list (after the active topic
     /// tab is applied). Cleared on tab change.
     selected: usize,
@@ -286,10 +341,10 @@ struct WsjState {
     /// Per-(url, length) summary state. Keyed so the user can flip
     /// between short/medium/long without losing earlier requests.
     summaries: HashMap<String, SummaryState>,
-    /// Active `:wsj <terms>` filter, if any. When set, an extra
+    /// Active `:feeds <terms>` filter, if any. When set, an extra
     /// `🔎 <query>` tab is appended to the tab bar and articles whose
     /// title/topic/summary contain at least one term surface there,
-    /// ranked by hit count. Cleared by `x` or `:wsj` with no args.
+    /// ranked by hit count. Cleared by `x` or `:feeds` with no args.
     search: Option<SearchFilter>,
     /// True between a refresh kick-off and the corresponding
     /// articles update landing in `articles`.
@@ -305,7 +360,7 @@ struct WsjState {
 
 const STATUS_TTL: Duration = Duration::from_millis(2500);
 const ALL_TAB_LABEL: &str = "All";
-/// Prefix for the dynamic search tab built by `:wsj <terms>`. Matches
+/// Prefix for the dynamic search tab built by `:feeds <terms>`. Matches
 /// the news widget's `🔎 <query>` convention so users transferring
 /// muscle memory between the two read the same icon as "search".
 const SEARCH_TAB_PREFIX: &str = "🔎 ";
@@ -315,15 +370,18 @@ const SEARCH_TAB_PREFIX: &str = "🔎 ";
 /// articles into view.
 const MAX_TITLE_LINES: usize = 3;
 
-pub struct WsjWidget {
+pub struct FeedsWidget {
     id: String,
     instance: String,
     display_name_cache: String,
-    config: WsjConfig,
-    state: Arc<Mutex<WsjState>>,
+    config: FeedsConfig,
+    state: Arc<Mutex<FeedsState>>,
     summary_length: SummaryLength,
-    /// Active feeds derived from `config.topics`.
-    feeds: Vec<WsjFeed>,
+    /// Active feeds — exactly the per-instance `[[feeds]]` blocks.
+    /// When the config arrived empty, this is seeded from the WSJ
+    /// starter template at construction time (with a warning) so a
+    /// fresh install still paints headlines.
+    feeds: Vec<FeedDefinition>,
     /// LLM provider (None when disabled in llm.toml).
     llm: Option<Arc<dyn LlmProvider>>,
     cache: ScopedCache,
@@ -334,76 +392,94 @@ pub struct WsjWidget {
     shortcut_prefs: Vec<char>,
 }
 
-impl WsjWidget {
+impl FeedsWidget {
     pub fn with_config(
         instance: String,
-        config: WsjConfig,
+        config: FeedsConfig,
         app_theme: Arc<Theme>,
         cache: ScopedCache,
         llm: Option<Arc<dyn LlmProvider>>,
     ) -> Self {
         let theme = app_theme.with_overrides(&config.colors);
-        let shortcut_prefs = if config.shortcuts.is_empty() {
-            vec!['j', 'w', 's']
-        } else {
-            config.shortcuts.clone()
-        };
+        let shortcut_prefs = config.shortcuts.clone();
         let id = if instance == "main" {
-            "wsj".to_string()
+            KIND.to_string()
         } else {
-            format!("wsj@{instance}")
+            format!("{KIND}@{instance}")
         };
-        let display_name_cache = if instance == "main" {
-            "WSJ".to_string()
-        } else {
-            format!("WSJ ({instance})")
-        };
+        // Title-bar / dashboard label and the LLM summarizer's
+        // source name. Explicit `display_name` wins; otherwise we
+        // try the instance name, then fall back to "Feeds".
+        let display_name_cache = config
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if instance == "main" {
+                    "Feeds".to_string()
+                } else {
+                    // Title-case the instance ("wsj" → "Wsj") so the
+                    // dashboard label looks deliberate even when the
+                    // user didn't set `display_name = "…"`. Users
+                    // who care about exact casing override via
+                    // `display_name`.
+                    title_case_ascii(&instance)
+                }
+            });
 
-        // Resolve activated topics against the catalogue. Unknown
-        // entries are warned + dropped (likely a typo or a feed we
-        // retired). If everything was dropped, fall back to defaults
-        // so the widget isn't dead on arrival.
-        let mut feeds: Vec<WsjFeed> = config
-            .topics
-            .iter()
-            .filter_map(|name| {
-                WSJ_CATALOGUE
-                    .iter()
-                    .find(|(t, _)| t.eq_ignore_ascii_case(name))
-                    .map(|(t, u)| WsjFeed { topic: *t, url: *u })
-            })
-            .collect();
-        if feeds.is_empty() {
+        // Resolve the active catalogue. Per-instance `[[feeds]]`
+        // blocks are the source of truth; when none are configured,
+        // seed from the WSJ starter template so a brand-new install
+        // still has something to render — but emit a warning so the
+        // user knows their TOML is empty.
+        let feeds: Vec<FeedDefinition> = if config.feeds.is_empty() {
             tracing::warn!(
-                topics = ?config.topics,
-                "wsj: no configured topics matched catalogue, falling back to defaults"
+                instance = %instance,
+                "feeds: no [[feeds]] blocks configured, seeding from the WSJ starter template — \
+                 add `[[feeds]]` entries to your TOML to customize"
             );
-            feeds = default_topics()
+            match templates::by_id("wsj") {
+                Some(t) => t
+                    .feeds
+                    .into_iter()
+                    .filter(|f| f.default)
+                    .map(|f| FeedDefinition {
+                        topic: f.topic,
+                        url: f.url,
+                    })
+                    .collect(),
+                None => Vec::new(),
+            }
+        } else {
+            config
+                .feeds
                 .iter()
-                .filter_map(|name| {
-                    WSJ_CATALOGUE
-                        .iter()
-                        .find(|(t, _)| t.eq_ignore_ascii_case(name))
-                        .map(|(t, u)| WsjFeed { topic: *t, url: *u })
+                .map(|f| FeedDefinition {
+                    topic: f.topic.clone(),
+                    url: f.url.clone(),
                 })
-                .collect();
-        }
+                .collect()
+        };
 
         let poll_interval = Duration::from_secs(config.poll_interval_secs.max(60));
         let summary_length = config.default_summary_length;
 
         // Seed articles from the on-disk cache so the first render
         // paints content immediately while the next fetch happens.
-        let mut initial_state = WsjState {
+        let mut initial_state = FeedsState {
             active_tab: ALL_TAB_LABEL.to_string(),
             poll: crate::polling::PollTracker::new(poll_interval),
             ..Default::default()
         };
-        if let Some(entry) = cache.load::<Vec<WsjArticle>>(CACHE_KEY_ARTICLES) {
+        if let Some(entry) = cache.load::<Vec<FeedArticle>>(CACHE_KEY_ARTICLES) {
             initial_state.poll.seed_from_cache_age(entry.age());
             initial_state.articles = entry.value;
         }
-        initial_state.poll.apply_jitter(&format!("wsj@{instance}"));
+        initial_state
+            .poll
+            .apply_jitter(&format!("{KIND}@{instance}"));
 
         let images = Arc::new(HeroImageStore::new(cache.clone()));
 
@@ -428,13 +504,13 @@ impl WsjWidget {
     fn mark_dirty(&self) {
         self.state
             .lock()
-            .expect("wsj state poisoned")
+            .expect("feeds state poisoned")
             .poll
             .mark_dirty();
     }
 
     fn is_due(&self) -> bool {
-        let st = self.state.lock().expect("wsj state poisoned");
+        let st = self.state.lock().expect("feeds state poisoned");
         if st.fetching {
             return false;
         }
@@ -446,7 +522,7 @@ impl WsjWidget {
             return;
         }
         {
-            let mut st = self.state.lock().expect("wsj state poisoned");
+            let mut st = self.state.lock().expect("feeds state poisoned");
             st.fetching = true;
             st.poll.mark_attempted();
             st.dirty = true;
@@ -455,15 +531,15 @@ impl WsjWidget {
         let state = self.state.clone();
         let cache = self.cache.clone();
         tokio::spawn(async move {
-            let provider = WsjProvider::new(feeds);
+            let provider = FeedsRssProvider::new(feeds);
             let articles = provider.fetch().await;
             // Persist for next launch.
             if !articles.is_empty() {
                 if let Err(err) = cache.store(CACHE_KEY_ARTICLES, &articles) {
-                    tracing::warn!(error = %err, "wsj articles cache store failed");
+                    tracing::warn!(error = %err, "feeds: articles cache store failed");
                 }
             }
-            let mut st = state.lock().expect("wsj state poisoned");
+            let mut st = state.lock().expect("feeds state poisoned");
             if !articles.is_empty() {
                 // Clamp selection so the new list doesn't leave the
                 // cursor pointing past the end.
@@ -483,7 +559,7 @@ impl WsjWidget {
     /// sorts results by hit count (descending) so the most densely-
     /// matching headlines appear first.
     fn filtered_indices(&self) -> Vec<usize> {
-        let st = self.state.lock().expect("wsj state poisoned");
+        let st = self.state.lock().expect("feeds state poisoned");
         if let Some(search) = st.search.as_ref() {
             if st.active_tab.starts_with(SEARCH_TAB_PREFIX) {
                 let mut scored: Vec<(usize, usize)> = st
@@ -516,13 +592,13 @@ impl WsjWidget {
             .collect()
     }
 
-    fn selected_article(&self) -> Option<WsjArticle> {
+    fn selected_article(&self) -> Option<FeedArticle> {
         let filtered = self.filtered_indices();
-        let idx = self.state.lock().expect("wsj state poisoned").selected;
+        let idx = self.state.lock().expect("feeds state poisoned").selected;
         let real = filtered.get(idx).copied()?;
         self.state
             .lock()
-            .expect("wsj state poisoned")
+            .expect("feeds state poisoned")
             .articles
             .get(real)
             .cloned()
@@ -533,7 +609,7 @@ impl WsjWidget {
         if total == 0 {
             return;
         }
-        let mut st = self.state.lock().expect("wsj state poisoned");
+        let mut st = self.state.lock().expect("feeds state poisoned");
         let new = (st.selected as isize + delta).clamp(0, total as isize - 1);
         if new as usize != st.selected {
             // Article change → reset the expanded-panel scroll so
@@ -548,7 +624,7 @@ impl WsjWidget {
         if tabs.is_empty() {
             return;
         }
-        let mut st = self.state.lock().expect("wsj state poisoned");
+        let mut st = self.state.lock().expect("feeds state poisoned");
         let cur = tabs.iter().position(|t| t == &st.active_tab).unwrap_or(0);
         let n = tabs.len();
         let next = if forward {
@@ -563,7 +639,7 @@ impl WsjWidget {
     }
 
     /// Tab labels: "All", one per activated topic, plus a dynamic
-    /// `🔎 <query>` tab when a `:wsj <terms>` search is active.
+    /// `🔎 <query>` tab when a `:feeds <terms>` search is active.
     fn tab_labels(&self) -> Vec<String> {
         let mut out = vec![ALL_TAB_LABEL.to_string()];
         for f in &self.feeds {
@@ -572,7 +648,7 @@ impl WsjWidget {
         if let Some(search) = self
             .state
             .lock()
-            .expect("wsj state poisoned")
+            .expect("feeds state poisoned")
             .search
             .as_ref()
         {
@@ -581,7 +657,7 @@ impl WsjWidget {
         out
     }
 
-    /// `:wsj <terms>` — install or replace the active search filter,
+    /// `:feeds <terms>` — install or replace the active search filter,
     /// append the search tab, and jump to it so the user sees results
     /// immediately. Empty / whitespace-only / punctuation-only input
     /// degrades to `clear_search` so a typo in the terminal can't get
@@ -592,7 +668,7 @@ impl WsjWidget {
             return;
         };
         let tab_label = format!("{SEARCH_TAB_PREFIX}{}", filter.query);
-        let mut st = self.state.lock().expect("wsj state poisoned");
+        let mut st = self.state.lock().expect("feeds state poisoned");
         st.search = Some(filter);
         st.active_tab = tab_label;
         st.selected = 0;
@@ -602,10 +678,10 @@ impl WsjWidget {
         st.dirty = true;
     }
 
-    /// `x` or bare `:wsj` — drop any active search filter and snap
+    /// `x` or bare `:feeds` — drop any active search filter and snap
     /// back to the "All" tab. No-op when no search was active.
     fn clear_search(&mut self) {
-        let mut st = self.state.lock().expect("wsj state poisoned");
+        let mut st = self.state.lock().expect("feeds state poisoned");
         if st.search.take().is_some() {
             st.active_tab = ALL_TAB_LABEL.to_string();
             st.selected = 0;
@@ -616,13 +692,59 @@ impl WsjWidget {
         }
     }
 
+    /// Recognize `cmd` against this instance's command surface:
+    /// the always-on kind-level triple (`feeds`, `feeds-summary`,
+    /// `feeds-refresh`) plus any per-instance aliases configured in
+    /// `commands = [...]` (so an instance with `commands = ["wsj"]`
+    /// also answers to `:wsj`, `:wsj-summary`, and `:wsj-refresh`).
+    /// Returns `None` for commands this widget doesn't claim, which
+    /// lets the dispatcher try the next widget.
+    fn match_command(&self, cmd: &str) -> Option<CommandAction> {
+        // Kind-level baseline — every feeds instance answers to these.
+        match cmd {
+            "feeds" => return Some(CommandAction::Search),
+            "feeds-summary" => return Some(CommandAction::SummaryLength),
+            "feeds-refresh" => return Some(CommandAction::Refresh),
+            _ => {}
+        }
+        // Per-instance aliases. Empty trims and case-insensitive
+        // matches so a stray space or capitalization in the TOML
+        // doesn't silently break the alias.
+        for alias in &self.config.commands {
+            let alias = alias.trim();
+            if alias.is_empty() {
+                continue;
+            }
+            if cmd.eq_ignore_ascii_case(alias) {
+                return Some(CommandAction::Search);
+            }
+            // `{alias}-summary` / `{alias}-refresh`. We build the
+            // expected strings rather than splitting `cmd` on '-' so
+            // aliases that themselves contain '-' (e.g. "mw-pro")
+            // still match correctly.
+            if cmd.len() == alias.len() + "-summary".len()
+                && cmd[..alias.len()].eq_ignore_ascii_case(alias)
+                && cmd[alias.len()..].eq_ignore_ascii_case("-summary")
+            {
+                return Some(CommandAction::SummaryLength);
+            }
+            if cmd.len() == alias.len() + "-refresh".len()
+                && cmd[..alias.len()].eq_ignore_ascii_case(alias)
+                && cmd[alias.len()..].eq_ignore_ascii_case("-refresh")
+            {
+                return Some(CommandAction::Refresh);
+            }
+        }
+        None
+    }
+
     fn set_status(&self, msg: impl Into<String>) {
-        let mut st = self.state.lock().expect("wsj state poisoned");
+        let mut st = self.state.lock().expect("feeds state poisoned");
         st.status = Some(TimedFeedback::new(msg.into(), STATUS_TTL));
     }
 
     fn live_status(&self) -> Option<String> {
-        let mut st = self.state.lock().expect("wsj state poisoned");
+        let mut st = self.state.lock().expect("feeds state poisoned");
         live_value(&mut st.status).cloned()
     }
 
@@ -651,7 +773,7 @@ impl WsjWidget {
         // Already in some state? Skip unless it was Failed (allow
         // retries with the same length).
         {
-            let st = self.state.lock().expect("wsj state poisoned");
+            let st = self.state.lock().expect("feeds state poisoned");
             match st.summaries.get(&key) {
                 Some(SummaryState::Ready(_)) | Some(SummaryState::Requested) => return,
                 _ => {}
@@ -660,7 +782,7 @@ impl WsjWidget {
         // On-disk cache?
         let cache_key = summary_cache_key(&article.url, length);
         if let Some(entry) = self.cache.load::<String>(&cache_key) {
-            let mut st = self.state.lock().expect("wsj state poisoned");
+            let mut st = self.state.lock().expect("feeds state poisoned");
             st.summaries.insert(key, SummaryState::Ready(entry.value));
             return;
         }
@@ -672,24 +794,25 @@ impl WsjWidget {
         let excerpt = article.summary.clone().unwrap_or_default();
         if excerpt.trim().is_empty() {
             self.set_status("No description in RSS — nothing to summarize");
-            let mut st = self.state.lock().expect("wsj state poisoned");
+            let mut st = self.state.lock().expect("feeds state poisoned");
             st.summaries
                 .insert(key, SummaryState::Failed("RSS description missing".into()));
             return;
         }
         {
-            let mut st = self.state.lock().expect("wsj state poisoned");
+            let mut st = self.state.lock().expect("feeds state poisoned");
             st.summaries.insert(key.clone(), SummaryState::Requested);
             st.dirty = true;
         }
         let state = self.state.clone();
         let cache = self.cache.clone();
         let length_static = length;
+        let source_label = self.display_name_cache.clone();
         tokio::spawn(async move {
             let user_block = format!("Title: {title}\nURL: {url}\n\nContent:\n{excerpt}\n");
             let request = LlmRequest {
                 model: None,
-                system: Some(length_static.system_prompt().into()),
+                system: Some(length_static.system_prompt(&source_label)),
                 messages: vec![LlmMessage {
                     role: Role::User,
                     content: user_block,
@@ -704,31 +827,31 @@ impl WsjWidget {
                         SummaryState::Failed("Empty LLM response".into())
                     } else {
                         if let Err(err) = cache.store(&cache_key, &text) {
-                            tracing::warn!(error = %err, url = %url, "wsj summary cache store failed");
+                            tracing::warn!(error = %err, url = %url, "feeds: summary cache store failed");
                         }
                         SummaryState::Ready(text)
                     }
                 }
                 Err(err) => {
-                    tracing::warn!(error = %err, url = %url, "wsj LLM call failed");
+                    tracing::warn!(error = %err, url = %url, "feeds: LLM call failed");
                     SummaryState::Failed(format!("{err}"))
                 }
             };
-            let mut st = state.lock().expect("wsj state poisoned");
+            let mut st = state.lock().expect("feeds state poisoned");
             st.summaries.insert(key, outcome);
             st.dirty = true;
         });
     }
 
     fn toggle_expanded(&self) {
-        let mut st = self.state.lock().expect("wsj state poisoned");
+        let mut st = self.state.lock().expect("feeds state poisoned");
         st.expanded = !st.expanded;
     }
 
     fn jump_to_external(&self) {
         if let Some(article) = self.selected_article() {
             if let Err(err) = open::that(&article.url) {
-                tracing::warn!(error = %err, url = %article.url, "wsj: failed to open URL");
+                tracing::warn!(error = %err, url = %article.url, "feeds: failed to open URL");
             }
         }
     }
@@ -739,7 +862,7 @@ impl WsjWidget {
         let active = self
             .state
             .lock()
-            .expect("wsj state poisoned")
+            .expect("feeds state poisoned")
             .active_tab
             .clone();
         let tabs = self.tab_labels();
@@ -766,7 +889,7 @@ impl WsjWidget {
             hits.push((label.clone(), x, x.saturating_add(width), area.y));
             x = x.saturating_add(width);
         }
-        self.state.lock().expect("wsj state poisoned").tab_rects = hits;
+        self.state.lock().expect("feeds state poisoned").tab_rects = hits;
         frame.render_widget(
             Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
             area,
@@ -776,21 +899,22 @@ impl WsjWidget {
     fn render_list(&self, frame: &mut Frame, area: Rect) {
         let filtered = self.filtered_indices();
         let (selected, scroll) = {
-            let st = self.state.lock().expect("wsj state poisoned");
+            let st = self.state.lock().expect("feeds state poisoned");
             (st.selected, st.list_scroll)
         };
         let articles = self
             .state
             .lock()
-            .expect("wsj state poisoned")
+            .expect("feeds state poisoned")
             .articles
             .clone();
 
         if filtered.is_empty() {
-            let msg = if self.state.lock().expect("wsj state poisoned").fetching {
-                "Fetching WSJ headlines…"
+            let fetching = self.state.lock().expect("feeds state poisoned").fetching;
+            let msg = if fetching {
+                format!("Fetching {} headlines…", self.display_name_cache)
             } else {
-                "No articles. Press `r` to refresh."
+                "No articles. Press `r` to refresh.".to_string()
             };
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(msg, self.theme.text_dim)))
@@ -866,7 +990,7 @@ impl WsjWidget {
             }
             new_scroll += 1;
         }
-        self.state.lock().expect("wsj state poisoned").list_scroll = new_scroll;
+        self.state.lock().expect("feeds state poisoned").list_scroll = new_scroll;
 
         // Render with the dynamic per-article row budget. We track
         // (article_idx, abs_y_start, abs_y_last) ranges so mouse
@@ -922,7 +1046,7 @@ impl WsjWidget {
         }
         // Store the hit-test data for handle_mouse.
         {
-            let mut st = self.state.lock().expect("wsj state poisoned");
+            let mut st = self.state.lock().expect("feeds state poisoned");
             st.list_rect = Some(area);
             st.list_rows = hit_ranges;
         }
@@ -956,7 +1080,7 @@ impl WsjWidget {
             // still scroll headlines. Mouse-collapse via `e` puts
             // them back in flat-list mode anyway.
             self.render_list(frame, area);
-            self.state.lock().expect("wsj state poisoned").expanded_rect = None;
+            self.state.lock().expect("feeds state poisoned").expanded_rect = None;
             return;
         }
 
@@ -986,7 +1110,7 @@ impl WsjWidget {
         self.render_list(frame, rows[0]);
         self.render_horizontal_separator(frame, rows[1]);
         self.render_expanded(frame, rows[2], allow_image);
-        self.state.lock().expect("wsj state poisoned").expanded_rect = Some(rows[2]);
+        self.state.lock().expect("feeds state poisoned").expanded_rect = Some(rows[2]);
     }
 
     /// Three-row separator: blank · `─` line · blank. The line uses
@@ -1019,7 +1143,7 @@ impl WsjWidget {
     /// stays the visual anchor.
     fn render_timestamps(&self, frame: &mut Frame, area: Rect) {
         let (rows, articles) = {
-            let st = self.state.lock().expect("wsj state poisoned");
+            let st = self.state.lock().expect("feeds state poisoned");
             (st.list_rows.clone(), st.articles.clone())
         };
         if rows.is_empty() {
@@ -1124,7 +1248,7 @@ impl WsjWidget {
         let summary_state = self
             .state
             .lock()
-            .expect("wsj state poisoned")
+            .expect("feeds state poisoned")
             .summaries
             .get(&summary_key(&article.url, length))
             .cloned();
@@ -1197,7 +1321,7 @@ impl WsjWidget {
             .sum();
         let max_scroll = estimated_rows.saturating_sub(body_h);
         let scroll = {
-            let mut st = self.state.lock().expect("wsj state poisoned");
+            let mut st = self.state.lock().expect("feeds state poisoned");
             // Clamp + persist back so PgDn at the end is a no-op.
             st.expanded_scroll = st.expanded_scroll.min(max_scroll);
             st.expanded_content_height = estimated_rows;
@@ -1283,8 +1407,21 @@ fn wrap_title(text: &str, width: usize, max_lines: usize) -> Vec<String> {
     crate::text::wrap(text, width, max_lines, false)
 }
 
+/// Title-case the first ASCII letter of an instance name so the
+/// dashboard label looks deliberate when the user didn't set
+/// `display_name = "…"` (e.g., instance `"wsj"` → `"Wsj"`,
+/// `"marketwatch"` → `"Marketwatch"`). For exact casing the user
+/// should set `display_name` explicitly.
+fn title_case_ascii(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 #[async_trait]
-impl Widget for WsjWidget {
+impl Widget for FeedsWidget {
     fn id(&self) -> &str {
         &self.id
     }
@@ -1305,7 +1442,7 @@ impl Widget for WsjWidget {
         if self.is_due() {
             self.spawn_refresh();
         }
-        let mut st = self.state.lock().expect("wsj state poisoned");
+        let mut st = self.state.lock().expect("feeds state poisoned");
         if crate::ui::status::drain_if_expired(&mut st.status) {
             st.dirty = true;
         }
@@ -1313,7 +1450,7 @@ impl Widget for WsjWidget {
     }
 
     fn take_dirty(&mut self) -> bool {
-        let mut st = self.state.lock().expect("wsj state poisoned");
+        let mut st = self.state.lock().expect("feeds state poisoned");
         std::mem::replace(&mut st.dirty, false)
     }
 
@@ -1366,7 +1503,7 @@ impl Widget for WsjWidget {
         self.render_tabs(frame, body_rows[0]);
         // body_rows[1] is intentionally left blank.
 
-        let expanded = self.state.lock().expect("wsj state poisoned").expanded;
+        let expanded = self.state.lock().expect("feeds state poisoned").expanded;
         // Layout switch: when the widget cell is narrow (width <
         // NARROW_VS_WIDE_THRESHOLD), the horizontal list|details
         // split crowds both columns, so we vertically stack
@@ -1402,7 +1539,7 @@ impl Widget for WsjWidget {
                 // cols[1] is the gap — intentionally left blank.
                 self.render_expanded(frame, cols[2], true);
                 // Cache the expanded-pane rect for mouse hit-tests.
-                self.state.lock().expect("wsj state poisoned").expanded_rect = Some(cols[2]);
+                self.state.lock().expect("feeds state poisoned").expanded_rect = Some(cols[2]);
             }
         } else {
             // Not expanded: carve off a small right-aligned column
@@ -1436,7 +1573,7 @@ impl Widget for WsjWidget {
                 // legible.
                 self.render_list(frame, body_rows[2]);
             }
-            self.state.lock().expect("wsj state poisoned").expanded_rect = None;
+            self.state.lock().expect("feeds state poisoned").expanded_rect = None;
         }
 
         // Footer
@@ -1524,14 +1661,14 @@ impl Widget for WsjWidget {
             KeyCode::Char('s') => {
                 self.request_summary();
                 // Auto-expand so the user can see the summary land.
-                self.state.lock().expect("wsj state poisoned").expanded = true;
+                self.state.lock().expect("feeds state poisoned").expanded = true;
                 EventResult::Handled
             }
             KeyCode::Char('r') => {
                 self.mark_dirty();
                 EventResult::Handled
             }
-            // `x` drops any active :wsj <terms> search filter and
+            // `x` drops any active :feeds <terms> search filter and
             // snaps back to the All tab. No-op when no search is
             // active so a stray `x` press isn't disruptive.
             KeyCode::Char('x') => {
@@ -1545,7 +1682,7 @@ impl Widget for WsjWidget {
             // bracket aliases are easier to reach without leaving
             // the home row.
             KeyCode::PageDown | KeyCode::Char(']') => {
-                let mut st = self.state.lock().expect("wsj state poisoned");
+                let mut st = self.state.lock().expect("feeds state poisoned");
                 if st.expanded {
                     let step = 5u16;
                     let max = st.expanded_content_height.saturating_sub(1);
@@ -1554,7 +1691,7 @@ impl Widget for WsjWidget {
                 EventResult::Handled
             }
             KeyCode::PageUp | KeyCode::Char('[') => {
-                let mut st = self.state.lock().expect("wsj state poisoned");
+                let mut st = self.state.lock().expect("feeds state poisoned");
                 if st.expanded {
                     st.expanded_scroll = st.expanded_scroll.saturating_sub(5);
                 }
@@ -1569,7 +1706,7 @@ impl Widget for WsjWidget {
         // Snapshot hit-test rects (release the lock before doing
         // anything that re-locks state).
         let (list_rect, expanded_rect, list_rows, tab_rects) = {
-            let st = self.state.lock().expect("wsj state poisoned");
+            let st = self.state.lock().expect("feeds state poisoned");
             (
                 st.list_rect,
                 st.expanded_rect,
@@ -1593,7 +1730,7 @@ impl Widget for WsjWidget {
             // footer): ignore.
             MouseEventKind::ScrollUp => {
                 if over_expanded {
-                    let mut st = self.state.lock().expect("wsj state poisoned");
+                    let mut st = self.state.lock().expect("feeds state poisoned");
                     st.expanded_scroll = st.expanded_scroll.saturating_sub(3);
                     EventResult::Handled
                 } else if over_list {
@@ -1605,7 +1742,7 @@ impl Widget for WsjWidget {
             }
             MouseEventKind::ScrollDown => {
                 if over_expanded {
-                    let mut st = self.state.lock().expect("wsj state poisoned");
+                    let mut st = self.state.lock().expect("feeds state poisoned");
                     let max = st.expanded_content_height.saturating_sub(1);
                     st.expanded_scroll = st.expanded_scroll.saturating_add(3).min(max);
                     EventResult::Handled
@@ -1628,7 +1765,7 @@ impl Widget for WsjWidget {
                     .find(|(_, x0, x1, y)| row == *y && col >= *x0 && col < *x1)
                 {
                     let label = label.clone();
-                    let mut st = self.state.lock().expect("wsj state poisoned");
+                    let mut st = self.state.lock().expect("feeds state poisoned");
                     if st.active_tab != label {
                         st.active_tab = label;
                         st.selected = 0;
@@ -1645,7 +1782,7 @@ impl Widget for WsjWidget {
                     .find(|(_, y0, y1)| row >= *y0 && row <= *y1)
                 {
                     let new_idx = *idx;
-                    let mut st = self.state.lock().expect("wsj state poisoned");
+                    let mut st = self.state.lock().expect("feeds state poisoned");
                     if new_idx != st.selected {
                         st.expanded_scroll = 0;
                     }
@@ -1660,8 +1797,11 @@ impl Widget for WsjWidget {
     }
 
     fn handle_command(&mut self, cmd: &str, args: &[&str]) -> Result<bool> {
-        match cmd {
-            "wsj-summary" => {
+        let Some(action) = self.match_command(cmd) else {
+            return Ok(false);
+        };
+        match action {
+            CommandAction::SummaryLength => {
                 let arg = args.first().copied().unwrap_or("").trim();
                 let next = match arg.to_ascii_lowercase().as_str() {
                     "short" | "s" => Some(SummaryLength::Short),
@@ -1670,17 +1810,17 @@ impl Widget for WsjWidget {
                     _ => None,
                 };
                 let Some(next) = next else {
-                    anyhow::bail!("usage: :wsj-summary <short|medium|long>");
+                    anyhow::bail!("usage: :{cmd} <short|medium|long>");
                 };
                 self.summary_length = next;
                 self.set_status(format!("Summary length: {}", next.label()));
                 Ok(true)
             }
-            "wsj" => {
-                // `:wsj <terms>` → keyword search; bare `:wsj` → clear
+            CommandAction::Search => {
+                // `:<root> <terms>` → keyword search; bare `:<root>` → clear
                 // any active search filter (mirrors `:news` semantics).
-                // Explicit refresh stays on `:wsj-refresh` below so
-                // users haven't lost that capability.
+                // Explicit refresh stays on `:<root>-refresh` so users
+                // haven't lost that capability.
                 let query = args.join(" ");
                 let trimmed = query.trim();
                 if trimmed.is_empty() {
@@ -1690,24 +1830,25 @@ impl Widget for WsjWidget {
                 }
                 Ok(true)
             }
-            "wsj-refresh" => {
+            CommandAction::Refresh => {
                 self.mark_dirty();
                 Ok(true)
             }
-            _ => Ok(false),
         }
     }
 
     fn config(&self) -> serde_json::Value {
         serde_json::json!({
-            "topics": self.config.topics,
+            "display_name": self.display_name_cache,
+            "feed_count": self.config.feeds.len(),
             "poll_interval_secs": self.config.poll_interval_secs,
             "default_summary_length": self.config.default_summary_length.label(),
         })
     }
 
     fn apply_config(&mut self, config: serde_json::Value) -> Result<()> {
-        let new_config: WsjConfig = serde_json::from_value(config).context("invalid wsj config")?;
+        let new_config: FeedsConfig =
+            serde_json::from_value(config).context("invalid feeds config")?;
         let app_theme = self.app_theme.clone();
         let cache = self.cache.clone();
         let llm = self.llm.clone();
@@ -1716,9 +1857,11 @@ impl Widget for WsjWidget {
         self.feeds = replaced.feeds;
         self.summary_length = replaced.summary_length;
         self.theme = replaced.theme;
+        self.display_name_cache = replaced.display_name_cache;
+        self.shortcut_prefs = replaced.shortcut_prefs;
         // Reset poll interval to the new config's value.
         {
-            let mut st = self.state.lock().expect("wsj state poisoned");
+            let mut st = self.state.lock().expect("feeds state poisoned");
             st.poll
                 .set_interval(Duration::from_secs(self.config.poll_interval_secs.max(60)));
         }
@@ -1740,9 +1883,9 @@ impl Widget for WsjWidget {
             ("s", "LLM summarize at current length"),
             ("Ctrl+S", "cycle summary length (short/medium/long)"),
             ("r", "force refresh"),
-            ("x", "clear :wsj <terms> search filter"),
+            ("x", "clear :feeds <terms> search filter"),
             (
-                ":wsj <terms>",
+                ":feeds <terms>",
                 "filter articles by keyword (ranked by hits, commas/semicolons ignored)",
             ),
         ]
@@ -1750,8 +1893,8 @@ impl Widget for WsjWidget {
 
     /// Live scheme switching. The app calls this on every widget
     /// after `:scheme <name>` swaps the global theme; without an
-    /// override the WSJ widget kept its merged `theme` field from
-    /// construction and changes only showed up after restart.
+    /// override the feeds widget would keep its merged `theme` field
+    /// from construction and changes only show up after restart.
     fn set_app_theme(&mut self, theme: Arc<Theme>) {
         self.theme = theme.with_overrides(&self.config.colors);
         self.app_theme = theme;
@@ -1761,7 +1904,7 @@ impl Widget for WsjWidget {
         Some(
             self.state
                 .lock()
-                .expect("wsj state poisoned")
+                .expect("feeds state poisoned")
                 .poll
                 .snapshot(),
         )
@@ -1783,7 +1926,7 @@ impl Widget for WsjWidget {
         let count = self
             .state
             .lock()
-            .expect("wsj state poisoned")
+            .expect("feeds state poisoned")
             .articles
             .len();
         Some(format!("{count} articles"))
@@ -1791,9 +1934,9 @@ impl Widget for WsjWidget {
 }
 
 pub fn build(ctx: &WidgetCtx) -> Box<dyn Widget> {
-    let cfg: WsjConfig =
+    let cfg: FeedsConfig =
         crate::config::load_widget_toml_for_instance(KIND, &ctx.instance).unwrap_or_default();
-    Box::new(WsjWidget::with_config(
+    Box::new(FeedsWidget::with_config(
         ctx.instance.clone(),
         cfg,
         ctx.theme.clone(),
@@ -1802,42 +1945,87 @@ pub fn build(ctx: &WidgetCtx) -> Box<dyn Widget> {
     ))
 }
 
+/// Wizard Choice value used when the user wants an empty starter
+/// (no `[[feeds]]` blocks pre-filled). Picking this prints commented-
+/// out example blocks so the user can replace the URLs with their own.
+const EMPTY_TEMPLATE_ID: &str = "empty";
+
 pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
     use crate::wizard::descriptor::{ChoiceOption, WizardDescriptor, WizardField, WizardFieldKind};
-    let topic_options: Vec<ChoiceOption> = WSJ_CATALOGUE
-        .iter()
-        .map(|(label, _)| ChoiceOption {
-            value: *label,
-            label,
+
+    // Build the source-choice list dynamically from the built-in
+    // templates, plus an "Empty" option that seeds zero `[[feeds]]`
+    // blocks for users who want to BYO catalogue. Templates are read
+    // from disk-embedded TOML files under
+    // `src/widgets/feeds/templates/` — to add a new built-in source,
+    // drop a new TOML there and append it to `BUILTIN_TEMPLATES` in
+    // `templates.rs`.
+    //
+    // Note: `ChoiceOption` carries `&'static str` for value/label.
+    // Templates load into owned Strings, so we leak each pair into
+    // 'static once at wizard creation. This runs once per `--setup`
+    // invocation — bounded, never on the render hot path.
+    let mut source_options: Vec<ChoiceOption> = templates::all()
+        .into_iter()
+        .map(|t| ChoiceOption {
+            value: Box::leak(t.id.into_boxed_str()),
+            label: Box::leak(t.display_name.into_boxed_str()),
             help: None,
         })
         .collect();
+    source_options.push(ChoiceOption {
+        value: EMPTY_TEMPLATE_ID,
+        label: "Empty (bring your own feeds)",
+        help: Some("Skip the catalogue prefill — generates a TOML with no [[feeds]] blocks and an example you can edit."),
+    });
+
     WizardDescriptor {
-        display_name: "WSJ",
-        blurb: "Wall Street Journal headline reader using WSJ's official RSS \
-                feeds. LLM summarization with selectable length.",
+        display_name: "Feeds",
+        blurb: "Tabbed single-source RSS reader. Pick a starter template — \
+                the wizard copies its catalogue into the generated \
+                `feeds@<instance>.toml` as live and commented-out \
+                `[[feeds]]` blocks you can edit afterward. Pick Empty to \
+                start with no feeds and supply your own URLs.",
         load_from_toml: None,
-        render_toml: None,
+        render_toml: Some(render_feeds_toml),
         fields: vec![
             WizardField {
-                key: "topics",
-                label: "Topic feeds to activate",
-                help: "↑/↓ to move, Space toggles. Each ticked topic becomes \
-                       a filter tab inside the widget. The default selection \
-                       matches WSJ's most-trafficked sections.",
+                key: "source",
+                label: "Starter template",
+                help: "Which built-in catalogue to seed this instance from. \
+                       The template's [[feeds]] become live entries; \
+                       additional topics in the same template are written \
+                       commented out so you can uncomment to enable. The \
+                       template choice is not persisted in the TOML — once \
+                       generated, the file is fully yours to edit.",
+                required: true,
+                kind: WizardFieldKind::Choice {
+                    options: source_options,
+                    default: Some("wsj"),
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "display_name",
+                label: "Dashboard label (optional)",
+                help: "Title-bar / dashboard name for this instance. Also \
+                       used as the LLM summarizer's house-style label. \
+                       Leave empty to fall back to the template's name \
+                       (e.g. \"WSJ\", \"MarketWatch\").",
                 required: false,
-                kind: WizardFieldKind::MultiChoice {
-                    options: topic_options,
-                    defaults: vec!["World", "Business", "Markets", "Tech"],
+                kind: WizardFieldKind::Text {
+                    default: None,
+                    placeholder: Some("(use template default)"),
                 },
                 validate: None,
             },
             WizardField {
                 key: "poll_interval_secs",
                 label: "Refresh interval (seconds)",
-                help: "How often to repoll WSJ RSS. 900s (15 min) is a polite \
-                       default — WSJ updates throughout the day but feeds \
-                       won't change faster than that.",
+                help: "How often to repoll the source's RSS. 900s (15 min) \
+                       is a polite default — most newsrooms update \
+                       throughout the day but feeds won't change faster \
+                       than that.",
                 required: true,
                 kind: WizardFieldKind::Number {
                     default: Some(900.0),
@@ -1878,6 +2066,252 @@ pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
     }
 }
 
+/// Custom TOML renderer. The wizard's default flat renderer would
+/// only emit the four scalar fields and skip the catalogue entirely.
+/// We instead write the picked template's `[[feeds]]` blocks
+/// (default-on entries live, non-default entries commented out) so
+/// the generated file is immediately useful and self-documenting.
+///
+/// Wizard re-runs preserve any hand-edited `[[feeds]]` array from
+/// the existing TOML — the template is only consulted when there's
+/// no existing file (or the existing file has zero `[[feeds]]`).
+/// `shortcuts` is similarly carried forward.
+fn render_feeds_toml(
+    values: &std::collections::HashMap<String, crate::wizard::descriptor::WizardValue>,
+    existing: Option<&str>,
+) -> String {
+    use crate::wizard::descriptor::WizardValue;
+
+    let source = match values.get("source") {
+        Some(WizardValue::Choice(s)) if !s.is_empty() => s.clone(),
+        _ => "wsj".to_string(),
+    };
+    let template = if source == EMPTY_TEMPLATE_ID {
+        None
+    } else {
+        templates::by_id(&source).or_else(|| templates::by_id("wsj"))
+    };
+
+    let display_name = match values.get("display_name") {
+        Some(WizardValue::Text(t)) => t.trim().to_string(),
+        _ => String::new(),
+    };
+    let poll_interval = match values.get("poll_interval_secs") {
+        Some(WizardValue::Number(n)) => *n as i64,
+        _ => 900,
+    };
+    let summary_length = match values.get("default_summary_length") {
+        Some(WizardValue::Choice(s)) if !s.is_empty() => s.clone(),
+        _ => "medium".to_string(),
+    };
+
+    // Pull forward the user's prior `[[feeds]]` blocks, `shortcuts`
+    // array, and `commands` array from disk so a wizard re-run never
+    // clobbers hand-edits.
+    type ExistingState = (
+        Option<Vec<(String, String)>>,
+        Option<Vec<String>>,
+        Option<Vec<String>>,
+    );
+    let (existing_feeds, existing_shortcuts, existing_commands): ExistingState = existing
+        .and_then(|text| toml::from_str::<toml::Value>(text).ok())
+        .map(|doc| {
+            let feeds = doc.get("feeds").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| {
+                        let topic = v.get("topic")?.as_str()?.to_string();
+                        let url = v.get("url")?.as_str()?.to_string();
+                        Some((topic, url))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let shortcuts = doc.get("shortcuts").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            });
+            let commands = doc.get("commands").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            });
+            (feeds, shortcuts, commands)
+        })
+        .unwrap_or((None, None, None));
+
+    let mut out = String::new();
+    out.push_str("# Feeds widget — single-source RSS reader.\n");
+    out.push_str(
+        "# Generated by --setup. Edit [[feeds]] blocks below to add, \n\
+         # remove, or rearrange tabs; re-running the wizard preserves \n\
+         # your hand-edits.\n\n",
+    );
+
+    let template_display_name = template
+        .as_ref()
+        .map(|t| t.display_name.as_str())
+        .unwrap_or("Feeds");
+    if display_name.is_empty() {
+        out.push_str("# display_name controls the title-bar / dashboard label\n");
+        out.push_str("# and the LLM summarizer's house-style name. Leave\n");
+        out.push_str("# commented out to fall back to the instance name.\n");
+        out.push_str(&format!(
+            "# display_name = {}\n",
+            toml_string_literal(template_display_name)
+        ));
+    } else {
+        out.push_str(&format!(
+            "display_name = {}\n",
+            toml_string_literal(&display_name)
+        ));
+    }
+    out.push_str(&format!("poll_interval_secs = {poll_interval}\n"));
+    out.push_str(&format!("default_summary_length = \"{summary_length}\"\n"));
+    out.push('\n');
+
+    // Shortcuts: preserve existing if any, else seed from the
+    // template's default_shortcut_prefs (or omit when Empty).
+    if let Some(shortcuts) = existing_shortcuts {
+        if !shortcuts.is_empty() {
+            out.push_str("# Preferred Shift+<letter> shortcut keys. First-fit:\n");
+            out.push_str("# the app claims the first letter not already taken.\n");
+            out.push_str("shortcuts = [");
+            for (i, s) in shortcuts.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&toml_string_literal(s));
+            }
+            out.push_str("]\n\n");
+        }
+    } else if let Some(t) = template.as_ref() {
+        if !t.default_shortcut_prefs.is_empty() {
+            out.push_str("# Preferred Shift+<letter> shortcut keys. First-fit:\n");
+            out.push_str("# the app claims the first letter not already taken.\n");
+            out.push_str("shortcuts = [");
+            for (i, c) in t.default_shortcut_prefs.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&format!("\"{}\"", c.to_ascii_uppercase()));
+            }
+            out.push_str("]\n\n");
+        }
+    }
+
+    // Per-instance command aliases. Each alias adds three names to
+    // the dispatcher: `:<alias>`, `:<alias>-summary`,
+    // `:<alias>-refresh`. Kind-level `:feeds*` commands are always
+    // available regardless.
+    if let Some(commands) = existing_commands {
+        if !commands.is_empty() {
+            out.push_str(
+                "# Per-instance command aliases. `commands = [\"wsj\"]` makes\n\
+                 # :wsj <terms>, :wsj-summary, and :wsj-refresh route to this\n\
+                 # instance on top of the kind-level :feeds* commands.\n",
+            );
+            out.push_str("commands = [");
+            for (i, c) in commands.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&toml_string_literal(c));
+            }
+            out.push_str("]\n\n");
+        }
+    } else if let Some(t) = template.as_ref() {
+        if !t.default_commands.is_empty() {
+            out.push_str(
+                "# Per-instance command aliases. Each entry adds :<alias>,\n\
+                 # :<alias>-summary, and :<alias>-refresh as additional names\n\
+                 # for this instance. Kind-level :feeds* commands stay\n\
+                 # available regardless.\n",
+            );
+            out.push_str("commands = [");
+            for (i, c) in t.default_commands.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&toml_string_literal(c));
+            }
+            out.push_str("]\n\n");
+        }
+    }
+
+    // Feeds block. Priority: existing on-disk feeds → template feeds
+    // (default-on live, others commented out) → Empty (example only).
+    if let Some(feeds) = existing_feeds.filter(|f| !f.is_empty()) {
+        out.push_str("# Active feeds — each [[feeds]] block becomes a tab.\n");
+        for (topic, url) in &feeds {
+            out.push_str("[[feeds]]\n");
+            out.push_str(&format!("topic = {}\n", toml_string_literal(topic)));
+            out.push_str(&format!("url = {}\n", toml_string_literal(url)));
+            out.push('\n');
+        }
+    } else if let Some(t) = template.as_ref() {
+        out.push_str(
+            "# Active feeds — each [[feeds]] block becomes a tab.\n\
+             # Comment out a block to disable that tab.\n\n",
+        );
+        for f in &t.feeds {
+            if f.default {
+                out.push_str("[[feeds]]\n");
+                out.push_str(&format!("topic = {}\n", toml_string_literal(&f.topic)));
+                out.push_str(&format!("url = {}\n", toml_string_literal(&f.url)));
+                out.push('\n');
+            }
+        }
+        let non_defaults: Vec<&templates::TemplateFeed> =
+            t.feeds.iter().filter(|f| !f.default).collect();
+        if !non_defaults.is_empty() {
+            out.push_str(
+                "# Additional topics available — uncomment to enable.\n",
+            );
+            for f in non_defaults {
+                out.push_str("# [[feeds]]\n");
+                out.push_str(&format!(
+                    "# topic = {}\n",
+                    toml_string_literal(&f.topic)
+                ));
+                out.push_str(&format!("# url = {}\n", toml_string_literal(&f.url)));
+                out.push('\n');
+            }
+        }
+    } else {
+        // Empty starter — give the user a commented example to
+        // crib from.
+        out.push_str(
+            "# Active feeds — each [[feeds]] block becomes a tab. Uncomment\n\
+             # the example below and replace topic/url with your own source.\n\n\
+             # [[feeds]]\n\
+             # topic = \"Top Stories\"\n\
+             # url = \"https://example.com/rss\"\n",
+        );
+    }
+
+    out
+}
+
+/// Minimal TOML string-literal quoter. Uses double-quoted form with
+/// backslash escaping for `"` and `\`. Sufficient for the small
+/// values the feeds widget writes (topic labels, source ids,
+/// display names).
+fn toml_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1906,16 +2340,6 @@ mod tests {
             summary_cache_key(url, SummaryLength::Short),
             summary_cache_key(url, SummaryLength::Medium)
         );
-    }
-
-    #[test]
-    fn default_topics_all_exist_in_catalogue() {
-        for topic in default_topics() {
-            assert!(
-                WSJ_CATALOGUE.iter().any(|(t, _)| *t == topic),
-                "default topic {topic:?} not in catalogue"
-            );
-        }
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! truncation + padding, word-wrap with a per-call max-line cap, and a
 //! tolerant HTML sanitiser for RSS/Atom `<description>` blobs.
 //!
-//! These were previously duplicated across `email`, `news`, `wsj`, and
+//! These were previously duplicated across `email`, `news`, `feeds`, and
 //! `resources` with subtle differences (some used `chars().count()`
 //! instead of Unicode display width — wrong for CJK and emoji — and
 //! the wrap implementations disagreed on paragraph handling and on

@@ -1,0 +1,75 @@
+# WSJ starter template — Wall Street Journal.
+#
+# Embedded into the binary at build time and surfaced by the feeds
+# widget's --setup wizard. Editing this file requires a rebuild;
+# users who want to add a custom source instead drop a fresh TOML
+# at this same shape under ~/.config/glint/templates/ (planned for
+# a later phase) or write their feeds@<instance>.toml by hand.
+
+id = "wsj"
+display_name = "WSJ"
+
+# Preferred Shift+<letter> shortcut keys. The wizard seeds this into
+# the generated instance TOML's `shortcuts = [...]` line; the
+# runtime's first-fit dispatcher walks the list and claims the
+# first letter not already taken by another widget.
+default_shortcut_prefs = ["J", "W", "S"]
+
+# Per-instance command aliases. The runtime recognizes :wsj <terms>,
+# :wsj-summary, and :wsj-refresh as additional names for this
+# instance on top of the always-available kind-level `:feeds*`
+# commands.
+default_commands = ["wsj"]
+
+# Feed catalogue — every topic the source publishes. `default = true`
+# entries are active in a fresh instance; the rest are written as
+# commented-out blocks the user can uncomment to enable.
+#
+# Verified reachable May 2026. The longer-form `feeds.content.dowjones.io`
+# host returns 50–100 items per topic; the older `feeds.a.dj.com`
+# host is being slowly deprecated.
+
+[[feeds]]
+topic = "World"
+url = "https://feeds.content.dowjones.io/public/rss/RSSWorldNews"
+default = true
+
+[[feeds]]
+topic = "US"
+url = "https://feeds.content.dowjones.io/public/rss/RSSUSNews"
+default = true
+
+[[feeds]]
+topic = "Business"
+url = "https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness"
+default = true
+
+[[feeds]]
+topic = "Markets"
+url = "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain"
+default = true
+
+[[feeds]]
+topic = "Tech"
+url = "https://feeds.content.dowjones.io/public/rss/RSSWSJD"
+default = true
+
+[[feeds]]
+topic = "Opinion"
+url = "https://feeds.content.dowjones.io/public/rss/RSSOpinion"
+default = false
+
+[[feeds]]
+topic = "Politics"
+url = "https://feeds.content.dowjones.io/public/rss/socialpoliticsfeed"
+default = false
+
+[[feeds]]
+topic = "Economy"
+url = "https://feeds.content.dowjones.io/public/rss/socialeconomyfeed"
+default = false
+
+[[feeds]]
+topic = "Life"
+url = "https://feeds.content.dowjones.io/public/rss/RSSLifestyle"
+default = false

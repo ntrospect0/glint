@@ -338,7 +338,7 @@ mod tests {
         let mut p2 = PollTracker::new(Duration::from_secs(60));
         let mut p3 = PollTracker::new(Duration::from_secs(60));
         p1.apply_jitter("news@main");
-        p2.apply_jitter("wsj@main");
+        p2.apply_jitter("feeds@main");
         p3.apply_jitter("email@main");
         let ts = [p1.last_attempt, p2.last_attempt, p3.last_attempt];
         let unique = ts.iter().collect::<std::collections::HashSet<_>>().len();

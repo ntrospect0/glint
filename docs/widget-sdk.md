@@ -135,9 +135,9 @@ This is convention, not enforcement. Widgets remain free to bind however they wa
 |---|---|---|
 | `↑` / `↓` / `j` / `k` | Move selection up / down | Vim aliases on letters; arrows for non-vim muscle memory. |
 | `←` / `→` / `h` / `l` | Cycle horizontal context (tabs, periods, panes) | Use when the widget has a horizontal axis worth cycling. |
-| `Enter` | **Primary in-place action** | Context-dependent: expand a list row (news, wsj), swap selection (forex), open the active note (notes). Never opens an external URL — that's too easy to mis-fire when the user meant "look at this inline." |
+| `Enter` | **Primary in-place action** | Context-dependent: expand a list row (news, feeds), swap selection (forex), open the active note (notes). Never opens an external URL — that's too easy to mis-fire when the user meant "look at this inline." |
 | `e` / `Space` | Expand / collapse selected item | Alias for `Enter` in list widgets that have an inline expansion view. Both work. |
-| `o` | **Open externally** (browser, file, app) | The dedicated "leave glint" gesture. Used by stocks, forex, news, wsj. Should always be a *single key* away from the user's intent; never on `Enter`. |
+| `o` | **Open externally** (browser, file, app) | The dedicated "leave glint" gesture. Used by stocks, forex, news, feeds. Should always be a *single key* away from the user's intent; never on `Enter`. |
 | `r` | Force refresh | Bypasses the poll interval. |
 | `?` | Help overlay | Global; you don't bind this. |
 | `Tab` / `Shift+Tab` | Focus cycle | Global; you don't bind this. |
@@ -147,7 +147,7 @@ This is convention, not enforcement. Widgets remain free to bind however they wa
 
 ### List-management gestures
 
-For widgets that let the user add or remove items from a persisted list (stocks watchlist, forex watchlist, notes, wsj feeds-at-runtime):
+For widgets that let the user add or remove items from a persisted list (stocks watchlist, forex watchlist, notes, feeds topics-at-runtime):
 
 | Key | Action |
 |---|---|
@@ -161,7 +161,7 @@ For widgets that let the user add or remove items from a persisted list (stocks 
 
 | Key | Action |
 |---|---|
-| `s` | Run / cycle a summary (news, wsj). LLM-backed. |
+| `s` | Run / cycle a summary (news, feeds). LLM-backed. |
 | `y` | Yank selected value to clipboard. |
 | `x` | Clear a transient state (a `:lookup` row, a stale message). |
 | `c` | Cycle a display mode (stocks: %/$, forex: reset amount). |
@@ -172,7 +172,7 @@ For widgets that let the user add or remove items from a persisted list (stocks 
 | Combo | Meaning |
 |---|---|
 | `Shift+<letter>` | **Focus shortcut** — reserved for the app's `Shift+<letter>` focus-jump dispatcher. Widgets declare a preference list via `shortcut_preferences()`; do *not* bind these manually in `handle_key`. |
-| `Ctrl+<letter>` | Modifier-required actions (e.g. wsj's `Ctrl+S` for summary-length cycle when `Shift+S` was unavailable). Use sparingly; users with non-US keyboards may have surprising `Ctrl+` mappings. |
+| `Ctrl+<letter>` | Modifier-required actions (e.g. feeds's `Ctrl+S` for summary-length cycle when `Shift+S` was unavailable). Use sparingly; users with non-US keyboards may have surprising `Ctrl+` mappings. |
 | `Alt+<letter>` | Avoid. Many terminals consume `Alt` for window-manager actions. |
 
 ### Hard-reserved keys
@@ -391,7 +391,7 @@ let up = uptime_label(secs);  // u64
 - **You need a calendar / clock-time format** ("3:42 PM"). These are *interval* formatters, not point-in-time. Use chrono's `format()` directly.
 
 **Reference examples:**
-- `relative_time_label` — [`src/widgets/wsj/mod.rs`](../src/widgets/wsj/mod.rs) and [`src/widgets/news/mod.rs`](../src/widgets/news/mod.rs).
+- `relative_time_label` — [`src/widgets/feeds/mod.rs`](../src/widgets/feeds/mod.rs) and [`src/widgets/news/mod.rs`](../src/widgets/news/mod.rs).
 - `short_duration_label` — [`src/widgets/weather/mod.rs`](../src/widgets/weather/mod.rs) (data age in the meta row).
 - `uptime_label` — [`src/widgets/resources/mod.rs`](../src/widgets/resources/mod.rs).
 
@@ -509,7 +509,7 @@ The most common shape is `Option<TimedFeedback<String>>` for footer messages, bu
 - **Animations** with multiple frames or per-tick updates. `TimedFeedback` is set-once-and-forget. For pulsing / progress bars, manage the time yourself.
 
 **Reference examples:**
-- `Option<TimedFeedback<String>>` for footer messages — [`src/widgets/stocks/mod.rs`](../src/widgets/stocks/mod.rs), [`src/widgets/forex/mod.rs`](../src/widgets/forex/mod.rs), [`src/widgets/wsj/mod.rs`](../src/widgets/wsj/mod.rs).
+- `Option<TimedFeedback<String>>` for footer messages — [`src/widgets/stocks/mod.rs`](../src/widgets/stocks/mod.rs), [`src/widgets/forex/mod.rs`](../src/widgets/forex/mod.rs), [`src/widgets/feeds/mod.rs`](../src/widgets/feeds/mod.rs).
 - `Option<TimedFeedback<usize>>` for "which row just got copied" pulse — [`src/widgets/forex/mod.rs`](../src/widgets/forex/mod.rs) (`copy_feedback`).
 
 ---
@@ -584,13 +584,13 @@ These conventions emerged from building 11+ widgets. They aren't enforced — ju
 
 ### Layout
 
-- Reserve a 1-cell right margin so content doesn't touch the panel's right border. Look for `*_RIGHT_BUFFER` constants in `wsj` and `email`.
+- Reserve a 1-cell right margin so content doesn't touch the panel's right border. Look for `*_RIGHT_BUFFER` constants in `feeds` and `email`.
 - When you split horizontally, insert an explicit `Constraint::Length(1)` between sub-panels as a visual gap.
-- Adaptive layout: switch between horizontal split (wide) and vertical stack (narrow) based on `area.width`. Threshold around 80 cols has worked for `wsj`.
+- Adaptive layout: switch between horizontal split (wide) and vertical stack (narrow) based on `area.width`. Threshold around 80 cols has worked for `feeds`.
 
 ### Mouse hit-testing
 
-- Capture screen-absolute rects (and per-row hit ranges) into widget state *during render*, then consult them in `handle_mouse`. Avoid re-running layout math on every click. Examples: `wsj`'s `list_rows`, `tab_rects`; `forex`'s `row_hits`.
+- Capture screen-absolute rects (and per-row hit ranges) into widget state *during render*, then consult them in `handle_mouse`. Avoid re-running layout math on every click. Examples: `feeds`'s `list_rows`, `tab_rects`; `forex`'s `row_hits`.
 - Route scroll wheel by cursor position (inside list → navigate, inside details → scroll content) rather than always doing the same thing.
 
 ### Confirm modals
@@ -633,14 +633,14 @@ When you want to copy a pattern, these are the canonical references:
 | Simple data list with polling | [`stocks`](../src/widgets/stocks/mod.rs) |
 | Two-tier polling policy | [`email`](../src/widgets/email/mod.rs) (`account_poll` + `mail_poll`) |
 | Decision-tree fetch logic | [`weather`](../src/widgets/weather/mod.rs) (`NextAction`) |
-| RSS feed aggregation | [`news`](../src/widgets/news/mod.rs), [`wsj`](../src/widgets/wsj/mod.rs) |
-| LLM summarization w/ length toggle | [`wsj`](../src/widgets/wsj/mod.rs) |
-| Inline image rendering | [`gallery`](../src/widgets/gallery/mod.rs), [`wsj`](../src/widgets/wsj/mod.rs) |
+| RSS feed aggregation | [`news`](../src/widgets/news/mod.rs), [`feeds`](../src/widgets/feeds/mod.rs) |
+| LLM summarization w/ length toggle | [`feeds`](../src/widgets/feeds/mod.rs) |
+| Inline image rendering | [`gallery`](../src/widgets/gallery/mod.rs), [`feeds`](../src/widgets/feeds/mod.rs) |
 | OAuth token storage | [`auth/google/store.rs`](../src/auth/google/store.rs) |
 | Credentials file (chmod 0600) | [`wsj/auth.rs`](../src/widgets/wsj/auth.rs) |
 | Confirm-removal modal | [`notes`](../src/widgets/notes/mod.rs), [`stocks`](../src/widgets/stocks/mod.rs) |
-| Mouse hit-testing with wrapped rows | [`wsj`](../src/widgets/wsj/mod.rs) |
-| Adaptive horizontal/vertical layout | [`wsj`](../src/widgets/wsj/mod.rs) |
+| Mouse hit-testing with wrapped rows | [`feeds`](../src/widgets/feeds/mod.rs) |
+| Adaptive horizontal/vertical layout | [`feeds`](../src/widgets/feeds/mod.rs) |
 | Editable inline cell | [`forex`](../src/widgets/forex/mod.rs) (`editing_amount`) |
 | Stack composition (multi-widget tab strip) | [`stack`](../src/widgets/stack.rs) — platform layer |
 | Wizard descriptor (declarative setup) | every widget's `wizard_descriptor()` fn |
@@ -651,7 +651,7 @@ When you want to copy a pattern, these are the canonical references:
 
 The current extraction sprint is complete — the high-confidence cluster candidates surfaced in audits 1–2 have all landed (see § Platform capabilities above). The remaining items are tracked but waiting on either pain signal or design clarity:
 
-1. **`ScopedCache::load_within<T>(key, ttl)`** — convenience wrapper over `load + entry.age() < ttl`. Manually computed today in `wsj`, `gallery`, and planned `news` cache flows. ~40 LOC saved across 3 sites; easy lift when one of those widgets needs more cache work.
+1. **`ScopedCache::load_within<T>(key, ttl)`** — convenience wrapper over `load + entry.age() < ttl`. Manually computed today in `feeds`, `gallery`, and planned `news` cache flows. ~40 LOC saved across 3 sites; easy lift when one of those widgets needs more cache work.
 2. **Spawn-refresh skeleton** — every polling widget has the same `lock → mark inflight → spawn → fetch → lock → write data` shape. Theoretical biggest win (~200 LOC) but the highest abstraction risk — the variance across result types and state shapes makes a clean generic non-obvious. **Don't reach for this** until a new widget shows up demanding a "common shape" we don't already have.
 3. **Selection trait (`SelectableList`)** — `move_selection(delta)` + clamp, currently duplicated across 5 widgets. The variance (scroll-reset behavior, primary-row skip in forex, list-then-transient layering in stocks) means a single trait either becomes too prescriptive or too loose to pay for itself. **Likely doesn't ship.**
 4. **`apply_config` macro** — every widget's `apply_config` does the same deserialize → clone(theme, cache, …) → `*self = Self::with_config(...)` dance. ~100 LOC could collapse, but macros hurt readability and stack-trace clarity. **Likely doesn't ship.**

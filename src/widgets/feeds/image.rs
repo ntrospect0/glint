@@ -24,9 +24,11 @@ use std::{
     time::Duration,
 };
 
-/// Browser-shaped User-Agent for `images.wsj.net` fetches. WSJ's CDN
-/// 403s the default reqwest UA. Same string the now-deleted auth
-/// module used.
+/// Browser-shaped User-Agent for image fetches. Several news-site
+/// CDNs (notably `images.wsj.net`) 403 the default reqwest UA, so
+/// we present as a regular Firefox build with the ntrospect0/glint
+/// URL in the comment so any operator who inspects logs sees who
+/// we are.
 const USER_AGENT: &str = concat!(
     "Mozilla/5.0 (compatible; glint-tui/",
     env!("CARGO_PKG_VERSION"),
@@ -44,14 +46,14 @@ use crate::cache::ScopedCache;
 /// ~640 px on the long side is wasted memory, since ratatui_image's
 /// resize protocol downscales to terminal-cell resolution anyway.
 /// We downsample on decode so the `Arc<DynamicImage>` we hold per URL
-/// is bounded regardless of what `images.wsj.net` served.
+/// is bounded regardless of what the source CDN served.
 const MAX_IMAGE_DIM: u32 = 640;
 
 /// Cap on URLs simultaneously held in the in-memory image + protocol
-/// caches. WSJ rarely surfaces more than a dozen "currently of
-/// interest" articles at once; bounding at 10 keeps the widget's
-/// resident footprint constant regardless of how many articles the
-/// user navigates through in a session.
+/// caches. Mainstream news sources rarely surface more than a dozen
+/// "currently of interest" articles at once; bounding at 10 keeps the
+/// widget's resident footprint constant regardless of how many
+/// articles the user navigates through in a session.
 const MAX_CACHED_IMAGES: usize = 10;
 
 /// Aspect-correct downscale when either side exceeds `MAX_IMAGE_DIM`.
@@ -66,8 +68,8 @@ fn downscale(img: DynamicImage) -> DynamicImage {
 }
 
 /// How long a cached image stays valid. Past this, the next
-/// `ensure` call re-fetches it. WSJ rarely swaps hero images on a
-/// published article, so 24h is plenty.
+/// `ensure` call re-fetches it. News sites rarely swap hero images
+/// on a published article, so 24h is plenty.
 pub const IMAGE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Cache-key namespace for image bytes. Each entry is keyed by
@@ -235,13 +237,13 @@ impl HeroImageStore {
             let bytes = match result {
                 Ok(b) => b,
                 Err(err) => {
-                    tracing::warn!(url = %url_owned, error = %err, "wsj hero image fetch failed");
+                    tracing::warn!(url = %url_owned, error = %err, "feeds: hero image fetch failed");
                     *slot_clone.lock().expect("hero image state poisoned") = HeroState::Failed;
                     return;
                 }
             };
             if let Err(err) = cache.store_bytes(&cache_key(&url_owned), &bytes) {
-                tracing::debug!(url = %url_owned, error = %err, "wsj hero image cache store failed");
+                tracing::debug!(url = %url_owned, error = %err, "feeds: hero image cache store failed");
             }
             match image::load_from_memory(&bytes) {
                 Ok(img) => {
@@ -249,7 +251,7 @@ impl HeroImageStore {
                         HeroState::Ready(Arc::new(downscale(img)));
                 }
                 Err(err) => {
-                    tracing::warn!(url = %url_owned, error = %err, "wsj hero image decode failed");
+                    tracing::warn!(url = %url_owned, error = %err, "feeds: hero image decode failed");
                     *slot_clone.lock().expect("hero image state poisoned") = HeroState::Failed;
                 }
             }

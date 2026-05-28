@@ -9,7 +9,7 @@
 //! "Save failed" / "Copied to clipboard" messages in their footer
 //! all need the same shape: a value, the instant it was set, and a
 //! TTL after which it should vanish. Before this module the pattern
-//! was open-coded as `Option<(String, Instant)>` in `wsj`, `forex`,
+//! was open-coded as `Option<(String, Instant)>` in `feeds`, `forex`,
 //! and `stocks`, with each widget hand-rolling the elapsed-check.
 //!
 //! [`TimedFeedback`] is generic over the value type. The most common

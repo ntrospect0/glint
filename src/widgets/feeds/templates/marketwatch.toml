@@ -1,0 +1,49 @@
+# MarketWatch starter template.
+#
+# Embedded into the binary at build time and surfaced by the feeds
+# widget's --setup wizard. Editing this file requires a rebuild;
+# users who want to add a custom source instead drop a fresh TOML
+# at this same shape under ~/.config/glint/templates/ (planned for
+# a later phase) or write their feeds@<instance>.toml by hand.
+
+id = "marketwatch"
+display_name = "MarketWatch"
+
+# Preferred Shift+<letter> shortcut keys. The wizard seeds this into
+# the generated instance TOML's `shortcuts = [...]` line; the
+# runtime's first-fit dispatcher walks the list and claims the
+# first letter not already taken by another widget.
+default_shortcut_prefs = ["M", "K"]
+
+# Per-instance command aliases. The runtime recognizes :mw <terms>,
+# :mw-summary, and :mw-refresh as additional names for this instance
+# on top of the always-available kind-level `:feeds*` commands.
+default_commands = ["mw"]
+
+# Feed catalogue. Verified reachable May 2026 — the legacy
+# `feeds.marketwatch.com/marketwatch/<topic>/` host transparently
+# redirects to these dowjones.io endpoints. MarketWatch's older
+# industry-specific feeds (healthcare, biotech, pharma, retail,
+# telecom, software, real estate) all 404 as of May 2026 — coverage
+# has been consolidated into the four general-purpose streams below.
+# Add new slugs here if MarketWatch restores topical feeds.
+
+[[feeds]]
+topic = "Top Stories"
+url = "https://feeds.content.dowjones.io/public/rss/mw_topstories"
+default = true
+
+[[feeds]]
+topic = "Market Pulse"
+url = "https://feeds.content.dowjones.io/public/rss/mw_marketpulse"
+default = true
+
+[[feeds]]
+topic = "Real-Time"
+url = "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines"
+default = true
+
+[[feeds]]
+topic = "Bulletins"
+url = "https://feeds.content.dowjones.io/public/rss/mw_bulletins"
+default = true
