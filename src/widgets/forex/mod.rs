@@ -34,6 +34,7 @@
 pub mod graph;
 pub mod provider;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -196,7 +197,11 @@ fn default_canonical_unit(code: &str) -> f64 {
 #[derive(Debug, Clone)]
 enum QuoteState {
     Inflight,
-    Ready(Box<ForexQuote>),
+    /// Successful fetch. `Arc` (not `Box`) so the per-render
+    /// `HashMap::clone()` is a pointer bump per pair instead of a
+    /// full ForexQuote deep-copy — the intraday Vec adds a couple of
+    /// KB per pair on long ranges.
+    Ready(Arc<ForexQuote>),
     Failed,
 }
 
@@ -354,6 +359,11 @@ pub struct ForexWidget {
     shortcut: Option<char>,
     shortcut_prefs: Vec<char>,
     cache: ScopedCache,
+    /// Atomic gate over the per-tick status / copy-feedback drain.
+    /// `true` whenever either TimedFeedback slot is set; lets idle
+    /// ticks skip the state lock entirely. See the same field on
+    /// `StocksWidget` for the pattern.
+    feedback_pending: AtomicBool,
 }
 
 impl ForexWidget {
@@ -410,7 +420,7 @@ impl ForexWidget {
             initial_state.quotes = entry
                 .value
                 .into_iter()
-                .map(|(sym, q)| (sym, QuoteState::Ready(Box::new(q))))
+                .map(|(sym, q)| (sym, QuoteState::Ready(Arc::new(q))))
                 .collect();
         }
         // Auto-highlight the first alternate so the stats column and
@@ -438,6 +448,7 @@ impl ForexWidget {
             shortcut: None,
             shortcut_prefs,
             cache,
+            feedback_pending: AtomicBool::new(false),
         }
     }
 
@@ -551,7 +562,7 @@ impl ForexWidget {
                 match result {
                     Ok(q) => {
                         snapshot.insert(sym.clone(), q.clone());
-                        st.quotes.insert(sym, QuoteState::Ready(Box::new(q)));
+                        st.quotes.insert(sym, QuoteState::Ready(Arc::new(q)));
                     }
                     Err(err) => {
                         tracing::warn!(symbol = %sym, error = %err, "forex fetch failed");
@@ -863,6 +874,8 @@ impl ForexWidget {
     fn set_status(&self, msg: impl Into<String>) {
         let mut st = self.state.lock().expect("forex state poisoned");
         st.status = Some(TimedFeedback::new(msg.into(), STATUS_TTL));
+        drop(st);
+        self.feedback_pending.store(true, Ordering::Relaxed);
     }
 
     fn live_status(&self) -> Option<String> {
@@ -1126,6 +1139,8 @@ impl ForexWidget {
                 // the pulse on the right row.
                 let mut st = self.state.lock().expect("forex state poisoned");
                 st.copy_feedback = Some(TimedFeedback::new(st.selected, COPY_FEEDBACK_TTL));
+                drop(st);
+                self.feedback_pending.store(true, Ordering::Relaxed);
             }
             Err(err) => {
                 tracing::warn!(error = %err, "OSC 52 clipboard write failed");
@@ -1193,15 +1208,21 @@ impl Widget for ForexWidget {
             self.spawn_refresh();
         }
         // Tick-time housekeeping for short-lived UI chrome: drop the
-        // status line and the 📋→✅ copy pulse when their TTLs elapse,
-        // and surface the change via the dirty bit so the gated draw
-        // path actually repaints.
-        let mut st = self.state.lock().expect("forex state poisoned");
-        if crate::ui::status::drain_if_expired(&mut st.status) {
-            st.dirty = true;
-        }
-        if crate::ui::status::drain_if_expired(&mut st.copy_feedback) {
-            st.dirty = true;
+        // status line and the 📋→✅ copy pulse when their TTLs elapse.
+        // Atomic-gated so an idle dashboard skips the state lock
+        // entirely — the atomic only flips true when one of the two
+        // feedback slots is set.
+        if self.feedback_pending.load(Ordering::Relaxed) {
+            let mut st = self.state.lock().expect("forex state poisoned");
+            if crate::ui::status::drain_if_expired(&mut st.status) {
+                st.dirty = true;
+            }
+            if crate::ui::status::drain_if_expired(&mut st.copy_feedback) {
+                st.dirty = true;
+            }
+            if st.status.is_none() && st.copy_feedback.is_none() {
+                self.feedback_pending.store(false, Ordering::Relaxed);
+            }
         }
         Ok(())
     }
@@ -3345,7 +3366,7 @@ mod tests {
             .lock()
             .unwrap()
             .quotes
-            .insert("USDEUR=X".into(), QuoteState::Ready(Box::new(usd_eur)));
+            .insert("USDEUR=X".into(), QuoteState::Ready(Arc::new(usd_eur)));
         w.swap_primary("EUR");
         assert_eq!(w.primary, "EUR");
         // 1523.80 USD × 0.9237 = 1407.53406 EUR
@@ -3370,7 +3391,7 @@ mod tests {
         let usd_btc = rate("USD", "BTC", 1.0 / 90_000.0);
         w.state.lock().unwrap().quotes.insert(
             YahooForexProvider::symbol_for("USD", "BTC"),
-            QuoteState::Ready(Box::new(usd_btc)),
+            QuoteState::Ready(Arc::new(usd_btc)),
         );
         w.swap_primary("BTC");
         assert_eq!(w.primary, "BTC");
@@ -3389,7 +3410,7 @@ mod tests {
         // Seed a rate so swap math doesn't fall back to canonical.
         w.state.lock().unwrap().quotes.insert(
             "USDEUR=X".into(),
-            QuoteState::Ready(Box::new(rate("USD", "EUR", 0.9))),
+            QuoteState::Ready(Arc::new(rate("USD", "EUR", 0.9))),
         );
         w.swap_primary("EUR");
         let rows = w.all_rows();
@@ -3411,7 +3432,7 @@ mod tests {
         // Seed a rate so swap_primary has something to convert through.
         w.state.lock().unwrap().quotes.insert(
             "USDEUR=X".into(),
-            QuoteState::Ready(Box::new(rate("USD", "EUR", 0.9))),
+            QuoteState::Ready(Arc::new(rate("USD", "EUR", 0.9))),
         );
         // Move selection to EUR (row 1) and hit `s`.
         w.state.lock().unwrap().selected = 1;
@@ -3432,7 +3453,7 @@ mod tests {
         });
         w.state.lock().unwrap().quotes.insert(
             "USDEUR=X".into(),
-            QuoteState::Ready(Box::new(rate("USD", "EUR", 0.9))),
+            QuoteState::Ready(Arc::new(rate("USD", "EUR", 0.9))),
         );
         w.state.lock().unwrap().selected = 1;
         let _ = w.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -3624,7 +3645,7 @@ mod tests {
         // Seed a rate so the amount-conversion path doesn't fall back.
         w.state.lock().unwrap().quotes.insert(
             "USDEUR=X".into(),
-            QuoteState::Ready(Box::new(rate("USD", "EUR", 0.9))),
+            QuoteState::Ready(Arc::new(rate("USD", "EUR", 0.9))),
         );
         w.swap_primary("EUR");
         assert_eq!(w.primary, "EUR");
@@ -3714,7 +3735,7 @@ mod tests {
         ] {
             w.state.lock().unwrap().quotes.insert(
                 YahooForexProvider::symbol_for(from, to),
-                QuoteState::Ready(Box::new(rate(from, to, *price))),
+                QuoteState::Ready(Arc::new(rate(from, to, *price))),
             );
         }
         w.swap_primary("EUR");
@@ -3797,7 +3818,7 @@ mod tests {
         w.amount = 100.0;
         w.state.lock().unwrap().quotes.insert(
             "USDEUR=X".into(),
-            QuoteState::Ready(Box::new(rate("USD", "EUR", 0.9237))),
+            QuoteState::Ready(Arc::new(rate("USD", "EUR", 0.9237))),
         );
         let q = w.snapshot_quotes();
         let v = w.row_value("EUR", &q).unwrap();
