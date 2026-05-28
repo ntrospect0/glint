@@ -1,0 +1,55 @@
+version = 1
+
+[global]
+# Active color scheme — looked up in colorschemes.toml under [schemes.<name>].
+# Ships with "default", "chalktone", "gruvbox", "tokyonight",
+# "rosepine", "nord", "bluloco", "onedark", and "miasma". An
+# unrecognized name falls
+# back to glint's built-in palette.
+theme = "default"
+command_key = ":"
+refresh_all_on_focus = true
+log_level = "info"
+
+# Vertical mouse-wheel direction.
+#   "natural"  — wheel-up scrolls a list selection / pane content up (default).
+#   "inverted" — wheel-up scrolls down. Pick this if your trackpad / mouse
+#                feels backwards in news, email, stocks, and other scrollable
+#                widgets. Applied once at the platform boundary so every
+#                widget honors the choice without per-widget config.
+mouse_scroll = "natural"
+
+# Bottom-of-screen status bar (glint version, ticking clock, scheme name,
+# quick hints). Set false to reclaim that row for the widget grid; `?`
+# still surfaces the full help overlay either way.
+show_status_bar = true
+
+[layout]
+columns = [40, 60]
+rows = [35, 35, 30]
+
+[[layout.cells]]
+widget = "clock"
+col = 0
+row = 0
+
+[[layout.cells]]
+widget = "calendar"
+col = 1
+row = 0
+
+[[layout.cells]]
+widget = "weather"
+col = 0
+row = 1
+
+[[layout.cells]]
+widget = "news"
+col = 1
+row = 1
+
+[[layout.cells]]
+widget = "stocks"
+col = 0
+row = 2
+col_span = 2

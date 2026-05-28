@@ -1,0 +1,23 @@
+# Optional IANA timezone name for the primary clock; defaults to system local time.
+# timezone = "America/Vancouver"
+show_seconds = false              # show :SS in the big block-digit display
+show_seconds_ticker = true        # show a small ticking HH:MM:SS below the big digits
+show_date = true
+hour_format = "24h"               # "12h" or "24h"
+
+# Additional world clocks rendered when there's vertical room.
+[[secondary_timezones]]
+label = "New York"
+timezone = "America/New_York"
+
+[[secondary_timezones]]
+label = "London"
+timezone = "Europe/London"
+
+[[secondary_timezones]]
+label = "Tokyo"
+timezone = "Asia/Tokyo"
+
+[[secondary_timezones]]
+label = "Taipei"
+timezone = "Asia/Taipei"

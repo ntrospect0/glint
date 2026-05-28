@@ -1,0 +1,165 @@
+# Poll cadence in seconds (floor 60).
+poll_interval_secs = 900
+
+# When true, horizontal mouse scroll cycles the filter tabs. Disabled by
+# default because trackpad sideways gestures often fire accidentally.
+horizontal_scroll_filters = false
+
+# Show the topic categorization (e.g. `[Business,World]`) on each article's
+# meta row. Many users prefer the quieter look — flip this off to hide.
+show_topic_labels = true
+
+# When true and an LLM provider is configured in llm.toml, pressing `s`
+# on an expanded article requests an on-demand summary from the LLM.
+# Set to false to stay fully offline even when the provider is wired up.
+summarize_with_llm = true
+
+# Default behaviour when `s` requests a summary: HTTP-fetch the article
+# page and feed its extracted body to the LLM (true) or send just the
+# RSS excerpt (false). Per-feed `fetch_body = true/false` below overrides
+# this for specific sources — useful for feeds whose RSS already carries
+# the full article (Phoronix, HN) or whose article page would just
+# return a paywall (WSJ, NYT, FT). Default = true since fetched bodies
+# produce far richer summaries than RSS teasers.
+fetch_body_for_summary = true
+
+# RSS / Atom feeds to aggregate. `label` is shown in the article row.
+# Each feed may override `fetch_body = true/false`; absent means inherit
+# the widget-wide `fetch_body_for_summary` above.
+# All sources here are free / non-paywall to read (some have paywalls on
+# the article pages themselves — your browser session handles auth when
+# you hit Enter to open). Add or remove freely.
+
+# ── Tech ─────────────────────────────────────────────────────────────────────
+[[feeds]]
+label = "Hacker News"
+url = "https://hnrss.org/frontpage"
+
+[[feeds]]
+label = "Ars Technica"
+url = "https://feeds.arstechnica.com/arstechnica/index"
+
+[[feeds]]
+label = "The Verge"
+url = "https://www.theverge.com/rss/index.xml"
+
+[[feeds]]
+label = "Engadget"
+url = "https://www.engadget.com/rss.xml"
+
+[[feeds]]
+label = "Phoronix"
+url = "https://www.phoronix.com/rss.php"
+
+# ── World ────────────────────────────────────────────────────────────────────
+[[feeds]]
+label = "BBC News"
+url = "http://feeds.bbci.co.uk/news/rss.xml"
+
+[[feeds]]
+label = "BBC World"
+url = "http://feeds.bbci.co.uk/news/world/rss.xml"
+
+[[feeds]]
+label = "Guardian World"
+url = "https://www.theguardian.com/world/rss"
+
+[[feeds]]
+label = "NPR World"
+url = "https://feeds.npr.org/1004/rss.xml"
+
+# ── Business / Finance ───────────────────────────────────────────────────────
+[[feeds]]
+label = "BBC Business"
+url = "http://feeds.bbci.co.uk/news/business/rss.xml"
+
+[[feeds]]
+label = "Yahoo Finance"
+url = "https://finance.yahoo.com/news/rssindex"
+
+[[feeds]]
+label = "MarketWatch"
+url = "http://feeds.marketwatch.com/marketwatch/topstories/"
+
+[[feeds]]
+label = "CNBC Top"
+url = "https://www.cnbc.com/id/100003114/device/rss/rss.html"
+
+# WSJ / Barron's headline feeds are public; article bodies are paywalled
+# but your browser session opens them when you hit Enter.
+# [[feeds]]
+# label = "WSJ Markets"
+# url = "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"
+# [[feeds]]
+# label = "Barron's"
+# url = "https://feeds.a.dj.com/rss/RSSBarronsMain.xml"
+
+# ── Canada ───────────────────────────────────────────────────────────────────
+[[feeds]]
+label = "CBC News"
+url = "https://www.cbc.ca/webfeed/rss/rss-topstories"
+
+[[feeds]]
+label = "CBC Politics"
+url = "https://www.cbc.ca/webfeed/rss/rss-politics"
+
+[[feeds]]
+label = "CBC Business"
+url = "https://www.cbc.ca/webfeed/rss/rss-business"
+
+[[feeds]]
+label = "CTV News"
+url = "https://www.ctvnews.ca/rss/ctvnews-ca-top-stories-public-rss-1.822009"
+
+# ── Entertainment ────────────────────────────────────────────────────────────
+[[feeds]]
+label = "Pitchfork"
+url = "https://pitchfork.com/rss/news/"
+
+[[feeds]]
+label = "Hollywood Reporter"
+url = "https://www.hollywoodreporter.com/feed/"
+
+# Topics tag articles whose title/summary contains any keyword (case-insensitive
+# substring match) and double as filter tabs across the top of the news cell
+# (←/→ to cycle). Add, rename, or remove tabs by editing this list.
+[[topics]]
+label = "Tech"
+keywords = [
+  "AI", "OpenAI", "Anthropic", "LLM", "GPU", "developer", "Linux", "Rust",
+  "Apple", "Google", "Microsoft", "Meta", "chip", "software", "startup",
+  "open source", "GitHub",
+]
+
+[[topics]]
+label = "Business"
+keywords = [
+  "CEO", "merger", "acquisition", "IPO", "revenue", "earnings", "quarterly",
+  "Wall Street", "market", "Fed", "inflation", "interest rate", "Bitcoin",
+  "crypto", "yield", "treasury", "stocks", "bonds", "dividend", "trader",
+]
+
+[[topics]]
+label = "World"
+keywords = [
+  "Ukraine", "Russia", "China", "EU", "UN", "climate", "war", "election",
+  "summit", "treaty", "Israel", "Gaza", "Iran", "NATO", "global", "Brussels",
+  "international",
+]
+
+[[topics]]
+label = "Canada"
+keywords = [
+  "Canada", "Canadian", "Ottawa", "Toronto", "Vancouver", "Montreal",
+  "Quebec", "Alberta", "B.C.", "Trudeau", "Carney", "CBC", "Bank of Canada",
+  "Loonie",
+]
+
+[[topics]]
+label = "Entertainment"
+keywords = [
+  "movie", "film", "actor", "actress", "Hollywood", "Netflix", "HBO", "Disney",
+  "Oscar", "Grammy", "Emmy", "show", "series", "trailer",
+  "album", "song", "single", "artist", "band", "concert", "tour", "music",
+  "EP", "soundtrack",
+]

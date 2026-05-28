@@ -1,0 +1,36 @@
+# ── Tickers ──────────────────────────────────────────────────────────────────
+# Major indices listed at the top of the ticker list. Use Yahoo Finance
+# symbols: ^DJI (Dow Jones), ^GSPC (S&P 500), ^IXIC (Nasdaq Composite).
+indices = ["^DJI", "^GSPC", "^IXIC"]
+
+# Your watchlist. Add or remove tickers freely.
+watchlist = ["AAPL", "MSFT", "GOOGL", "NVDA", "TSLA"]
+
+# ── Refresh ──────────────────────────────────────────────────────────────────
+# Poll cadence (seconds, floor 15). Yahoo's chart endpoint refreshes every
+# minute or so, so under 60s is overkill.
+poll_interval_secs = 60
+
+# ── Display ──────────────────────────────────────────────────────────────────
+# Initial display mode for the change column. Cycle while focused with c
+# (or pick directly with % / $). One of "percent" or "dollar".
+default_display_mode = "percent"
+
+# Initial graph period: "1d", "1w", "1m", "6m", "ytd", "1y", "3y", "5y",
+# "10y". When focused, press 1..9 (or click a toggle / ‹›) to switch.
+default_period = "1d"
+
+# When true, horizontal mouse scroll cycles the period toggles. Disabled
+# by default because trackpad sideways gestures often fire accidentally.
+horizontal_scroll_period = false
+
+# ── Jump (open ticker in browser) ────────────────────────────────────────────
+# Pressing `j` on a selected ticker opens this URL. `{ticker}` is replaced
+# with the URL-encoded symbol. Leave commented out to make `j` a no-op.
+#
+# Examples:
+#   jump_url_template = "https://www.marketwatch.com/investing/stock/{ticker}"
+#   jump_url_template = "https://www.google.com/finance/quote/{ticker}"
+#   jump_url_template = "https://finance.yahoo.com/quote/{ticker}"
+#   jump_url_template = "https://www.barrons.com/market-data/stocks/{ticker}"
+# jump_url_template = "https://www.marketwatch.com/investing/stock/{ticker}"

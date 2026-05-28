@@ -1,0 +1,223 @@
+# Color schemes for glint's chrome (borders, titles) and a handful of
+# semantic text roles. Pick the active scheme via `[global] theme = "..."` in
+# config.toml — or live-switch with `:scheme <name>` from the command bar.
+# Per-widget overrides go in a `[colors]` block inside each widget's TOML
+# (clock.toml, stocks.toml, …).
+#
+# StyleSpec format — either a shorthand string ("light_cyan", "#7dd3fc") that
+# sets the foreground only, or a table with fg / bg / modifiers:
+#
+#   border.focused = "light_cyan"
+#   border.focused = { fg = "light_cyan", bg = "default", modifiers = ["bold"] }
+#
+# NOTE: write `border.focused` (unquoted) so TOML sees the dot as a nested
+# table separator. Writing `"border.focused"` produces a literal flat key
+# that the deserializer can't see — your override would parse without error
+# but silently never apply.
+#
+# Recognized modifiers: bold, dim, italic, underline, slow_blink, rapid_blink,
+# reversed, hidden, crossed_out. "default" / "reset" / "none" means "inherit
+# from the terminal" — useful for `bg` and `border.unfocused` to let your
+# terminal theme show through.
+#
+# Roles glint reads:
+#   border.focused           — widget border when the cell is focused (Tab cycles)
+#   border.unfocused         — widget border on inactive cells
+#   widget_title.focused     — title text when the pane is focused. The
+#                              focus indicator itself is a `┤ ├` tee-junction
+#                              bracket pad painted in `border.focused` around
+#                              the title — this role styles only the title
+#                              text inside the brackets. Stack widgets use
+#                              the same style for the active tab.
+#   widget_title.unfocused   — title text when the pane (or the stack's
+#                              active tab on an unfocused pane) isn't focused.
+#                              The bracket pad falls back to plain spaces in
+#                              this state. Should stay visibly distinct from
+#                              text.dim so the active tab in an unfocused
+#                              stack still reads as "this is what's surfaced."
+#   metadata.focused         — right-aligned metadata suffix (Weather location,
+#                              Email account, News article count) when the
+#                              pane is focused.
+#   metadata.unfocused       — same metadata when the pane isn't focused —
+#                              usually a quiet/dim variant so it fades into
+#                              the chrome.
+#   text.plain               — default body text (the regular off-white prose)
+#   text.brilliant           — emphasized body text (bold/bright)
+#   text.dim                 — annotation text: bottom hint rows, "all day"
+#                              labels, graph axis labels, "(no stats)"
+#                              placeholders, inactive stack tabs, gray
+#                              separator dividers
+#   text.selected            — selected tab, active period toggle, [Today] pill
+#   text.focused             — focused entity highlight (cyan company name in
+#                              stocks, focused article title in news, local
+#                              time in clock)
+#   text.shortcut            — single highlighted letter in each widget title
+#                              indicating the Shift+<letter> focus shortcut
+#                              (e.g. red C in Clock = Shift+C focuses the clock)
+#
+# Missing roles silently fall back to glint's built-in defaults below, so a
+# scheme can override one field and leave the rest alone.
+
+# IMPORTANT: dotted keys (border.focused, text.plain, …) must NOT be quoted.
+# In TOML, `"border.focused"` is a single literal key, while `border.focused`
+# (unquoted) creates the nested `[border] focused` structure glint expects.
+# Quoted keys parse cleanly but never reach the deserializer, so they look
+# like silent no-ops at runtime.
+
+# ── Default ─────────────────────────────────────────────────────────────────
+# Matches the original glint palette.
+[schemes.default]
+border.focused           = { fg = "light_cyan",   modifiers = ["bold"] }
+border.unfocused         = "default"
+widget_title.focused     = { modifiers = ["bold"] }
+widget_title.unfocused   = { modifiers = ["bold"] }
+metadata.focused         = "default"
+metadata.unfocused       = { modifiers = ["dim"] }
+text.plain               = "default"
+text.brilliant           = { modifiers = ["bold"] }
+text.dim                 = { modifiers = ["dim"] }
+text.selected            = { fg = "light_yellow", modifiers = ["bold"] }
+text.focused             = { fg = "light_cyan",   modifiers = ["bold"] }
+text.shortcut            = { fg = "light_red",    modifiers = ["bold"] }
+
+# ── Chalktone ───────────────────────────────────────────────────────────────
+# Soft, dusty pastels — chalk on a slate blackboard. Derivation of
+# https://github.com/daneofmanythings/chalktone.nvim
+[schemes.chalktone]
+border.focused           = { fg = "#dabb87", modifiers = ["bold"] }
+border.unfocused         = "#5a625e"
+widget_title.focused     = { fg = "#e6dcc6", modifiers = ["bold"] }
+widget_title.unfocused   = { fg = "#cdc4ad", modifiers = ["bold"] }
+metadata.focused         = { fg = "#cdc4ad" }
+metadata.unfocused       = { fg = "#6f7570" }
+text.plain               = { fg = "#cdc4ad" }
+text.brilliant           = { fg = "#e6dcc6", modifiers = ["bold"] }
+text.dim                 = { fg = "#6f7570" }
+text.selected            = { fg = "#c19a9a", modifiers = ["bold"] }
+text.focused             = { fg = "#7eafa3", modifiers = ["bold"] }
+text.shortcut            = { fg = "#c25450", modifiers = ["bold"] }
+
+# ── Gruvbox ─────────────────────────────────────────────────────────────────
+# Warm retro palette, dark medium contrast — derivation of
+# https://github.com/ellisonleao/gruvbox.nvim
+[schemes.gruvbox]
+border.focused           = { fg = "#fabd2f", modifiers = ["bold"] }
+border.unfocused         = "#3c3836"
+widget_title.focused     = { fg = "#ebdbb2", modifiers = ["bold"] }
+widget_title.unfocused   = { fg = "#d5c4a1", modifiers = ["bold"] }
+metadata.focused         = { fg = "#d5c4a1" }
+metadata.unfocused       = { fg = "#7c6f64" }
+text.plain               = { fg = "#d5c4a1" }
+text.brilliant           = { fg = "#ebdbb2", modifiers = ["bold"] }
+text.dim                 = { fg = "#7c6f64" }
+text.selected            = { fg = "#fe8019", modifiers = ["bold"] }
+text.focused             = { fg = "#8ec07c", modifiers = ["bold"] }
+text.shortcut            = { fg = "#fb4934", modifiers = ["bold"] }
+
+# ── Tokyo Night ─────────────────────────────────────────────────────────────
+# Cool, modern dark palette — derivation of the Storm variant of
+# https://github.com/folke/tokyonight.nvim
+# Blue/cyan accents over a deep indigo bg, with the signature warm
+# yellow used here for selection.
+[schemes.tokyonight]
+border.focused           = { fg = "#7aa2f7", modifiers = ["bold"] }
+border.unfocused         = "#3b4261"
+widget_title.focused     = { fg = "#c0caf5", modifiers = ["bold"] }
+widget_title.unfocused   = { fg = "#a9b1d6", modifiers = ["bold"] }
+metadata.focused         = { fg = "#a9b1d6" }
+metadata.unfocused       = { fg = "#565f89" }
+text.plain               = { fg = "#a9b1d6" }
+text.brilliant           = { fg = "#c0caf5", modifiers = ["bold"] }
+text.dim                 = { fg = "#565f89" }
+text.selected            = { fg = "#e0af68", modifiers = ["bold"] }
+text.focused             = { fg = "#7dcfff", modifiers = ["bold"] }
+text.shortcut            = { fg = "#f7768e", modifiers = ["bold"] }
+
+# ── Rose Pine ───────────────────────────────────────────────────────────────
+# Soho-vibes warm minimalism — derivation of the Main variant of
+# https://github.com/rose-pine/neovim (see also rosepinetheme.com).
+# Muted purples + foam/iris accents, with gold for selection and love
+# for shortcuts.
+[schemes.rosepine]
+border.focused           = { fg = "#9ccfd8", modifiers = ["bold"] }
+border.unfocused         = "#403d52"
+widget_title.focused     = { fg = "#e0def4", modifiers = ["bold"] }
+widget_title.unfocused   = { fg = "#908caa", modifiers = ["bold"] }
+metadata.focused         = { fg = "#908caa" }
+metadata.unfocused       = { fg = "#6e6a86" }
+text.plain               = { fg = "#908caa" }
+text.brilliant           = { fg = "#e0def4", modifiers = ["bold"] }
+text.dim                 = { fg = "#6e6a86" }
+text.selected            = { fg = "#f6c177", modifiers = ["bold"] }
+text.focused             = { fg = "#9ccfd8", modifiers = ["bold"] }
+text.shortcut            = { fg = "#eb6f92", modifiers = ["bold"] }
+
+# ── Nord ─────────────────────────────────────────────────────────────────────
+# Arctic, north-bluish palette — derivation of
+# https://github.com/kunzaatko/nord.nvim (which mirrors the canonical
+# https://www.nordtheme.com/ palette).
+[schemes.nord]
+border.focused           = { fg = "#88c0d0", modifiers = ["bold"] }
+border.unfocused         = "#3b4252"
+widget_title.focused     = { fg = "#eceff4", modifiers = ["bold"] }
+widget_title.unfocused   = { fg = "#d8dee9", modifiers = ["bold"] }
+metadata.focused         = { fg = "#d8dee9" }
+metadata.unfocused       = { fg = "#616e88" }
+text.plain               = { fg = "#d8dee9" }
+text.brilliant           = { fg = "#eceff4", modifiers = ["bold"] }
+text.dim                 = { fg = "#616e88" }
+text.selected            = { fg = "#ebcb8b", modifiers = ["bold"] }
+text.focused             = { fg = "#88c0d0", modifiers = ["bold"] }
+text.shortcut            = { fg = "#bf616a", modifiers = ["bold"] }
+
+# ── Bluloco ─────────────────────────────────────────────────────────────────
+# Modern dark with a signature cobalt-blue accent — derivation of
+# https://github.com/uloco/bluloco.nvim
+[schemes.bluloco]
+border.focused           = { fg = "#4090f7", modifiers = ["bold"] }
+border.unfocused         = "#3e4452"
+widget_title.focused     = { fg = "#c8ccd4", modifiers = ["bold"] }
+widget_title.unfocused   = { fg = "#abb2bf", modifiers = ["bold"] }
+metadata.focused         = { fg = "#abb2bf" }
+metadata.unfocused       = { fg = "#5c6370" }
+text.plain               = { fg = "#abb2bf" }
+text.brilliant           = { fg = "#c8ccd4", modifiers = ["bold"] }
+text.dim                 = { fg = "#5c6370" }
+text.selected            = { fg = "#f9c859", modifiers = ["bold"] }
+text.focused             = { fg = "#4090f7", modifiers = ["bold"] }
+text.shortcut            = { fg = "#ff6480", modifiers = ["bold"] }
+
+# ── OneDark ─────────────────────────────────────────────────────────────────
+# Atom-derived modern dark — derivation of the default `dark` style of
+# https://github.com/navarasu/onedark.nvim
+# Signature One blue (#61afef), warm yellow for selection, cyan focus.
+[schemes.onedark]
+border.focused           = { fg = "#61afef", modifiers = ["bold"] }
+border.unfocused         = "#3e4452"
+widget_title.focused     = { fg = "#c8ccd4", modifiers = ["bold"] }
+widget_title.unfocused   = { fg = "#abb2bf", modifiers = ["bold"] }
+metadata.focused         = { fg = "#abb2bf" }
+metadata.unfocused       = { fg = "#5c6370" }
+text.plain               = { fg = "#abb2bf" }
+text.brilliant           = { fg = "#c8ccd4", modifiers = ["bold"] }
+text.dim                 = { fg = "#5c6370" }
+text.selected            = { fg = "#e5c07b", modifiers = ["bold"] }
+text.focused             = { fg = "#56b6c2", modifiers = ["bold"] }
+text.shortcut            = { fg = "#e06c75", modifiers = ["bold"] }
+
+# ── Miasma ──────────────────────────────────────────────────────────────────
+# Horror-tinged, earthy decay — derivation of
+# https://github.com/xero/miasma.nvim
+[schemes.miasma]
+border.focused           = { fg = "#b8823b", modifiers = ["bold"] }
+border.unfocused         = "#3a3a3a"
+widget_title.focused     = { fg = "#c9c0a8", modifiers = ["bold"] }
+widget_title.unfocused   = { fg = "#a89880", modifiers = ["bold"] }
+metadata.focused         = { fg = "#a89880" }
+metadata.unfocused       = { fg = "#5c5347" }
+text.plain               = { fg = "#a89880" }
+text.brilliant           = { fg = "#c9c0a8", modifiers = ["bold"] }
+text.dim                 = { fg = "#5c5347" }
+text.selected            = { fg = "#c25450", modifiers = ["bold"] }
+text.focused             = { fg = "#78824b", modifiers = ["bold"] }
+text.shortcut            = { fg = "#a13438", modifiers = ["bold"] }

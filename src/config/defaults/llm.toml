@@ -1,0 +1,36 @@
+# Master switch. If false, every LLM-backed feature falls back to its
+# structured-only counterpart (keyword filtering, raw RSS summaries, …).
+enabled = true
+
+# ── Provider ─────────────────────────────────────────────────────────────────
+# glint can use one LLM provider at a time. Switch by changing `name`
+# (and the matching credentials file — see `model` notes below).
+#
+#   name = "anthropic"
+#     model     — e.g. "claude-sonnet-4-6", "claude-haiku-4-5"
+#     api_base  — https://api.anthropic.com
+#     key file  — credentials/anthropic_key.toml
+#
+#   name = "openai"
+#     model     — e.g. "gpt-5-mini", "gpt-4o-mini", "gpt-4o"
+#     api_base  — https://api.openai.com
+#     key file  — credentials/openai_key.toml
+#
+# `model` is free-form — any model name the provider's API accepts works,
+# so you can track new releases without waiting for a glint update.
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-6"
+api_base = "https://api.anthropic.com"
+max_tokens = 512
+
+# ── Budget / cache ───────────────────────────────────────────────────────────
+# Cached entries also expire 7 days after insertion regardless of capacity.
+[limits]
+max_requests_per_minute = 20
+cache_capacity = 128
+
+# ── Per-feature toggles ──────────────────────────────────────────────────────
+# Per-widget LLM toggles live in each widget's own TOML — e.g. news.toml has
+# `summarize_with_llm = true`, email.toml has its own. Nothing widget-specific
+# belongs in this file.

@@ -1,0 +1,9 @@
+# Open-Meteo is free and key-less. Set lat/lon to your city.
+# Comment out latitude + longitude (and leave auto_locate = true) to fall back
+# to IP-based geolocation via ipapi.co.
+label = "Richmond, BC"
+latitude = 49.166
+longitude = -123.133
+units = "metric"                  # "metric" (°C, km/h) or "imperial" (°F, mph)
+poll_interval_secs = 600
+auto_locate = true                # only consulted when lat/lon are unset
