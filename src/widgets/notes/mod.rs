@@ -3,8 +3,12 @@
 
 //! Notes widget — a vim-flavoured notepad with multi-note
 //! navigation. Notes live as one `.md` file per note under
-//! `~/.config/glint/notes/<instance>/`; the filesystem is the source of
-//! truth, and the widget reloads from disk on startup.
+//! `<root>/<instance>/`, where `root` defaults to `~/.glint/notes` and
+//! is overridable in `notes.toml` via `notes_dir = "..."`. The
+//! filesystem is the source of truth, and the widget reloads from disk
+//! on startup. If the configured directory can't be created the widget
+//! falls back to `~/.glint/notes`, and as a final fallback
+//! `~/.config/glint/notes` — surfacing a title-bar toast either way.
 //!
 //! ## Modes
 //!
@@ -61,6 +65,13 @@ pub const KIND: &str = "notes";
 /// usable with an empty file.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct NotesConfig {
+    /// On-disk root for note files (the `<instance>/` subdir lives
+    /// inside this). Leading `~/` is expanded against `$HOME`. Empty
+    /// or absent → the built-in default `~/.glint/notes`. Unwritable
+    /// values fall back through the chain documented on
+    /// [`store::resolve_root`].
+    #[serde(default)]
+    pub notes_dir: Option<String>,
     /// Per-widget `Shift+<letter>` shortcut preferences. Empty falls
     /// through to a built-in default list.
     #[serde(default)]
@@ -312,6 +323,12 @@ pub struct NotesWidget {
     theme: Theme,
     shortcut: Option<char>,
     shortcut_prefs: Vec<char>,
+    /// Resolved on-disk root for this widget's notes — set once at
+    /// mount via [`store::resolve_root`] and threaded through every
+    /// load/save/delete call. Survives the lifetime of the widget; the
+    /// user changing `notes_dir` in `notes.toml` is picked up on the
+    /// next launch, not live.
+    root: std::path::PathBuf,
     /// Cached most-recent content rect so the mouse handler can route
     /// scroll/click events without re-deriving the layout. Updated on
     /// every render.
@@ -362,7 +379,12 @@ impl NotesWidget {
             config.shortcuts.clone()
         };
         let mut state = NotesState::default();
-        state.notes = store::load_all(&instance);
+        let (root, fallback_msg) =
+            resolve_root_or_emergency(config.notes_dir.as_deref(), &instance);
+        if let Some(msg) = fallback_msg {
+            state.set_status(msg);
+        }
+        state.notes = store::load_all(&root, &instance);
         if !state.notes.is_empty() {
             state.active = Some(0);
         }
@@ -376,6 +398,7 @@ impl NotesWidget {
             theme,
             shortcut: None,
             shortcut_prefs,
+            root,
             last_content_rect: Arc::new(Mutex::new(Rect::default())),
             last_list_rect: Arc::new(Mutex::new(Rect::default())),
             last_list_entry_rows: Arc::new(Mutex::new(Vec::new())),
@@ -392,7 +415,7 @@ impl NotesWidget {
             body: String::new(),
             modified: std::time::SystemTime::now(),
         };
-        if let Err(err) = store::save(&self.instance, &mut note) {
+        if let Err(err) = store::save(&self.root, &self.instance, &mut note) {
             tracing::warn!(error = %err, "notes: save new note failed");
             st.set_status(format!("Save failed: {err}"));
             return;
@@ -415,7 +438,7 @@ impl NotesWidget {
             return;
         };
         let id = note.id.clone();
-        if let Err(err) = store::delete(&self.instance, &id) {
+        if let Err(err) = store::delete(&self.root, &self.instance, &id) {
             tracing::warn!(error = %err, "notes: delete failed");
             st.set_status(format!("Delete failed: {err}"));
             return;
@@ -443,7 +466,7 @@ impl NotesWidget {
         let Some(note) = st.notes.get_mut(active) else {
             return;
         };
-        if let Err(err) = store::save(&self.instance, note) {
+        if let Err(err) = store::save(&self.root, &self.instance, note) {
             tracing::warn!(error = %err, "notes: save failed");
             st.set_status(format!("Save failed: {err}"));
             return;
@@ -2295,20 +2318,167 @@ fn truncate_for_meta(s: &str, max: usize) -> String {
     crate::text::truncate(s, max)
 }
 
-/// Wizard descriptor. Notes have no per-instance fields the
-/// wizard manages — the on-disk note files are the data. Surfaces a
-/// short blurb so the wizard's widget picker explains what it is.
+/// Wizard descriptor. The only field is `notes_dir` — where note
+/// files live on disk. Defaults to `~/.glint/notes`; leaving the field
+/// blank in the wizard keeps the default. Other knobs (colours,
+/// shortcut letters) live in `notes.toml` and are managed by hand.
 pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
-    use crate::wizard::descriptor::WizardDescriptor;
+    use crate::wizard::descriptor::{
+        PathMode, WizardDescriptor, WizardField, WizardFieldKind,
+    };
     WizardDescriptor {
         display_name: "Notes",
         blurb: "A vim-flavoured notepad. Multiple notes; the list \
                 sorts by last-edited. Notes persist as one .md file \
-                per note under ~/.config/glint/notes/<instance>/ so \
-                they're easy to back up or hand-edit.",
-        load_from_toml: None,
-        render_toml: None,
-        fields: Vec::new(),
+                per note under <notes_dir>/<instance>/ so they're \
+                easy to back up or hand-edit.",
+        load_from_toml: Some(load_notes_config_from_toml),
+        render_toml: Some(render_notes_toml),
+        fields: vec![WizardField {
+            key: "notes_dir",
+            label: "Notes directory",
+            help: "Where note files are stored on disk. Defaults to \
+                   ~/.glint/notes; leave blank to accept that. If the \
+                   directory can't be created at launch, Glint falls \
+                   back to ~/.glint/notes, then to ~/.config/glint/notes, \
+                   and surfaces a title-bar warning either way.",
+            required: false,
+            kind: WizardFieldKind::Path {
+                mode: PathMode::Dir,
+                default: Some("~/.glint/notes".to_string()),
+            },
+            validate: None,
+        }],
+    }
+}
+
+/// Pre-populate the wizard's value map from an existing `notes.toml`
+/// (called on `--setup` re-runs). The wizard's default flat hydration
+/// would already pick `notes_dir` up as a top-level string scalar; we
+/// supply an explicit loader anyway so a missing value lands as an
+/// empty `Path` (signalling "use the default" rather than the literal
+/// string `"~/.glint/notes"` showing in the input).
+fn load_notes_config_from_toml(
+    doc: &toml::Value,
+) -> std::collections::HashMap<String, crate::wizard::descriptor::WizardValue> {
+    use crate::wizard::descriptor::WizardValue;
+    let mut out = std::collections::HashMap::new();
+    if let Some(v) = doc.get("notes_dir").and_then(|v| v.as_str()) {
+        out.insert("notes_dir".to_string(), WizardValue::Path(v.to_string()));
+    }
+    out
+}
+
+/// Custom TOML renderer so hand-edited `[colors]` blocks and
+/// `shortcuts = [...]` lines in `notes.toml` survive `--setup`
+/// re-runs. The wizard only owns the `notes_dir` scalar; everything
+/// else gets merged through verbatim via `toml_merge`.
+fn render_notes_toml(
+    values: &std::collections::HashMap<String, crate::wizard::descriptor::WizardValue>,
+    existing: Option<&str>,
+) -> String {
+    use crate::wizard::descriptor::WizardValue;
+    let notes_dir = match values.get("notes_dir") {
+        Some(WizardValue::Path(s)) | Some(WizardValue::Text(s)) => s.trim().to_string(),
+        _ => String::new(),
+    };
+    let base: std::borrow::Cow<str> = match existing {
+        Some(text) if !text.trim().is_empty() => std::borrow::Cow::Borrowed(text),
+        _ => std::borrow::Cow::Borrowed(NOTES_TOML_PREAMBLE),
+    };
+    if notes_dir.is_empty() {
+        // Blank → omit the key entirely so the widget picks up the
+        // built-in default. Strip any prior `notes_dir = ...` line so
+        // a re-run that clears the field actually clears it on disk.
+        return strip_top_level_scalar(&base, "notes_dir");
+    }
+    let literal = format!(
+        "\"{}\"",
+        notes_dir.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    crate::wizard::toml_merge::merge_top_level_scalars(&base, &[("notes_dir", literal)])
+}
+
+/// Remove a `key = "..."` (or `key = ...`) top-level assignment from
+/// a TOML body, preserving every other line. Used when the wizard
+/// clears the notes_dir field on a re-run so the widget falls back to
+/// the built-in default rather than to a stale persisted value.
+fn strip_top_level_scalar(text: &str, key: &str) -> String {
+    let prefix = format!("{key} ");
+    let prefix_eq = format!("{key}=");
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !(trimmed.starts_with(&prefix) || trimmed.starts_with(&prefix_eq))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+/// First-install preamble for `notes.toml`. Used when the wizard
+/// writes the file for the first time (no prior contents). Re-runs
+/// preserve whatever is on disk via `toml_merge`.
+const NOTES_TOML_PREAMBLE: &str =
+    "# Generated by `glint --setup`. Hand-edit freely; the wizard\n\
+     # only manages the `notes_dir` line.\n\
+     #\n\
+     # notes_dir: where note files are stored on disk. Leading `~/`\n\
+     # is expanded against $HOME. Leave unset to use the built-in\n\
+     # default `~/.glint/notes`.\n\
+     \n";
+
+/// Run the store's three-tier root resolver and translate its result
+/// into a `(root, optional_toast)` pair for the widget. Toast text is
+/// the user-facing summary of any fallback that occurred; `None` means
+/// the configured (or default) path worked first try.
+fn resolve_root_or_emergency(
+    configured: Option<&str>,
+    instance: &str,
+) -> (std::path::PathBuf, Option<String>) {
+    match store::resolve_root(configured) {
+        Ok((root, store::Resolution::Configured)) => (root, None),
+        Ok((root, store::Resolution::FellBackToDefault { rejected })) => {
+            tracing::warn!(
+                instance = %instance,
+                rejected = %rejected.display(),
+                using = %root.display(),
+                "notes: configured dir unwritable; using ~/.glint/notes"
+            );
+            (
+                root,
+                Some(format!(
+                    "Notes dir {} unwritable — using ~/.glint/notes",
+                    rejected.display()
+                )),
+            )
+        }
+        Ok((root, store::Resolution::FellBackToLegacy { rejected })) => {
+            tracing::warn!(
+                instance = %instance,
+                rejected = ?rejected,
+                using = %root.display(),
+                "notes: configured + ~/.glint/notes both unwritable; using legacy ~/.config/glint/notes"
+            );
+            (
+                root,
+                Some("Notes dir fallback — using ~/.config/glint/notes".to_string()),
+            )
+        }
+        Err(err) => {
+            // All three candidates failed — extremely unusual (home
+            // dir unwritable). Use the legacy path as a dead anchor
+            // so per-note saves error individually with a clear
+            // message, rather than refusing to mount the widget.
+            tracing::error!(error = %err, "notes: no writable root; saves will fail");
+            let dead = crate::config::config_dir()
+                .map(|p| p.join("notes"))
+                .unwrap_or_else(|_| std::path::PathBuf::from("./glint-notes"));
+            (
+                dead,
+                Some("Notes storage unavailable — saves will fail".to_string()),
+            )
+        }
     }
 }
 
@@ -2327,9 +2497,21 @@ mod tests {
     use super::*;
 
     fn make_widget() -> NotesWidget {
+        // Keep tests off the user's real ~/.glint/notes (the new
+        // default) by pointing the resolver at a per-process temp dir.
+        let tmp = std::env::temp_dir().join(format!(
+            "glint-notes-mod-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let cfg = NotesConfig {
+            notes_dir: Some(tmp.to_string_lossy().to_string()),
+            ..NotesConfig::default()
+        };
         NotesWidget::with_config(
             "test-main".to_string(),
-            NotesConfig::default(),
+            cfg,
             Arc::new(Theme::builtin_defaults()),
         )
     }

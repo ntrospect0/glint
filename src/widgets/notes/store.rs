@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 ntrospect0
 
-//! Per-instance note persistence under `~/.config/glint/notes/<instance>/`.
+//! Per-instance note persistence.
+//!
+//! The directory layout is `<root>/<instance>/<id>.md`, where `root`
+//! is whatever [`resolve_root`] decided on at widget mount: the user's
+//! configured `notes_dir` if it could be created, falling back to
+//! `~/.glint/notes`, then to the legacy `~/.config/glint/notes`.
 //!
 //! One Markdown file per note. The on-disk layout is intentionally plain:
 //! users can `cat` a note, hand-edit it, back the directory up with git,
@@ -19,7 +24,7 @@
 
 use std::{
     fs, io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::SystemTime,
 };
@@ -65,12 +70,128 @@ pub fn new_id() -> String {
     format!("{nanos:020}-{seq:06}")
 }
 
-/// Resolve the on-disk directory for one instance's notes. Created
-/// lazily on first write.
-pub fn notes_dir(instance: &str) -> Result<PathBuf> {
-    let root = crate::config::config_dir()?.join("notes");
-    let safe_instance = sanitize_instance(instance);
-    Ok(root.join(safe_instance))
+/// Which tier of [`resolve_root`]'s fallback chain produced the path.
+/// Carried out so the widget can craft a user-visible toast when
+/// anything other than the happy path took effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    /// The configured `notes_dir` succeeded (or no override was given
+    /// and the built-in `~/.glint/notes` default succeeded — these
+    /// share a tier from the widget's perspective).
+    Configured,
+    /// The configured `notes_dir` was set but couldn't be created;
+    /// `~/.glint/notes` worked as a fallback. Carries the rejected
+    /// path so the toast can quote it.
+    FellBackToDefault { rejected: PathBuf },
+    /// Neither the configured override nor `~/.glint/notes` could be
+    /// created; we landed on the legacy `~/.config/glint/notes`.
+    /// Carries every path that was tried so the toast / log can
+    /// surface the full story.
+    FellBackToLegacy { rejected: Vec<PathBuf> },
+}
+
+/// Resolve the root directory for notes storage and ensure it exists.
+///
+/// Tries the user's configured override first (if non-empty), then
+/// `~/.glint/notes`, then the legacy `~/.config/glint/notes`. Each
+/// candidate is `mkdir -p`'d; the first one that survives that step
+/// wins. A leading `~/` in the configured path is expanded against
+/// `$HOME`.
+///
+/// Returns an `Err` only if all three candidates fail — which in
+/// practice means the home directory is unwritable, a situation glint
+/// can't gracefully recover from anyway.
+pub fn resolve_root(configured: Option<&str>) -> Result<(PathBuf, Resolution)> {
+    let mut rejected: Vec<PathBuf> = Vec::new();
+
+    // ── Tier 1: configured override (if non-empty after trimming). ──
+    let configured_path = configured
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(expand_tilde);
+    if let Some(path) = configured_path.as_ref() {
+        if try_mkdir_p(path) {
+            return Ok((path.clone(), Resolution::Configured));
+        }
+        rejected.push(path.clone());
+    }
+
+    // ── Tier 2: ~/.glint/notes. ──
+    let glint_home = home_join(".glint").map(|p| p.join("notes"));
+    if let Some(path) = glint_home.as_ref() {
+        if try_mkdir_p(path) {
+            // If the user didn't configure anything, this is the
+            // happy path — no fallback occurred.
+            return Ok((
+                path.clone(),
+                if rejected.is_empty() {
+                    Resolution::Configured
+                } else {
+                    Resolution::FellBackToDefault {
+                        rejected: rejected.remove(0),
+                    }
+                },
+            ));
+        }
+        rejected.push(path.clone());
+    }
+
+    // ── Tier 3: ~/.config/glint/notes (XDG-aware). ──
+    let legacy = crate::config::config_dir().map(|p| p.join("notes"));
+    if let Ok(path) = legacy {
+        if try_mkdir_p(&path) {
+            return Ok((path, Resolution::FellBackToLegacy { rejected }));
+        }
+        rejected.push(path);
+    }
+
+    anyhow::bail!(
+        "could not create any notes directory; tried {}",
+        rejected
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn try_mkdir_p(path: &Path) -> bool {
+    match fs::create_dir_all(path) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "notes: mkdir failed; trying next fallback"
+            );
+            false
+        }
+    }
+}
+
+/// Expand a leading `~/` (or bare `~`) against `$HOME`. Anything else
+/// is returned unchanged. We only handle the common leading-tilde case
+/// — `~user/...` is intentionally not supported.
+fn expand_tilde(raw: &str) -> PathBuf {
+    if raw == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(raw));
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(raw)
+}
+
+fn home_join(suffix: &str) -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(suffix))
+}
+
+/// Resolve the on-disk directory for one instance's notes inside an
+/// already-resolved root. Created lazily on first write.
+pub fn notes_dir(root: &Path, instance: &str) -> PathBuf {
+    root.join(sanitize_instance(instance))
 }
 
 fn sanitize_instance(instance: &str) -> String {
@@ -88,14 +209,8 @@ fn sanitize_instance(instance: &str) -> String {
 /// Load every `<id>.md` from the instance's notes directory. Missing
 /// directory → empty vec (no error). Per-file read failures are logged
 /// and skipped so one corrupt note doesn't hide the rest.
-pub fn load_all(instance: &str) -> Vec<Note> {
-    let dir = match notes_dir(instance) {
-        Ok(p) => p,
-        Err(err) => {
-            tracing::warn!(error = %err, "notes: dir unresolvable");
-            return Vec::new();
-        }
-    };
+pub fn load_all(root: &Path, instance: &str) -> Vec<Note> {
+    let dir = notes_dir(root, instance);
     if !dir.exists() {
         return Vec::new();
     }
@@ -141,8 +256,8 @@ pub fn load_all(instance: &str) -> Vec<Note> {
 /// Atomic write of one note. Creates the instance directory on demand.
 /// Updates the in-memory note's `modified` to the new mtime so callers
 /// can re-sort without an extra stat.
-pub fn save(instance: &str, note: &mut Note) -> Result<()> {
-    let dir = notes_dir(instance)?;
+pub fn save(root: &Path, instance: &str, note: &mut Note) -> Result<()> {
+    let dir = notes_dir(root, instance);
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join(format!("{}.md", note.id));
     let tmp = dir.join(format!("{}.md.tmp", note.id));
@@ -156,19 +271,14 @@ pub fn save(instance: &str, note: &mut Note) -> Result<()> {
 }
 
 /// Remove a note from disk. Returns `Ok(())` if the file is already gone.
-pub fn delete(instance: &str, id: &str) -> Result<()> {
-    let dir = notes_dir(instance)?;
+pub fn delete(root: &Path, instance: &str, id: &str) -> Result<()> {
+    let dir = notes_dir(root, instance);
     let path = dir.join(format!("{id}.md"));
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("remove {}", path.display())),
     }
-}
-
-#[allow(dead_code)] // surfaced when the wizard adds a "notes dir" hint.
-pub fn root_dir() -> Result<PathBuf> {
-    Ok(crate::config::config_dir()?.join("notes"))
 }
 
 #[cfg(test)]
@@ -183,7 +293,6 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", &dir);
         tempdir::PathGuard(dir)
     }
 
@@ -193,6 +302,11 @@ mod tests {
     mod tempdir {
         use std::path::PathBuf;
         pub struct PathGuard(pub PathBuf);
+        impl AsRef<std::path::Path> for PathGuard {
+            fn as_ref(&self) -> &std::path::Path {
+                &self.0
+            }
+        }
         impl Drop for PathGuard {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.0);
@@ -231,16 +345,12 @@ mod tests {
         assert_eq!(n.display_name(), "(empty)");
     }
 
-    /// Parallel tests share XDG_CONFIG_HOME via the process env, so we
-    /// also need unique instance names to isolate their notes dirs.
     fn unique_instance(label: &str) -> String {
         format!(
             "{label}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         )
-        // Sanitize for our own rules so the assertion-target path
-        // matches what notes_dir() resolves to.
         .replace(
             |c: char| !matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-'),
             "_",
@@ -248,76 +358,111 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "mutates the process-wide XDG_CONFIG_HOME — opt in with --ignored"]
     fn save_then_load_round_trips_body_and_modified() {
-        let _g = tmp_home();
+        let g = tmp_home();
         let inst = unique_instance("roundtrip");
         let mut n = Note {
             id: new_id(),
             body: "alpha\nbeta".into(),
             modified: SystemTime::UNIX_EPOCH,
         };
-        save(&inst, &mut n).expect("save");
+        save(g.as_ref(), &inst, &mut n).expect("save");
         assert!(n.modified > SystemTime::UNIX_EPOCH, "save must stamp mtime");
 
-        let loaded = load_all(&inst);
+        let loaded = load_all(g.as_ref(), &inst);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].body, "alpha\nbeta");
         assert_eq!(loaded[0].id, n.id);
     }
 
     #[test]
-    #[ignore = "mutates the process-wide XDG_CONFIG_HOME — opt in with --ignored"]
     fn load_all_sorts_newest_first() {
-        let _g = tmp_home();
+        let g = tmp_home();
         let inst = unique_instance("sort");
         let mut older = Note {
             id: new_id(),
             body: "old".into(),
             modified: SystemTime::UNIX_EPOCH,
         };
-        save(&inst, &mut older).expect("save older");
-        // Bump filesystem mtime resolution by a deliberate gap so the
-        // second save sorts strictly newer.
+        save(g.as_ref(), &inst, &mut older).expect("save older");
         std::thread::sleep(std::time::Duration::from_millis(10));
         let mut newer = Note {
             id: new_id(),
             body: "new".into(),
             modified: SystemTime::UNIX_EPOCH,
         };
-        save(&inst, &mut newer).expect("save newer");
+        save(g.as_ref(), &inst, &mut newer).expect("save newer");
 
-        let loaded = load_all(&inst);
+        let loaded = load_all(g.as_ref(), &inst);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].body, "new", "newest first");
         assert_eq!(loaded[1].body, "old");
     }
 
     #[test]
-    #[ignore = "mutates the process-wide XDG_CONFIG_HOME — opt in with --ignored"]
     fn delete_removes_the_file_and_is_idempotent() {
-        let _g = tmp_home();
+        let g = tmp_home();
         let inst = unique_instance("delete");
         let mut n = Note {
             id: new_id(),
             body: "doomed".into(),
             modified: SystemTime::now(),
         };
-        save(&inst, &mut n).expect("save");
-        delete(&inst, &n.id).expect("delete");
-        assert!(load_all(&inst).is_empty());
-        // Deleting again must not error.
-        delete(&inst, &n.id).expect("idempotent delete");
+        save(g.as_ref(), &inst, &mut n).expect("save");
+        delete(g.as_ref(), &inst, &n.id).expect("delete");
+        assert!(load_all(g.as_ref(), &inst).is_empty());
+        delete(g.as_ref(), &inst, &n.id).expect("idempotent delete");
     }
 
     #[test]
     fn sanitize_instance_strips_path_traversal() {
         assert_eq!(sanitize_instance("work"), "work");
-        // `.` is allowed (legitimate in `foo.bar`); `/` becomes `_`.
-        // ".." stays as ".." since dots are allowed, but the path
-        // separator is the actual escape vector and gets sanitized.
         assert_eq!(sanitize_instance("../escape"), ".._escape");
         assert_eq!(sanitize_instance("a/b"), "a_b");
         assert_eq!(sanitize_instance("..\\evil"), ".._evil");
+    }
+
+    #[test]
+    fn resolve_root_uses_configured_when_creatable() {
+        let g = tmp_home();
+        let target = g.0.join("custom-notes");
+        let configured = target.to_string_lossy().to_string();
+        let (root, res) = resolve_root(Some(&configured)).expect("resolve");
+        assert_eq!(root, target);
+        assert!(matches!(res, Resolution::Configured));
+        assert!(target.exists(), "mkdir -p should have run");
+    }
+
+    #[test]
+    fn resolve_root_falls_back_when_configured_is_unwritable() {
+        // A path under an existing regular file can't be `mkdir -p`'d —
+        // exercises the fallback without needing root or chmod.
+        let g = tmp_home();
+        let blocker = g.0.join("blocker");
+        fs::write(&blocker, b"not a directory").unwrap();
+        let bad = blocker.join("sub").to_string_lossy().to_string();
+        let (root, res) = resolve_root(Some(&bad)).expect("resolve");
+        // Either tier 2 (~/.glint/notes) or tier 3 (~/.config/glint/notes)
+        // should have caught it — both signal a fallback.
+        assert_ne!(root, PathBuf::from(&bad));
+        assert!(
+            matches!(
+                res,
+                Resolution::FellBackToDefault { .. } | Resolution::FellBackToLegacy { .. }
+            ),
+            "expected fallback resolution, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn expand_tilde_handles_common_forms() {
+        let home = dirs::home_dir().expect("home");
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/foo/bar"), home.join("foo/bar"));
+        // Non-tilde paths pass through unchanged.
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+        assert_eq!(expand_tilde("relative/path"), PathBuf::from("relative/path"));
+        // Bare ~name (no slash) is not expanded.
+        assert_eq!(expand_tilde("~alice/foo"), PathBuf::from("~alice/foo"));
     }
 }
