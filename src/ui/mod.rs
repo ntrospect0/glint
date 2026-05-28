@@ -788,22 +788,30 @@ pub fn render(frame: &mut Frame, state: &RenderState) {
 /// Invalidation rules (any one forces a full repaint this frame and
 /// drops the cache so the next frame is also full):
 ///
-/// 1. **Cache empty** — first draw of the session, or someone reset
-///    it manually.
-/// 2. **Frame area changed** — terminal resize; cached buffer is the
-///    wrong size.
-/// 3. **Help overlay toggled** — overlay pixels in the cache would
+/// 1. **`force_full` set by caller** — the dirty-id set isn't a
+///    reliable signal this frame. Used on non-tick events (key,
+///    mouse, paste, resize, config change): widgets' `handle_key`
+///    et al. mutate state without setting their own dirty bit by
+///    trait contract (they rely on the app's unconditional non-
+///    tick redraw), so we can't trust `dirty_ids` to enumerate
+///    what visibly changed.
+/// 2. **Cache empty** — first draw of the session, or someone
+///    reset it manually.
+/// 3. **Frame area changed** — terminal resize; cached buffer is
+///    the wrong size.
+/// 4. **Help overlay toggled** — overlay pixels in the cache would
 ///    smear across widgets when the overlay closes, so we forcibly
 ///    repaint on either edge.
-/// 4. **Help overlay currently shown** — the overlay paints over
+/// 5. **Help overlay currently shown** — the overlay paints over
 ///    every widget anyway, so caching its frame is meaningless;
 ///    re-render in full while it's up.
-/// 5. **Per-widget**: dirty bit set, focus changed for this widget
+/// 6. **Per-widget**: dirty bit set, focus changed for this widget
 ///    (gained or lost), or cell rect moved.
 pub fn render_partial(
     frame: &mut Frame,
     state: &RenderState,
     dirty_ids: &HashSet<String>,
+    force_full: bool,
     cache: &mut PartialDrawCache,
 ) {
     let area = frame.area();
@@ -816,7 +824,7 @@ pub fn render_partial(
         .last_drawn
         .as_ref()
         .map_or(true, |b| b.area != area);
-    let force_full = area_changed || help_toggled || state.show_help;
+    let force_full = force_full || area_changed || help_toggled || state.show_help;
 
     if force_full {
         render(frame, state);

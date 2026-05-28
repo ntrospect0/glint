@@ -1119,8 +1119,26 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
             // immediately after the closure returns.
             let mut cache = std::mem::take(&mut app.partial_draw);
             let render_state = app.render_state();
+            // Per-widget `dirty_ids` is the authoritative "what
+            // changed" signal only on ticks. Non-tick events
+            // (key / mouse / paste / resize / config change) can
+            // mutate widget state without going through the dirty
+            // bit — by trait contract widgets rely on the app's
+            // unconditional non-tick redraw and don't bother
+            // setting their own bit from `handle_key`. So on
+            // non-tick events we tell `render_partial` to treat
+            // the cache as out-of-date and repaint everything.
+            // The full-repaint path still refreshes the cache, so
+            // subsequent ticks resume the partial-blit fast path.
+            let force_full = !is_tick;
             terminal.draw(|frame| {
-                ui::render_partial(frame, &render_state, &widgets_dirty_ids, &mut cache);
+                ui::render_partial(
+                    frame,
+                    &render_state,
+                    &widgets_dirty_ids,
+                    force_full,
+                    &mut cache,
+                );
             })?;
             app.partial_draw = cache;
         }
