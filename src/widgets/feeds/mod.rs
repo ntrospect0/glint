@@ -1458,6 +1458,18 @@ impl Widget for FeedsWidget {
         if self.is_due() {
             self.spawn_refresh();
         }
+        // Hero-image background tasks flip `pending_change` when a
+        // slot moves between Fetching / Ready / Failed. The partial-
+        // redraw path only re-runs `render()` when the widget's
+        // dirty bit is set, so without this poll the cached
+        // "loading…" placeholder would keep blitting forever after
+        // an image actually landed. Cheap atomic swap per tick.
+        if self.images.take_pending_change() {
+            self.state
+                .lock()
+                .expect("feeds state poisoned")
+                .dirty = true;
+        }
         // Atomic-gated status drain — skips the state lock on idle
         // ticks. See the same pattern on stocks / forex / calendar.
         if self.feedback_pending.load(Ordering::Relaxed) {

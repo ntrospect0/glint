@@ -20,7 +20,10 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -118,6 +121,17 @@ pub struct HeroImageStore {
     /// reads from render are status queries, not access events —
     /// they deliberately don't touch this order.
     lru: Mutex<VecDeque<String>>,
+    /// Set whenever a slot transitions to `Fetching`, `Ready`, or
+    /// `Failed`. The owning widget polls + clears this in its
+    /// `update()` and converts it into a dirty-bit flip so the
+    /// next frame actually renders the new state. Without this
+    /// signal, the partial-redraw path would keep blitting the
+    /// cached "loading…" placeholder forever — only the widget's
+    /// `render()` re-reads the slot, and the partial path skips
+    /// `render()` when `dirty_ids` doesn't name the widget. Wrapped
+    /// in `Arc` so spawned download tasks can flip it via a cloned
+    /// handle without back-referencing the store.
+    pending_change: Arc<AtomicBool>,
 }
 
 impl HeroImageStore {
@@ -143,7 +157,17 @@ impl HeroImageStore {
             protocols: Mutex::new(HashMap::new()),
             last_url: Mutex::new(None),
             lru: Mutex::new(VecDeque::with_capacity(MAX_CACHED_IMAGES + 1)),
+            pending_change: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Load + clear the pending-change flag. The widget polls this
+    /// each tick and, when it returns `true`, marks itself dirty so
+    /// the next render fires and the newly-Ready image lands on
+    /// screen. Cheap when nothing has changed (single relaxed-order
+    /// swap), so safe to call every tick.
+    pub fn take_pending_change(&self) -> bool {
+        self.pending_change.swap(false, Ordering::Relaxed)
     }
 
     /// Move `url` to the back of the LRU queue (most-recently
@@ -214,6 +238,7 @@ impl HeroImageStore {
                     Ok(img) => {
                         *slot.lock().expect("hero image state poisoned") =
                             HeroState::Ready(Arc::new(downscale(img)));
+                        self.pending_change.store(true, Ordering::Relaxed);
                         return;
                     }
                     Err(err) => {
@@ -227,11 +252,15 @@ impl HeroImageStore {
             }
         }
 
-        // Mark fetching and fire off the network task.
+        // Mark fetching and fire off the network task. The Fetching
+        // transition itself flips a "loading…" message into view
+        // (if the slot was Idle), so signal pending too.
         *slot.lock().expect("hero image state poisoned") = HeroState::Fetching;
+        self.pending_change.store(true, Ordering::Relaxed);
         let url_owned = url.to_string();
         let cache = self.cache.clone();
         let slot_clone = slot.clone();
+        let pending = Arc::clone(&self.pending_change);
         tokio::spawn(async move {
             let result = download_bytes(&url_owned).await;
             let bytes = match result {
@@ -239,6 +268,7 @@ impl HeroImageStore {
                 Err(err) => {
                     tracing::warn!(url = %url_owned, error = %err, "feeds: hero image fetch failed");
                     *slot_clone.lock().expect("hero image state poisoned") = HeroState::Failed;
+                    pending.store(true, Ordering::Relaxed);
                     return;
                 }
             };
@@ -255,6 +285,7 @@ impl HeroImageStore {
                     *slot_clone.lock().expect("hero image state poisoned") = HeroState::Failed;
                 }
             }
+            pending.store(true, Ordering::Relaxed);
         });
     }
 
