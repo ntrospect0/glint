@@ -2033,14 +2033,17 @@ fn render_graph_panel(
         lay_out_x_axis_labels(&label_refs, plot_w as usize)
     } else {
         // Place each annotation's label at the column matching its
-        // vertical guide. The first annotation (always at bar_index 0)
-        // is dropped — labeling the chart's left edge crowds the next
-        // label and looks awkward, since there's no guide line there
-        // anyway. Overlap collisions resolve in favor of the earlier
-        // label.
+        // vertical guide. Every annotation lands a label, including
+        // the first (bar_index 0) — without it, 1W readers were
+        // counting only 4 day labels (Tue/Wed/Thu/Fri) and thinking
+        // the chart covered 4 days when there's a full 5th day of
+        // data on the left. The vertical-guide pass still skips
+        // bar_index 0 to avoid colliding with the y-axis labels;
+        // the x-axis label row is one row below the plot, well
+        // clear of that overlap. Overlap collisions between labels
+        // resolve in favor of the earlier (leftmost) one.
         let cols: Vec<(usize, &str)> = annotations
             .iter()
-            .filter(|ann| ann.bar_index > 0)
             .map(|ann| {
                 let n = timestamps_render.len();
                 let frac = if n <= 1 {
