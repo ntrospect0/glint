@@ -3,7 +3,7 @@
 
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     path::PathBuf,
     sync::Arc,
@@ -70,6 +70,11 @@ pub struct App {
     /// avoids a disk write on every keypress while still persisting
     /// every meaningful change.
     last_persisted_stack_state: HashMap<String, usize>,
+    /// Cached pixels + bookkeeping from the previous draw. The
+    /// partial-render path blits unchanged cells from here into the
+    /// new frame instead of re-running their `render()`. See
+    /// [`ui::PartialDrawCache`] for the invalidation rules.
+    partial_draw: ui::PartialDrawCache,
 }
 
 impl App {
@@ -151,6 +156,7 @@ impl App {
             command_buffer: None,
             command_feedback: None,
             last_persisted_stack_state,
+            partial_draw: ui::PartialDrawCache::default(),
         }
     }
 
@@ -222,16 +228,18 @@ impl App {
         false
     }
 
-    /// Drain every widget's dirty bit and OR the results. Always calls
-    /// `take_dirty` on every widget — even when we already know the
-    /// answer is "draw" — so a queued change can't smuggle a stale
-    /// bit into the next tick and force a redundant redraw there.
-    fn drain_widget_dirty(&mut self) -> bool {
-        let mut dirty = false;
+    /// Drain every widget's dirty bit. Returns the set of ids that
+    /// reported `true` — the partial-render path needs to know
+    /// *which* widgets need a fresh paint, not just "any of them."
+    /// Always calls `take_dirty` on every widget (even when the
+    /// answer is obviously yes elsewhere) so a queued bit can't
+    /// smuggle into the next tick and trigger a redundant redraw.
+    fn drain_widget_dirty_ids(&mut self) -> HashSet<String> {
+        let mut dirty: HashSet<String> = HashSet::new();
         for id in self.manager.ids().to_vec() {
             if let Some(w) = self.manager.get_mut(&id) {
                 if w.take_dirty() {
-                    dirty = true;
+                    dirty.insert(id);
                 }
             }
         }
@@ -1098,16 +1106,23 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
         // Always drain widget dirty bits so they don't pile up between
         // draws — even when we already know we're going to draw (non-tick
         // events), so the next tick starts from a clean slate.
-        let widgets_dirty = app.drain_widget_dirty();
+        let widgets_dirty_ids = app.drain_widget_dirty_ids();
         let should_draw = if is_tick {
-            widgets_dirty || feedback_cleared || focus_promoted
+            !widgets_dirty_ids.is_empty() || feedback_cleared || focus_promoted
         } else {
             true
         };
         if should_draw {
+            // Move the partial-draw cache out so the closure has a
+            // disjoint mut borrow while `render_state()` holds an
+            // immutable borrow of the rest of `app`. We restore it
+            // immediately after the closure returns.
+            let mut cache = std::mem::take(&mut app.partial_draw);
+            let render_state = app.render_state();
             terminal.draw(|frame| {
-                ui::render(frame, &app.render_state());
+                ui::render_partial(frame, &render_state, &widgets_dirty_ids, &mut cache);
             })?;
+            app.partial_draw = cache;
         }
     }
 

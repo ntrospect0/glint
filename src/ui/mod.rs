@@ -7,9 +7,10 @@ pub mod modal;
 pub mod status;
 pub mod status_bar;
 
-use std::{cell::Cell, sync::Arc};
+use std::{cell::Cell, collections::HashMap, collections::HashSet, sync::Arc};
 
 use ratatui::{
+    buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -615,11 +616,108 @@ mod tests {
         assert!(!text.contains('▶'));
         assert!(!text.contains('◀'));
     }
+
+    fn fill_buffer(buf: &mut Buffer, ch: char) {
+        for y in buf.area.y..buf.area.bottom() {
+            for x in buf.area.x..buf.area.right() {
+                buf[(x, y)].set_char(ch);
+            }
+        }
+    }
+
+    fn snapshot_chars(buf: &Buffer, rect: Rect) -> String {
+        let mut out = String::new();
+        for y in rect.y..rect.y + rect.height {
+            for x in rect.x..rect.x + rect.width {
+                out.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn blit_rect_copies_cells_inside_both_buffers() {
+        let area = Rect::new(0, 0, 8, 4);
+        let mut src = Buffer::empty(area);
+        let mut dst = Buffer::empty(area);
+        fill_buffer(&mut src, 'A');
+        fill_buffer(&mut dst, '.');
+
+        blit_rect(&mut dst, &src, Rect::new(2, 1, 3, 2));
+
+        let got = snapshot_chars(&dst, area);
+        assert_eq!(
+            got,
+            "........\n\
+             ..AAA...\n\
+             ..AAA...\n\
+             ........\n",
+        );
+    }
+
+    #[test]
+    fn blit_rect_silently_skips_out_of_bounds_cells() {
+        let area = Rect::new(0, 0, 4, 4);
+        let mut src = Buffer::empty(area);
+        let mut dst = Buffer::empty(area);
+        fill_buffer(&mut src, 'A');
+        fill_buffer(&mut dst, '.');
+
+        // Rect runs past the right/bottom edge; out-of-bounds cells
+        // are skipped, in-bounds cells still copy.
+        blit_rect(&mut dst, &src, Rect::new(2, 2, 10, 10));
+
+        let got = snapshot_chars(&dst, area);
+        assert_eq!(
+            got,
+            "....\n\
+             ....\n\
+             ..AA\n\
+             ..AA\n",
+        );
+    }
+
+    #[test]
+    fn blit_rect_with_zero_size_is_noop() {
+        let area = Rect::new(0, 0, 4, 4);
+        let mut src = Buffer::empty(area);
+        let mut dst = Buffer::empty(area);
+        fill_buffer(&mut src, 'A');
+        fill_buffer(&mut dst, '.');
+
+        blit_rect(&mut dst, &src, Rect::new(1, 1, 0, 0));
+        blit_rect(&mut dst, &src, Rect::new(1, 1, 2, 0));
+        blit_rect(&mut dst, &src, Rect::new(1, 1, 0, 2));
+
+        let got = snapshot_chars(&dst, area);
+        assert!(got.chars().all(|c| c == '.' || c == '\n'));
+    }
+}
+
+/// Mutable cache passed by `App` to [`render_partial`]. Owns the
+/// pixels of the previous draw plus a few fields the render path
+/// uses to decide whether the cache is still valid for the current
+/// frame. Reset to `Default::default()` when the app wants to force
+/// a full repaint (rare — `render_partial` handles invalidation on
+/// its own for the common cases).
+#[derive(Default)]
+pub struct PartialDrawCache {
+    /// Buffer of the last successful draw. `None` invalidates the
+    /// entire cache and the next draw becomes a full repaint.
+    pub last_drawn: Option<Buffer>,
+    /// Rect each widget occupied on the previous draw.
+    pub last_cell_rects: HashMap<String, Rect>,
+    /// Focused widget id on the previous draw.
+    pub last_focused_id: Option<String>,
+    /// `show_help` value on the previous draw.
+    pub last_show_help: bool,
 }
 
 /// Render the full frame: grid cells on top, single-line status bar pinned
 /// to the bottom row. Unknown widget ids render a stub placeholder. The help
-/// overlay is drawn last on top of everything when enabled.
+/// overlay is drawn last on top of everything when enabled. Always paints
+/// every widget — used by tests + the `render_partial` fallback path.
 pub fn render(frame: &mut Frame, state: &RenderState) {
     let area = frame.area();
     // Bottom-of-screen "chrome row" — a single row that swaps between
@@ -677,6 +775,214 @@ pub fn render(frame: &mut Frame, state: &RenderState) {
             state.help_scroll_max,
         );
     }
+}
+
+/// Same shape as [`render`], but only repaints widget cells whose
+/// dirty bit is set (or whose visual surface changed for another
+/// reason — focus shift, layout reflow, etc.). Cells we skip are
+/// blitted from `cache.last_drawn` into the new frame's buffer, so
+/// the terminal-diff layer downstream sees the same final pixels
+/// either way. Chrome (command bar / feedback / status bar) and the
+/// help overlay are cheap and always painted fresh.
+///
+/// Invalidation rules (any one forces a full repaint this frame and
+/// drops the cache so the next frame is also full):
+///
+/// 1. **Cache empty** — first draw of the session, or someone reset
+///    it manually.
+/// 2. **Frame area changed** — terminal resize; cached buffer is the
+///    wrong size.
+/// 3. **Help overlay toggled** — overlay pixels in the cache would
+///    smear across widgets when the overlay closes, so we forcibly
+///    repaint on either edge.
+/// 4. **Help overlay currently shown** — the overlay paints over
+///    every widget anyway, so caching its frame is meaningless;
+///    re-render in full while it's up.
+/// 5. **Per-widget**: dirty bit set, focus changed for this widget
+///    (gained or lost), or cell rect moved.
+pub fn render_partial(
+    frame: &mut Frame,
+    state: &RenderState,
+    dirty_ids: &HashSet<String>,
+    cache: &mut PartialDrawCache,
+) {
+    let area = frame.area();
+
+    // Frame-level invalidations: any of these means we can't trust
+    // the cached pixels, so render everything and rebuild the cache
+    // from this draw.
+    let help_toggled = state.show_help != cache.last_show_help;
+    let area_changed = cache
+        .last_drawn
+        .as_ref()
+        .map_or(true, |b| b.area != area);
+    let force_full = area_changed || help_toggled || state.show_help;
+
+    if force_full {
+        render(frame, state);
+        if state.show_help {
+            // Don't cache while the overlay is up — `last_drawn`
+            // would hold overlay pixels and corrupt the next paint
+            // after dismissal. Drop the cache entirely so the next
+            // frame goes through full-repaint again.
+            *cache = PartialDrawCache {
+                last_show_help: true,
+                ..Default::default()
+            };
+        } else {
+            *cache = PartialDrawCache {
+                last_drawn: Some(frame.buffer_mut().clone()),
+                last_cell_rects: collect_cell_rects(frame, state),
+                last_focused_id: state.focused.map(str::to_string),
+                last_show_help: false,
+            };
+        }
+        return;
+    }
+
+    // From here on the cache is valid: same size, no help overlay.
+    let cached_buf = cache
+        .last_drawn
+        .as_ref()
+        .expect("cache validated above is non-None");
+
+    // Mirror what `render` does for the chrome split so we know the
+    // widget grid's `main_area`. Chrome is always re-painted from
+    // scratch — it's a single row and cheap.
+    let chrome_visible =
+        state.command_buffer.is_some() || state.command_feedback.is_some() || state.show_status_bar;
+    let chrome_h: u16 = if chrome_visible { 1 } else { 0 };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(chrome_h)])
+        .split(area);
+    let main_area = chunks[0];
+    let chrome_area = chunks[1];
+
+    // First pass: figure out which cells need a fresh widget render
+    // this frame. A widget needs to render when:
+    //
+    //   - its dirty bit was set,
+    //   - it gained or lost focus,
+    //   - its rect moved (layout reflow, stack tab switch, …), or
+    //   - we don't have a previous rect for it yet (newly added).
+    //
+    // Everything else blits.
+    let focus_changed = state.focused.map(str::to_string) != cache.last_focused_id;
+    let resolved = state.layout.resolve(main_area);
+    let mut to_render: HashSet<String> = HashSet::new();
+    let mut new_rects: HashMap<String, Rect> = HashMap::with_capacity(resolved.len());
+    for r in &resolved {
+        let Some(id) = r.cell.render_target_id() else {
+            continue;
+        };
+        new_rects.insert(id.clone(), r.area);
+        let rect_moved = cache
+            .last_cell_rects
+            .get(&id)
+            .map_or(true, |prev| *prev != r.area);
+        let focus_touched = focus_changed
+            && (cache.last_focused_id.as_deref() == Some(id.as_str())
+                || state.focused == Some(id.as_str()));
+        if dirty_ids.contains(&id) || rect_moved || focus_touched {
+            to_render.insert(id);
+        }
+    }
+
+    // Second pass: blit cached pixels for the cells we're skipping,
+    // then render the dirty ones on top. Doing blits first means
+    // any newly-rendered widget overwrites stale cached pixels in
+    // its rect (defense-in-depth against an edge where rect_moved
+    // didn't fire but should have).
+    for r in &resolved {
+        let Some(id) = r.cell.render_target_id() else {
+            continue;
+        };
+        if !to_render.contains(&id) {
+            blit_rect(frame.buffer_mut(), cached_buf, r.area);
+        }
+    }
+    for r in &resolved {
+        let Some(id) = r.cell.render_target_id() else {
+            continue;
+        };
+        if !to_render.contains(&id) {
+            continue;
+        }
+        let is_focused = state.focused == Some(id.as_str());
+        match state.manager.get(&id) {
+            Some(widget) => widget.render(frame, r.area, is_focused),
+            None => render_unknown(frame, r.area, &id, is_focused, state.theme),
+        }
+    }
+
+    // Chrome row is always fresh.
+    if chrome_h > 0 {
+        if let Some(buf) = state.command_buffer {
+            render_command_bar(frame, chrome_area, buf, state.theme);
+        } else if let Some((msg, severity)) = state.command_feedback {
+            render_feedback(frame, chrome_area, msg, severity, state.theme);
+        } else if state.show_status_bar {
+            status_bar::render(
+                frame,
+                chrome_area,
+                state.focused,
+                state.theme_name,
+                state.theme,
+            );
+        }
+    }
+
+    // Capture this frame's pixels + bookkeeping for next time.
+    cache.last_drawn = Some(frame.buffer_mut().clone());
+    cache.last_cell_rects = new_rects;
+    cache.last_focused_id = state.focused.map(str::to_string);
+    cache.last_show_help = false;
+}
+
+/// Copy a rect's worth of cells from `src` into `dst`. Assumes the
+/// rect is fully inside both buffers (caller has already clamped to
+/// `dst.area`); out-of-bounds reads/writes are silently skipped via
+/// the `Buffer` index API which clamps. Used by the partial-render
+/// path to blit a previous widget's pixels into the new frame.
+fn blit_rect(dst: &mut Buffer, src: &Buffer, rect: Rect) {
+    let src_area = src.area;
+    let dst_area = dst.area;
+    for y in rect.y..rect.y.saturating_add(rect.height) {
+        for x in rect.x..rect.x.saturating_add(rect.width) {
+            if x >= src_area.right()
+                || y >= src_area.bottom()
+                || x >= dst_area.right()
+                || y >= dst_area.bottom()
+            {
+                continue;
+            }
+            dst[(x, y)] = src[(x, y)].clone();
+        }
+    }
+}
+
+/// Resolve the current layout against the frame's main area and
+/// collect each widget's rect, keyed by render-target id. Mirrors
+/// the resolve in `render` / `render_partial` and is only used on
+/// the full-redraw path so the cache picks up the right per-widget
+/// rects when there's nothing to blit from.
+fn collect_cell_rects(frame: &Frame, state: &RenderState) -> HashMap<String, Rect> {
+    let area = frame.area();
+    let chrome_visible =
+        state.command_buffer.is_some() || state.command_feedback.is_some() || state.show_status_bar;
+    let chrome_h: u16 = if chrome_visible { 1 } else { 0 };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(chrome_h)])
+        .split(area);
+    let main_area = chunks[0];
+    state
+        .layout
+        .resolve(main_area)
+        .into_iter()
+        .filter_map(|r| r.cell.render_target_id().map(|id| (id, r.area)))
+        .collect()
 }
 
 fn render_command_bar(frame: &mut Frame, area: Rect, buffer: &str, theme: &Theme) {
