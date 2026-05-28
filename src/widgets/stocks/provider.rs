@@ -274,6 +274,15 @@ impl YahooFinanceProvider {
                 quote.eps = summary.eps;
                 quote.dividend_yield = summary.dividend_yield;
                 quote.beta = summary.beta;
+                // Authoritative "yesterday's regular close" comes from the
+                // `price` module — `meta.chartPreviousClose` on the chart
+                // endpoint is the close before the chart's *range* starts
+                // (e.g. ~1y ago on a 1Y fetch), so it can't be trusted as
+                // the 1D change baseline. When summary returns the field,
+                // it always wins.
+                if let Some(prev) = summary.regular_market_previous_close {
+                    quote.previous_close = prev;
+                }
             }
             Err(err) => {
                 tracing::debug!(symbol = %symbol, error = %err, "quoteSummary fetch failed");
@@ -480,7 +489,7 @@ impl YahooFinanceProvider {
     async fn fetch_summary(&self, symbol: &str) -> Result<SummaryFields> {
         let crumb = self.ensure_crumb().await?;
         let url = format!(
-            "{base}/v10/finance/quoteSummary/{sym}?modules=summaryDetail,defaultKeyStatistics&crumb={crumb}",
+            "{base}/v10/finance/quoteSummary/{sym}?modules=summaryDetail,defaultKeyStatistics,price&crumb={crumb}",
             base = self.summary_base_url.trim_end_matches('/'),
             sym = urlencoding::encode(symbol),
             crumb = urlencoding::encode(&crumb),
@@ -511,6 +520,7 @@ impl YahooFinanceProvider {
             .with_context(|| format!("quoteSummary returned no result for {symbol}"))?;
         let detail = result.summary_detail.as_ref();
         let stats = result.default_key_statistics.as_ref();
+        let price = result.price.as_ref();
         Ok(SummaryFields {
             market_cap: detail
                 .and_then(|d| d.market_cap.as_ref())
@@ -528,6 +538,9 @@ impl YahooFinanceProvider {
                 .and_then(|d| d.dividend_yield.as_ref())
                 .and_then(|v| v.raw),
             beta: stats.and_then(|s| s.beta.as_ref()).and_then(|v| v.raw),
+            regular_market_previous_close: price
+                .and_then(|p| p.regular_market_previous_close.as_ref())
+                .and_then(|v| v.raw),
         })
     }
 }
@@ -542,6 +555,11 @@ struct SummaryFields {
     eps: Option<f64>,
     dividend_yield: Option<f64>,
     beta: Option<f64>,
+    /// Yesterday's regular-session close. Authoritative for the 1D
+    /// change baseline — the chart endpoint's `chartPreviousClose` is the
+    /// close before the chart's *range* starts, not the previous regular
+    /// trading day, so it's unreliable on non-1D fetches.
+    regular_market_previous_close: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -564,6 +582,8 @@ struct SummaryResult {
     summary_detail: Option<SummaryDetail>,
     #[serde(rename = "defaultKeyStatistics", default)]
     default_key_statistics: Option<DefaultKeyStatistics>,
+    #[serde(default)]
+    price: Option<Price>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -586,6 +606,13 @@ struct DefaultKeyStatistics {
     trailing_eps: Option<RawF64>,
     #[serde(default)]
     beta: Option<RawF64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Price {
+    #[serde(default)]
+    regular_market_previous_close: Option<RawF64>,
 }
 
 /// Yahoo's "{raw, fmt, longFmt}" wrapper. Empty objects ({}) also appear when
