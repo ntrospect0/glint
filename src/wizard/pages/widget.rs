@@ -202,7 +202,7 @@ pub fn handle_key(
         // Number gets ±step via ←/→. Vim-style h/l aliases only fire on
         // Number fields — for Text / TextList / Path they'd otherwise
         // eat the literal letters the user is trying to type (a Gallery
-        // path like `/Users/john/...` would lose every `h` and `l`).
+        // path like `/Users/you/...` would lose every `h` and `l`).
         // Bool already lives in `handle_options_key` above.
         KeyCode::Left => {
             adjust_focused(app, &widget_id, &wd, false);
