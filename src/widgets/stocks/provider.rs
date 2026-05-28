@@ -390,7 +390,7 @@ impl YahooFinanceProvider {
         ) {
             (Some(tp), Some(current_start), true) => {
                 let prev = tp
-                    .regular
+                    .regular()
                     .iter()
                     .flatten()
                     .filter_map(|p| match (p.start, p.end) {
@@ -734,10 +734,47 @@ struct CurrentTradingPeriod {
     regular: Option<TradingPeriod>,
 }
 
+/// `tradingPeriods` arrives in two different shapes depending on the
+/// chart endpoint's interval/range:
+///
+/// * On 1D (`interval=5m&range=2d`) Yahoo nests the sessions under
+///   pre / regular / post keys: `{ regular: [[…]], pre: [[…]], … }`.
+/// * On 1W (`interval=30m&range=5d`) Yahoo elides the keys and
+///   ships the regular sessions as a bare list-of-lists at the top
+///   level: `[[…], [[…], …]`.
+/// * On longer ranges (1M / 6M / 1Y / 5Y / 10Y / YTD) the field is
+///   absent or null altogether.
+///
+/// The single-struct deserializer we had only matched the first
+/// shape, so the 1W fetch failed at the response-parse step for
+/// every symbol — list rows fell back to `err` and the chart
+/// showed `Loading {sym}…` forever. An untagged enum accepts both
+/// concrete shapes; null still maps to `None` via the surrounding
+/// `Option<TradingPeriods>` field's `#[serde(default)]`.
 #[derive(Debug, Deserialize)]
-struct TradingPeriods {
-    #[serde(default)]
-    regular: Vec<Vec<TradingPeriod>>,
+#[serde(untagged)]
+enum TradingPeriods {
+    /// Object form: `{ regular: [[…]], pre: [[…]], post: [[…]] }`.
+    /// We only care about `regular`; the other keys ride along but
+    /// stay unused.
+    Structured {
+        #[serde(default)]
+        regular: Vec<Vec<TradingPeriod>>,
+    },
+    /// Bare list-of-lists. Each inner list is a single regular
+    /// trading session.
+    Flat(Vec<Vec<TradingPeriod>>),
+}
+
+impl TradingPeriods {
+    /// Regular-session list-of-lists, abstracted across both Yahoo
+    /// response shapes so the consumer doesn't have to branch.
+    fn regular(&self) -> &Vec<Vec<TradingPeriod>> {
+        match self {
+            TradingPeriods::Structured { regular } => regular,
+            TradingPeriods::Flat(sessions) => sessions,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -782,6 +819,38 @@ pub(super) fn downsample_pairs_to_max(pairs: Vec<(i64, f64)>, max: usize) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Yahoo ships `tradingPeriods` in three shapes; our deserializer
+    /// has to accept all three or the whole `chart` response fails
+    /// to parse for any range that hits a shape we missed. The
+    /// regression that motivated this: 1W (`interval=30m&range=5d`)
+    /// returns the bare list-of-lists form. Before the untagged
+    /// enum, this broke every 1W fetch — symbol rows fell back to
+    /// `err` and the chart said `Loading {sym}…` forever.
+    #[test]
+    fn trading_periods_accepts_object_list_and_null_shapes() {
+        // 1D shape: object with regular/pre/post nested lists.
+        let object_shape = r#"{
+            "regular": [[{"start": 1, "end": 2}]]
+        }"#;
+        let parsed: TradingPeriods = serde_json::from_str(object_shape).unwrap();
+        assert_eq!(parsed.regular().len(), 1);
+        assert_eq!(parsed.regular()[0][0].start, Some(1));
+
+        // 1W shape: bare list-of-lists at the top level.
+        let list_shape = r#"[
+            [{"start": 10, "end": 20}],
+            [{"start": 30, "end": 40}]
+        ]"#;
+        let parsed: TradingPeriods = serde_json::from_str(list_shape).unwrap();
+        assert_eq!(parsed.regular().len(), 2);
+        assert_eq!(parsed.regular()[1][0].start, Some(30));
+
+        // Null shape: handled by the surrounding Option's #[serde(default)].
+        let null_shape = r#"null"#;
+        let parsed: Option<TradingPeriods> = serde_json::from_str(null_shape).unwrap();
+        assert!(parsed.is_none());
+    }
 
     #[test]
     fn change_and_pct_use_previous_close() {
