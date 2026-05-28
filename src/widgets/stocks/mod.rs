@@ -4,7 +4,6 @@
 pub mod graph;
 pub mod provider;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use std::{
     collections::HashMap,
@@ -301,13 +300,6 @@ pub struct StocksWidget {
     /// Persistent cache of fetched quotes keyed by period. Each successful
     /// refresh writes the full `symbol → StockQuote` snapshot.
     cache: ScopedCache,
-    /// Atomic gate over the per-tick status-TTL drain. `update()` runs
-    /// every 250 ms and would otherwise lock the state mutex on every
-    /// tick just to check whether the (almost always None) status slot
-    /// had expired. We flip this to `true` whenever a status is set
-    /// and clear it from `update()` once the slot is empty again, so
-    /// idle ticks skip the lock entirely.
-    feedback_pending: AtomicBool,
 }
 
 impl StocksWidget {
@@ -373,7 +365,6 @@ impl StocksWidget {
             shortcut: None,
             shortcut_prefs,
             cache,
-            feedback_pending: AtomicBool::new(false),
         }
     }
 
@@ -712,8 +703,6 @@ impl StocksWidget {
     fn set_status(&self, msg: impl Into<String>) {
         let mut st = self.state.lock().expect("stocks state poisoned");
         st.status = Some(TimedFeedback::new(msg.into(), STATUS_TTL));
-        drop(st);
-        self.feedback_pending.store(true, Ordering::Relaxed);
     }
 
     /// Persist the current `indices` + `watchlist` arrays back to
@@ -1139,17 +1128,10 @@ impl Widget for StocksWidget {
         // Surface tick-time status TTL expiry through the dirty bit so
         // the render filter actually gets to drop the now-stale chrome
         // — without this the "Added AAPL" line would linger until the
-        // next unrelated redraw. Atomic-gated so an idle dashboard
-        // (no pending status) doesn't lock the state mutex every 250 ms
-        // just to check that the slot is still empty.
-        if self.feedback_pending.load(Ordering::Relaxed) {
-            let mut st = self.state.lock().expect("stocks state poisoned");
-            if crate::ui::status::drain_if_expired(&mut st.status) {
-                st.dirty = true;
-            }
-            if st.status.is_none() {
-                self.feedback_pending.store(false, Ordering::Relaxed);
-            }
+        // next unrelated redraw.
+        let mut st = self.state.lock().expect("stocks state poisoned");
+        if crate::ui::status::drain_if_expired(&mut st.status) {
+            st.dirty = true;
         }
         Ok(())
     }
