@@ -614,7 +614,7 @@ These conventions emerged from building 11+ widgets. They aren't enforced — ju
 ### Persistence of runtime mutations
 
 - If your widget mutates a list at runtime (e.g., add ticker, remove currency), write back to the widget's TOML via [`config::rewrite_widget_top_level_string_array`](../src/config/mod.rs). Preserves comments and other settings.
-- Credentials go in `~/.config/glint/credentials/<widget>_<thing>.toml`, chmod `0600`. See [`wsj/auth.rs`](../src/widgets/wsj/auth.rs).
+- Credentials go in `~/.config/glint/credentials/<widget>_<thing>.toml`, chmod `0600`. See [`auth/google/store.rs`](../src/auth/google/store.rs).
 
 ### Don't fight the trait
 
@@ -637,7 +637,6 @@ When you want to copy a pattern, these are the canonical references:
 | LLM summarization w/ length toggle | [`feeds`](../src/widgets/feeds/mod.rs) |
 | Inline image rendering | [`gallery`](../src/widgets/gallery/mod.rs), [`feeds`](../src/widgets/feeds/mod.rs) |
 | OAuth token storage | [`auth/google/store.rs`](../src/auth/google/store.rs) |
-| Credentials file (chmod 0600) | [`wsj/auth.rs`](../src/widgets/wsj/auth.rs) |
 | Confirm-removal modal | [`notes`](../src/widgets/notes/mod.rs), [`stocks`](../src/widgets/stocks/mod.rs) |
 | Mouse hit-testing with wrapped rows | [`feeds`](../src/widgets/feeds/mod.rs) |
 | Adaptive horizontal/vertical layout | [`feeds`](../src/widgets/feeds/mod.rs) |

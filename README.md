@@ -62,7 +62,7 @@ You need a recent Rust toolchain (1.81+). Install via
 [`rustup`](https://rustup.rs/) if you don't have one.
 
 ```sh
-git clone <repo-url> glint
+git clone https://github.com/ntrospect0/glint.git glint
 cd glint
 
 # Per-user install (no sudo, installs to ~/.local/bin):
@@ -493,7 +493,9 @@ is largely stable. If you want to dig in:
    `src/widgets/registry.rs`. The registry is the single registration
    point — no edits to `app.rs`, `main.rs`, or the wizard are needed.
 5. `AGENTS.md` carries the architecture overview (read it before
-   non-trivial PRs). A dedicated developer guide is in flight.
+   non-trivial PRs). `docs/widget-sdk.md` is the widget author's
+   guide — platform capabilities, conventions, and reference
+   patterns extracted from the shipped widgets.
 
 Issues and PRs welcome.
 
