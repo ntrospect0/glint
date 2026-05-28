@@ -196,7 +196,12 @@ fn count_substring(haystack: &str, needle: &str) -> usize {
 
 #[derive(Default)]
 struct NewsState {
-    articles: Vec<Article>,
+    /// `Arc<Article>` (not raw `Article`) so the per-render
+    /// `Vec::clone()` is O(N) atomic increments instead of O(N) deep
+    /// Article copies. With a 100-item feed this drops 500-ish String
+    /// allocations per render to ~100 atomic bumps. The Vec heap
+    /// alloc itself is unavoidable.
+    articles: Vec<Arc<Article>>,
     selected: usize,
     scroll: usize,
     /// When true, the selected article renders its full body (raw RSS
@@ -394,7 +399,7 @@ impl NewsWidget {
         initial_state.poll = crate::polling::PollTracker::new(poll_interval);
         if let Some(entry) = cache.load::<Vec<Article>>(CACHE_KEY_ARTICLES) {
             initial_state.poll.seed_from_cache_age(entry.age());
-            initial_state.articles = entry.value;
+            initial_state.articles = entry.value.into_iter().map(Arc::new).collect();
         }
         initial_state.poll.apply_jitter(&format!("news@{instance}"));
 
@@ -754,7 +759,7 @@ impl NewsWidget {
         None
     }
 
-    fn filtered_articles(&self) -> Vec<Article> {
+    fn filtered_articles(&self) -> Vec<Arc<Article>> {
         let st = self.state.lock().expect("news state poisoned");
         let active = st.active_filter_idx;
         let search_tab_idx = self.filter_tabs.len();
@@ -762,10 +767,10 @@ impl NewsWidget {
         // Search tab: rank by hit count desc, drop misses.
         if st.search.is_some() && active == search_tab_idx {
             let search = st.search.as_ref().expect("checked above");
-            let mut scored: Vec<(usize, Article)> = st
+            let mut scored: Vec<(usize, Arc<Article>)> = st
                 .articles
                 .iter()
-                .map(|a| (search.hit_count(a), a.clone()))
+                .map(|a| (search.hit_count(a), Arc::clone(a)))
                 .filter(|(n, _)| *n > 0)
                 .collect();
             // Stable sort so equal-score articles keep recency order from
@@ -795,7 +800,7 @@ impl NewsWidget {
         &self,
         click_row: u16,
         list_area: Rect,
-        articles: &[Article],
+        articles: &[Arc<Article>],
     ) -> Option<usize> {
         let st = self.state.lock().expect("news state poisoned");
         let scroll = st.scroll;
@@ -885,7 +890,7 @@ impl NewsWidget {
                     if let Err(err) = cache.store(CACHE_KEY_ARTICLES, &articles) {
                         tracing::warn!(error = %err, "news cache store failed");
                     }
-                    st.articles = articles;
+                    st.articles = articles.into_iter().map(Arc::new).collect();
                     // Drop in-memory summaries for articles that rotated
                     // out of the feed. The summary text is already on
                     // disk via the scoped cache, so a rare re-encounter
@@ -1031,11 +1036,11 @@ impl Widget for NewsWidget {
         let search_tab_idx = self.filter_tabs.len();
         // Apply the active filter. Tab 0 = All, the last tab when a search
         // is active = scored search results, anything between = topic match.
-        let articles: Vec<Article> = if let Some(s) = search
+        let articles: Vec<Arc<Article>> = if let Some(s) = search
             .as_ref()
             .filter(|_| active_filter_idx == search_tab_idx)
         {
-            let mut scored: Vec<(usize, Article)> = all_articles
+            let mut scored: Vec<(usize, Arc<Article>)> = all_articles
                 .into_iter()
                 .map(|a| (s.hit_count(&a), a))
                 .filter(|(n, _)| *n > 0)
@@ -2418,26 +2423,26 @@ pub fn build(ctx: &super::WidgetCtx) -> Box<dyn super::Widget> {
 mod tests {
     use super::*;
 
-    fn article(url: &str, title: &str, secs_ago: i64) -> Article {
-        Article {
+    fn article(url: &str, title: &str, secs_ago: i64) -> Arc<Article> {
+        Arc::new(Article {
             title: title.into(),
             url: url.into(),
             source: "TestFeed".into(),
             published: Utc::now() - chrono::Duration::seconds(secs_ago),
             summary: Some("a short summary".into()),
             topics: vec![],
-        }
+        })
     }
 
-    fn tagged_article(url: &str, title: &str, topics: &[&str]) -> Article {
-        Article {
+    fn tagged_article(url: &str, title: &str, topics: &[&str]) -> Arc<Article> {
+        Arc::new(Article {
             title: title.into(),
             url: url.into(),
             source: "TestFeed".into(),
             published: Utc::now(),
             summary: Some("a short summary".into()),
             topics: topics.iter().map(|t| t.to_string()).collect(),
-        }
+        })
     }
 
     #[test]

@@ -304,7 +304,11 @@ fn count_substring(haystack: &str, needle: &str) -> usize {
 
 #[derive(Default)]
 struct FeedsState {
-    articles: Vec<FeedArticle>,
+    /// `Arc<FeedArticle>` so the per-render `Vec::clone()` is O(N)
+    /// atomic increments instead of O(N) deep FeedArticle copies. With
+    /// 50–200 items × multiple Strings each, the prior pattern cloned
+    /// hundreds of Strings per dashboard redraw.
+    articles: Vec<Arc<FeedArticle>>,
     /// Index into the *filtered* article list (after the active topic
     /// tab is applied). Cleared on tab change.
     selected: usize,
@@ -475,7 +479,7 @@ impl FeedsWidget {
         };
         if let Some(entry) = cache.load::<Vec<FeedArticle>>(CACHE_KEY_ARTICLES) {
             initial_state.poll.seed_from_cache_age(entry.age());
-            initial_state.articles = entry.value;
+            initial_state.articles = entry.value.into_iter().map(Arc::new).collect();
         }
         initial_state
             .poll
@@ -545,7 +549,7 @@ impl FeedsWidget {
                 // cursor pointing past the end.
                 let max = articles.len().saturating_sub(1);
                 st.selected = st.selected.min(max);
-                st.articles = articles;
+                st.articles = articles.into_iter().map(Arc::new).collect();
             }
             st.fetching = false;
             st.dirty = true;
@@ -592,7 +596,7 @@ impl FeedsWidget {
             .collect()
     }
 
-    fn selected_article(&self) -> Option<FeedArticle> {
+    fn selected_article(&self) -> Option<Arc<FeedArticle>> {
         let filtered = self.filtered_indices();
         let idx = self.state.lock().expect("feeds state poisoned").selected;
         let real = filtered.get(idx).copied()?;
@@ -1274,8 +1278,11 @@ impl FeedsWidget {
         lines.push(Line::from(""));
         match summary_state {
             None => {
-                if let Some(s) = article.summary {
-                    lines.push(Line::from(Span::styled(s, self.theme.text_plain)));
+                if let Some(s) = article.summary.as_ref() {
+                    lines.push(Line::from(Span::styled(
+                        s.clone(),
+                        self.theme.text_plain,
+                    )));
                 }
                 // The s / Ctrl+S / e instructions live in the
                 // widget footer already, no need to repeat them in

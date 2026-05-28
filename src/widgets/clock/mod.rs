@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 ntrospect0
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -522,10 +523,26 @@ pub struct ClockWidget {
     /// display changes at 1Hz and `take_dirty` needs to detect that
     /// without redrawing on every 250ms tick.
     last_tick_second: Option<i64>,
+    /// Wall-clock millis-since-epoch of the most recent `render()`
+    /// call. Read by `update()` to detect when this widget is on a
+    /// hidden stack tab — render() isn't called on hidden children,
+    /// so a stale timestamp means we're invisible and per-second
+    /// dirty flips can be suppressed (otherwise an invisible clock
+    /// face would force a full-dashboard redraw at 1 Hz). Atomic so
+    /// the `&self` render path can write without locking.
+    last_render_at_millis: AtomicI64,
     /// Display-state dirty flag — see Widget::take_dirty. True at
     /// construction so the initial render lands.
     dirty: bool,
 }
+
+/// How fresh `last_render_at_millis` must be for the widget to count
+/// as "currently visible." Stack widgets call `update()` on hidden
+/// children every `stack_hidden_poll_ratio` ticks (default 10 ×
+/// 250 ms = 2.5 s); a visible clock renders at least once per second
+/// (it's the dashboard's 1 Hz dirty source). 1500 ms catches the
+/// visible case while comfortably excluding the hidden case.
+const HIDDEN_RENDER_THRESHOLD_MS: i64 = 1500;
 
 impl Default for ClockWidget {
     fn default() -> Self {
@@ -647,6 +664,7 @@ impl ClockWidget {
             shortcut: None,
             shortcut_prefs,
             last_tick_second: None,
+            last_render_at_millis: AtomicI64::new(0),
             dirty: true,
         }
     }
@@ -1015,11 +1033,23 @@ impl Widget for ClockWidget {
     }
 
     async fn update(&mut self, _ctx: &AppContext) -> Result<()> {
-        let now_secs = chrono::Utc::now().timestamp();
+        let now_millis = chrono::Utc::now().timestamp_millis();
+        let now_secs = now_millis / 1000;
         let second_changed = self.last_tick_second != Some(now_secs);
         if second_changed {
             self.last_tick_second = Some(now_secs);
         }
+        // Detect "I'm on a hidden stack tab." Stack children only
+        // render when active; if the last render was more than
+        // HIDDEN_RENDER_THRESHOLD_MS ago, suppress per-second dirty
+        // flips so an invisible clock face doesn't force a
+        // full-dashboard redraw at 1 Hz. Timer-fire / focus-grab
+        // signals still flow via `pending_focus_grab` (polled
+        // separately by the app), and the next user-triggered tab
+        // switch forces a redraw regardless, so visibility catches
+        // up immediately when the clock comes back to the front.
+        let last_render = self.last_render_at_millis.load(Ordering::Relaxed);
+        let visible = last_render > 0 && (now_millis - last_render) < HIDDEN_RENDER_THRESHOLD_MS;
 
         // Single state-lock for the per-tick work — combining the
         // mode check, stopwatch/timer phase advance, and dirty
@@ -1030,7 +1060,7 @@ impl Widget for ClockWidget {
         // surface depends on it (the Clock view's ticker line; no
         // other mode does).
         let (need_dirty, emit_bel) = self.tick_mode_state(second_changed);
-        if need_dirty {
+        if need_dirty && visible {
             self.dirty = true;
         }
         if emit_bel {
@@ -1063,6 +1093,11 @@ impl Widget for ClockWidget {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
+        // Stamp the visibility tracker so update() can tell whether
+        // this widget is being drawn. Stack widgets skip render() for
+        // hidden children, so a stale value means "not visible."
+        self.last_render_at_millis
+            .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
         let (transient, searching) = self.snapshot_transient();
         let mode = self.state.lock().expect("clock state poisoned").mode;
         let base = if self.instance == "main" {

@@ -127,7 +127,12 @@ impl Default for EmailConfig {
 
 #[derive(Default)]
 struct EmailState {
-    messages: Vec<EmailMessage>,
+    /// `Arc<EmailMessage>` so the per-render `Vec::clone()` is O(N)
+    /// atomic increments instead of O(N) deep EmailMessage copies. A
+    /// typical inbox snapshot is 50+ messages × multiple Strings each,
+    /// previously cloned wholesale every time the clock-driven 1 Hz
+    /// redraw fired.
+    messages: Vec<Arc<EmailMessage>>,
     selected: usize,
     scroll: usize,
     expanded: bool,
@@ -368,7 +373,7 @@ impl EmailWidget {
             for m in &mut messages {
                 truncate_body_in_place(&mut m.plain_body, 4096);
             }
-            initial_state.messages = messages;
+            initial_state.messages = messages.into_iter().map(Arc::new).collect();
         }
         // Spread first-fire phases across instances so multiple
         // 60s-cadence widgets don't all hit the network in the same
@@ -404,7 +409,7 @@ impl EmailWidget {
         }
     }
 
-    fn filtered_messages(&self) -> Vec<EmailMessage> {
+    fn filtered_messages(&self) -> Vec<Arc<EmailMessage>> {
         let st = self.state.lock().expect("email state poisoned");
         let folder = self
             .folders
@@ -514,7 +519,7 @@ impl EmailWidget {
             }
             let mut st = state.lock().expect("email state poisoned");
             st.inflight = false;
-            st.messages = messages;
+            st.messages = messages.into_iter().map(Arc::new).collect();
             st.last_error = last_error;
             if account.is_some() {
                 st.account = account;
@@ -650,7 +655,7 @@ impl EmailWidget {
             return;
         }
         let filtered = self.filtered_messages();
-        let selected: Option<EmailMessage> = {
+        let selected: Option<Arc<EmailMessage>> = {
             let st = self.state.lock().expect("email state poisoned");
             filtered.get(st.selected).cloned()
         };
@@ -689,7 +694,7 @@ impl EmailWidget {
             return;
         }
         let filtered = self.filtered_messages();
-        let selected: Option<EmailMessage> = {
+        let selected: Option<Arc<EmailMessage>> = {
             let st = self.state.lock().expect("email state poisoned");
             filtered.get(st.selected).cloned()
         };
@@ -966,7 +971,7 @@ impl Widget for EmailWidget {
             .get(active_idx.min(self.folders.len().saturating_sub(1)))
             .cloned()
             .unwrap_or_else(|| "INBOX".into());
-        let filtered: Vec<EmailMessage> = messages
+        let filtered: Vec<Arc<EmailMessage>> = messages
             .into_iter()
             .filter(|m| m.folder.eq_ignore_ascii_case(&folder_name))
             .collect();

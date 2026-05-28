@@ -7,9 +7,13 @@ indices = ["^DJI", "^GSPC", "^IXIC"]
 watchlist = ["AAPL", "MSFT", "GOOGL", "NVDA", "TSLA"]
 
 # ── Refresh ──────────────────────────────────────────────────────────────────
-# Poll cadence (seconds, floor 15). Yahoo's chart endpoint refreshes every
-# minute or so, so under 60s is overkill.
-poll_interval_secs = 60
+# Poll cadence (seconds, floor 15). The widget runs at `poll_interval_secs`
+# while it's a background pane and speeds up to `focused_poll_interval_secs`
+# when it's the active stack child with keyboard focus. Defaults keep Yahoo
+# quota use low across a multi-widget dashboard while still giving the
+# pane you're actively watching minute-level updates.
+poll_interval_secs = 300
+focused_poll_interval_secs = 60
 
 # ── Display ──────────────────────────────────────────────────────────────────
 # Initial display mode for the change column. Cycle while focused with c

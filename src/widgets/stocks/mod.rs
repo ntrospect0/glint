@@ -4,6 +4,7 @@
 pub mod graph;
 pub mod provider;
 
+use std::time::Instant;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -45,6 +46,13 @@ pub struct StocksConfig {
 
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
+
+    /// Fast cadence used when the widget is the active stack child *and*
+    /// holds keyboard focus. Outside that window we fall back to
+    /// `poll_interval_secs`, which keeps the background fetch rate down
+    /// to ~5min on a multi-widget dashboard.
+    #[serde(default = "default_focused_poll_interval")]
+    pub focused_poll_interval_secs: u64,
 
     /// `"percent"` / `"dollar"` / `"change"`.
     #[serde(default)]
@@ -123,6 +131,9 @@ fn default_watchlist() -> Vec<String> {
     ]
 }
 fn default_poll_interval() -> u64 {
+    300
+}
+fn default_focused_poll_interval() -> u64 {
     60
 }
 
@@ -132,6 +143,7 @@ impl Default for StocksConfig {
             indices: default_indices(),
             watchlist: default_watchlist(),
             poll_interval_secs: default_poll_interval(),
+            focused_poll_interval_secs: default_focused_poll_interval(),
             default_display_mode: DisplayMode::default(),
             default_period: Period::default(),
             jump_url_template: None,
@@ -155,7 +167,11 @@ pub enum DisplayMode {
 #[derive(Debug, Clone)]
 enum QuoteState {
     Inflight,
-    Ready(Box<StockQuote>),
+    /// Successful fetch. `Arc` (not `Box`) so the per-render
+    /// `HashMap::clone()` is a pointer bump per symbol instead of a
+    /// full StockQuote deep-copy — the intraday Vec alone can be a
+    /// couple of KB on long ranges.
+    Ready(Arc<StockQuote>),
     /// Last fetch failed. Reason is already logged via tracing; we don't need
     /// to surface it in the UI right now (the row just shows "err").
     Failed,
@@ -194,7 +210,22 @@ struct StocksState {
     /// data) and by `mark_dirty()` (user-triggered `r` / `:refresh`).
     /// Consumed by `is_due()` after the bypass fires.
     force_next_refresh: bool,
+    /// Most-recent `render()` call where the widget held focus. `None`
+    /// when the last render was unfocused, or when the widget has never
+    /// rendered (e.g. on a hidden stack tab since construction). The
+    /// freshness check inside `is_due()` switches between fast (focused)
+    /// and slow (background) cadence based on this — see
+    /// `FOCUS_FRESHNESS_WINDOW`.
+    last_focused_at: Option<Instant>,
 }
+
+/// How recently `render()` must have been called with `focused = true`
+/// to count as "currently focused" for cadence purposes. The render
+/// loop touches every visible widget at least once per second whenever
+/// anything on the dashboard is dirty (the clock alone is enough), so
+/// 2 s gives slack for one missed tick while still dropping the widget
+/// out of fast cadence within a couple of seconds of losing focus.
+const FOCUS_FRESHNESS_WINDOW: Duration = Duration::from_secs(2);
 
 impl Default for StocksState {
     fn default() -> Self {
@@ -210,6 +241,7 @@ impl Default for StocksState {
             status: None,
             dirty: false,
             force_next_refresh: true,
+            last_focused_at: None,
         }
     }
 }
@@ -313,7 +345,7 @@ impl StocksWidget {
             initial_state.quotes = entry
                 .value
                 .into_iter()
-                .map(|(sym, q)| (sym, QuoteState::Ready(Box::new(q))))
+                .map(|(sym, q)| (sym, QuoteState::Ready(Arc::new(q))))
                 .collect();
         }
         initial_state
@@ -397,6 +429,20 @@ impl StocksWidget {
         if st.any_inflight {
             return false;
         }
+        // Pick the cadence for *this* check: fast while the user is
+        // actively looking at the widget, slow otherwise. A multi-widget
+        // dashboard would otherwise burn quota fetching Yahoo every
+        // minute for a pane the user can't even see.
+        let focused_now = st
+            .last_focused_at
+            .map(|t| t.elapsed() < FOCUS_FRESHNESS_WINDOW)
+            .unwrap_or(false);
+        let active_interval_secs = if focused_now {
+            self.config.focused_poll_interval_secs.max(15)
+        } else {
+            self.config.poll_interval_secs.max(15)
+        };
+        st.poll.set_interval(Duration::from_secs(active_interval_secs));
         if !st.poll.is_due() {
             return false;
         }
@@ -466,7 +512,7 @@ impl StocksWidget {
                 match result {
                     Ok(q) => {
                         snapshot.insert(sym.clone(), q.clone());
-                        st.quotes.insert(sym, QuoteState::Ready(Box::new(q)));
+                        st.quotes.insert(sym, QuoteState::Ready(Arc::new(q)));
                     }
                     Err(err) => {
                         tracing::warn!(symbol = %sym, error = %err, "stock fetch failed");
@@ -848,8 +894,19 @@ impl StocksWidget {
         }
     }
 
-    fn snapshot_quotes(&self) -> HashMap<String, QuoteState> {
-        let st = self.state.lock().expect("stocks state poisoned");
+    /// Single-lock helper called once at the top of `render`. Records
+    /// the focus state for the next `is_due()` cadence pick AND
+    /// returns the per-render quote snapshot — folding what would
+    /// otherwise be two separate `state.lock()` calls into one.
+    /// `QuoteState::Ready` carries `Arc<StockQuote>`, so the
+    /// HashMap clone is O(N) atomic-increments, not O(N) deep
+    /// StockQuote copies.
+    fn record_focus_and_snapshot_quotes(
+        &self,
+        focused: bool,
+    ) -> HashMap<String, QuoteState> {
+        let mut st = self.state.lock().expect("stocks state poisoned");
+        st.last_focused_at = focused.then(Instant::now);
         st.quotes.clone()
     }
 
@@ -1085,6 +1142,12 @@ impl Widget for StocksWidget {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
+        // Single-lock entry: record focus for the next is_due() cadence
+        // pick AND grab the per-render quote snapshot in one critical
+        // section. Hidden stack tabs don't get render() at all, so a
+        // stale `last_focused_at` from a prior focused render naturally
+        // ages out via the `FOCUS_FRESHNESS_WINDOW` check.
+        let quotes = self.record_focus_and_snapshot_quotes(focused);
         let title = if self.instance == "main" {
             "Stocks".to_string()
         } else {
@@ -1110,7 +1173,6 @@ impl Widget for StocksWidget {
             return;
         }
 
-        let quotes = self.snapshot_quotes();
         let symbols: Vec<String> = self.all_symbols();
         let selected_sym = self.selected_symbol();
         let base_count = self.config.indices.len() + self.config.watchlist.len();
@@ -1511,6 +1573,7 @@ impl Widget for StocksWidget {
             "indices": self.config.indices,
             "watchlist": self.config.watchlist,
             "poll_interval_secs": self.config.poll_interval_secs,
+            "focused_poll_interval_secs": self.config.focused_poll_interval_secs,
             "display_mode": display_mode_label(self.display_mode),
         })
     }
@@ -3270,10 +3333,27 @@ pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
             },
             WizardField {
                 key: "poll_interval_secs",
-                label: "Quote refresh interval (seconds)",
-                help: "How often to repoll Yahoo for live quotes. Yahoo's \
-                       free API tolerates 15s pretty well; 60s is a safer \
-                       default for a long-running dashboard.",
+                label: "Background refresh interval (seconds)",
+                help: "Quote-poll cadence when the widget is *not* the \
+                       focused pane. 300s (5min) keeps Yahoo quota use \
+                       low on a multi-widget dashboard. The widget \
+                       speeds up to `focused_poll_interval_secs` while \
+                       it has focus.",
+                required: true,
+                kind: WizardFieldKind::Number {
+                    default: Some(300.0),
+                    range: Some((15.0, 3600.0)),
+                    integer: true,
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "focused_poll_interval_secs",
+                label: "Focused refresh interval (seconds)",
+                help: "Cadence used while the widget is the active stack \
+                       child and holds keyboard focus. Defaults to 60s — \
+                       Yahoo's chart endpoint refreshes about once a \
+                       minute, so going lower won't yield fresher data.",
                 required: true,
                 kind: WizardFieldKind::Number {
                     default: Some(60.0),
@@ -3563,7 +3643,7 @@ mod tests {
         let q = quote("AAPL", 200.0, 196.0);
         let qs: HashMap<String, QuoteState> = {
             let mut m = HashMap::new();
-            m.insert("AAPL".to_string(), QuoteState::Ready(Box::new(q)));
+            m.insert("AAPL".to_string(), QuoteState::Ready(Arc::new(q)));
             m
         };
         let line_sel = format_list_row(

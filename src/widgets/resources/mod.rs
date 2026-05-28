@@ -31,9 +31,18 @@ use super::{AppContext, EventResult, Widget};
 /// Loaded from `~/.config/glint/resources.toml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResourcesConfig {
-    /// Clamped to ≥1s (sub-second refresh hammers sysinfo for no visual gain).
+    /// Background refresh cadence — used when the widget is *not* the
+    /// focused pane. Each refresh walks every process on the system to
+    /// pick the top-N, so going faster than this costs O(processes)
+    /// syscalls. Clamped to ≥1s.
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
+
+    /// Fast refresh cadence used while the widget is the active stack
+    /// child *and* holds keyboard focus. Defaults to 2s to match what
+    /// users typically want while actively watching processes.
+    #[serde(default = "default_focused_poll_interval")]
+    pub focused_poll_interval_secs: u64,
 
     /// Top processes to surface. Clamped to ≤40 at construction.
     #[serde(default = "default_top_n")]
@@ -53,16 +62,26 @@ pub struct ResourcesConfig {
 }
 
 fn default_poll_interval() -> u64 {
+    5
+}
+fn default_focused_poll_interval() -> u64 {
     2
 }
 fn default_top_n() -> usize {
     10
 }
 
+/// How recently `render()` must have been called with `focused = true`
+/// to count as "currently focused" for cadence purposes. Same value as
+/// the stocks widget — see [`stocks::FOCUS_FRESHNESS_WINDOW`] for the
+/// reasoning.
+const FOCUS_FRESHNESS_WINDOW: Duration = Duration::from_secs(2);
+
 impl Default for ResourcesConfig {
     fn default() -> Self {
         Self {
             poll_interval_secs: default_poll_interval(),
+            focused_poll_interval_secs: default_focused_poll_interval(),
             top_n_processes: default_top_n(),
             sort_by_memory: false,
             colors: ColorScheme::default(),
@@ -111,6 +130,10 @@ struct ResourcesState {
     system: System,
     last_refresh: Option<Instant>,
     snapshot: Snapshot,
+    /// Most-recent `render()` call where the widget held focus. See
+    /// [`FOCUS_FRESHNESS_WINDOW`] — drives the fast vs slow cadence
+    /// choice inside `refresh_if_due`.
+    last_focused_at: Option<Instant>,
 }
 
 impl Default for ResourcesState {
@@ -121,6 +144,7 @@ impl Default for ResourcesState {
             system: System::new_with_specifics(RefreshKind::new()),
             last_refresh: None,
             snapshot: Snapshot::default(),
+            last_focused_at: None,
         }
     }
 }
@@ -131,7 +155,10 @@ pub struct ResourcesWidget {
     display_name_cache: String,
     config: ResourcesConfig,
     state: Arc<Mutex<ResourcesState>>,
-    poll_interval: Duration,
+    /// Slow cadence used when the widget isn't the focused pane.
+    background_poll_interval: Duration,
+    /// Fast cadence used while the widget holds focus.
+    focused_poll_interval: Duration,
     /// App-level theme; cached for `apply_config` / `:scheme` reloads.
     app_theme: Arc<Theme>,
     /// Merged theme (app + widget `[colors]` overrides).
@@ -163,17 +190,19 @@ impl ResourcesWidget {
         } else {
             config.shortcuts.clone()
         };
-        // Floor the interval at 1s — sysinfo's CPU sampling needs at
+        // Floor each interval at 1s — sysinfo's CPU sampling needs at
         // least ~200ms between calls to produce a stable %; sub-second
         // ticking is mostly visual noise on a dashboard.
-        let interval_secs = config.poll_interval_secs.max(1);
+        let background = config.poll_interval_secs.max(1);
+        let focused = config.focused_poll_interval_secs.max(1);
         Self {
             id,
             instance,
             display_name_cache,
             config,
             state: Arc::new(Mutex::new(ResourcesState::default())),
-            poll_interval: Duration::from_secs(interval_secs),
+            background_poll_interval: Duration::from_secs(background),
+            focused_poll_interval: Duration::from_secs(focused),
             app_theme,
             theme,
             shortcut: None,
@@ -188,9 +217,20 @@ impl ResourcesWidget {
     fn refresh_if_due(&self) -> bool {
         let mut st = self.state.lock().expect("resources state poisoned");
         let now = Instant::now();
+        // Pick fast cadence only when the widget has been rendered with
+        // focus very recently — otherwise the background scan is fine.
+        let focused_now = st
+            .last_focused_at
+            .map(|t| t.elapsed() < FOCUS_FRESHNESS_WINDOW)
+            .unwrap_or(false);
+        let interval = if focused_now {
+            self.focused_poll_interval
+        } else {
+            self.background_poll_interval
+        };
         let due = match st.last_refresh {
             None => true,
-            Some(t) => now.duration_since(t) >= self.poll_interval,
+            Some(t) => now.duration_since(t) >= interval,
         };
         if !due {
             return false;
@@ -363,6 +403,14 @@ impl Widget for ResourcesWidget {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
+        // Record focus so the next `refresh_if_due()` can pick fast vs
+        // slow cadence. Hidden stack children don't get render() at
+        // all, so a stale `Some(t)` naturally ages out via the
+        // `FOCUS_FRESHNESS_WINDOW` check.
+        self.state
+            .lock()
+            .expect("resources state poisoned")
+            .last_focused_at = focused.then(Instant::now);
         let title_base = if self.instance == "main" {
             "Resources".to_string()
         } else {
@@ -622,7 +670,8 @@ impl Widget for ResourcesWidget {
 
     fn config(&self) -> serde_json::Value {
         serde_json::json!({
-            "poll_interval_secs": self.poll_interval.as_secs(),
+            "poll_interval_secs": self.background_poll_interval.as_secs(),
+            "focused_poll_interval_secs": self.focused_poll_interval.as_secs(),
             "top_n_processes": self.config.top_n_processes,
             "sort_by_memory": self.config.sort_by_memory,
         })
@@ -670,10 +719,28 @@ pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
         fields: vec![
             WizardField {
                 key: "poll_interval_secs",
-                label: "Refresh interval (seconds)",
-                help: "How often to sample CPU / memory / processes. \
-                       Clamped to ≥1 second at runtime — sysinfo's CPU \
-                       sampling needs ~200ms between calls for a stable %.",
+                label: "Background refresh interval (seconds)",
+                help: "Sample CPU / memory / processes at this cadence \
+                       when the widget is *not* the focused pane. Each \
+                       refresh walks every process on the system, so a \
+                       slower default keeps idle CPU low; the widget \
+                       speeds up to `focused_poll_interval_secs` while \
+                       it has focus. Clamped to ≥1s.",
+                required: true,
+                kind: WizardFieldKind::Number {
+                    default: Some(5.0),
+                    range: Some((1.0, 60.0)),
+                    integer: true,
+                },
+                validate: None,
+            },
+            WizardField {
+                key: "focused_poll_interval_secs",
+                label: "Focused refresh interval (seconds)",
+                help: "Cadence used while the widget is the active stack \
+                       child and holds keyboard focus. Defaults to 2s \
+                       (sysinfo needs ~200ms between samples for stable \
+                       CPU %). Clamped to ≥1s.",
                 required: true,
                 kind: WizardFieldKind::Number {
                     default: Some(2.0),
