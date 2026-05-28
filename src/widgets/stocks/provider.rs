@@ -68,7 +68,16 @@ impl Period {
     /// can reuse the period→params mapping verbatim.
     pub(crate) fn yahoo_params(self) -> (&'static str, &'static str) {
         match self {
-            Period::Day => ("5m", "1d"),
+            // 2d (not 1d) so the response carries yesterday's full
+            // regular session in addition to whatever today has so far.
+            // The 1D chart renders only one trading day at a time, but
+            // the chart filter falls back to yesterday's bars before
+            // today's regular session opens — and during pre-market on
+            // a fresh trading day, a literal 1d query returns only
+            // today's pre-market bars with no yesterday data to fall
+            // back to. The post-fetch downsampler caps bar count, so
+            // doubling the range here doesn't bloat the cache.
+            Period::Day => ("5m", "2d"),
             Period::Week => ("30m", "5d"),
             Period::Month => ("1d", "1mo"),
             Period::SixMonth => ("1d", "6mo"),
@@ -127,6 +136,19 @@ pub struct StockQuote {
     pub regular_session_start_ts: Option<i64>,
     #[serde(default)]
     pub regular_session_end_ts: Option<i64>,
+    /// Unix-second bounds of the *most recent completed* regular
+    /// session — taken from the latest entry in
+    /// `meta.tradingPeriods.regular` whose start is strictly before
+    /// `regular_session_start_ts`. The 1D chart filter falls back to
+    /// these bounds when today's regular session has no bars yet
+    /// (overnight gap, pre-market, weekend) so the graph shows the
+    /// previous trading day's trend instead of empty space or
+    /// pre-market noise. `None` when Yahoo's `tradingPeriods` block
+    /// omits a prior period (rare for equities).
+    #[serde(default)]
+    pub previous_session_start_ts: Option<i64>,
+    #[serde(default)]
+    pub previous_session_end_ts: Option<i64>,
     #[allow(dead_code)] // surfaced in status bar / staleness label in a follow-up.
     pub fetched_at: chrono::DateTime<chrono::Local>,
     /// Extended-hours quote fields straight from `chart.meta`. Populated for
@@ -344,6 +366,37 @@ impl YahooFinanceProvider {
             _ => (None, None),
         };
 
+        // Most-recent completed regular session — used by the 1D chart
+        // filter to fall back to yesterday's trend during overnight
+        // gap / pre-market / weekend windows. Pick the
+        // `tradingPeriods.regular` entry with the latest `start` that's
+        // strictly before `regular_session_start_ts` (the current/
+        // upcoming session). Strictly-less guards against a corner
+        // case where Yahoo's `tradingPeriods` includes the current
+        // session — we want the one *before* it.
+        let (previous_session_start_ts, previous_session_end_ts) = match (
+            meta.trading_periods.as_ref(),
+            regular_session_start_ts,
+            matches!(period, Period::Day),
+        ) {
+            (Some(tp), Some(current_start), true) => {
+                let prev = tp
+                    .regular
+                    .iter()
+                    .flatten()
+                    .filter_map(|p| match (p.start, p.end) {
+                        (Some(s), Some(e)) if s < current_start => Some((s, e)),
+                        _ => None,
+                    })
+                    .max_by_key(|(s, _)| *s);
+                match prev {
+                    Some((s, e)) => (Some(s), Some(e)),
+                    None => (None, None),
+                }
+            }
+            _ => (None, None),
+        };
+
         Ok(StockQuote {
             symbol: meta.symbol.unwrap_or_else(|| symbol.to_string()),
             short_name: meta
@@ -374,6 +427,8 @@ impl YahooFinanceProvider {
             intraday_timestamps,
             regular_session_start_ts,
             regular_session_end_ts,
+            previous_session_start_ts,
+            previous_session_end_ts,
             fetched_at: chrono::Local::now(),
             post_market_price: meta.post_market_price,
             post_market_change: meta.post_market_change,
@@ -638,6 +693,11 @@ struct ChartMeta {
     market_state: Option<String>,
     #[serde(default)]
     current_trading_period: Option<CurrentTradingPeriod>,
+    /// Periods the chart's bars actually cover (one entry per trading
+    /// day, inner array per session within a day — usually 1). We pick
+    /// the most-recent-completed entry as the previous-session bounds.
+    #[serde(default)]
+    trading_periods: Option<TradingPeriods>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -645,6 +705,12 @@ struct ChartMeta {
 struct CurrentTradingPeriod {
     #[serde(default)]
     regular: Option<TradingPeriod>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TradingPeriods {
+    #[serde(default)]
+    regular: Vec<Vec<TradingPeriod>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -714,6 +780,8 @@ mod tests {
             intraday_timestamps: vec![],
             regular_session_start_ts: None,
             regular_session_end_ts: None,
+            previous_session_start_ts: None,
+            previous_session_end_ts: None,
             fetched_at: chrono::Local::now(),
             post_market_price: None,
             post_market_change: None,
@@ -778,6 +846,8 @@ mod tests {
             intraday_timestamps: vec![],
             regular_session_start_ts: None,
             regular_session_end_ts: None,
+            previous_session_start_ts: None,
+            previous_session_end_ts: None,
             fetched_at: chrono::Local::now(),
             post_market_price: None,
             post_market_change: None,

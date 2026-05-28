@@ -1759,31 +1759,32 @@ fn render_graph_panel(
     // === Trace rendering ===
     //
     // For 1D, the chart shows only the regular trading session bars
-    // (09:30–16:00 ET). Yahoo's `1d` response still contains the full
-    // extended-hours window (we keep `includePrePost=true` so the
-    // AH/PRE header has data to derive from) — we just filter to the
-    // regular session here. If the filter returns empty (early
-    // pre-market on a new day before any regular bars), we render the
-    // full sparse data so the chart isn't blank.
-    let filtered: Option<(Vec<f64>, Vec<i64>)> = if matches!(period, Period::Day)
-        && q.intraday.len() == q.intraday_timestamps.len()
-        && q.regular_session_start_ts.is_some()
-        && q.regular_session_end_ts.is_some()
-    {
-        let start = q.regular_session_start_ts.unwrap();
-        let end = q.regular_session_end_ts.unwrap();
-        let (vs, ts): (Vec<f64>, Vec<i64>) = q
-            .intraday
-            .iter()
-            .zip(q.intraday_timestamps.iter())
-            .filter(|(_, t)| **t >= start && **t <= end)
-            .map(|(v, t)| (*v, *t))
-            .unzip();
-        if vs.is_empty() {
-            None
-        } else {
-            Some((vs, ts))
-        }
+    // (09:30–16:00 ET) — never pre-market or after-hours, even when
+    // those sessions are active. Yahoo's `1d` response still contains
+    // the full extended-hours window (we keep `includePrePost=true`
+    // so the AH/PRE header line can derive from those bars), but the
+    // chart itself stays calm: extended-hours movement is conveyed by
+    // the header numbers only.
+    //
+    // Session selection follows what's actually populated:
+    //
+    //   1. If any bar lands in today's regular session range
+    //      (`regular_session_*_ts` from `currentTradingPeriod`), the
+    //      chart shows today's regular bars. This covers the live
+    //      regular session and post-close (where today's session has
+    //      already produced bars).
+    //   2. Otherwise — overnight gap, pre-market before the bell,
+    //      weekend, holiday morning — the chart falls back to the
+    //      most-recent completed regular session
+    //      (`previous_session_*_ts` from `tradingPeriods.regular`).
+    //      The graph holds yesterday's trend; only the AH/PRE header
+    //      line refreshes with extended-hours activity.
+    //   3. If neither bound is available (Yahoo didn't return
+    //      `currentTradingPeriod` / `tradingPeriods`, rare), the
+    //      filter degrades to the unfiltered data — better something
+    //      than empty space when the platform layer can't help.
+    let filtered: Option<(Vec<f64>, Vec<i64>)> = if matches!(period, Period::Day) {
+        pick_day_chart_bars(q)
     } else {
         None
     };
@@ -2336,6 +2337,44 @@ fn is_leap_year(year: i32) -> bool {
 ///
 /// Returns `None` during the regular session (no extended movement to
 /// surface) or when the change is exactly zero (no movement yet).
+/// Pick the regular-session bars the 1D chart should render. Tries
+/// today's regular session first (`regular_session_*_ts`), falls back
+/// to yesterday's (`previous_session_*_ts`) when today has no bars
+/// yet, returns `None` when neither yields anything. Pre-market and
+/// after-hours bars are never included — those sessions only update
+/// the AH/PRE header line.
+fn pick_day_chart_bars(q: &StockQuote) -> Option<(Vec<f64>, Vec<i64>)> {
+    if q.intraday.len() != q.intraday_timestamps.len() {
+        return None;
+    }
+    let filter_range = |start: i64, end: i64| -> Vec<(f64, i64)> {
+        q.intraday
+            .iter()
+            .zip(q.intraday_timestamps.iter())
+            .filter(|(_, t)| **t >= start && **t <= end)
+            .map(|(v, t)| (*v, *t))
+            .collect()
+    };
+    let today = match (q.regular_session_start_ts, q.regular_session_end_ts) {
+        (Some(s), Some(e)) => filter_range(s, e),
+        _ => Vec::new(),
+    };
+    let chosen = if !today.is_empty() {
+        today
+    } else {
+        match (q.previous_session_start_ts, q.previous_session_end_ts) {
+            (Some(s), Some(e)) => filter_range(s, e),
+            _ => Vec::new(),
+        }
+    };
+    if chosen.is_empty() {
+        None
+    } else {
+        let (vs, ts): (Vec<f64>, Vec<i64>) = chosen.into_iter().unzip();
+        Some((vs, ts))
+    }
+}
+
 fn extended_hours_segment(q: &StockQuote) -> Option<(&'static str, f64, f64)> {
     if let Some(seg) = extended_hours_from_bars(q) {
         return Some(seg);
@@ -3367,6 +3406,8 @@ mod tests {
             intraday_timestamps: vec![],
             regular_session_start_ts: None,
             regular_session_end_ts: None,
+            previous_session_start_ts: None,
+            previous_session_end_ts: None,
             fetched_at: chrono::Local::now(),
             post_market_price: None,
             post_market_change: None,
@@ -3811,6 +3852,87 @@ mod tests {
         let line = lay_out_x_axis_labels_at_cols(&items, 10);
         assert!(line.starts_with("Jan"));
         assert!(!line.contains("Feb"));
+    }
+
+    #[test]
+    fn pick_day_chart_bars_uses_today_regular_when_present() {
+        // Mid-regular-session: bars exist within today's reg range.
+        // Chart should use today's regular bars only.
+        let mut q = quote("AAPL", 200.0, 195.0);
+        q.regular_session_start_ts = Some(1_700_000_000);
+        q.regular_session_end_ts = Some(1_700_023_400);
+        q.previous_session_start_ts = Some(1_699_900_000);
+        q.previous_session_end_ts = Some(1_699_923_400);
+        q.intraday_timestamps = vec![
+            1_699_920_000, // yesterday regular (would be in prev range)
+            1_700_005_000, // today regular
+            1_700_010_000, // today regular
+        ];
+        q.intraday = vec![196.0, 199.0, 200.0];
+        let (vs, ts) = pick_day_chart_bars(&q).expect("today's regular session present");
+        assert_eq!(ts, vec![1_700_005_000, 1_700_010_000]);
+        assert_eq!(vs, vec![199.0, 200.0]);
+    }
+
+    #[test]
+    fn pick_day_chart_bars_falls_back_to_previous_when_today_empty() {
+        // Pre-market on a new day: today's regular range has no bars
+        // yet, but yesterday's full session is in the data. Chart
+        // should show yesterday's bars (not the pre-market bars).
+        let mut q = quote("AAPL", 196.0, 195.0);
+        q.regular_session_start_ts = Some(1_700_100_000); // today reg_start (well in future)
+        q.regular_session_end_ts = Some(1_700_123_400);
+        q.previous_session_start_ts = Some(1_700_000_000);
+        q.previous_session_end_ts = Some(1_700_023_400);
+        q.intraday_timestamps = vec![
+            1_700_005_000, // yesterday regular
+            1_700_010_000, // yesterday regular
+            1_700_044_000, // yesterday AH (~7:30 ET) — must NOT appear
+            1_700_086_000, // today PRE (~6:00 ET) — must NOT appear
+            1_700_087_800, // today PRE — must NOT appear
+        ];
+        q.intraday = vec![196.0, 197.0, 198.0, 198.5, 199.0];
+        let (vs, ts) = pick_day_chart_bars(&q).expect("previous session fallback");
+        assert_eq!(
+            ts,
+            vec![1_700_005_000, 1_700_010_000],
+            "pre-market and AH bars must be excluded"
+        );
+        assert_eq!(vs, vec![196.0, 197.0]);
+    }
+
+    #[test]
+    fn pick_day_chart_bars_excludes_post_market_when_today_has_regular_bars() {
+        // After today's regular close: today's regular bars are present
+        // alongside today's AH bars. Chart should drop the AH bars.
+        let mut q = quote("AAPL", 200.0, 195.0);
+        q.regular_session_start_ts = Some(1_700_000_000);
+        q.regular_session_end_ts = Some(1_700_023_400);
+        q.intraday_timestamps = vec![
+            1_700_005_000, // regular
+            1_700_023_000, // regular (5min before close)
+            1_700_023_400, // boundary (Yahoo: first AH bar) — must NOT appear
+            1_700_024_000, // AH — must NOT appear
+        ];
+        q.intraday = vec![198.0, 200.0, 200.5, 201.0];
+        let (vs, ts) = pick_day_chart_bars(&q).expect("today's regular bars");
+        // Filter is inclusive on both ends, so boundary bar is included
+        // intentionally — keeps the regular-close auction within the
+        // chart even when Yahoo timestamps it at ts == reg_end. AH bars
+        // after that drop off.
+        assert_eq!(ts, vec![1_700_005_000, 1_700_023_000, 1_700_023_400]);
+        assert_eq!(vs, vec![198.0, 200.0, 200.5]);
+    }
+
+    #[test]
+    fn pick_day_chart_bars_returns_none_when_no_session_bounds() {
+        // Yahoo didn't return trading periods at all (rare edge case).
+        // Helper returns None and the caller falls back to unfiltered
+        // data.
+        let mut q = quote("AAPL", 196.0, 195.0);
+        q.intraday_timestamps = vec![1_700_005_000, 1_700_010_000];
+        q.intraday = vec![195.0, 196.0];
+        assert!(pick_day_chart_bars(&q).is_none());
     }
 
     #[test]
