@@ -179,7 +179,15 @@ enum QuoteState {
 }
 
 struct StocksState {
-    quotes: HashMap<String, QuoteState>,
+    /// Per-period quote snapshots. The active view reads
+    /// `quotes_by_period[self.period]`. Switching periods used to
+    /// leak the previous period's intraday series under the new
+    /// period's x-axis labels until the refetch landed — keeping
+    /// each period's data in its own slot makes period switches
+    /// instant when we've already fetched the new period this
+    /// session, and ensures concurrent in-flight fetches land in
+    /// the right bucket even if the user has switched again.
+    quotes_by_period: HashMap<Period, HashMap<String, QuoteState>>,
     selected: usize,
     /// First-visible logical row in the list panel. Auto-adjusted on render
     /// so the selected ticker stays in view.
@@ -228,10 +236,33 @@ struct StocksState {
 /// out of fast cadence within a couple of seconds of losing focus.
 const FOCUS_FRESHNESS_WINDOW: Duration = Duration::from_secs(2);
 
+impl StocksState {
+    /// Read-only view of the active period's quote map. Returns an
+    /// empty borrow when nothing has been fetched / cached for that
+    /// period yet so callers don't need to special-case `None`.
+    fn quotes(&self, period: Period) -> &HashMap<String, QuoteState> {
+        // SAFETY: the static empty map lives for the whole program;
+        // re-using it avoids the borrow-checker awkwardness of
+        // returning `Option<&_>` from a method that's overwhelmingly
+        // used as "iterate / look up by symbol."
+        static EMPTY: std::sync::OnceLock<HashMap<String, QuoteState>> =
+            std::sync::OnceLock::new();
+        self.quotes_by_period
+            .get(&period)
+            .unwrap_or_else(|| EMPTY.get_or_init(HashMap::new))
+    }
+    /// Mutable view of the active period's quote map. Creates an
+    /// empty slot on first access so callers can just `.insert` /
+    /// `.entry` without a contains_key dance.
+    fn quotes_mut(&mut self, period: Period) -> &mut HashMap<String, QuoteState> {
+        self.quotes_by_period.entry(period).or_default()
+    }
+}
+
 impl Default for StocksState {
     fn default() -> Self {
         Self {
-            quotes: HashMap::new(),
+            quotes_by_period: HashMap::new(),
             selected: 0,
             list_scroll: 0,
             transient_ticker: None,
@@ -343,18 +374,21 @@ impl StocksWidget {
             format!("Stocks ({instance})")
         };
         let poll_interval = Duration::from_secs(config.poll_interval_secs.max(15));
-        // Seed quotes for the default period so the dashboard paints prior
-        // prices instantly. Period switches after startup miss the cache (we
-        // only persist one period's payload here) and refetch on demand.
+        // Seed quotes for the default period so the dashboard paints
+        // prior prices instantly. Other periods are lazily loaded from
+        // disk on first switch (see `set_period`).
         let mut initial_state = StocksState::default();
         initial_state.poll = crate::polling::PollTracker::new(poll_interval);
         if let Some(entry) = cache.load::<HashMap<String, StockQuote>>(&quotes_cache_key(period)) {
             initial_state.poll.seed_from_cache_age(entry.age());
-            initial_state.quotes = entry
-                .value
-                .into_iter()
-                .map(|(sym, q)| (sym, QuoteState::Ready(Arc::new(q))))
-                .collect();
+            initial_state.quotes_by_period.insert(
+                period,
+                entry
+                    .value
+                    .into_iter()
+                    .map(|(sym, q)| (sym, QuoteState::Ready(Arc::new(q))))
+                    .collect(),
+            );
         }
         initial_state
             .poll
@@ -382,6 +416,31 @@ impl StocksWidget {
             return;
         }
         self.period = period;
+        // Lazy-seed the new period's quote map from disk if we
+        // haven't touched it this session yet. Without this, a
+        // first-time switch into a period would render with empty
+        // / Inflight rows for the network roundtrip; with it the
+        // user sees the previous on-disk snapshot instantly and
+        // the background refetch (triggered by mark_dirty below)
+        // updates prices when it lands. Skip the disk read when
+        // there's already an in-memory map for this period —
+        // staying in this-session memory is preferable to the
+        // on-disk copy, which may be older.
+        {
+            let mut st = self.state.lock().expect("stocks state poisoned");
+            if !st.quotes_by_period.contains_key(&period) {
+                if let Some(entry) =
+                    self.cache.load::<HashMap<String, StockQuote>>(&quotes_cache_key(period))
+                {
+                    let seeded: HashMap<String, QuoteState> = entry
+                        .value
+                        .into_iter()
+                        .map(|(sym, q)| (sym, QuoteState::Ready(Arc::new(q))))
+                        .collect();
+                    st.quotes_by_period.insert(period, seeded);
+                }
+            }
+        }
         // Force a refresh on the next tick so the chart and change%
         // catch up to the new window.
         self.mark_dirty();
@@ -460,9 +519,10 @@ impl StocksWidget {
         //   2. The force_next_refresh one-shot flag is set (cold-start
         //      catch-up fetch, or user-triggered `r` / `:refresh`).
         // Consume the flag so subsequent ticks fall back to the gate.
+        let active_quotes = st.quotes(self.period);
         let need_first_fetch = symbols
             .iter()
-            .any(|s| !matches!(st.quotes.get(s), Some(QuoteState::Ready(_))));
+            .any(|s| !matches!(active_quotes.get(s), Some(QuoteState::Ready(_))));
         if st.force_next_refresh || need_first_fetch {
             st.force_next_refresh = false;
             return true;
@@ -480,19 +540,20 @@ impl StocksWidget {
         if symbols.is_empty() {
             return;
         }
+        let period = self.period;
         {
             let mut st = self.state.lock().expect("stocks state poisoned");
             st.any_inflight = true;
             st.poll.mark_attempted();
+            let bucket = st.quotes_mut(period);
             for sym in &symbols {
-                st.quotes.entry(sym.clone()).or_insert(QuoteState::Inflight);
+                bucket.entry(sym.clone()).or_insert(QuoteState::Inflight);
             }
             st.dirty = true;
         }
         let provider = self.provider.clone();
         let state = self.state.clone();
         let cache = self.cache.clone();
-        let period = self.period;
         tokio::spawn(async move {
             // Fetch each symbol in parallel. Yahoo's v8/chart endpoint is
             // per-symbol so we can't batch into one request.
@@ -506,22 +567,24 @@ impl StocksWidget {
             });
             let results = futures::future::join_all(futs).await;
             let mut st = state.lock().expect("stocks state poisoned");
-            // Seed the cache snapshot from existing Ready entries so a partial
-            // failure (e.g. one symbol's request errors) doesn't wipe the
-            // on-disk snapshot for the symbols that *did* succeed previously.
+            // Seed the cache snapshot from existing Ready entries for
+            // *this period* so a partial failure (e.g. one symbol's
+            // request errors) doesn't wipe the on-disk snapshot for the
+            // symbols that *did* succeed previously.
             let mut snapshot: HashMap<String, StockQuote> = st
-                .quotes
+                .quotes(period)
                 .iter()
                 .filter_map(|(k, v)| match v {
                     QuoteState::Ready(q) => Some((k.clone(), (**q).clone())),
                     _ => None,
                 })
                 .collect();
+            let bucket = st.quotes_mut(period);
             for (sym, result) in results {
                 match result {
                     Ok(q) => {
                         snapshot.insert(sym.clone(), q.clone());
-                        st.quotes.insert(sym, QuoteState::Ready(Arc::new(q)));
+                        bucket.insert(sym, QuoteState::Ready(Arc::new(q)));
                     }
                     Err(err) => {
                         tracing::warn!(symbol = %sym, error = %err, "stock fetch failed");
@@ -530,7 +593,7 @@ impl StocksWidget {
                         // transient network outages (e.g. wake-from-sleep).
                         // Only flip to `Failed` if we never had a successful
                         // fetch for this symbol.
-                        st.quotes
+                        bucket
                             .entry(sym)
                             .and_modify(|e| {
                                 if !matches!(e, QuoteState::Ready(_)) {
@@ -807,10 +870,16 @@ impl StocksWidget {
             return;
         }
         // Drop the stale quote so the row doesn't briefly flicker on
-        // re-add. The next refresh repopulates from Yahoo.
+        // re-add. The next refresh repopulates from Yahoo. We sweep
+        // every period's bucket — if the user had this symbol on
+        // 1D and 1W in this session, dropping just one would leave
+        // the other rendering yesterday's price under tomorrow's
+        // labels.
         {
             let mut st = self.state.lock().expect("stocks state poisoned");
-            st.quotes.remove(&sym);
+            for bucket in st.quotes_by_period.values_mut() {
+                bucket.remove(&sym);
+            }
             st.confirm_remove = None;
             // Clamp selection to the last row of the new list (or 0
             // when everything was removed).
@@ -918,7 +987,7 @@ impl StocksWidget {
     ) -> HashMap<String, QuoteState> {
         let mut st = self.state.lock().expect("stocks state poisoned");
         st.last_focused_at = focused.then(Instant::now);
-        st.quotes.clone()
+        st.quotes(self.period).clone()
     }
 
     /// Return the active status string, clearing it if its TTL has
@@ -1788,10 +1857,34 @@ fn render_graph_panel(
         return;
     }
 
-    // Compute y-range from the data, with a small padding so the trace doesn't
-    // hug the borders.
+    // Filter to the bars we'll actually paint BEFORE computing the
+    // y-range — on 1D `q.intraday` includes pre-market and after-
+    // hours bars (we keep `includePrePost=true` on the fetch so the
+    // AH/PRE header can derive from them), but only the regular-
+    // session bars land on the chart. Scanning the full extended-
+    // hours window for min/max stretched the y-axis to fit price
+    // moves that the visible trace never reaches, leaving dead
+    // space at the top and/or bottom of the plot.
+    //
+    // For non-1D periods `filtered` is None and `intraday_render`
+    // points at `q.intraday` directly, so the behavior there is
+    // unchanged.
+    let filtered: Option<(Vec<f64>, Vec<i64>, (i64, i64))> = if matches!(period, Period::Day) {
+        pick_day_chart_bars_with_session(q)
+    } else {
+        None
+    };
+    let (intraday_render, timestamps_render): (&[f64], &[i64]) = match &filtered {
+        Some((vs, ts, _)) => (vs.as_slice(), ts.as_slice()),
+        None => (q.intraday.as_slice(), q.intraday_timestamps.as_slice()),
+    };
+    if intraday_render.is_empty() {
+        return;
+    }
+
+    // Compute y-range from the visible bars.
     let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
-    for v in &q.intraday {
+    for v in intraday_render {
         if *v < min {
             min = *v;
         }
@@ -1839,40 +1932,12 @@ fn render_graph_panel(
 
     // === Trace rendering ===
     //
-    // For 1D, the chart shows only the regular trading session bars
-    // (09:30–16:00 ET) — never pre-market or after-hours, even when
-    // those sessions are active. Yahoo's `1d` response still contains
-    // the full extended-hours window (we keep `includePrePost=true`
-    // so the AH/PRE header line can derive from those bars), but the
-    // chart itself stays calm: extended-hours movement is conveyed by
-    // the header numbers only.
-    //
-    // Session selection follows what's actually populated:
-    //
-    //   1. If any bar lands in today's regular session range
-    //      (`regular_session_*_ts` from `currentTradingPeriod`), the
-    //      chart shows today's regular bars. This covers the live
-    //      regular session and post-close (where today's session has
-    //      already produced bars).
-    //   2. Otherwise — overnight gap, pre-market before the bell,
-    //      weekend, holiday morning — the chart falls back to the
-    //      most-recent completed regular session
-    //      (`previous_session_*_ts` from `tradingPeriods.regular`).
-    //      The graph holds yesterday's trend; only the AH/PRE header
-    //      line refreshes with extended-hours activity.
-    //   3. If neither bound is available (Yahoo didn't return
-    //      `currentTradingPeriod` / `tradingPeriods`, rare), the
-    //      filter degrades to the unfiltered data — better something
-    //      than empty space when the platform layer can't help.
-    let filtered: Option<(Vec<f64>, Vec<i64>, (i64, i64))> = if matches!(period, Period::Day) {
-        pick_day_chart_bars_with_session(q)
-    } else {
-        None
-    };
-    let (intraday_render, timestamps_render): (&[f64], &[i64]) = match &filtered {
-        Some((vs, ts, _)) => (vs.as_slice(), ts.as_slice()),
-        None => (q.intraday.as_slice(), q.intraday_timestamps.as_slice()),
-    };
+    // Session selection (computed above for the y-range) drives the
+    // bars that actually paint. On 1D the chart shows only the
+    // regular session bars; on longer periods `intraday_render` is
+    // the unfiltered series. See the doc-comment on
+    // `pick_day_chart_bars_with_session` for how the today/yesterday
+    // fallback works on 1D.
 
     // trace_w = how many columns the actual trace fills.
     //   - 1D pad mode: elapsed time within the regular session, not
