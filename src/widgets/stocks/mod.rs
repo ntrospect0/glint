@@ -3603,6 +3603,45 @@ mod tests {
     }
 
     #[test]
+    fn quotes_buckets_are_isolated_per_period() {
+        // Per-period buckets must keep their data when switching back
+        // and forth. If a write to one bucket leaks into another the
+        // user sees the wrong period's bars under the new x-axis
+        // labels (the bug that motivated the per-period split).
+        let mut st = StocksState::default();
+        let day_q = quote("AAPL", 200.0, 199.0);
+        st.quotes_mut(Period::Day)
+            .insert("AAPL".into(), QuoteState::Ready(Arc::new(day_q.clone())));
+        assert_eq!(st.quotes(Period::Day).len(), 1);
+        assert_eq!(
+            st.quotes(Period::Week).len(),
+            0,
+            "Week bucket should not see Day's data"
+        );
+
+        let week_q = quote("AAPL", 210.0, 200.0);
+        st.quotes_mut(Period::Week)
+            .insert("AAPL".into(), QuoteState::Ready(Arc::new(week_q.clone())));
+        assert_eq!(st.quotes(Period::Day).len(), 1);
+        assert_eq!(st.quotes(Period::Week).len(), 1);
+
+        // The Day quote remains intact after the Week insert (no
+        // cross-contamination).
+        match st.quotes(Period::Day).get("AAPL") {
+            Some(QuoteState::Ready(q)) => {
+                assert_eq!(q.price, 200.0, "Day price should still be 200.0");
+            }
+            _ => panic!("Day bucket should still hold a Ready entry"),
+        }
+        match st.quotes(Period::Week).get("AAPL") {
+            Some(QuoteState::Ready(q)) => {
+                assert_eq!(q.price, 210.0);
+            }
+            _ => panic!("Week bucket should hold a Ready entry"),
+        }
+    }
+
+    #[test]
     fn humanize_big_uses_expected_suffixes() {
         assert_eq!(humanize_big(500.0), "500");
         assert_eq!(humanize_big(15_400.0), "15.4K");
