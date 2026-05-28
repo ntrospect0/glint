@@ -385,9 +385,23 @@ impl NotesWidget {
             state.set_status(msg);
         }
         state.notes = store::load_all(&root, &instance);
-        if !state.notes.is_empty() {
-            state.active = Some(0);
-        }
+        // Restore the previously-active note from the runtime-state
+        // file if we still have a note with the same id. Falls back
+        // to the most-recently-edited note (index 0) when the
+        // persisted id no longer exists — either deleted via `dd`
+        // or vanished from the on-disk store between sessions.
+        let persisted_id = crate::runtime_state::load()
+            .notes
+            .get(&id)
+            .and_then(|e| e.active_note_id.clone());
+        state.active = if state.notes.is_empty() {
+            None
+        } else {
+            persisted_id
+                .as_deref()
+                .and_then(|pid| state.notes.iter().position(|n| n.id == pid))
+                .or(Some(0))
+        };
         Self {
             id,
             instance,
@@ -409,53 +423,59 @@ impl NotesWidget {
     }
 
     fn create_note(&self) {
-        let mut st = self.state.lock().expect("notes state poisoned");
-        let mut note = Note {
-            id: store::new_id(),
-            body: String::new(),
-            modified: std::time::SystemTime::now(),
-        };
-        if let Err(err) = store::save(&self.root, &self.instance, &mut note) {
-            tracing::warn!(error = %err, "notes: save new note failed");
-            st.set_status(format!("Save failed: {err}"));
-            return;
+        {
+            let mut st = self.state.lock().expect("notes state poisoned");
+            let mut note = Note {
+                id: store::new_id(),
+                body: String::new(),
+                modified: std::time::SystemTime::now(),
+            };
+            if let Err(err) = store::save(&self.root, &self.instance, &mut note) {
+                tracing::warn!(error = %err, "notes: save new note failed");
+                st.set_status(format!("Save failed: {err}"));
+                return;
+            }
+            // Insert at the front (most-recently-edited).
+            st.notes.insert(0, note);
+            st.active = Some(0);
+            st.cursor_row = 0;
+            st.cursor_col = 0;
+            st.content_scroll = 0;
+            st.mode = Mode::Insert;
+            st.focus = SubFocus::Content;
+            st.status = None;
         }
-        // Insert at the front (most-recently-edited).
-        st.notes.insert(0, note);
-        st.active = Some(0);
-        st.cursor_row = 0;
-        st.cursor_col = 0;
-        st.content_scroll = 0;
-        st.mode = Mode::Insert;
-        st.focus = SubFocus::Content;
-        st.status = None;
+        self.persist_runtime_state();
     }
 
     fn delete_active(&self) {
-        let mut st = self.state.lock().expect("notes state poisoned");
-        let Some(active) = st.active else { return };
-        let Some(note) = st.notes.get(active) else {
-            return;
-        };
-        let id = note.id.clone();
-        if let Err(err) = store::delete(&self.root, &self.instance, &id) {
-            tracing::warn!(error = %err, "notes: delete failed");
-            st.set_status(format!("Delete failed: {err}"));
-            return;
+        {
+            let mut st = self.state.lock().expect("notes state poisoned");
+            let Some(active) = st.active else { return };
+            let Some(note) = st.notes.get(active) else {
+                return;
+            };
+            let id = note.id.clone();
+            if let Err(err) = store::delete(&self.root, &self.instance, &id) {
+                tracing::warn!(error = %err, "notes: delete failed");
+                st.set_status(format!("Delete failed: {err}"));
+                return;
+            }
+            st.notes.remove(active);
+            st.history.remove(&id);
+            st.active = if st.notes.is_empty() {
+                None
+            } else {
+                Some(active.min(st.notes.len() - 1))
+            };
+            st.cursor_row = 0;
+            st.cursor_col = 0;
+            st.content_scroll = 0;
+            st.pending = PendingChord::None;
+            st.confirm_delete = None;
+            st.status = None;
         }
-        st.notes.remove(active);
-        st.history.remove(&id);
-        st.active = if st.notes.is_empty() {
-            None
-        } else {
-            Some(active.min(st.notes.len() - 1))
-        };
-        st.cursor_row = 0;
-        st.cursor_col = 0;
-        st.content_scroll = 0;
-        st.pending = PendingChord::None;
-        st.confirm_delete = None;
-        st.status = None;
+        self.persist_runtime_state();
     }
 
     /// Persist the active note's body to disk. Bumps mtime and re-sorts
@@ -749,29 +769,61 @@ impl NotesWidget {
     }
 
     fn select_note(&self, idx: usize) {
-        let mut st = self.state.lock().expect("notes state poisoned");
-        if idx < st.notes.len() {
+        let changed = {
+            let mut st = self.state.lock().expect("notes state poisoned");
+            if idx >= st.notes.len() {
+                return;
+            }
+            let prev = st.active;
             st.active = Some(idx);
             st.cursor_row = 0;
             st.cursor_col = 0;
             st.content_scroll = 0;
             st.pending = PendingChord::None;
+            prev != Some(idx)
+        };
+        if changed {
+            self.persist_runtime_state();
         }
     }
 
     fn cycle_active(&self, delta: i32) {
-        let mut st = self.state.lock().expect("notes state poisoned");
-        if st.notes.is_empty() {
-            return;
+        let changed = {
+            let mut st = self.state.lock().expect("notes state poisoned");
+            if st.notes.is_empty() {
+                return;
+            }
+            let n = st.notes.len() as i32;
+            let cur = st.active.unwrap_or(0) as i32;
+            let next = ((cur + delta).rem_euclid(n)) as usize;
+            let prev = st.active;
+            st.active = Some(next);
+            st.cursor_row = 0;
+            st.cursor_col = 0;
+            st.content_scroll = 0;
+            st.pending = PendingChord::None;
+            prev != Some(next)
+        };
+        if changed {
+            self.persist_runtime_state();
         }
-        let n = st.notes.len() as i32;
-        let cur = st.active.unwrap_or(0) as i32;
-        let next = ((cur + delta).rem_euclid(n)) as usize;
-        st.active = Some(next);
-        st.cursor_row = 0;
-        st.cursor_col = 0;
-        st.content_scroll = 0;
-        st.pending = PendingChord::None;
+    }
+
+    /// Snapshot which note the user has open into the runtime-state
+    /// file so a relaunch lands the same one. Called from
+    /// `select_note`, `cycle_active`, `create_note`, `delete_active`.
+    /// Best-effort: failures log and the dashboard keeps running.
+    fn persist_runtime_state(&self) {
+        let active_note_id = {
+            let st = self.state.lock().expect("notes state poisoned");
+            st.active.and_then(|i| st.notes.get(i).map(|n| n.id.clone()))
+        };
+        let mut payload = crate::runtime_state::load();
+        let entry = payload.notes.entry(self.id.clone()).or_default();
+        entry.active_note_id = active_note_id;
+        if let Err(err) = crate::runtime_state::save(&payload) {
+            tracing::warn!(error = %err, "failed to persist notes runtime state");
+        }
     }
 }
 

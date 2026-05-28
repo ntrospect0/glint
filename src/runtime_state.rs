@@ -63,6 +63,12 @@ pub struct RuntimeState {
     /// the widget id (`"forex"`, `"forex@crypto"`, …).
     #[serde(default)]
     pub forex: HashMap<String, ForexEntry>,
+    /// Per-notes-instance widget state — remembers which note the
+    /// user was viewing so a relaunch reopens the same one rather
+    /// than always landing on the most-recently-edited note. Keyed
+    /// by the widget id (`"notes"`, `"notes@work"`, …).
+    #[serde(default)]
+    pub notes: HashMap<String, NotesEntry>,
 }
 
 // Manual `Default` rather than `derive` so a freshly-constructed
@@ -78,6 +84,7 @@ impl Default for RuntimeState {
             clocks: HashMap::new(),
             stocks: HashMap::new(),
             forex: HashMap::new(),
+            notes: HashMap::new(),
         }
     }
 }
@@ -143,6 +150,17 @@ pub struct StocksEntry {
     /// unknown values fall back to the configured `default_period`.
     #[serde(default)]
     pub period: Option<String>,
+}
+
+/// Per-notes-instance persisted state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotesEntry {
+    /// Stable note id (the on-disk filename stem) the user had open
+    /// at exit. `None` when the store was empty. Restored only when
+    /// a note with the same id still exists — otherwise the widget
+    /// falls back to the most-recently-edited note (index 0).
+    #[serde(default)]
+    pub active_note_id: Option<String>,
 }
 
 /// Per-forex-instance persisted state.
@@ -265,6 +283,7 @@ impl RuntimeState {
             clocks: HashMap::new(),
             stocks: HashMap::new(),
             forex: HashMap::new(),
+            notes: HashMap::new(),
         }
     }
 }
@@ -329,6 +348,27 @@ mod tests {
         assert!(s.stocks.is_empty());
         assert!(s.forex.is_empty());
         assert!(s.clocks.is_empty());
+        assert!(s.notes.is_empty());
+    }
+
+    #[test]
+    fn notes_entry_round_trips_through_toml() {
+        let mut state = RuntimeState::default();
+        state.notes.insert(
+            "notes".into(),
+            NotesEntry {
+                active_note_id: Some("note-1719847200000".into()),
+            },
+        );
+        let text = toml::to_string_pretty(&state).unwrap();
+        let parsed: RuntimeState = toml::from_str(&text).unwrap();
+        assert_eq!(
+            parsed
+                .notes
+                .get("notes")
+                .and_then(|e| e.active_note_id.as_deref()),
+            Some("note-1719847200000")
+        );
     }
 
     #[test]
@@ -394,6 +434,7 @@ mod tests {
             clocks: HashMap::new(),
             stocks: HashMap::new(),
             forex: HashMap::new(),
+            notes: HashMap::new(),
         };
         state
             .stacks
