@@ -24,6 +24,7 @@ pub mod image;
 pub mod provider;
 pub mod templates;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -394,6 +395,11 @@ pub struct FeedsWidget {
     images: Arc<HeroImageStore>,
     shortcut: Option<char>,
     shortcut_prefs: Vec<char>,
+    /// Atomic gate over the per-tick status-TTL drain. Set on every
+    /// `set_status` call; cleared from `update()` once the slot is
+    /// drained. Lets idle ticks skip the state lock. See the same
+    /// field on `StocksWidget`.
+    feedback_pending: AtomicBool,
 }
 
 impl FeedsWidget {
@@ -502,6 +508,7 @@ impl FeedsWidget {
             images,
             shortcut: None,
             shortcut_prefs,
+            feedback_pending: AtomicBool::new(false),
         }
     }
 
@@ -745,6 +752,8 @@ impl FeedsWidget {
     fn set_status(&self, msg: impl Into<String>) {
         let mut st = self.state.lock().expect("feeds state poisoned");
         st.status = Some(TimedFeedback::new(msg.into(), STATUS_TTL));
+        drop(st);
+        self.feedback_pending.store(true, Ordering::Relaxed);
     }
 
     fn live_status(&self) -> Option<String> {
@@ -1449,9 +1458,16 @@ impl Widget for FeedsWidget {
         if self.is_due() {
             self.spawn_refresh();
         }
-        let mut st = self.state.lock().expect("feeds state poisoned");
-        if crate::ui::status::drain_if_expired(&mut st.status) {
-            st.dirty = true;
+        // Atomic-gated status drain — skips the state lock on idle
+        // ticks. See the same pattern on stocks / forex / calendar.
+        if self.feedback_pending.load(Ordering::Relaxed) {
+            let mut st = self.state.lock().expect("feeds state poisoned");
+            if crate::ui::status::drain_if_expired(&mut st.status) {
+                st.dirty = true;
+            }
+            if st.status.is_none() {
+                self.feedback_pending.store(false, Ordering::Relaxed);
+            }
         }
         Ok(())
     }

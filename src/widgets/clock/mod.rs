@@ -538,8 +538,8 @@ pub struct ClockWidget {
 
 /// How fresh `last_render_at_millis` must be for the widget to count
 /// as "currently visible." Stack widgets call `update()` on hidden
-/// children every `stack_hidden_poll_ratio` ticks (default 10 ×
-/// 250 ms = 2.5 s); a visible clock renders at least once per second
+/// children every `stack_hidden_poll_ratio` ticks (default 20 ×
+/// 250 ms = 5 s); a visible clock renders at least once per second
 /// (it's the dashboard's 1 Hz dirty source). 1500 ms catches the
 /// visible case while comfortably excluding the hidden case.
 const HIDDEN_RENDER_THRESHOLD_MS: i64 = 1500;

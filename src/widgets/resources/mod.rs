@@ -20,7 +20,7 @@ use ratatui::{
     Frame,
 };
 use serde::Deserialize;
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 use crate::text::truncate;
 use crate::theme::{ColorScheme, Theme};
@@ -129,6 +129,16 @@ struct Snapshot {
 struct ResourcesState {
     system: System,
     last_refresh: Option<Instant>,
+    /// Wall-clock timestamp of the most recent *full* process sweep
+    /// (`ProcessesToUpdate::All`). Between sweeps we refresh just the
+    /// PIDs in `tracked_pids` so a 500-process macOS doesn't pay an
+    /// O(P) syscall on every tick — see
+    /// [`FULL_SWEEP_INTERVAL`].
+    last_full_sweep_at: Option<Instant>,
+    /// PIDs of the most-recent top-N processes; refreshed every tick
+    /// between full sweeps. New hot processes get picked up on the
+    /// next full sweep (≤ FULL_SWEEP_INTERVAL latency).
+    tracked_pids: Vec<Pid>,
     snapshot: Snapshot,
     /// Most-recent `render()` call where the widget held focus. See
     /// [`FOCUS_FRESHNESS_WINDOW`] — drives the fast vs slow cadence
@@ -143,11 +153,20 @@ impl Default for ResourcesState {
         Self {
             system: System::new_with_specifics(RefreshKind::new()),
             last_refresh: None,
+            last_full_sweep_at: None,
+            tracked_pids: Vec::new(),
             snapshot: Snapshot::default(),
             last_focused_at: None,
         }
     }
 }
+
+/// How long between *full* process sweeps. Partial sweeps in between
+/// refresh just the top-N tracked PIDs (cheap). A new hot process
+/// becomes visible at most this long after it starts running — long
+/// enough to skip the O(processes) walk on most ticks, short enough
+/// that the dashboard still feels live.
+const FULL_SWEEP_INTERVAL: Duration = Duration::from_secs(20);
 
 pub struct ResourcesWidget {
     id: String,
@@ -235,16 +254,37 @@ impl ResourcesWidget {
         if !due {
             return false;
         }
-        // Refresh just what we render. `refresh_cpu_usage` requires a
-        // prior baseline call; `sysinfo` handles the bookkeeping for us
-        // as long as we keep the same `System` instance across calls.
+        // Decide *what* we're refreshing this tick. A full sweep walks
+        // every process on the system (O(P) syscalls — ~500 on macOS);
+        // a partial sweep only refreshes the PIDs already in our top-N
+        // list (O(N), typically ≤ 10). We pay for the full sweep at
+        // most once per FULL_SWEEP_INTERVAL, so a previously-quiet
+        // process that suddenly spikes becomes visible within that
+        // window. `refresh_cpu_usage` + `refresh_memory` are cheap
+        // either way (single syscall each).
+        let full_sweep = match st.last_full_sweep_at {
+            None => true,
+            Some(t) => now.duration_since(t) >= FULL_SWEEP_INTERVAL,
+        };
         st.system.refresh_cpu_usage();
         st.system.refresh_memory();
-        st.system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::new().with_cpu().with_memory(),
-        );
+        if full_sweep || st.tracked_pids.is_empty() {
+            st.system.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::new().with_cpu().with_memory(),
+            );
+            st.last_full_sweep_at = Some(now);
+        } else {
+            // Have to copy the PIDs first — `refresh_processes_specifics`
+            // borrows `&self.system` mutably while we hand it the slice.
+            let pids: Vec<Pid> = st.tracked_pids.clone();
+            st.system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&pids),
+                false,
+                ProcessRefreshKind::new().with_cpu().with_memory(),
+            );
+        }
 
         let cpu_per_core: Vec<f32> = st.system.cpus().iter().map(|c| c.cpu_usage()).collect();
         let total_memory = st.system.total_memory();
@@ -256,21 +296,38 @@ impl ResourcesWidget {
         let uptime_secs = System::uptime();
         let hostname = System::host_name().unwrap_or_else(|| "(unknown)".into());
 
-        let mut rows: Vec<ProcRow> = st
-            .system
-            .processes()
-            .iter()
-            .map(|(pid, p)| ProcRow {
-                name: p.name().to_string_lossy().into_owned(),
-                pid: pid.as_u32(),
-                cpu_percent: p.cpu_usage(),
-                memory_bytes: p.memory(),
-                virtual_bytes: p.virtual_memory(),
-            })
-            // Drop the row that is just bookkeeping noise — zero CPU AND
-            // zero memory rows are kernel placeholders on some platforms.
-            .filter(|r| r.cpu_percent > 0.0 || r.memory_bytes > 0)
-            .collect();
+        // On a full sweep we walk every process to rediscover the
+        // top-N; on a partial sweep we just resort the existing
+        // tracked set (their CPU% / mem just got refreshed). Either
+        // way we land on a `Vec<ProcRow>` truncated to `top_n`.
+        let top_n = self.config.top_n_processes.min(40);
+        let row_from = |pid: u32, p: &sysinfo::Process| ProcRow {
+            name: p.name().to_string_lossy().into_owned(),
+            pid,
+            cpu_percent: p.cpu_usage(),
+            memory_bytes: p.memory(),
+            virtual_bytes: p.virtual_memory(),
+        };
+        let mut rows: Vec<ProcRow> = if full_sweep {
+            st.system
+                .processes()
+                .iter()
+                .map(|(pid, p)| row_from(pid.as_u32(), p))
+                // Drop the bookkeeping-noise row — zero CPU AND zero
+                // memory rows are kernel placeholders on some platforms.
+                .filter(|r| r.cpu_percent > 0.0 || r.memory_bytes > 0)
+                .collect()
+        } else {
+            // Look each tracked PID up against the freshly-partial-
+            // refreshed `system`. A process that exited between
+            // sweeps simply disappears here; the next full sweep
+            // backfills the top-N with whatever's hot then.
+            st.tracked_pids
+                .iter()
+                .filter_map(|pid| st.system.process(*pid).map(|p| row_from(pid.as_u32(), p)))
+                .filter(|r| r.cpu_percent > 0.0 || r.memory_bytes > 0)
+                .collect()
+        };
         if self.config.sort_by_memory {
             rows.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes));
         } else {
@@ -280,8 +337,12 @@ impl ResourcesWidget {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
         }
-        let top_n = self.config.top_n_processes.min(40);
         rows.truncate(top_n);
+        // Capture the new top-N PIDs so the next partial sweep refreshes
+        // just those. After a full sweep this is the rediscovered set;
+        // after a partial sweep it's the same set in (possibly) a new
+        // order — that's fine, we're tracking PIDs not positions.
+        st.tracked_pids = rows.iter().map(|r| Pid::from_u32(r.pid)).collect();
 
         st.snapshot = Snapshot {
             cpu_per_core,

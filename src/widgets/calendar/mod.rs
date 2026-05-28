@@ -7,6 +7,7 @@ pub mod local;
 pub mod outlook;
 pub mod provider;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -246,7 +247,11 @@ impl Default for CalendarConfig {
 
 #[derive(Default)]
 struct CalendarState {
-    events: Vec<Event>,
+    /// `Arc<Event>` so the per-render `Vec::clone()` is O(N) atomic
+    /// increments instead of O(N) deep Event copies. With month view
+    /// holding 100+ events × 5 Strings each, this drops ~500 String
+    /// allocations per dashboard redraw to ~100 refcount bumps.
+    events: Vec<Arc<Event>>,
     last_error: Option<String>,
     poll: crate::polling::PollTracker,
     inflight: bool,
@@ -361,6 +366,11 @@ pub struct CalendarWidget {
     /// stack) so the `o` handler doesn't have to inspect the live
     /// provider tree to know whether Google / Outlook were enabled.
     configured_provider_kinds: Vec<ProviderKind>,
+    /// Atomic gate over the per-tick status-TTL drain. `true` whenever
+    /// a `TimedFeedback` is set; flips back to false the next time
+    /// `update()` finds the slot drained. Lets idle ticks skip the
+    /// state lock entirely. See the same field on `StocksWidget`.
+    feedback_pending: AtomicBool,
 }
 
 /// Minimum gap between two horizontal-scroll-driven anchor jumps. A typical
@@ -395,7 +405,7 @@ impl CalendarWidget {
         // timeline while the provider refresh runs in the background.
         if let Some(entry) = cache.load::<Vec<Event>>(CACHE_KEY_EVENTS) {
             state.poll.seed_from_cache_age(entry.age());
-            state.events = entry.value;
+            state.events = entry.value.into_iter().map(Arc::new).collect();
         }
         state.poll.apply_jitter(&format!("calendar@{instance}"));
         let colors_override = config.colors.clone();
@@ -436,6 +446,7 @@ impl CalendarWidget {
             last_vertical_scroll: None,
             first_day_of_week: config.first_day_of_week.as_weekday(),
             configured_provider_kinds: config.providers.iter().map(|p| p.kind).collect(),
+            feedback_pending: AtomicBool::new(false),
         }
     }
 
@@ -549,7 +560,7 @@ impl CalendarWidget {
                     if let Err(err) = cache.store(CACHE_KEY_EVENTS, &events) {
                         tracing::warn!(error = %err, "calendar cache store failed");
                     }
-                    st.events = events;
+                    st.events = events.into_iter().map(Arc::new).collect();
                     st.last_fetched_range = Some((start, end));
                     st.last_error = None;
                 }
@@ -669,7 +680,7 @@ impl CalendarWidget {
         st.week_col_scroll[dow] = next as u16;
     }
 
-    fn snapshot_events(&self) -> Vec<Event> {
+    fn snapshot_events(&self) -> Vec<Arc<Event>> {
         let st = self.state.lock().expect("calendar state poisoned");
         st.events.clone()
     }
@@ -678,6 +689,8 @@ impl CalendarWidget {
         let mut st = self.state.lock().expect("calendar state poisoned");
         st.status = Some(TimedFeedback::new(msg.into(), STATUS_TTL));
         st.dirty = true;
+        drop(st);
+        self.feedback_pending.store(true, Ordering::Relaxed);
     }
 
     fn live_status(&self) -> Option<String> {
@@ -1111,7 +1124,7 @@ fn render_month_grid(
     month: u32,
     is_anchor: bool,
     selected: NaiveDate,
-    events: &[Event],
+    events: &[Arc<Event>],
     theme: &Theme,
     first_day_of_week: Weekday,
 ) {
@@ -1445,7 +1458,7 @@ impl CalendarWidget {
         }
     }
 
-    fn render_day(&self, frame: &mut Frame, area: Rect, events: &[Event]) {
+    fn render_day(&self, frame: &mut Frame, area: Rect, events: &[Arc<Event>]) {
         // When the cell is wide enough, preview the selected day alongside
         // the day after. Selected day's date is highlighted; the preview's
         // date is dim/gray so it's clear which is "today's selection".
@@ -1498,9 +1511,13 @@ impl CalendarWidget {
         is_anchor: bool,
         body_left_pad: u16,
         body_right_pad: u16,
-        events: &[Event],
+        events: &[Arc<Event>],
     ) {
-        let day_events: Vec<&Event> = events.iter().filter(|e| e.on_date(date)).collect();
+        let day_events: Vec<&Event> = events
+            .iter()
+            .map(Arc::as_ref)
+            .filter(|e| e.on_date(date))
+            .collect();
 
         let header_height = 8u16.min(area.height);
         let header_area = Rect {
@@ -1754,11 +1771,15 @@ impl CalendarWidget {
 
     /// Render the agenda for the month-view's selected day below the calendar
     /// grid. Shares the time-aligned event format with [`agenda_lines`].
-    fn render_month_agenda(&self, frame: &mut Frame, area: Rect, events: &[Event]) {
+    fn render_month_agenda(&self, frame: &mut Frame, area: Rect, events: &[Arc<Event>]) {
         if area.height == 0 || area.width == 0 {
             return;
         }
-        let day_events: Vec<&Event> = events.iter().filter(|e| e.on_date(self.anchor)).collect();
+        let day_events: Vec<&Event> = events
+            .iter()
+            .map(Arc::as_ref)
+            .filter(|e| e.on_date(self.anchor))
+            .collect();
         let today = Local::now().date_naive();
         let header_text = format!(
             "{}, {} {}",
@@ -1816,7 +1837,7 @@ impl CalendarWidget {
         frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
     }
 
-    fn render_week(&self, frame: &mut Frame, area: Rect, events: &[Event], focused: bool) {
+    fn render_week(&self, frame: &mut Frame, area: Rect, events: &[Arc<Event>], focused: bool) {
         let s = start_of_week(self.anchor, self.first_day_of_week);
         // 7 day columns interleaved with 6 single-char separator columns.
         let constraints: Vec<Constraint> = (0..13)
@@ -1965,7 +1986,11 @@ impl CalendarWidget {
                 header_rect,
             );
 
-            let day_events: Vec<&Event> = events.iter().filter(|e| e.on_date(day)).collect();
+            let day_events: Vec<&Event> = events
+                .iter()
+                .map(Arc::as_ref)
+                .filter(|e| e.on_date(day))
+                .collect();
             let mut event_lines: Vec<Line<'_>> = Vec::new();
             if day_events.is_empty() {
                 event_lines.push(Line::from(Span::styled("·", self.theme.text_dim)));
@@ -2014,7 +2039,7 @@ impl CalendarWidget {
         }
     }
 
-    fn render_month(&self, frame: &mut Frame, area: Rect, events: &[Event]) {
+    fn render_month(&self, frame: &mut Frame, area: Rect, events: &[Arc<Event>]) {
         // Each single-month grid wants ~37 cols (5 chars × 7 cells + a bit of
         // padding). Stack 1, 2, or 3 months side-by-side as width allows.
         let (anchor_y, anchor_m) = (self.anchor.year(), self.anchor.month());
@@ -2249,9 +2274,16 @@ impl Widget for CalendarWidget {
         }
         // Drive the dirty flag when a transient status crosses its
         // TTL so the title-bar metadata reverts on the next frame.
-        let mut st = self.state.lock().expect("calendar state poisoned");
-        if crate::ui::status::drain_if_expired(&mut st.status) {
-            st.dirty = true;
+        // Atomic-gated so an idle dashboard (no pending status) skips
+        // the state lock entirely.
+        if self.feedback_pending.load(Ordering::Relaxed) {
+            let mut st = self.state.lock().expect("calendar state poisoned");
+            if crate::ui::status::drain_if_expired(&mut st.status) {
+                st.dirty = true;
+            }
+            if st.status.is_none() {
+                self.feedback_pending.store(false, Ordering::Relaxed);
+            }
         }
         Ok(())
     }
