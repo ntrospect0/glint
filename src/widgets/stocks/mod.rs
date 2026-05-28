@@ -416,33 +416,16 @@ impl StocksWidget {
             return;
         }
         self.period = period;
-        // Lazy-seed the new period's quote map from disk if we
-        // haven't touched it this session yet. Without this, a
-        // first-time switch into a period would render with empty
-        // / Inflight rows for the network roundtrip; with it the
-        // user sees the previous on-disk snapshot instantly and
-        // the background refetch (triggered by mark_dirty below)
-        // updates prices when it lands. Skip the disk read when
-        // there's already an in-memory map for this period —
-        // staying in this-session memory is preferable to the
-        // on-disk copy, which may be older.
-        {
-            let mut st = self.state.lock().expect("stocks state poisoned");
-            if !st.quotes_by_period.contains_key(&period) {
-                if let Some(entry) =
-                    self.cache.load::<HashMap<String, StockQuote>>(&quotes_cache_key(period))
-                {
-                    let seeded: HashMap<String, QuoteState> = entry
-                        .value
-                        .into_iter()
-                        .map(|(sym, q)| (sym, QuoteState::Ready(Arc::new(q))))
-                        .collect();
-                    st.quotes_by_period.insert(period, seeded);
-                }
-            }
-        }
         // Force a refresh on the next tick so the chart and change%
-        // catch up to the new window.
+        // catch up to the new window. We deliberately do NOT seed
+        // the new period's bucket from disk here — disk caches
+        // produced by earlier code paths may be poisoned with the
+        // wrong period's data (the old shared `state.quotes` could
+        // leak data into per-period cache files on partial fetch
+        // failures), and showing stale-wrong is worse than showing
+        // "Loading…" until the refetch lands. In-session in-memory
+        // buckets for previously-visited periods stay intact and
+        // re-display instantly.
         self.mark_dirty();
     }
 
