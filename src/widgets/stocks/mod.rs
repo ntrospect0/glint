@@ -2343,12 +2343,46 @@ fn extended_hours_segment(q: &StockQuote) -> Option<(&'static str, f64, f64)> {
     extended_hours_from_meta(q)
 }
 
+/// How close to `regular_session_start_ts` the latest bar must be for
+/// us to consider it a pre-market bar. Yahoo's pre-market window runs
+/// ~04:00–09:30 ET (5.5 hours); we use 7 hours as a safety cushion
+/// for holidays and platform edge cases. Bars older than this — but
+/// still before `regular_session_start_ts` — get treated as the
+/// previous day's after-hours carried through the overnight gap.
+const PRE_MARKET_LOOKBACK_SECS: i64 = 7 * 3600;
+
 /// Derive AH/PRE from the intraday timestamps + the regular-session
-/// boundaries. Picks AH when the latest bar is past `regular_session_end_ts`
-/// (post-market is happening, just finished, or we're in the overnight
-/// gap), and PRE when the latest bar is before `regular_session_start_ts`
-/// (next morning's pre-market session). Returns `None` during the regular
-/// session.
+/// boundaries.
+///
+/// **Baseline = `q.price` (Yahoo's `meta.regularMarketPrice`).** This
+/// is *the official closing-auction price* of the most recently
+/// completed regular session — what MarketWatch, finance.yahoo.com,
+/// and macOS Stocks all use to compute AH/PRE change. We deliberately
+/// do NOT pick a baseline bar from `intraday`: Yahoo's 5-min bars
+/// straddle the regular close (the 15:55 bar covers 15:55–16:00 and
+/// the bar at ts == reg_end is the *first AH bar*, not the close
+/// auction). Either of those bar closes differs from the official
+/// auction price by a few cents, producing AH-change values that
+/// don't agree with what users see elsewhere. `q.price` is the
+/// canonical close.
+///
+/// Three cases:
+///   1. **Post-market / post-current-day AH** — latest bar past
+///      `regular_session_end_ts`. Label "AH". Baseline `q.price`
+///      (today's close).
+///   2. **Pre-market of the upcoming session** — latest bar before
+///      `regular_session_start_ts`, within `PRE_MARKET_LOOKBACK_SECS`
+///      of it. Label "PRE". Baseline `q.price` (yesterday's close —
+///      Yahoo updates `regularMarketPrice` to the last completed
+///      session's close once that session ends).
+///   3. **Overnight gap** — latest bar before
+///      `regular_session_start_ts` but older than the pre-market
+///      lookback window. Label "AH" (yesterday's after-hours session
+///      is the most recent activity, carried through the gap).
+///      Baseline `q.price` (yesterday's close). This is the case the
+///      original logic mis-labeled as "PRE" with the wrong baseline.
+///
+/// Returns `None` during the regular session.
 fn extended_hours_from_bars(q: &StockQuote) -> Option<(&'static str, f64, f64)> {
     if q.intraday.is_empty() || q.intraday_timestamps.is_empty() {
         return None;
@@ -2363,42 +2397,44 @@ fn extended_hours_from_bars(q: &StockQuote) -> Option<(&'static str, f64, f64)> 
     let last_ts = q.intraday_timestamps[last_idx];
     let last_price = q.intraday[last_idx];
 
-    if last_ts > reg_end {
-        // Post-market session or overnight. Baseline is the regular close:
-        // the latest bar whose timestamp is at or before regular_session_end.
-        let regular_close = q
-            .intraday_timestamps
-            .iter()
-            .zip(q.intraday.iter())
-            .rev()
-            .find(|(ts, _)| **ts <= reg_end)
-            .map(|(_, v)| *v)?;
-        if regular_close == 0.0 {
-            return None;
-        }
-        let chg = last_price - regular_close;
-        if chg == 0.0 {
-            return None;
-        }
-        let pct = chg / regular_close * 100.0;
-        Some(("AH", chg, pct))
+    let label = if last_ts > reg_end {
+        "AH"
     } else if last_ts < reg_start {
-        // Pre-market session (no regular bars yet today). Baseline is
-        // yesterday's regular close, which Yahoo returns as previous_close.
-        if q.previous_close == 0.0 {
-            return None;
+        // Pre-market of the upcoming session vs. overnight gap
+        // carrying yesterday's AH. Distinguished by how close
+        // `last_ts` is to `reg_start`: real pre-market bars sit
+        // within the pre-market window; anything older is overnight.
+        if (reg_start - last_ts) < PRE_MARKET_LOOKBACK_SECS {
+            "PRE"
+        } else {
+            "AH"
         }
-        let chg = last_price - q.previous_close;
-        if chg == 0.0 {
-            return None;
-        }
-        let pct = chg / q.previous_close * 100.0;
-        Some(("PRE", chg, pct))
     } else {
-        // Latest bar sits inside the regular session — no extended-hours
-        // segment makes sense right now.
-        None
+        // Latest bar sits inside the regular session — no
+        // extended-hours segment to render.
+        return None;
+    };
+
+    finalize_segment(label, last_price, q.price)
+}
+
+/// Build the `(label, change, change_pct)` triple, returning `None`
+/// when the baseline is zero/invalid or the change is exactly zero
+/// (nothing worth surfacing on the header).
+fn finalize_segment(
+    label: &'static str,
+    last_price: f64,
+    baseline: f64,
+) -> Option<(&'static str, f64, f64)> {
+    if baseline == 0.0 {
+        return None;
     }
+    let chg = last_price - baseline;
+    if chg == 0.0 {
+        return None;
+    }
+    let pct = chg / baseline * 100.0;
+    Some((label, chg, pct))
 }
 
 /// Fallback: read Yahoo's `meta` post/pre fields directly. Used when bars
@@ -3570,20 +3606,22 @@ mod tests {
 
     #[test]
     fn extended_hours_from_bars_shows_ah_when_latest_bar_is_post_market() {
-        // Mock a 1D quote with: 3 regular-session bars closing at 196,
-        // then 2 post-market bars closing at 198. Yahoo's "AH" should
-        // report +2.00 (+1.02%).
-        let mut q = quote("AAPL", 198.0, 195.0);
-        // Regular session 09:30–16:00 ET; bars at 15:50, 15:55, 16:00, 16:05, 16:10.
-        q.regular_session_start_ts = Some(1_700_000_000); // arbitrary anchor
+        // 4:10pm ET scenario: regular session just closed at 196.0
+        // (q.price = official close auction), latest AH bar is at 198.0.
+        // Expect AH = +2.00 (+1.02%) against the official close, not
+        // against any boundary bar's close.
+        let mut q = quote("AAPL", 196.0, 195.0); // q.price = today's close, prev = yesterday
+        q.regular_session_start_ts = Some(1_700_000_000); // anchor
         q.regular_session_end_ts = Some(1_700_023_400); // anchor + 6.5h
         q.intraday_timestamps = vec![
-            1_700_023_100, // 5m before close
-            1_700_023_400, // exactly close
-            1_700_023_700, // 5m after close (post-market)
-            1_700_024_000, // 10m after close (post-market)
+            1_700_023_100, // 15:55 — last regular bar
+            1_700_023_400, // 16:00 — boundary (first AH bar in Yahoo's convention)
+            1_700_023_700, // 16:05 AH
+            1_700_024_000, // 16:10 AH
         ];
-        q.intraday = vec![196.0, 196.0, 197.0, 198.0];
+        // Boundary bar's close differs from official close — that's the
+        // whole point. We use q.price, not the boundary bar.
+        q.intraday = vec![195.93, 196.07, 197.0, 198.0];
         let seg = extended_hours_segment(&q).expect("AH from bars");
         assert_eq!(seg.0, "AH");
         assert!((seg.1 - 2.0).abs() < 1e-9, "got {}", seg.1);
@@ -3593,13 +3631,13 @@ mod tests {
     #[test]
     fn extended_hours_from_bars_persists_after_post_market_closes() {
         // 21:22 ET scenario: post-market closed at 20:00 ET, no new bars
-        // are coming. The latest bar is still post-market, so AH stays.
-        let mut q = quote("AAPL", 198.0, 195.0);
+        // are coming. Last bar is past reg_end → still AH against
+        // today's close.
+        let mut q = quote("AAPL", 196.0, 195.0);
         q.regular_session_start_ts = Some(1_700_000_000);
         q.regular_session_end_ts = Some(1_700_023_400);
-        // Last bar is well past regular_session_end (4h after close).
         q.intraday_timestamps = vec![1_700_023_400, 1_700_037_800];
-        q.intraday = vec![196.0, 198.0];
+        q.intraday = vec![196.07, 198.0];
         let seg = extended_hours_segment(&q).expect("AH persists overnight");
         assert_eq!(seg.0, "AH");
         assert!((seg.1 - 2.0).abs() < 1e-9);
@@ -3608,16 +3646,78 @@ mod tests {
     #[test]
     fn extended_hours_from_bars_shows_pre_when_latest_bar_is_premarket() {
         // Next morning: pre-market bars exist, no regular bars yet.
-        let mut q = quote("AAPL", 199.0, 196.0);
-        // Regular session today 09:30 ET = anchor; bar at 06:00 ET (pre).
+        // q.price still reflects yesterday's close (Yahoo updates it
+        // at the close auction and holds until next open).
+        let mut q = quote("AAPL", 196.0, 195.0); // q.price = yesterday's close
         q.regular_session_start_ts = Some(1_700_100_000);
         q.regular_session_end_ts = Some(1_700_123_400);
-        q.intraday_timestamps = vec![1_700_086_000, 1_700_087_800]; // both before reg_start
+        // Bars at ~06:00 ET (3.5h before today's open — well within
+        // PRE_MARKET_LOOKBACK_SECS of 7h).
+        q.intraday_timestamps = vec![1_700_086_000, 1_700_087_800];
         q.intraday = vec![198.0, 199.0];
         let seg = extended_hours_segment(&q).expect("PRE from bars");
         assert_eq!(seg.0, "PRE");
-        // PRE baseline is previous_close (196), so chg = 199 - 196 = +3.
+        // chg = 199 (last PRE bar) - 196 (yesterday's close) = +3.
         assert!((seg.1 - 3.0).abs() < 1e-9, "got {}", seg.1);
+    }
+
+    #[test]
+    fn extended_hours_from_bars_shows_ah_in_overnight_gap() {
+        // The 2am-ET case. Today's regular session hasn't started; the
+        // latest bar is yesterday's last AH bar from ~7:30pm. The old
+        // logic mis-labeled this PRE and computed chg against Yahoo's
+        // `chartPreviousClose` (= the day-before-yesterday's close).
+        // Now it labels AH against q.price (= yesterday's official
+        // close auction).
+        let mut q = quote("AAPL", 196.0, 100.0); // previous_close junk to prove
+                                                  // we don't depend on it.
+        // Today's reg session: anchor (~09:30 ET) to anchor + 6.5h.
+        q.regular_session_start_ts = Some(1_700_100_000);
+        q.regular_session_end_ts = Some(1_700_123_400);
+        // Yesterday's last AH bar is well before today's reg_start —
+        // ~16h before, outside the 7h PRE_MARKET_LOOKBACK window.
+        q.intraday_timestamps = vec![
+            1_700_037_000, // yesterday boundary bar
+            1_700_040_000, // yesterday AH
+            1_700_044_000, // yesterday last AH (~7:30 ET)
+        ];
+        q.intraday = vec![196.07, 197.0, 198.0];
+        let seg = extended_hours_segment(&q).expect("AH from overnight gap");
+        assert_eq!(seg.0, "AH");
+        // chg = 198 - 196 (q.price).
+        assert!((seg.1 - 2.0).abs() < 1e-9, "got {}", seg.1);
+        assert!((seg.2 - (2.0 / 196.0 * 100.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn extended_hours_ignores_boundary_bar_for_baseline() {
+        // Regression test for the bug the user found by cross-checking
+        // against MarketWatch: Yahoo's bar at ts == reg_end is the
+        // FIRST AH bar, not the regular-close bar, and its close
+        // differs from the official close auction price by a few
+        // cents. We must use q.price (the auction price), not any
+        // bar's close, as the AH baseline. With real AAPL boundary
+        // data: close auction 310.85, boundary bar 310.92, last AH
+        // 310.60. MW shows -$0.25 (= 310.60 - 310.85); the old logic
+        // computed -$0.32 against the boundary bar.
+        let mut q = quote("AAPL", 310.85, 308.33);
+        q.regular_session_start_ts = Some(1_700_000_000);
+        q.regular_session_end_ts = Some(1_700_023_400);
+        q.intraday_timestamps = vec![
+            1_700_023_100, // 15:55 last regular bar
+            1_700_023_400, // 16:00 boundary (close = 310.92 ≠ 310.85 auction)
+            1_700_024_300, // 16:15 AH
+            1_700_037_800, // last AH (~20:00, 4h after close)
+        ];
+        q.intraday = vec![310.93, 310.92, 310.71, 310.60];
+        let seg = extended_hours_segment(&q).expect("AH segment present");
+        assert_eq!(seg.0, "AH");
+        let expected = 310.60 - 310.85;
+        assert!(
+            (seg.1 - expected).abs() < 1e-6,
+            "expected {expected}, got {}",
+            seg.1
+        );
     }
 
     #[test]

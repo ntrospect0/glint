@@ -117,10 +117,12 @@ pub struct StockQuote {
     /// regular/post session boundaries on the 1D chart.
     #[serde(default)]
     pub intraday_timestamps: Vec<i64>,
-    /// Unix-second bounds of the *regular* trading session for the day
-    /// `intraday` describes, taken from `meta.currentTradingPeriod.regular`.
-    /// `None` when Yahoo didn't return the field (e.g. indices on long
-    /// ranges) or when the period isn't 1D.
+    /// Unix-second bounds of the *current/upcoming* regular trading
+    /// session, taken from `meta.currentTradingPeriod.regular`. During
+    /// the regular session this is today's open/close; outside it
+    /// (overnight, weekend, pre-market) this is the next scheduled
+    /// session. `None` when Yahoo didn't return the field (e.g. indices
+    /// on long ranges) or when the period isn't 1D.
     #[serde(default)]
     pub regular_session_start_ts: Option<i64>,
     #[serde(default)]
