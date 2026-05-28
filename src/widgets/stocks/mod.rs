@@ -1864,23 +1864,38 @@ fn render_graph_panel(
     //      `currentTradingPeriod` / `tradingPeriods`, rare), the
     //      filter degrades to the unfiltered data — better something
     //      than empty space when the platform layer can't help.
-    let filtered: Option<(Vec<f64>, Vec<i64>)> = if matches!(period, Period::Day) {
-        pick_day_chart_bars(q)
+    let filtered: Option<(Vec<f64>, Vec<i64>, (i64, i64))> = if matches!(period, Period::Day) {
+        pick_day_chart_bars_with_session(q)
     } else {
         None
     };
     let (intraday_render, timestamps_render): (&[f64], &[i64]) = match &filtered {
-        Some((vs, ts)) => (vs.as_slice(), ts.as_slice()),
+        Some((vs, ts, _)) => (vs.as_slice(), ts.as_slice()),
         None => (q.intraday.as_slice(), q.intraday_timestamps.as_slice()),
     };
 
     // trace_w = how many columns the actual trace fills.
-    //   - 1D pad mode: elapsed regular-session bars vs. TRADING_DAY_BARS
-    //     (regular session = 78 bars at 5-min interval).
+    //   - 1D pad mode: elapsed time within the regular session, not
+    //     a bar count. The provider downsamples 1D to 240 total
+    //     points across pre+regular+post, so the regular-session
+    //     slice ends up much smaller than the natural 78-at-5m count
+    //     — using bar count would under-fill the chart by ~38% even
+    //     after the session has fully closed.
     //   - YTD: day-of-year / days-in-year × plot_w.
     //   - other periods / non-pad: full plot_w.
     let trace_w = if pad_intraday_to_full_day && matches!(period, Period::Day) {
-        let frac = (intraday_render.len() as f64 / TRADING_DAY_BARS as f64).clamp(0.0, 1.0);
+        let frac = match &filtered {
+            Some((_, _, (start, end))) if *end > *start => {
+                let now = chrono::Utc::now().timestamp();
+                let span = (*end - *start) as f64;
+                let elapsed = (now - *start) as f64;
+                (elapsed / span).clamp(0.0, 1.0)
+            }
+            // No session bounds → can't reason about elapsed time;
+            // fall back to bar-count fraction so we at least paint
+            // *something* sized to the data.
+            _ => (intraday_render.len() as f64 / TRADING_DAY_BARS as f64).clamp(0.0, 1.0),
+        };
         let w = (plot_w as f64 * frac).round() as u16;
         w.clamp(2, plot_w)
     } else if matches!(period, Period::YearToDate) {
@@ -2424,7 +2439,26 @@ fn is_leap_year(year: i32) -> bool {
 /// yet, returns `None` when neither yields anything. Pre-market and
 /// after-hours bars are never included — those sessions only update
 /// the AH/PRE header line.
+/// Same shape as [`pick_day_chart_bars_with_session`] but discards
+/// the session-bounds tuple. Test-only helper — production renderer
+/// needs the bounds to compute trace-width fill fraction from
+/// elapsed time.
+#[cfg(test)]
 fn pick_day_chart_bars(q: &StockQuote) -> Option<(Vec<f64>, Vec<i64>)> {
+    pick_day_chart_bars_with_session(q).map(|(vs, ts, _)| (vs, ts))
+}
+
+/// Select the regular-session bars for the 1D chart and report the
+/// `(start, end)` timestamps of whichever session was chosen. Tries
+/// today's regular session first; falls back to yesterday's when
+/// today has no bars yet (overnight gap, pre-market). Returns the
+/// session bounds alongside so the trace-width calc can compute
+/// fill fraction from *elapsed time*, not from the downsampled
+/// bar count — the provider tops the 1D series at 240 points
+/// across pre+regular+post, so the regular-session slice ends up
+/// much smaller than the natural 78-bar count and would under-
+/// fill the chart even at session close.
+fn pick_day_chart_bars_with_session(q: &StockQuote) -> Option<(Vec<f64>, Vec<i64>, (i64, i64))> {
     if q.intraday.len() != q.intraday_timestamps.len() {
         return None;
     }
@@ -2437,22 +2471,22 @@ fn pick_day_chart_bars(q: &StockQuote) -> Option<(Vec<f64>, Vec<i64>)> {
             .collect()
     };
     let today = match (q.regular_session_start_ts, q.regular_session_end_ts) {
-        (Some(s), Some(e)) => filter_range(s, e),
-        _ => Vec::new(),
+        (Some(s), Some(e)) => (filter_range(s, e), (s, e)),
+        _ => (Vec::new(), (0, 0)),
     };
-    let chosen = if !today.is_empty() {
+    let (chosen, bounds) = if !today.0.is_empty() {
         today
     } else {
         match (q.previous_session_start_ts, q.previous_session_end_ts) {
-            (Some(s), Some(e)) => filter_range(s, e),
-            _ => Vec::new(),
+            (Some(s), Some(e)) => (filter_range(s, e), (s, e)),
+            _ => (Vec::new(), (0, 0)),
         }
     };
     if chosen.is_empty() {
         None
     } else {
         let (vs, ts): (Vec<f64>, Vec<i64>) = chosen.into_iter().unzip();
-        Some((vs, ts))
+        Some((vs, ts, bounds))
     }
 }
 
