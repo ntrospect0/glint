@@ -14,10 +14,8 @@
 //!   with empty state (every stack defaults to tab 0).
 //! - **Save**: error logged via `tracing::warn!`; the dashboard keeps
 //!   running.
-//!
-//! See `docs/stack-spec.md` §5.
 
-#![allow(dead_code)]
+#![allow(dead_code)] // wizard-finalize hook + entry types kept ahead of new persistence call sites.
 
 use std::collections::HashMap;
 use std::fs;
@@ -224,10 +222,6 @@ pub fn load() -> RuntimeState {
     }
 }
 
-/// Atomic write to `~/.config/glint/.runtime_state.toml`. Writes via
-/// a sibling temp file + rename so a crash mid-write can't corrupt an
-/// existing state file. Errors log + return — callers should not
-/// abort on a failed save.
 /// Remove `runtime_state.toml`. The wizard calls this at finalize so a
 /// fresh layout doesn't inherit stack active-tab indices keyed by
 /// IDs that no longer exist. Idempotent — missing file is success.
@@ -240,6 +234,10 @@ pub fn clear() -> Result<()> {
     }
 }
 
+/// Atomic write to `~/.config/glint/.runtime_state.toml`. Writes via
+/// a sibling temp file + rename so a crash mid-write can't corrupt an
+/// existing state file. Errors log + return — callers should not
+/// abort on a failed save.
 pub fn save(state: &RuntimeState) -> Result<()> {
     let path = state_path()?;
     let dir = path
