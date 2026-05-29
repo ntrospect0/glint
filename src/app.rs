@@ -1210,6 +1210,7 @@ mod tests {
         assert!(widget_at(&app, area, 50, 39).is_none());
     }
 
+    #[cfg(feature = "widgets-all")]
     #[test]
     fn focus_cycles_in_layout_order() {
         let config = Config::default();
@@ -1239,6 +1240,7 @@ mod tests {
         assert_eq!(app.focused_widget(), Some("stocks"));
     }
 
+    #[cfg(feature = "widgets-all")]
     #[test]
     fn multi_instance_widgets_register_under_composed_ids() {
         // Two clocks (home + office) + one stocks should yield three widgets
@@ -1301,6 +1303,7 @@ mod tests {
         assert_ne!(home_letter, office_letter);
     }
 
+    #[cfg(feature = "widgets-all")]
     #[test]
     fn shortcuts_resolve_preference_conflicts_by_load_order() {
         let app = App::new(Config::default());
@@ -1319,6 +1322,7 @@ mod tests {
         assert_eq!(parent(&'n'), Some("news"));
     }
 
+    #[cfg(feature = "widgets-all")]
     #[test]
     fn stack_cell_shortcuts_walk_into_children() {
         // A stack containing clock + weather should yield shortcuts

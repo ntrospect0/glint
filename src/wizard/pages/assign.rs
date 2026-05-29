@@ -448,6 +448,7 @@ mod tests {
         assert_eq!(current_value_index(&app), position_of(STACK_VALUE));
     }
 
+    #[cfg(feature = "widgets-all")]
     #[test]
     fn current_value_index_returns_kind_for_single_widget_cells() {
         let mut state = WizardState::default();
@@ -488,6 +489,7 @@ mod tests {
         app
     }
 
+    #[cfg(feature = "widgets-all")]
     #[test]
     fn tab_commits_highlighted_non_stack_option_and_advances() {
         // Regression for "I picked email, news, calendar but the wizard

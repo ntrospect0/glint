@@ -1628,6 +1628,7 @@ mod tests {
         let _ = KeyEvent::from(KeyCode::Down);
     }
 
+    #[cfg(feature = "widget-stocks")]
     #[test]
     fn stocks_descriptor_watchlist_default_is_stock_tickers_not_indices() {
         // Direct guard against the user-reported bug: the stocks

@@ -491,6 +491,7 @@ watchlist = ["AAPL", "MSFT"]
         );
     }
 
+    #[cfg(feature = "widget-clock")]
     #[test]
     fn clock_descriptor_load_round_trips_secondary_timezones() {
         // End-to-end check that re-running --setup with an existing
@@ -545,6 +546,7 @@ timezone = "Asia/Tokyo"
         );
     }
 
+    #[cfg(feature = "widget-stocks")]
     #[test]
     fn stocks_descriptor_auto_loads_indices_and_watchlist() {
         // The stocks widget has no custom load_from_toml — exercise the
@@ -580,6 +582,7 @@ default_period = "1d"
         );
     }
 
+    #[cfg(feature = "widget-news")]
     #[test]
     fn news_descriptor_round_trips_scalar_fields() {
         // News uses a custom load_from_toml — confirm it surfaces the
@@ -619,6 +622,7 @@ url = "https://hnrss.org/frontpage"
         );
     }
 
+    #[cfg(feature = "widget-news")]
     #[test]
     fn news_render_preserves_existing_feeds_array() {
         // Critical: re-running --setup must not drop the user's
@@ -647,6 +651,7 @@ url = "https://example.com/rss"
         assert!(out.contains("url = \"https://example.com/rss\""));
     }
 
+    #[cfg(feature = "widget-news")]
     #[test]
     fn news_feed_multichoice_round_trips_catalogue_and_custom_feeds() {
         // User had two catalogue feeds + one custom URL. The wizard
@@ -698,6 +703,7 @@ url = "https://example.com/private.xml"
         assert!(rendered.contains("poll_interval_secs = 600"));
     }
 
+    #[cfg(feature = "widget-news")]
     #[test]
     fn news_render_deselecting_catalogue_feed_drops_it_without_touching_custom() {
         let original = r#"poll_interval_secs = 900
@@ -725,6 +731,7 @@ url = "https://example.com/private.xml"
         assert!(rendered.contains("https://example.com/private.xml"));
     }
 
+    #[cfg(feature = "widget-news")]
     #[test]
     fn news_topics_multichoice_round_trips_with_keyword_preservation() {
         // Existing file has Tech (with the user's edited keyword list)
@@ -775,6 +782,7 @@ keywords = ["my-key"]
         assert!(rendered.contains("\"my-key\""));
     }
 
+    #[cfg(feature = "widget-calendar")]
     #[test]
     fn calendar_sources_multichoice_round_trips_providers() {
         let original = r#"poll_interval_secs = 60
@@ -810,6 +818,7 @@ kind = "local"
         assert!(rendered.contains("poll_interval_secs = 120"));
     }
 
+    #[cfg(feature = "widget-email")]
     #[test]
     fn email_folders_loaded_from_toml_as_multichoice() {
         let original = r#"provider = "gmail"
@@ -827,6 +836,7 @@ folders = ["INBOX", "SENT", "Bills/Utilities"]
         assert_eq!(folders, vec!["INBOX", "SENT", "Bills/Utilities"]);
     }
 
+    #[cfg(feature = "widget-email")]
     #[test]
     fn email_render_emits_folders_array_from_multichoice() {
         let mut values = std::collections::HashMap::new();
@@ -849,6 +859,7 @@ folders = ["INBOX", "SENT", "Bills/Utilities"]
         );
     }
 
+    #[cfg(feature = "widget-email")]
     #[test]
     fn email_descriptor_exposes_remote_multichoice_folders() {
         // Guard against the folder picker getting accidentally
@@ -870,6 +881,7 @@ folders = ["INBOX", "SENT", "Bills/Utilities"]
         }
     }
 
+    #[cfg(all(feature = "widget-calendar", feature = "widget-email"))]
     #[test]
     fn calendar_email_descriptors_expose_oauth_fields() {
         // Sanity guard: both widgets must surface an OAuth trigger

@@ -27,23 +27,30 @@ path = "src/main.rs"
 # src/widgets/registry.rs, and the build tree picks it up.
 [features]
 default = ["widgets-all"]
+
+# Each widget gates its widget-exclusive dependencies through the matching
+# `dep:` entry below, so `--no-default-features --features "widget-clock"`
+# really does compile out everything email / gallery / news / etc. pull in.
+# Shared infra (chrono, reqwest, tokio, ratatui, anyhow, serde, sha2, …)
+# stays unconditional — gating it would either need every widget to opt in
+# or break the wizard / runtime, neither of which is worth the LOC.
 widget-clock = []
 widget-weather = []
-widget-calendar = []
-widget-news = []
+widget-calendar = ["dep:roxmltree", "dep:ical"]
+widget-news = ["dep:feed-rs", "dep:readability", "dep:url"]
 widget-stocks = []
 # Forex reuses Stocks' Yahoo `Period` mapping verbatim, so enabling
-# widget-forex implicitly pulls in widget-stocks. (The graph renderer is
-# duplicated under forex/graph.rs — the Period enum is the load-bearing
-# dependency.)
+# widget-forex implicitly pulls in widget-stocks.
 widget-forex = ["widget-stocks"]
-widget-email = []
-widget-resources = []
-widget-gallery = []
+widget-email = ["dep:imap", "dep:native-tls", "dep:mail-parser"]
+widget-resources = ["dep:sysinfo"]
+widget-gallery = ["dep:image", "dep:ratatui-image"]
 widget-notes = []
-# Feeds depends on news's sanitize_summary helper. Hosts the tabbed
-# single-source RSS reader (WSJ, Barron's, MarketWatch, …).
-widget-feeds = ["widget-news"]
+# Feeds depends on news's sanitize_summary helper and renders article
+# images via ratatui-image, so it pulls both widget-news and the image
+# stack directly. Hosts the tabbed single-source RSS reader (WSJ,
+# Barron's, MarketWatch, …).
+widget-feeds = ["widget-news", "dep:image", "dep:ratatui-image"]
 widgets-all = [
   "widget-clock",
   "widget-weather",
@@ -93,10 +100,10 @@ async-trait = "0.1"
 futures = "0.3"
 open = "5"
 urlencoding = "2"
-feed-rs = "2"
+feed-rs = { version = "2", optional = true }   # widget-news (+ widget-feeds via news)
 lru = "0.12"
-roxmltree = "0.20"
-ical = "0.11"
+roxmltree = { version = "0.20", optional = true } # widget-calendar (CalDAV provider)
+ical = { version = "0.11", optional = true }     # widget-calendar (CalDAV provider)
 sha2 = "0.10"
 getrandom = "0.2"
 tracing = "0.1"
@@ -110,9 +117,9 @@ unicode-width = "0.1"
 # the readable article body from an HTML page before handing it to the
 # LLM for summarization. Lazy / on-demand; only fires when the user
 # explicitly opts into the LLM summary via `s`.
-readability = "0.3"
+readability = { version = "0.3", optional = true }
 # `readability::extract` takes a `&Url` for resolving relative links.
-url = "2"
+url = { version = "2", optional = true }
 dirs = "5"
 clap = { version = "4", features = ["derive"] }
 
@@ -125,7 +132,7 @@ arboard = "3"
 
 # System metrics (powers the Resources widget). Cross-platform read-only
 # CPU / memory / process snapshots; no FFI of our own.
-sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+sysinfo = { version = "0.32", default-features = false, features = ["system"], optional = true }
 
 # Inline image rendering (powers the Gallery widget). Detects the host
 # terminal's image protocol — iTerm2, Kitty, Sixel — and falls back to
@@ -136,21 +143,21 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # Cargo's feature unification then forces them across the whole tree even
 # though our direct `image = { default-features = false, ... }` line opts
 # out. Only the codecs in our direct features list end up in the build.
-ratatui-image = { version = "2", default-features = false, features = ["crossterm", "rustix"] }
+ratatui-image = { version = "2", default-features = false, features = ["crossterm", "rustix"], optional = true }
 # Gallery only enumerates JPEG/PNG/GIF/WebP/BMP/TIFF/ICO (see
 # `IMAGE_EXTENSIONS` in widgets/gallery/mod.rs). Disabling the default
 # features sheds AVIF/EXR/HDR/PNM/QOI/Farbfeld plus `ravif`, `rayon`,
 # `moxcms`, `exr` and assorted color-space crates.
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico"], optional = true }
 
 # IMAP support for the Email widget's IMAP provider (third option
 # alongside Gmail OAuth and Outlook OAuth). The sync `imap` crate is
 # the mature option; we run its calls under `tokio::task::spawn_blocking`
 # so the wider async runtime isn't held up. `mail-parser` parses RFC
 # 5322 message bodies (To/From/Subject/text) once IMAP delivers them.
-imap = "2"
-native-tls = "0.2"
-mail-parser = "0.9"
+imap = { version = "2", optional = true }
+native-tls = { version = "0.2", optional = true }
+mail-parser = { version = "0.9", optional = true }
 
 [dev-dependencies]
 wiremock = "0.6"

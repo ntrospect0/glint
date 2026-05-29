@@ -133,6 +133,11 @@ fn run_imap() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(async move { Ok(()) })
 }
 
+// Post-auth folder pre-fetch is widget-email specific — the only consumer
+// is the wizard's email-folder picker. When widget-email is disabled the
+// hooks compile out and the PROVIDERS entries below substitute `None`
+// for their `post_auth_refresh`.
+#[cfg(feature = "widget-email")]
 fn fetch_gmail_folders(
 ) -> Pin<Box<dyn Future<Output = Result<(&'static str, Vec<(String, String)>)>> + Send>> {
     Box::pin(async move {
@@ -145,6 +150,7 @@ fn fetch_gmail_folders(
     })
 }
 
+#[cfg(feature = "widget-email")]
 fn fetch_outlook_folders(
 ) -> Pin<Box<dyn Future<Output = Result<(&'static str, Vec<(String, String)>)>> + Send>> {
     Box::pin(async move {
@@ -157,6 +163,7 @@ fn fetch_outlook_folders(
     })
 }
 
+#[cfg(feature = "widget-email")]
 fn fetch_imap_folders(
 ) -> Pin<Box<dyn Future<Output = Result<(&'static str, Vec<(String, String)>)>> + Send>> {
     Box::pin(async move {
@@ -169,6 +176,16 @@ fn fetch_imap_folders(
         Ok(("email_folders", opts))
     })
 }
+
+#[cfg(feature = "widget-email")]
+const GMAIL_REFRESH: Option<PostAuthRefresh> = Some(fetch_gmail_folders);
+#[cfg(not(feature = "widget-email"))]
+const GMAIL_REFRESH: Option<PostAuthRefresh> = None;
+
+#[cfg(feature = "widget-email")]
+const OUTLOOK_REFRESH: Option<PostAuthRefresh> = Some(fetch_outlook_folders);
+#[cfg(not(feature = "widget-email"))]
+const OUTLOOK_REFRESH: Option<PostAuthRefresh> = None;
 
 const GOOGLE_SETUP: SetupSchema = SetupSchema {
     short_name: "Google",
@@ -246,15 +263,18 @@ pub const PROVIDERS: &[AuthProvider] = &[
         display_name: "Google (Calendar + Gmail)",
         run: run_google,
         credentials: Some(&GOOGLE_CREDENTIALS),
-        post_auth_refresh: Some(fetch_gmail_folders),
+        post_auth_refresh: GMAIL_REFRESH,
     },
     AuthProvider {
         name: "microsoft",
         display_name: "Microsoft (Outlook + Mail)",
         run: run_microsoft,
         credentials: Some(&MICROSOFT_CREDENTIALS),
-        post_auth_refresh: Some(fetch_outlook_folders),
+        post_auth_refresh: OUTLOOK_REFRESH,
     },
+    // IMAP is email-only; without widget-email there's no consumer for the
+    // credentials and the provider is omitted entirely.
+    #[cfg(feature = "widget-email")]
     AuthProvider {
         name: "imap",
         display_name: "IMAP (email via any IMAP server)",
@@ -354,6 +374,8 @@ mod tests {
     fn find_resolves_registered_providers() {
         assert!(find("google").is_some());
         assert!(find("microsoft").is_some());
+        // IMAP is registered only when widget-email is enabled.
+        #[cfg(feature = "widget-email")]
         assert!(find("imap").is_some());
         assert!(find("not-a-real-provider").is_none());
     }
