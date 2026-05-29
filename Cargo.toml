@@ -63,8 +63,14 @@ widgets-all = [
 ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
-# Async
-tokio = { version = "1", features = ["full"] }
+# Async. We pull only what we use: `rt-multi-thread` for the runtime +
+# `spawn_blocking` / `block_in_place` (sync IMAP, readability extract);
+# `macros` for `#[tokio::main]` / `#[tokio::test]` / `join!` / `select!`;
+# `net` + `io-util` for the OAuth loopback TCP listener; `time` for
+# polling intervals + per-request timeouts; `sync` for the mpsc channels.
+# Dropping the `"full"` feature shaves the unused fs/process/signal
+# subsystems and ~5 transitive crates.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
 
 # HTTP & serialization
 # `gzip`/`brotli`/`deflate` + `http2` so the shared HTTP client can
@@ -95,7 +101,6 @@ sha2 = "0.10"
 getrandom = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-strsim = "0.11"
 notify = "6"
 # Terminal cell width for unicode strings — needed for any column-width
 # math against text that can contain CJK / emoji / wide glyphs (where
@@ -126,8 +131,17 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # terminal's image protocol — iTerm2, Kitty, Sixel — and falls back to
 # unicode halfblocks when none is available. Pulls in the `image` crate
 # for PNG/JPEG/GIF decoding.
-ratatui-image = { version = "2", default-features = false, features = ["image-defaults", "crossterm", "rustix"] }
-image = "0.25"
+# NB: deliberately *not* requesting `image-defaults` here — that feature
+# turns on `image/default` (every codec including AVIF/EXR/HDR/QOI), and
+# Cargo's feature unification then forces them across the whole tree even
+# though our direct `image = { default-features = false, ... }` line opts
+# out. Only the codecs in our direct features list end up in the build.
+ratatui-image = { version = "2", default-features = false, features = ["crossterm", "rustix"] }
+# Gallery only enumerates JPEG/PNG/GIF/WebP/BMP/TIFF/ICO (see
+# `IMAGE_EXTENSIONS` in widgets/gallery/mod.rs). Disabling the default
+# features sheds AVIF/EXR/HDR/PNM/QOI/Farbfeld plus `ravif`, `rayon`,
+# `moxcms`, `exr` and assorted color-space crates.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico"] }
 
 # IMAP support for the Email widget's IMAP provider (third option
 # alongside Gmail OAuth and Outlook OAuth). The sync `imap` crate is
