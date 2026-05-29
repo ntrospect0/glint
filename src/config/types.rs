@@ -47,12 +47,12 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub mouse_scroll: MouseScroll,
 
-    /// Polling cadence multiplier for widgets hidden inside a stack
-    /// (see docs/stack-spec.md §2). `1` = full rate; `20` (default) =
-    /// hidden children's `update()` is called every 20th tick (~5s
-    /// at the 250ms tick rate); higher = even less frequent. Saves
-    /// CPU + API calls for stacks the user doesn't actively switch
-    /// through. Visible / non-stacked widgets are unaffected.
+    /// Polling cadence multiplier for widgets hidden inside a stack.
+    /// `1` = full rate; `20` (default) = hidden children's `update()`
+    /// is called every 20th tick (~5s at the 250ms tick rate); higher
+    /// = even less frequent. Saves CPU + API calls for stacks the user
+    /// doesn't actively switch through. Visible / non-stacked widgets
+    /// are unaffected.
     #[serde(default = "default_stack_hidden_poll_ratio")]
     pub stack_hidden_poll_ratio: u32,
 

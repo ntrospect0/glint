@@ -38,10 +38,10 @@ pub struct GridCell {
     pub row_span: usize,
 }
 
-/// Cap on stack size — see docs/stack-spec.md §1. Cells with more than
-/// MAX_STACK_WIDGETS entries in `widgets` are truncated (with a warning
-/// logged) rather than rejected, so a hand-edited config doesn't fail
-/// to launch over an obvious typo.
+/// Cap on stack size. Cells with more than `MAX_STACK_WIDGETS`
+/// entries in `widgets` are truncated (with a warning logged)
+/// rather than rejected, so a hand-edited config doesn't fail to
+/// launch over an obvious typo.
 pub const MAX_STACK_WIDGETS: usize = 3;
 
 impl GridCell {
