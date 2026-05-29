@@ -1,0 +1,461 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ntrospect0
+
+//! Clock-mode rendering and helpers — the big-digit time face, the
+//! optional ticker line, the date row, and the scrollable World
+//! Clocks block beneath. Also owns the transient `:time <location>`
+//! override (geocoding spawn, clear, snapshot) since those mutate
+//! state that only the clock view reads.
+//!
+//! Per-mode key handling lives in `state.rs` (`handle_key_clock_mode`)
+//! so that the mode tab strip and tick-state machine can sit next to
+//! the cross-mode pieces they coordinate.
+
+use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
+use chrono_tz::Tz;
+use ratatui::{
+    layout::{Alignment, Rect},
+    style::Style,
+    text::{Line, Span},
+    widgets::Paragraph,
+    Frame,
+};
+
+use crate::ui::big_digits;
+
+use super::{ClockWidget, EventResult};
+
+impl ClockWidget {
+    pub(super) fn snapshot_transient(&self) -> (Option<(String, Tz)>, bool) {
+        let st = self.state.lock().expect("clock state poisoned");
+        (st.transient_tz.clone(), st.transient_searching)
+    }
+
+    /// Effective primary timezone — transient override beats configured tz
+    /// beats system local.
+    fn effective_tz(&self) -> Option<Tz> {
+        self.state
+            .lock()
+            .expect("clock state poisoned")
+            .transient_tz
+            .as_ref()
+            .map(|(_, tz)| *tz)
+            .or(self.tz)
+    }
+
+    pub(super) fn lookup_location(&self, query: &str) {
+        {
+            let mut st = self.state.lock().expect("clock state poisoned");
+            st.transient_searching = true;
+            // Setting an override prepends Local + the override onto the
+            // world-clocks list, so any prior scroll offset no longer points
+            // at the same entry — reset to the top for predictability.
+            st.world_clock_scroll = 0;
+        }
+        let state = self.state.clone();
+        let query = query.to_string();
+        tokio::spawn(async move {
+            let result = crate::geolocation::by_name(&query).await;
+            let mut st = state.lock().expect("clock state poisoned");
+            st.transient_searching = false;
+            match result {
+                Ok(loc) => {
+                    let Some(tz_name) = loc.timezone.as_deref() else {
+                        tracing::warn!(query = %query, "geocoding succeeded but returned no timezone");
+                        return;
+                    };
+                    match tz_name.parse::<Tz>() {
+                        Ok(tz) => {
+                            st.transient_tz = Some((loc.label.clone(), tz));
+                        }
+                        Err(_) => {
+                            tracing::warn!(query = %query, tz = %tz_name, "unrecognized IANA timezone");
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(query = %query, error = %err, "clock geocoding failed");
+                }
+            }
+        });
+    }
+
+    pub(super) fn clear_transient(&self) {
+        let mut st = self.state.lock().expect("clock state poisoned");
+        st.transient_tz = None;
+        // Same reasoning as `lookup_location` — the list shape changes back,
+        // so reset the offset rather than leave it pointing somewhere stale.
+        st.world_clock_scroll = 0;
+    }
+
+    /// Move the world-clocks view by `delta` rows (negative = up). Returns
+    /// `Handled` only when scrolling is actually possible — when the full
+    /// list already fits, ↑/↓ and mouse-wheel fall through so the event can
+    /// reach a higher-level handler.
+    pub(super) fn scroll_world_clocks(&self, delta: i32) -> EventResult {
+        let mut st = self.state.lock().expect("clock state poisoned");
+        if st.world_clock_max_scroll == 0 {
+            return EventResult::Ignored;
+        }
+        let max = st.world_clock_max_scroll;
+        let next = (st.world_clock_scroll as i32 + delta).clamp(0, max as i32);
+        st.world_clock_scroll = next as usize;
+        EventResult::Handled
+    }
+
+    /// Returns (HH:MM[:SS], AM/PM, date) for the effective primary timezone.
+    pub(super) fn render_strings(&self, now_utc: DateTime<chrono::Utc>) -> (String, String, String) {
+        match self.effective_tz() {
+            Some(tz) => self.format_parts(now_utc.with_timezone(&tz)),
+            None => self.format_parts(now_utc.with_timezone(&Local)),
+        }
+    }
+
+    fn format_parts<T: TimeZone>(&self, dt: DateTime<T>) -> (String, String, String)
+    where
+        T::Offset: std::fmt::Display,
+    {
+        let (hour_disp, ampm) = if self.config.hour_format == 12 {
+            let h = dt.hour();
+            let (h12, suffix) = match h {
+                0 => (12, "AM"),
+                1..=11 => (h, "AM"),
+                12 => (12, "PM"),
+                _ => (h - 12, "PM"),
+            };
+            (h12, suffix.to_string())
+        } else {
+            (dt.hour(), String::new())
+        };
+
+        let time = if self.config.show_seconds {
+            format!("{:02}:{:02}:{:02}", hour_disp, dt.minute(), dt.second())
+        } else {
+            format!("{:02}:{:02}", hour_disp, dt.minute())
+        };
+
+        let date = if self.config.show_date {
+            format!(
+                "{} {} {}, {}",
+                weekday_name(dt.weekday()),
+                month_name(dt.month()),
+                dt.day(),
+                dt.year()
+            )
+        } else {
+            String::new()
+        };
+
+        (time, ampm, date)
+    }
+
+    pub(super) fn ticker_string(&self, now_utc: DateTime<chrono::Utc>) -> String {
+        match self.effective_tz() {
+            Some(tz) => format_ticker(now_utc.with_timezone(&tz), self.config.hour_format),
+            None => format_ticker(now_utc.with_timezone(&Local), self.config.hour_format),
+        }
+    }
+
+    /// Returns (label, "HH:MM Wkd Mon DD") pairs for the World Clocks block.
+    /// Primary timezone leads, then any configured secondaries. Each entry
+    /// carries its own local date so the user can tell when a clock is on a
+    /// different calendar day than local time without having to do timezone
+    /// arithmetic in their head.
+    pub(super) fn world_clock_entries(&self) -> Vec<(String, String)> {
+        let now = chrono::Utc::now();
+        let mut out: Vec<(String, String)> = Vec::with_capacity(self.secondaries.len() + 2);
+        let transient = self
+            .state
+            .lock()
+            .expect("clock state poisoned")
+            .transient_tz
+            .clone();
+
+        // When a `:time <location>` override is active the big-digit display
+        // is showing that override, so pin Local to the top of the World
+        // Clocks list — otherwise the user has no easy way to see their
+        // actual local time at a glance.
+        if transient.is_some() {
+            let local_now = now.with_timezone(&Local);
+            out.push(("Local".to_string(), format_clock_entry(&local_now)));
+        }
+
+        let (primary_label, primary_str) = match transient {
+            Some((label, tz)) => {
+                let t = now.with_timezone(&tz);
+                (label, format_clock_entry(&t))
+            }
+            None => match self.tz {
+                Some(tz) => {
+                    let t = now.with_timezone(&tz);
+                    (city_from_tz_name(tz.name()), format_clock_entry(&t))
+                }
+                None => {
+                    let t = now.with_timezone(&Local);
+                    ("Local".to_string(), format_clock_entry(&t))
+                }
+            },
+        };
+        out.push((primary_label, primary_str));
+        for (label, tz) in &self.secondaries {
+            let t = now.with_timezone(tz);
+            out.push((label.clone(), format_clock_entry(&t)));
+        }
+        out
+    }
+
+    /// Body renderer for the Clock mode — the original big-digit time
+    /// + ticker + date + world clocks layout, factored out of the
+    /// top-level `render` so the new tab strip + mode dispatch can
+    /// share the chrome (title row, border, mode tabs).
+    pub(super) fn render_clock_body(
+        &self,
+        frame: &mut Frame,
+        inner: Rect,
+        transient: Option<&(String, Tz)>,
+    ) {
+        let now = chrono::Utc::now();
+        let (time, ampm, date) = self.render_strings(now);
+
+        // Big-digit color seed: `text.focused` from the active scheme by
+        // default; `text.selected` while a `:time <location>` override is
+        // active so the user can't miss that they're not on home base. The
+        // gradient (subtle / hue_shift / glow / fade) derives its full
+        // 10-stop palette from this seed, so the digits restyle on
+        // `:scheme` regardless of the gradient mode chosen.
+        let big_style = if transient.is_some() {
+            self.theme.text_selected
+        } else {
+            self.theme.text_focused
+        };
+        let gradient = self.state.lock().expect("clock state poisoned").gradient;
+        let big_lines = big_digits::render_styled(&time, gradient, big_style);
+
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        // Top padding so the big digits don't kiss the border.
+        lines.push(Line::from(""));
+        for line in big_lines {
+            lines.push(line);
+        }
+
+        if self.config.show_seconds_ticker {
+            // Blank line between the big-digit clock and the HH:MM:SS ticker
+            // beneath it — gives the ticker some breathing room from the
+            // glyphs above.
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                self.ticker_string(now),
+                self.theme.text_dim,
+            )));
+        }
+
+        if !ampm.is_empty() {
+            lines.push(Line::from(Span::styled(ampm, self.theme.text_dim)));
+        }
+        if !date.is_empty() {
+            // No blank line above the date — the ticker and the day-date sit
+            // together as one block of secondary info beneath the clock.
+            lines.push(Line::from(date));
+        }
+
+        // World clocks block — show as many entries as fit, scroll the rest
+        // with ↑/↓ and mouse-wheel. Primary timezone leads so the user can
+        // see local time alongside the rest of the world. The transient
+        // footer (when a `:time` override is active) eats the bottom row, so
+        // the available height for the body shrinks by 1 in that case —
+        // factor that into the fit calculation, otherwise the last clock
+        // entry would be clipped by the footer.
+        let clocks = self.world_clock_entries();
+        let body_h = if transient.is_some() {
+            inner.height.saturating_sub(1)
+        } else {
+            inner.height
+        };
+        if !clocks.is_empty() {
+            // Block overhead is the blank pad + the "── World Clocks ──"
+            // header. Below that, every remaining row holds one entry.
+            const HEADER_ROWS: u16 = 2;
+            let avail_rows = (body_h as i32) - (lines.len() as i32) - (HEADER_ROWS as i32);
+            let avail_clocks = avail_rows.max(0) as usize;
+            if avail_clocks >= 1 {
+                let visible_count = avail_clocks.min(clocks.len());
+                let max_scroll = clocks.len().saturating_sub(visible_count);
+                let scroll = {
+                    let mut st = self.state.lock().expect("clock state poisoned");
+                    st.world_clock_max_scroll = max_scroll;
+                    if st.world_clock_scroll > max_scroll {
+                        st.world_clock_scroll = max_scroll;
+                    }
+                    st.world_clock_scroll
+                };
+                let visible_end = scroll + visible_count;
+                let has_above = scroll > 0;
+                let has_below = visible_end < clocks.len();
+
+                lines.push(Line::from(""));
+                // Chevrons surface which directions still have hidden rows.
+                // Header is centered by the surrounding Paragraph so the
+                // width drift between states is barely perceptible.
+                let header_text = match (has_above, has_below) {
+                    (false, false) => "── World Clocks ──",
+                    (true, false) => "── World Clocks ↑ ──",
+                    (false, true) => "── World Clocks ↓ ──",
+                    (true, true) => "── World Clocks ↑↓ ──",
+                };
+                lines.push(Line::from(Span::styled(
+                    header_text.to_string(),
+                    self.theme.text_dim,
+                )));
+
+                let max_label = clocks
+                    .iter()
+                    .map(|(l, _)| l.chars().count())
+                    .max()
+                    .unwrap_or(0);
+                // Local — and whichever entry the big-digit display is showing
+                // — get colored so the user can see at a glance which row
+                // matches the big clock. Local picks up `text.focused` from
+                // the active scheme; the `:time` override row picks up
+                // `text.selected` so it's distinct from Local but still
+                // theme-driven.
+                let local_highlight_style = self.theme.text_focused;
+                let override_highlight_style = self.theme.text_selected;
+                let has_override = transient.is_some();
+                for (idx, (label, time_str)) in
+                    clocks.iter().enumerate().skip(scroll).take(visible_count)
+                {
+                    // Highlight is keyed off the *absolute* index in the full
+                    // list (not the visible window) so the colored row keeps
+                    // its identity as the user scrolls past it.
+                    let style = if has_override {
+                        match idx {
+                            0 => local_highlight_style,
+                            1 => override_highlight_style,
+                            _ => Style::default(),
+                        }
+                    } else if idx == 0 {
+                        local_highlight_style
+                    } else {
+                        Style::default()
+                    };
+                    let line = format!("{:<width$}  {}", label, time_str, width = max_label);
+                    lines.push(Line::from(Span::styled(line, style)));
+                }
+            } else {
+                // No room — make sure stale max_scroll doesn't let ↑/↓ shift
+                // an invisible offset that re-clamps oddly when the cell
+                // grows again.
+                let mut st = self.state.lock().expect("clock state poisoned");
+                st.world_clock_max_scroll = 0;
+                st.world_clock_scroll = 0;
+            }
+        }
+
+        // When a `:time <city>` override is active, append a footer hint
+        // pinned to the bottom of the cell so the user has an obvious
+        // escape route back to Local time.
+        if transient.is_some() {
+            let hint = Line::from(Span::styled("x: revert to Local", self.theme.text_dim));
+            let body = Paragraph::new(lines).alignment(Alignment::Center);
+            let body_h = inner.height.saturating_sub(1);
+            let body_area = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: body_h,
+            };
+            let hint_area = Rect {
+                x: inner.x,
+                y: inner.y + body_h,
+                width: inner.width,
+                height: 1,
+            };
+            frame.render_widget(body, body_area);
+            frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), hint_area);
+        } else {
+            let body = Paragraph::new(lines).alignment(Alignment::Center);
+            frame.render_widget(body, inner);
+        }
+    }
+}
+
+fn format_clock_entry<T: TimeZone>(t: &DateTime<T>) -> String
+where
+    T::Offset: std::fmt::Display,
+{
+    format!(
+        "{} {:02}:{:02} {} {} {}",
+        day_night_icon(t.hour()),
+        t.hour(),
+        t.minute(),
+        weekday_name(t.weekday()),
+        month_name(t.month()),
+        t.day()
+    )
+}
+
+/// Simple day/night marker keyed off local hour-of-day. Use 06:00–17:59 as
+/// "day"; outside that window is "night". Not astronomically accurate but
+/// good enough as a glance signal alongside the time.
+pub(super) fn day_night_icon(hour: u32) -> &'static str {
+    if (6..=17).contains(&hour) {
+        "☀"
+    } else {
+        "☾"
+    }
+}
+
+/// Convert an IANA timezone name like "America/Vancouver" into a friendly
+/// label ("Vancouver"). Underscores become spaces.
+pub(super) fn city_from_tz_name(name: &str) -> String {
+    name.rsplit('/').next().unwrap_or(name).replace('_', " ")
+}
+
+fn format_ticker<T: TimeZone>(t: DateTime<T>, hour_format: u8) -> String
+where
+    T::Offset: std::fmt::Display,
+{
+    let hour = t.hour();
+    if hour_format == 12 {
+        let (h12, suffix) = match hour {
+            0 => (12, "AM"),
+            1..=11 => (hour, "AM"),
+            12 => (12, "PM"),
+            _ => (hour - 12, "PM"),
+        };
+        format!("{:02}:{:02}:{:02} {}", h12, t.minute(), t.second(), suffix)
+    } else {
+        format!("{:02}:{:02}:{:02}", hour, t.minute(), t.second())
+    }
+}
+
+fn weekday_name(w: chrono::Weekday) -> &'static str {
+    use chrono::Weekday::*;
+    match w {
+        Mon => "Mon",
+        Tue => "Tue",
+        Wed => "Wed",
+        Thu => "Thu",
+        Fri => "Fri",
+        Sat => "Sat",
+        Sun => "Sun",
+    }
+}
+
+fn month_name(m: u32) -> &'static str {
+    match m {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "???",
+    }
+}

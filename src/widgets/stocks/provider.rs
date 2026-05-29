@@ -1,116 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 ntrospect0
 
+//! Yahoo Finance adapter for equities + ETFs + indices.
+//!
+//! Wraps the v8/chart endpoint (the actual price-series source) and
+//! v10/quoteSummary (fundamentals: market cap, P/E, dividend yield,
+//! etc.) which requires a session cookie + crumb dance. The shared
+//! HTTP client builder, period→params mapping, and chart wire-shape
+//! deserializers live in [`crate::market_data::yahoo`] so the forex
+//! widget reuses them verbatim.
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-/// Time window selectable by the user from the stocks graph toggle bar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Period {
-    #[default]
-    #[serde(alias = "1d", alias = "day")]
-    Day,
-    #[serde(alias = "1w", alias = "week", alias = "5d")]
-    Week,
-    #[serde(alias = "1m", alias = "month", alias = "1mo")]
-    Month,
-    #[serde(alias = "6m", alias = "6mo")]
-    SixMonth,
-    #[serde(alias = "ytd", alias = "year_to_date")]
-    YearToDate,
-    #[serde(alias = "1y", alias = "year")]
-    Year,
-    #[serde(alias = "3y", alias = "threeyear")]
-    ThreeYear,
-    #[serde(alias = "5y", alias = "fiveyear")]
-    FiveYear,
-    #[serde(alias = "10y", alias = "tenyear")]
-    TenYear,
-}
-
-impl Period {
-    pub const ALL: [Period; 9] = [
-        Period::Day,
-        Period::Week,
-        Period::Month,
-        Period::SixMonth,
-        Period::YearToDate,
-        Period::Year,
-        Period::ThreeYear,
-        Period::FiveYear,
-        Period::TenYear,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Period::Day => "1D",
-            Period::Week => "1W",
-            Period::Month => "1M",
-            Period::SixMonth => "6M",
-            Period::YearToDate => "YTD",
-            Period::Year => "1Y",
-            Period::ThreeYear => "3Y",
-            Period::FiveYear => "5Y",
-            Period::TenYear => "10Y",
-        }
-    }
-
-    /// Parse a period label (case-insensitive). Used by the runtime-
-    /// state restore path so persisted labels round-trip through
-    /// disk. `None` for anything that doesn't match, which lets the
-    /// caller fall back to the configured default instead of panicking.
-    pub fn from_label(label: &str) -> Option<Self> {
-        match label.to_ascii_uppercase().as_str() {
-            "1D" => Some(Period::Day),
-            "1W" => Some(Period::Week),
-            "1M" => Some(Period::Month),
-            "6M" => Some(Period::SixMonth),
-            "YTD" => Some(Period::YearToDate),
-            "1Y" => Some(Period::Year),
-            "3Y" => Some(Period::ThreeYear),
-            "5Y" => Some(Period::FiveYear),
-            "10Y" => Some(Period::TenYear),
-            _ => None,
-        }
-    }
-
-    /// (interval, range) query parameters for Yahoo's v8/chart endpoint.
-    /// Longer windows use coarser intervals so the series stays a sane size.
-    /// Yahoo doesn't expose a native 3-year range; we request 5y and trim
-    /// client-side after the response comes back.
-    ///
-    /// `pub(crate)` so sibling widgets that talk to the same endpoint (forex)
-    /// can reuse the period→params mapping verbatim.
-    pub(crate) fn yahoo_params(self) -> (&'static str, &'static str) {
-        match self {
-            // 2d (not 1d) so the response carries yesterday's full
-            // regular session in addition to whatever today has so far.
-            // The 1D chart renders only one trading day at a time, but
-            // the chart filter falls back to yesterday's bars before
-            // today's regular session opens — and during pre-market on
-            // a fresh trading day, a literal 1d query returns only
-            // today's pre-market bars with no yesterday data to fall
-            // back to. The post-fetch downsampler caps bar count, so
-            // doubling the range here doesn't bloat the cache.
-            Period::Day => ("5m", "2d"),
-            Period::Week => ("30m", "5d"),
-            Period::Month => ("1d", "1mo"),
-            Period::SixMonth => ("1d", "6mo"),
-            Period::YearToDate => ("1d", "ytd"),
-            Period::Year => ("1d", "1y"),
-            // For 3y we ask for 5y of daily bars then slice client-side.
-            Period::ThreeYear => ("1d", "5y"),
-            // 1-week and 1-month bars for the long ranges keep the series
-            // small enough to render cleanly in a braille graph.
-            Period::FiveYear => ("1wk", "5y"),
-            Period::TenYear => ("1mo", "10y"),
-        }
-    }
-}
+use crate::market_data::{
+    yahoo::{self, downsample_pairs, ChartError, ChartResponse},
+    Period,
+};
 
 /// Snapshot of a single ticker, derived from Yahoo Finance's v8/chart endpoint.
 /// Some fields the spec calls out (P/E, EPS, market cap, yield) require a
@@ -220,23 +129,9 @@ pub struct YahooFinanceProvider {
 
 impl YahooFinanceProvider {
     pub fn new() -> Result<Self> {
-        // Yahoo blocks generic user-agents on the chart endpoint, so we send
-        // a browser-shaped UA. Identifies as glint underneath for transparency
-        // in their server logs. cookie_store(true) lets us hold the B / A1
-        // session cookies needed for the quoteSummary auth flow.
-        let client = reqwest::Client::builder()
-            .user_agent(concat!(
-                "Mozilla/5.0 (compatible; glint-tui/",
-                env!("CARGO_PKG_VERSION"),
-                ")"
-            ))
-            .timeout(std::time::Duration::from_secs(10))
-            .cookie_store(true)
-            .build()
-            .context("failed to build Yahoo Finance HTTP client")?;
         Ok(Self {
-            client,
-            base_url: "https://query1.finance.yahoo.com".into(),
+            client: yahoo::build_client()?,
+            base_url: yahoo::CHART_BASE_URL.into(),
             summary_base_url: "https://query2.finance.yahoo.com".into(),
             crumb: Arc::new(Mutex::new(None)),
         })
@@ -377,7 +272,7 @@ impl YahooFinanceProvider {
         // visible resolution. 5Y/10Y daily bars compress 6–12× with no
         // perceptible chart-quality loss. We downsample (timestamp, value)
         // pairs together so the parallel arrays stay aligned.
-        let paired = downsample_pairs_to_max(paired, 240);
+        let paired = downsample_pairs(paired, 240);
         let intraday: Vec<f64> = paired.iter().map(|(_, v)| *v).collect();
         let intraday_timestamps: Vec<i64> = paired.iter().map(|(ts, _)| *ts).collect();
 
@@ -664,225 +559,9 @@ struct SearchQuote {
     quote_type: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ChartResponse {
-    chart: ChartBody,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChartBody {
-    #[serde(default)]
-    result: Option<Vec<ChartResult>>,
-    #[serde(default)]
-    error: Option<ChartError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChartError {
-    #[serde(default)]
-    description: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChartResult {
-    meta: ChartMeta,
-    #[serde(default)]
-    timestamp: Option<Vec<i64>>,
-    #[serde(default)]
-    indicators: Option<ChartIndicators>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ChartMeta {
-    #[serde(default)]
-    symbol: Option<String>,
-    #[serde(default)]
-    short_name: Option<String>,
-    #[serde(default)]
-    long_name: Option<String>,
-    #[serde(default)]
-    currency: Option<String>,
-    #[serde(default)]
-    regular_market_price: Option<f64>,
-    #[serde(default)]
-    previous_close: Option<f64>,
-    #[serde(default)]
-    chart_previous_close: Option<f64>,
-    #[serde(default)]
-    regular_market_day_high: Option<f64>,
-    #[serde(default)]
-    regular_market_day_low: Option<f64>,
-    #[serde(default)]
-    fifty_two_week_high: Option<f64>,
-    #[serde(default)]
-    fifty_two_week_low: Option<f64>,
-    #[serde(default)]
-    regular_market_volume: Option<u64>,
-    #[serde(default)]
-    average_daily_volume_10_day: Option<u64>,
-    #[serde(default)]
-    market_cap: Option<u64>,
-    #[serde(default)]
-    post_market_price: Option<f64>,
-    #[serde(default)]
-    post_market_change: Option<f64>,
-    #[serde(default)]
-    post_market_change_percent: Option<f64>,
-    #[serde(default)]
-    pre_market_price: Option<f64>,
-    #[serde(default)]
-    pre_market_change: Option<f64>,
-    #[serde(default)]
-    pre_market_change_percent: Option<f64>,
-    #[serde(default)]
-    market_state: Option<String>,
-    #[serde(default)]
-    current_trading_period: Option<CurrentTradingPeriod>,
-    /// Periods the chart's bars actually cover (one entry per trading
-    /// day, inner array per session within a day — usually 1). We pick
-    /// the most-recent-completed entry as the previous-session bounds.
-    #[serde(default)]
-    trading_periods: Option<TradingPeriods>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CurrentTradingPeriod {
-    #[serde(default)]
-    regular: Option<TradingPeriod>,
-}
-
-/// `tradingPeriods` arrives in two different shapes depending on the
-/// chart endpoint's interval/range:
-///
-/// * On 1D (`interval=5m&range=2d`) Yahoo nests the sessions under
-///   pre / regular / post keys: `{ regular: [[…]], pre: [[…]], … }`.
-/// * On 1W (`interval=30m&range=5d`) Yahoo elides the keys and
-///   ships the regular sessions as a bare list-of-lists at the top
-///   level: `[[…], [[…], …]`.
-/// * On longer ranges (1M / 6M / 1Y / 5Y / 10Y / YTD) the field is
-///   absent or null altogether.
-///
-/// The single-struct deserializer we had only matched the first
-/// shape, so the 1W fetch failed at the response-parse step for
-/// every symbol — list rows fell back to `err` and the chart
-/// showed `Loading {sym}…` forever. An untagged enum accepts both
-/// concrete shapes; null still maps to `None` via the surrounding
-/// `Option<TradingPeriods>` field's `#[serde(default)]`.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum TradingPeriods {
-    /// Object form: `{ regular: [[…]], pre: [[…]], post: [[…]] }`.
-    /// We only care about `regular`; the other keys ride along but
-    /// stay unused.
-    Structured {
-        #[serde(default)]
-        regular: Vec<Vec<TradingPeriod>>,
-    },
-    /// Bare list-of-lists. Each inner list is a single regular
-    /// trading session.
-    Flat(Vec<Vec<TradingPeriod>>),
-}
-
-impl TradingPeriods {
-    /// Regular-session list-of-lists, abstracted across both Yahoo
-    /// response shapes so the consumer doesn't have to branch.
-    fn regular(&self) -> &Vec<Vec<TradingPeriod>> {
-        match self {
-            TradingPeriods::Structured { regular } => regular,
-            TradingPeriods::Flat(sessions) => sessions,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct TradingPeriod {
-    #[serde(default)]
-    start: Option<i64>,
-    #[serde(default)]
-    end: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChartIndicators {
-    #[serde(default)]
-    quote: Vec<QuoteBars>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QuoteBars {
-    #[serde(default)]
-    close: Vec<Option<f64>>,
-}
-
-/// Trim `(timestamp, value)` pairs to at most `max` evenly-spaced points,
-/// preserving the first and last samples. Used to keep multi-year daily
-/// series from holding thousands of points in memory + disk cache when
-/// the chart can only show ~200 columns at the widest. Timestamps follow
-/// values through the downsample so the renderer can still find the
-/// column position of a specific date.
-pub(super) fn downsample_pairs_to_max(pairs: Vec<(i64, f64)>, max: usize) -> Vec<(i64, f64)> {
-    if max == 0 || pairs.len() <= max {
-        return pairs;
-    }
-    let n = pairs.len();
-    let mut out = Vec::with_capacity(max);
-    for i in 0..max {
-        let idx = (i * (n - 1)) / (max - 1);
-        out.push(pairs[idx]);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn period_from_label_round_trips_all_labels() {
-        for p in Period::ALL {
-            assert_eq!(Period::from_label(p.label()), Some(p));
-            // Lower-case input must also work — the runtime-state
-            // file stores labels as the widget hands them out (we
-            // already emit upper-case), but a hand-edited file
-            // could lower-case them.
-            assert_eq!(Period::from_label(&p.label().to_ascii_lowercase()), Some(p));
-        }
-        assert_eq!(Period::from_label("not-a-period"), None);
-    }
-
-    /// Yahoo ships `tradingPeriods` in three shapes; our deserializer
-    /// has to accept all three or the whole `chart` response fails
-    /// to parse for any range that hits a shape we missed. The
-    /// regression that motivated this: 1W (`interval=30m&range=5d`)
-    /// returns the bare list-of-lists form. Before the untagged
-    /// enum, this broke every 1W fetch — symbol rows fell back to
-    /// `err` and the chart said `Loading {sym}…` forever.
-    #[test]
-    fn trading_periods_accepts_object_list_and_null_shapes() {
-        // 1D shape: object with regular/pre/post nested lists.
-        let object_shape = r#"{
-            "regular": [[{"start": 1, "end": 2}]]
-        }"#;
-        let parsed: TradingPeriods = serde_json::from_str(object_shape).unwrap();
-        assert_eq!(parsed.regular().len(), 1);
-        assert_eq!(parsed.regular()[0][0].start, Some(1));
-
-        // 1W shape: bare list-of-lists at the top level.
-        let list_shape = r#"[
-            [{"start": 10, "end": 20}],
-            [{"start": 30, "end": 40}]
-        ]"#;
-        let parsed: TradingPeriods = serde_json::from_str(list_shape).unwrap();
-        assert_eq!(parsed.regular().len(), 2);
-        assert_eq!(parsed.regular()[1][0].start, Some(30));
-
-        // Null shape: handled by the surrounding Option's #[serde(default)].
-        let null_shape = r#"null"#;
-        let parsed: Option<TradingPeriods> = serde_json::from_str(null_shape).unwrap();
-        assert!(parsed.is_none());
-    }
 
     #[test]
     fn change_and_pct_use_previous_close() {
@@ -921,33 +600,6 @@ mod tests {
         };
         assert!((q.change() - 4.0).abs() < 1e-9);
         assert!((q.change_pct() - 2.040_816).abs() < 1e-3);
-    }
-
-    #[test]
-    fn downsample_pairs_returns_input_when_already_under_cap() {
-        let s: Vec<(i64, f64)> =
-            vec![(100, 1.0), (200, 2.0), (300, 3.0), (400, 4.0)];
-        assert_eq!(downsample_pairs_to_max(s.clone(), 10), s);
-        assert_eq!(downsample_pairs_to_max(s.clone(), 4), s);
-    }
-
-    #[test]
-    fn downsample_pairs_preserves_endpoints_and_caps_length() {
-        let s: Vec<(i64, f64)> = (0..1000).map(|i| (i as i64, i as f64)).collect();
-        let out = downsample_pairs_to_max(s, 240);
-        assert_eq!(out.len(), 240);
-        assert_eq!(out[0], (0, 0.0));
-        assert_eq!(out[239], (999, 999.0));
-    }
-
-    #[test]
-    fn downsample_pairs_handles_empty_and_zero_max() {
-        assert_eq!(
-            downsample_pairs_to_max(Vec::new(), 100),
-            Vec::<(i64, f64)>::new()
-        );
-        let s: Vec<(i64, f64)> = vec![(1, 1.0), (2, 2.0), (3, 3.0)];
-        assert_eq!(downsample_pairs_to_max(s.clone(), 0), s);
     }
 
     #[test]

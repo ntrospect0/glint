@@ -5,9 +5,9 @@
 //!
 //! Reuses Yahoo's v8/chart endpoint via the same symbol convention as
 //! Stocks but formatted as `{BASE}{QUOTE}=X` (e.g. `EURUSD=X` for the
-//! euro/dollar rate, where the price = 1 EUR in USD). Periods, intervals
-//! and ranges piggyback on the Stocks `Period` enum so the toggle bar,
-//! keybindings, and the chart x-axis can be shared verbatim.
+//! euro/dollar rate, where the price = 1 EUR in USD). The HTTP client,
+//! period→params mapping, and chart wire-shape deserializers live in
+//! [`crate::market_data::yahoo`] so this module reuses them verbatim.
 //!
 //! Same caveats as Stocks: no API key, no rate-limit budget, fetches
 //! are silent on failure (rendered as `err`), the cache provides the
@@ -16,9 +16,10 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-// Reuse the Period enum + yahoo_params mapping that Stocks already
-// exposes — same interval/range query shapes for forex symbols.
-pub use crate::widgets::stocks::provider::Period;
+use crate::market_data::{
+    yahoo::{self, downsample_values, ChartResponse},
+    Period,
+};
 
 /// Tickers Yahoo serves on the crypto path (`{BASE}-{QUOTE}`) rather
 /// than the forex path (`{BASE}{QUOTE}=X`). Used by `symbol_for` to
@@ -75,10 +76,9 @@ impl ForexQuote {
     }
 }
 
-/// Yahoo Finance forex provider. Internally wraps a reqwest client
-/// identical to the Stocks provider's — same browser-shaped UA, same
-/// timeouts, same v8/chart endpoint. No quoteSummary call needed since
-/// FX pairs don't expose the company-fundamentals modules.
+/// Yahoo Finance forex provider. Wraps the shared [`yahoo::build_client`]
+/// + v8/chart endpoint. No quoteSummary call needed since FX pairs don't
+/// expose the company-fundamentals modules.
 #[derive(Clone)]
 pub struct YahooForexProvider {
     client: reqwest::Client,
@@ -87,18 +87,9 @@ pub struct YahooForexProvider {
 
 impl YahooForexProvider {
     pub fn new() -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .user_agent(concat!(
-                "Mozilla/5.0 (compatible; glint-tui/",
-                env!("CARGO_PKG_VERSION"),
-                ")"
-            ))
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .context("failed to build Yahoo Forex HTTP client")?;
         Ok(Self {
-            client,
-            base_url: "https://query1.finance.yahoo.com".into(),
+            client: yahoo::build_client()?,
+            base_url: yahoo::CHART_BASE_URL.into(),
         })
     }
 
@@ -235,7 +226,7 @@ impl YahooForexProvider {
         // with no perceptible chart-quality loss. USD-pivot synthesis (the
         // other producer of forex series) consumes already-downsampled legs,
         // so this is the single chokepoint.
-        let series = downsample_to_max(series, 240);
+        let series = downsample_values(series, 240);
 
         Ok(ForexQuote {
             symbol: meta.symbol.unwrap_or(symbol),
@@ -325,69 +316,6 @@ impl YahooForexProvider {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ChartResponse {
-    chart: ChartBody,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChartBody {
-    #[serde(default)]
-    result: Option<Vec<ChartResult>>,
-    #[serde(default)]
-    error: Option<ChartError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChartError {
-    #[serde(default)]
-    description: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChartResult {
-    meta: ChartMeta,
-    #[serde(default)]
-    indicators: Option<ChartIndicators>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ChartMeta {
-    #[serde(default)]
-    symbol: Option<String>,
-    #[serde(default)]
-    regular_market_price: Option<f64>,
-    #[serde(default)]
-    previous_close: Option<f64>,
-    #[serde(default)]
-    chart_previous_close: Option<f64>,
-    #[serde(default)]
-    regular_market_day_high: Option<f64>,
-    #[serde(default)]
-    regular_market_day_low: Option<f64>,
-    #[serde(default)]
-    fifty_two_week_high: Option<f64>,
-    #[serde(default)]
-    fifty_two_week_low: Option<f64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChartIndicators {
-    #[serde(default)]
-    quote: Vec<QuoteBars>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QuoteBars {
-    #[serde(default)]
-    close: Vec<Option<f64>>,
-}
-
-/// Trim `series` to at most `max` evenly-spaced points, preserving the
-/// first and last samples. Mirrors `stocks::provider::downsample_to_max`
-/// — both modules sample Yahoo's daily-bar series and share the same
-/// "TUI charts can't show more than ~200 columns" constraint.
 /// Invert a `ForexQuote` so its rates reflect the swapped pair
 /// direction. Used when Yahoo only lists one direction of a crypto
 /// pair (`BTC-USD`) and the caller wanted the inverse (`USD-BTC`):
@@ -413,19 +341,6 @@ fn invert_quote(q: ForexQuote, new_base: &str, new_quote: &str) -> ForexQuote {
         series: q.series.iter().map(|x| inv(*x)).collect(),
         fetched_at: q.fetched_at,
     }
-}
-
-fn downsample_to_max(series: Vec<f64>, max: usize) -> Vec<f64> {
-    if max == 0 || series.len() <= max {
-        return series;
-    }
-    let n = series.len();
-    let mut out = Vec::with_capacity(max);
-    for i in 0..max {
-        let idx = (i * (n - 1)) / (max - 1);
-        out.push(series[idx]);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -454,21 +369,6 @@ mod tests {
         assert!(!is_crypto("USD"));
         assert!(!is_crypto("EUR"));
         assert!(!is_crypto("UNKNOWN"));
-    }
-
-    #[test]
-    fn downsample_preserves_endpoints_and_caps_length() {
-        let s: Vec<f64> = (0..1200).map(|i| i as f64).collect();
-        let out = downsample_to_max(s, 240);
-        assert_eq!(out.len(), 240);
-        assert_eq!(out[0], 0.0);
-        assert_eq!(out[239], 1199.0);
-    }
-
-    #[test]
-    fn downsample_returns_input_when_already_under_cap() {
-        let s = vec![1.0, 2.0, 3.0];
-        assert_eq!(downsample_to_max(s.clone(), 10), s);
     }
 
     /// Live Yahoo round-trip across a representative spread of pairs,

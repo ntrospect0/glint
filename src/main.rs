@@ -20,6 +20,7 @@ mod format;
 mod geolocation;
 mod http;
 mod llm;
+mod market_data;
 mod polling;
 mod runtime_state;
 mod text;
