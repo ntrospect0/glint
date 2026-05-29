@@ -178,7 +178,7 @@ pub fn init_default_config() -> Result<PathBuf> {
 
     // Credentials live in their own subdirectory (created with 0700) so they
     // can be locked down with one chmod.
-    let credentials = crate::auth::credentials_dir()?;
+    let credentials = crate::credentials::dir()?;
     seed_credentials(
         &credentials.join("anthropic_key.toml"),
         DEFAULT_ANTHROPIC_KEY_TEMPLATE,

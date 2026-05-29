@@ -160,7 +160,7 @@ fn fetch_outlook_folders(
 fn fetch_imap_folders(
 ) -> Pin<Box<dyn Future<Output = Result<(&'static str, Vec<(String, String)>)>> + Send>> {
     Box::pin(async move {
-        let dir = super::credentials_dir()?;
+        let dir = crate::credentials::dir()?;
         let path = dir.join("imap.toml");
         let text = std::fs::read_to_string(&path)?;
         let creds: crate::widgets::email::imap::ImapCredentials = toml::from_str(&text)?;
@@ -288,7 +288,7 @@ pub fn needs_credential_capture(provider_name: &str) -> bool {
     let Some(spec) = provider.credentials else {
         return false;
     };
-    let Ok(dir) = super::credentials_dir() else {
+    let Ok(dir) = crate::credentials::dir() else {
         return true;
     };
     let path = dir.join(spec.filename);

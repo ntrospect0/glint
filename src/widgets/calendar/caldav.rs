@@ -24,7 +24,7 @@ use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 
-use crate::auth;
+use crate::credentials;
 
 use super::provider::{CalendarProvider, Event};
 
@@ -46,7 +46,7 @@ pub struct CalDavCredentials {
 
 impl CalDavCredentials {
     pub fn load() -> Result<Option<Self>> {
-        let path = auth::credentials_dir()?.join("caldav.toml");
+        let path = credentials::dir()?.join("caldav.toml");
         if !path.exists() {
             return Ok(None);
         }

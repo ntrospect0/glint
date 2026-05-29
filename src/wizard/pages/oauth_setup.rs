@@ -64,7 +64,7 @@ pub fn on_enter(app: &mut WizardApp, provider: &str) {
     let Some((spec, setup)) = schema_for(provider) else {
         return;
     };
-    let Ok(dir) = crate::auth::credentials_dir() else {
+    let Ok(dir) = crate::credentials::dir() else {
         return;
     };
     let path = dir.join(spec.filename);
@@ -179,7 +179,7 @@ fn save_and_authorize(
         writeln!(body, "{line}").ok();
     }
 
-    let dir = crate::auth::credentials_dir()?;
+    let dir = crate::credentials::dir()?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(spec.filename);
     std::fs::write(&path, body)?;

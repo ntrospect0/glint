@@ -896,7 +896,7 @@ fn build_gmail() -> Result<gmail::GmailProvider, String> {
 }
 
 fn build_imap() -> Result<imap::ImapProvider, String> {
-    let dir = crate::auth::credentials_dir()
+    let dir = crate::credentials::dir()
         .map_err(|err| format!("IMAP credentials dir unavailable: {err}"))?;
     let path = dir.join("imap.toml");
     if !path.exists() {

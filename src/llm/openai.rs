@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::auth;
+use crate::credentials;
 
 use super::{cache::CacheKey, cache::ResponseCache, rate_limiter::RateLimiter, LimitsConfig};
 use super::{LlmProvider, LlmRequest, LlmResponse, Role};
@@ -35,7 +35,7 @@ impl ApiKey {
     /// Returns `Ok(None)` when the file is absent or carries only the template
     /// placeholder, so callers can disable LLM features transparently.
     pub fn load() -> Result<Option<Self>> {
-        let path = auth::credentials_dir()?.join("openai_key.toml");
+        let path = credentials::dir()?.join("openai_key.toml");
         if !path.exists() {
             return Ok(None);
         }

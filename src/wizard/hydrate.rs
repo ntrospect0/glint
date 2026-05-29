@@ -350,7 +350,7 @@ fn hydrate_llm_settings(state: &mut WizardState, config_dir: &Path) {
             }
         }
     }
-    let Ok(creds_dir) = crate::auth::credentials_dir() else {
+    let Ok(creds_dir) = crate::credentials::dir() else {
         return;
     };
     for def in crate::llm::PROVIDERS {

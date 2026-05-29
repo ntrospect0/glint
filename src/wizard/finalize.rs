@@ -26,8 +26,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::auth;
 use crate::cache::Cache;
+use crate::credentials;
 use crate::config;
 use crate::widgets::registry;
 
@@ -296,7 +296,7 @@ fn write_llm_settings(state: &WizardState, dir: &Path) -> Result<()> {
 }
 
 fn write_provider_key(provider: &crate::llm::LlmProviderDef, key: &str) -> Result<()> {
-    let dir = auth::credentials_dir()?;
+    let dir = credentials::dir()?;
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join(provider.credentials_filename);
     let body = format!(
