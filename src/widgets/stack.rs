@@ -4,10 +4,10 @@
 //! Stack widget — a layout cell that holds up to 3 widgets and shows
 //! one at a time, with a tab strip in the title bar for switching.
 //!
-//! See `docs/stack-spec.md` for the full design. Related code lives
-//! in `config::layout` (schema), `wizard::pages::assign_stack` (wizard
-//! UI), `runtime_state` (active-tab persistence), and `app`
-//! (Shift+<letter> routing walks into stacks).
+//! Related code lives in `config::layout` (schema),
+//! `wizard::pages::assign_stack` (wizard UI), `runtime_state`
+//! (active-tab persistence), and `app` (Shift+<letter> routing walks
+//! into stacks).
 //!
 //! ## Rendering strategy
 //!
