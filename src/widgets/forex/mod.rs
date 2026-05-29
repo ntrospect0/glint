@@ -3601,7 +3601,7 @@ mod tests {
 
     #[test]
     fn edit_cancel_drops_buffer_without_changing_amount() {
-        let mut w = build_widget(ForexConfig::default());
+        let w = build_widget(ForexConfig::default());
         let amount_before = w.amount;
         w.enter_edit_mode();
         {
