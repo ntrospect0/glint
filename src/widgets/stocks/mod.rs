@@ -29,9 +29,12 @@ use crate::cache::ScopedCache;
 use crate::market_data::{quotes_cache_key, Period};
 use crate::theme::{ColorScheme, Theme};
 use crate::ui::chart::annotations::{
-    is_leap_year, month_short_name, rolling_year_month_labels, str_labels,
+    is_leap_year, period_annotations, rolling_year_month_labels, str_labels,
 };
-use crate::ui::chart::axes::{draw_reference_line, label_rows, lay_out_x_axis_labels};
+use crate::ui::chart::axes::{
+    draw_reference_line, draw_vertical_guide, label_rows, lay_out_x_axis_labels,
+    lay_out_x_axis_labels_at_cols,
+};
 use crate::ui::chart::braille;
 use crate::ui::status::{live_value, TimedFeedback};
 use crate::ui::{apply_title_row, MetadataEmphasis};
@@ -1925,9 +1928,17 @@ fn render_graph_panel(
     } else {
         None
     };
-    let (intraday_render, timestamps_render): (&[f64], &[i64]) = match &filtered {
-        Some((vs, ts, _)) => (vs.as_slice(), ts.as_slice()),
-        None => (q.intraday.as_slice(), q.intraday_timestamps.as_slice()),
+    let week_filtered: Option<(Vec<f64>, Vec<i64>)> = if matches!(period, Period::Week) {
+        pick_week_chart_bars(q)
+    } else {
+        None
+    };
+    let (intraday_render, timestamps_render): (&[f64], &[i64]) = if let Some((vs, ts, _)) = &filtered {
+        (vs.as_slice(), ts.as_slice())
+    } else if let Some((vs, ts)) = &week_filtered {
+        (vs.as_slice(), ts.as_slice())
+    } else {
+        (q.intraday.as_slice(), q.intraday_timestamps.as_slice())
     };
     if intraday_render.is_empty() {
         return;
@@ -2179,211 +2190,6 @@ fn render_graph_panel(
     );
 }
 
-/// Annotation for the calendar-aligned vertical guides + x-axis labels.
-/// Each entry pins a label to a specific bar index; the renderer maps
-/// that bar's column position to draw both the guide and the label so
-/// they share an x-coordinate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PeriodAnnotation {
-    bar_index: usize,
-    label: String,
-}
-
-/// Compute the calendar-boundary annotations for `period` from a slice of
-/// bar timestamps (unix seconds, UTC). Each annotation pins a short label
-/// to the first bar of a new natural unit:
-///   - 1W → start of each new ET trading day (Mon/Tue/Wed/Thu/Fri).
-///   - 1M → start of each new ISO week (Mon).
-///   - 6M / YTD → start of each new month.
-///   - 1Y → start of each new calendar quarter.
-///   - 3Y / 5Y → start of each new calendar year.
-///   - 10Y → every second calendar year boundary.
-/// 1D returns an empty list — the regular session is one unit, so the
-/// only useful x-axis markers are the legacy time-of-day labels.
-fn period_annotations(period: Period, timestamps: &[i64]) -> Vec<PeriodAnnotation> {
-    if timestamps.is_empty() {
-        return Vec::new();
-    }
-    let to_local = |ts: i64| {
-        chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
-            .map(|dt| dt.with_timezone(&chrono::Local))
-    };
-    // Resolve every timestamp once so the boundary-iteration loops below
-    // don't redo the chrono conversion.
-    let local: Vec<chrono::DateTime<chrono::Local>> =
-        timestamps.iter().filter_map(|t| to_local(*t)).collect();
-    if local.len() != timestamps.len() || local.is_empty() {
-        return Vec::new();
-    }
-    match period {
-        Period::Day => Vec::new(),
-        Period::Week => annotate_when_changes(&local, |dt| dt.date_naive().ordinal0() as i32, |dt| {
-            // Mon/Tue/Wed/Thu/Fri abbreviation from the weekday.
-            match dt.weekday() {
-                Weekday::Mon => "Mon",
-                Weekday::Tue => "Tue",
-                Weekday::Wed => "Wed",
-                Weekday::Thu => "Thu",
-                Weekday::Fri => "Fri",
-                Weekday::Sat => "Sat",
-                Weekday::Sun => "Sun",
-            }
-            .to_string()
-        }),
-        Period::Month => annotate_when_changes(
-            &local,
-            |dt| dt.iso_week().week() as i32 * 100 + (dt.iso_week().year() % 100),
-            |dt| format!("wk{}", iso_week_of_month_or_zero(*dt) + 1),
-        ),
-        Period::SixMonth | Period::YearToDate => annotate_when_changes(
-            &local,
-            |dt| dt.year() * 100 + dt.month() as i32,
-            |dt| month_short_name(dt.month()).to_string(),
-        ),
-        Period::Year => annotate_when_changes(
-            &local,
-            |dt| dt.year() * 10 + ((dt.month() as i32 - 1) / 3),
-            |dt| month_short_name(dt.month()).to_string(),
-        ),
-        Period::ThreeYear | Period::FiveYear => {
-            annotate_when_changes(&local, |dt| dt.year(), |dt| format!("{}", dt.year()))
-        }
-        Period::TenYear => {
-            // Year-changes filtered to even years (every-other-year guides).
-            let mut anns = annotate_when_changes(
-                &local,
-                |dt| dt.year(),
-                |dt| format!("{}", dt.year()),
-            );
-            anns.retain(|ann| {
-                ann.label
-                    .parse::<i32>()
-                    .map(|y| y % 2 == 0)
-                    .unwrap_or(true)
-            });
-            anns
-        }
-    }
-}
-
-/// Iterate `local` in order, emitting an annotation each time `key(dt)`
-/// changes between consecutive bars. The annotation is pinned to the
-/// *first* bar of the new value of `key` and the label comes from
-/// `label_of` applied to that same bar.
-fn annotate_when_changes<K, L>(
-    local: &[chrono::DateTime<chrono::Local>],
-    key: K,
-    label_of: L,
-) -> Vec<PeriodAnnotation>
-where
-    K: Fn(&chrono::DateTime<chrono::Local>) -> i32,
-    L: Fn(&chrono::DateTime<chrono::Local>) -> String,
-{
-    if local.is_empty() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let mut last_key = key(&local[0]);
-    out.push(PeriodAnnotation {
-        bar_index: 0,
-        label: label_of(&local[0]),
-    });
-    for (i, dt) in local.iter().enumerate().skip(1) {
-        let k = key(dt);
-        if k != last_key {
-            out.push(PeriodAnnotation {
-                bar_index: i,
-                label: label_of(dt),
-            });
-            last_key = k;
-        }
-    }
-    out
-}
-
-/// 0-indexed ISO-week ordinal within the month containing `dt`. Used by
-/// the 1M period to label week boundaries as `wk1`, `wk2`, etc., where
-/// `wk1` is the week containing the 1st of the month. Falls back to 0
-/// if the chrono calculation produces something nonsensical (shouldn't
-/// happen in practice).
-fn iso_week_of_month_or_zero(dt: chrono::DateTime<chrono::Local>) -> u32 {
-    let day = dt.day();
-    // Approximate "week of month" as `(day-1)/7` — close enough for
-    // labeling, doesn't need to match ISO week boundaries exactly.
-    (day.saturating_sub(1)) / 7
-}
-
-/// Place `(col, label)` pairs into a `width`-cell line so each label
-/// starts at its requested column. Labels rendered in input order; an
-/// earlier label wins any overlap with a later one. Trailing labels
-/// that would extend past `width` are truncated.
-fn lay_out_x_axis_labels_at_cols(items: &[(usize, &str)], width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let mut buf: Vec<char> = vec![' '; width];
-    for (col, label) in items {
-        let start = (*col).min(width.saturating_sub(1));
-        let chars: Vec<char> = label.chars().collect();
-        // Center the label on `col` so it visually anchors on the guide.
-        // Right edge would overflow off the chart for the rightmost label —
-        // clamp so the last label's right edge sits at width-1.
-        let half = chars.len() / 2;
-        let mut left = start.saturating_sub(half);
-        if left + chars.len() > width {
-            left = width.saturating_sub(chars.len());
-        }
-        // Skip if the slot is already painted (earlier label wins).
-        if buf[left..(left + chars.len()).min(width)]
-            .iter()
-            .any(|c| *c != ' ')
-        {
-            continue;
-        }
-        for (i, ch) in chars.iter().enumerate() {
-            if left + i >= width {
-                break;
-            }
-            buf[left + i] = *ch;
-        }
-    }
-    buf.iter().collect()
-}
-
-/// Draw a faint vertical guide line at a fixed column inside the plot.
-/// Skips rows where the trace already painted a glyph at that column so the
-/// guide reads as "behind" the trace where they overlap. Used for 1D
-/// pre-market / post-market cutoffs.
-#[allow(clippy::too_many_arguments)]
-fn draw_vertical_guide(
-    frame: &mut Frame,
-    x: u16,
-    plot_top: u16,
-    plot_h: u16,
-    trace_rows: &[String],
-    trace_col: u16,
-    style: Style,
-) {
-    if plot_h == 0 {
-        return;
-    }
-    let buf = frame.buffer_mut();
-    for row in 0..plot_h as usize {
-        let trace_owns_cell = trace_rows
-            .get(row)
-            .and_then(|s| s.chars().nth(trace_col as usize))
-            .map(|c| c != ' ')
-            .unwrap_or(false);
-        if trace_owns_cell {
-            continue;
-        }
-        let y = plot_top + row as u16;
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char('│');
-            cell.set_style(style);
-        }
-    }
-}
 
 /// Returns (change_abs, change_pct) for the given period. 1D uses the
 /// previous-close convention (standard ticker change); longer windows use
@@ -2456,6 +2262,54 @@ fn pick_day_chart_bars_with_session(q: &StockQuote) -> Option<(Vec<f64>, Vec<i64
     } else {
         let (vs, ts): (Vec<f64>, Vec<i64>) = chosen.into_iter().unzip();
         Some((vs, ts, bounds))
+    }
+}
+
+/// Trim the 1W series to the most recent 5 unique trading dates.
+/// Yahoo's `range=5d` is calendar-week-anchored rather than session-
+/// anchored, so a request late on Friday gets *six* trading days back
+/// (last Fri + Mon..Fri this week). That extra leading Friday's
+/// annotation lands at column 0 and visually crowds out Monday's
+/// label via `lay_out_x_axis_labels_at_cols`'s "earlier label wins
+/// overlaps" policy. Filtering client-side to the last 5 unique local-
+/// time dates gives the user the trading week they expect.
+///
+/// Returns `None` when the data already fits in 5 days (or shorter),
+/// so callers can fall through to the raw series.
+fn pick_week_chart_bars(q: &StockQuote) -> Option<(Vec<f64>, Vec<i64>)> {
+    if q.intraday.len() != q.intraday_timestamps.len() || q.intraday.is_empty() {
+        return None;
+    }
+    let to_local_date = |ts: i64| -> Option<i32> {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+            .map(|dt| dt.with_timezone(&chrono::Local).date_naive().num_days_from_ce())
+    };
+    // Walk the bars in order, collecting unique local dates as we go.
+    let mut unique_dates: Vec<i32> = Vec::new();
+    for ts in &q.intraday_timestamps {
+        if let Some(d) = to_local_date(*ts) {
+            if unique_dates.last() != Some(&d) {
+                unique_dates.push(d);
+            }
+        }
+    }
+    if unique_dates.len() <= 5 {
+        return None;
+    }
+    let cutoff = unique_dates[unique_dates.len() - 5];
+    let vs_ts: Vec<(f64, i64)> = q
+        .intraday
+        .iter()
+        .zip(q.intraday_timestamps.iter())
+        .filter_map(|(v, t)| {
+            to_local_date(*t).and_then(|d| if d >= cutoff { Some((*v, *t)) } else { None })
+        })
+        .collect();
+    if vs_ts.is_empty() {
+        None
+    } else {
+        let (vs, ts): (Vec<f64>, Vec<i64>) = vs_ts.into_iter().unzip();
+        Some((vs, ts))
     }
 }
 

@@ -459,13 +459,15 @@ fn period_annotations_six_month_marks_month_boundaries() {
 #[test]
 fn period_annotations_year_uses_quarter_boundaries() {
     // Months 1, 2, 3 (same quarter), 4 (new quarter), 7 (new quarter)
-    // — expect 3 annotations (Q1, Q2, Q3).
+    // — expect 3 annotations (Q1, Q2, Q3). Timestamps are at noon UTC
+    // so the local-time conversion keeps each bar on the intended
+    // calendar date regardless of the test runner's timezone.
     let ts = vec![
-        1_767_225_600, // Jan 1 2026
-        1_769_904_000, // Feb 1 2026
-        1_772_323_200, // Mar 1 2026
-        1_775_001_600, // Apr 1 2026
-        1_783_036_800, // Jul 1 2026
+        1_767_268_800, // Jan 1 2026 12:00 UTC
+        1_769_947_200, // Feb 1 2026 12:00 UTC
+        1_772_366_400, // Mar 1 2026 12:00 UTC
+        1_775_044_800, // Apr 1 2026 12:00 UTC
+        1_783_080_000, // Jul 1 2026 12:00 UTC
     ];
     let anns = period_annotations(Period::Year, &ts);
     assert_eq!(anns.len(), 3);
@@ -473,13 +475,13 @@ fn period_annotations_year_uses_quarter_boundaries() {
 
 #[test]
 fn period_annotations_five_year_uses_year_boundaries() {
-    // Jan 1 of 2022, 2023, 2024, 2025, 2026.
+    // Jan 1 12:00 UTC of 2022..2026.
     let ts = vec![
-        1_640_995_200, // 2022-01-01 UTC
-        1_672_531_200, // 2023-01-01 UTC
-        1_704_067_200, // 2024-01-01 UTC
-        1_735_689_600, // 2025-01-01 UTC
-        1_767_225_600, // 2026-01-01 UTC
+        1_641_038_400, // 2022-01-01 12:00 UTC
+        1_672_574_400, // 2023-01-01 12:00 UTC
+        1_704_110_400, // 2024-01-01 12:00 UTC
+        1_735_732_800, // 2025-01-01 12:00 UTC
+        1_767_268_800, // 2026-01-01 12:00 UTC
     ];
     let anns = period_annotations(Period::FiveYear, &ts);
     assert_eq!(anns.len(), 5);
@@ -488,15 +490,52 @@ fn period_annotations_five_year_uses_year_boundaries() {
 #[test]
 fn period_annotations_ten_year_keeps_only_even_years() {
     let ts = vec![
-        1_577_836_800, // 2020-01-01 UTC
-        1_609_459_200, // 2021-01-01 UTC
-        1_640_995_200, // 2022-01-01 UTC
-        1_672_531_200, // 2023-01-01 UTC
-        1_704_067_200, // 2024-01-01 UTC
+        1_577_880_000, // 2020-01-01 12:00 UTC
+        1_609_502_400, // 2021-01-01 12:00 UTC
+        1_641_038_400, // 2022-01-01 12:00 UTC
+        1_672_574_400, // 2023-01-01 12:00 UTC
+        1_704_110_400, // 2024-01-01 12:00 UTC
     ];
     let anns = period_annotations(Period::TenYear, &ts);
     let years: Vec<i32> = anns.iter().filter_map(|a| a.label.parse().ok()).collect();
     assert!(years.iter().all(|y| y % 2 == 0), "got {:?}", years);
+}
+
+#[test]
+fn period_annotations_drops_leading_partial_unit_for_long_periods() {
+    // Synthesise a 1Y-shaped fixture: 240 daily bars spanning roughly
+    // 8 months, with bar 0 at a mid-quarter date so the gap from
+    // bar 0 to the next quarter boundary is significantly shorter
+    // than the gap between subsequent boundaries. The universal gap-
+    // ratio heuristic in `period_annotations` then drops bar 0
+    // because its leading partial quarter would crowd the real
+    // "Apr" / "Jul" / "Oct" labels.
+    let day_secs: i64 = 86_400;
+    let mar_25_2025_noon_utc: i64 = 1_742_904_000; // Mar 25 2025 12:00 UTC
+    let ts: Vec<i64> = (0..240).map(|i| mar_25_2025_noon_utc + i * day_secs).collect();
+    let anns = period_annotations(Period::Year, &ts);
+    // Without the heuristic we'd see 4 annotations (Mar/Apr/Jul/Oct);
+    // the partial-Mar leading drops, leaving just the real Q boundaries.
+    assert!(
+        !anns.iter().any(|a| a.bar_index == 0),
+        "leading mid-Q1 label should be dropped: {anns:?}"
+    );
+    assert!(
+        anns.iter().any(|a| a.label == "Apr"),
+        "Apr Q boundary kept: {anns:?}"
+    );
+
+    // 5Y-shaped fixture: ~30 monthly bars starting mid-2021, expect
+    // bar 0's partial-"2021" leading label to drop in favour of the
+    // 2022/2023/... year-start labels.
+    let may_20_2021_noon_utc: i64 = 1_621_512_000;
+    let month_secs: i64 = 30 * day_secs;
+    let ts: Vec<i64> = (0..30).map(|i| may_20_2021_noon_utc + i * month_secs).collect();
+    let anns = period_annotations(Period::FiveYear, &ts);
+    assert!(
+        !anns.iter().any(|a| a.bar_index == 0),
+        "leading mid-2021 label should be dropped: {anns:?}"
+    );
 }
 
 #[test]
@@ -603,6 +642,43 @@ fn pick_day_chart_bars_returns_none_when_no_session_bounds() {
     q.intraday_timestamps = vec![1_700_005_000, 1_700_010_000];
     q.intraday = vec![195.0, 196.0];
     assert!(pick_day_chart_bars(&q).is_none());
+}
+
+#[test]
+fn pick_week_chart_bars_drops_to_last_five_unique_dates() {
+    // Six trading days of 2 bars each (e.g., open and close), days
+    // separated by 24h gaps so the local-date conversion produces
+    // distinct dates. Bar 0..1 are the leading day; we expect them
+    // dropped, leaving 10 bars over 5 days.
+    let mut q = quote("AAPL", 196.0, 195.0);
+    let day = 86_400;
+    let base = 1_700_000_000;
+    let bars: Vec<(i64, f64)> = (0..6)
+        .flat_map(|day_idx| {
+            [
+                (base + day * day_idx, 100.0 + day_idx as f64),
+                (base + day * day_idx + 3600, 101.0 + day_idx as f64),
+            ]
+        })
+        .collect();
+    q.intraday_timestamps = bars.iter().map(|(t, _)| *t).collect();
+    q.intraday = bars.iter().map(|(_, v)| *v).collect();
+    let (vs, ts) = pick_week_chart_bars(&q).expect("6 unique dates → filter applies");
+    assert_eq!(vs.len(), 10, "kept 5 days × 2 bars");
+    assert_eq!(ts.len(), 10);
+    // The dropped pair belongs to the leading day — their values are 100.0/101.0.
+    assert!(!vs.iter().any(|v| (*v - 100.0).abs() < 1e-9));
+    assert!(vs.iter().any(|v| (*v - 102.0).abs() < 1e-9));
+}
+
+#[test]
+fn pick_week_chart_bars_returns_none_when_already_five_or_fewer_days() {
+    let mut q = quote("AAPL", 196.0, 195.0);
+    let day = 86_400;
+    let base = 1_700_000_000;
+    q.intraday_timestamps = (0..5).map(|i| base + day * i).collect();
+    q.intraday = (0..5).map(|i| 100.0 + i as f64).collect();
+    assert!(pick_week_chart_bars(&q).is_none());
 }
 
 #[test]

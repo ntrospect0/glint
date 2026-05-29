@@ -55,8 +55,13 @@ use serde::Deserialize;
 use crate::cache::ScopedCache;
 use crate::market_data::{quotes_cache_key, Period};
 use crate::theme::{ColorScheme, Theme};
-use crate::ui::chart::annotations::{is_leap_year, rolling_year_month_labels, str_labels};
-use crate::ui::chart::axes::{draw_reference_line, label_rows, lay_out_x_axis_labels};
+use crate::ui::chart::annotations::{
+    is_leap_year, period_annotations, rolling_year_month_labels, str_labels,
+};
+use crate::ui::chart::axes::{
+    draw_reference_line, draw_vertical_guide, label_rows, lay_out_x_axis_labels,
+    lay_out_x_axis_labels_at_cols,
+};
 use crate::ui::chart::braille;
 use crate::ui::status::{live_value, TimedFeedback};
 use crate::ui::{apply_title_row, MetadataEmphasis};
@@ -114,13 +119,6 @@ pub struct ForexConfig {
     #[serde(default = "default_graph_high_low_lines")]
     pub graph_high_low_lines: bool,
 
-    /// Pad the 1D chart to a full 24-hour x-axis so the trace's right
-    /// edge reflects how far into the day we are. FX trades ~24/5 so
-    /// the proxy is rougher than for equities, but better than letting
-    /// a half-day's data stretch across the whole panel.
-    #[serde(default = "default_pad_intraday_to_full_day")]
-    pub pad_intraday_to_full_day: bool,
-
     /// Per-widget theme overrides layered on the app theme.
     #[serde(default)]
     pub colors: ColorScheme,
@@ -158,10 +156,6 @@ fn default_graph_high_low_lines() -> bool {
     true
 }
 
-fn default_pad_intraday_to_full_day() -> bool {
-    true
-}
-
 impl Default for ForexConfig {
     fn default() -> Self {
         Self {
@@ -173,7 +167,6 @@ impl Default for ForexConfig {
             jump_url_template: None,
             canonical_units: HashMap::new(),
             graph_high_low_lines: default_graph_high_low_lines(),
-            pad_intraday_to_full_day: default_pad_intraday_to_full_day(),
             colors: ColorScheme::default(),
             shortcuts: Vec::new(),
         }
@@ -1418,7 +1411,6 @@ impl Widget for ForexWidget {
                 &quotes,
                 self.period,
                 self.config.graph_high_low_lines,
-                self.config.pad_intraday_to_full_day,
                 &self.theme,
             );
             self.state.lock().unwrap().toggle_hits = toggle_hits;
@@ -1471,7 +1463,6 @@ impl Widget for ForexWidget {
                 &quotes,
                 self.period,
                 self.config.graph_high_low_lines,
-                self.config.pad_intraday_to_full_day,
                 &self.theme,
             );
             self.state.lock().unwrap().toggle_hits = toggle_hits;
@@ -2334,7 +2325,6 @@ fn render_graph_panel(
     quotes: &HashMap<String, QuoteState>,
     period: Period,
     show_high_low_lines: bool,
-    pad_intraday_to_full_day: bool,
     theme: &Theme,
 ) -> ToggleHits {
     if area.width < 4 || area.height < 4 {
@@ -2477,13 +2467,7 @@ fn render_graph_panel(
         frame.render_widget(Paragraph::new(Span::styled(label, theme.text_dim)), rect);
     }
 
-    let trace_w = if pad_intraday_to_full_day && matches!(period, Period::Day) {
-        // FX is ~24/5 — proxy "fraction of day elapsed" via UTC hour.
-        let frac =
-            (chrono::Utc::now().timestamp().rem_euclid(86_400) as f64 / 86_400.0).clamp(0.0, 1.0);
-        let w = (plot_w as f64 * frac).round() as u16;
-        w.clamp(2, plot_w)
-    } else if matches!(period, Period::YearToDate) {
+    let trace_w = if matches!(period, Period::YearToDate) {
         // YTD: x-axis spans Jan→Dec but the trace only covers Jan→today.
         // Without this clamp the YTD series would get stretched across
         // the full plot width, visually claiming data through Dec when
@@ -2500,9 +2484,105 @@ fn render_graph_panel(
         let w = (plot_w as f64 * frac).round() as u16;
         w.clamp(2, plot_w)
     } else {
+        // 1D fills the full width — Yahoo's `range=1d` returns exactly
+        // the last 24h of bars for FX (24/5 means no overnight gap to
+        // pad around), so the trace's right edge IS now. Long-period
+        // views (1W .. 10Y) likewise fill the full plot.
         plot_w
     };
-    let rows = braille::render_series(&quote.series, plot_h, trace_w, min, max);
+
+    // 1W is a trailing 7-calendar-day window anchored to today's local
+    // midnight (so today is at the right, and 6 days ago at midnight
+    // sits at the left edge — e.g. on Friday the leftmost label is
+    // Saturday). Because FX trades 24/5, the actual data has a ~48h
+    // gap on Sat/Sun that doesn't carry bars; rather than letting the
+    // braille renderer stretch the available data uniformly across
+    // the plot, we resample the series onto a uniform time grid so
+    // each column corresponds to a fixed point in the 7-day window.
+    // The Sat/Sun-morning slots that fall before FX reopens use the
+    // first known value (the chart shows a flat segment there,
+    // accurately representing "no movement"). Day-boundary markers
+    // land at the midnight of each of the 7 days.
+    let week_window: Option<(Vec<f64>, Vec<(usize, String)>)> = if matches!(period, Period::Week) {
+        use chrono::{Datelike, Timelike};
+        let now_local = chrono::Local::now();
+        let today_midnight = now_local
+            .with_hour(0)
+            .and_then(|t| t.with_minute(0))
+            .and_then(|t| t.with_second(0))
+            .and_then(|t| t.with_nanosecond(0))
+            .unwrap_or(now_local);
+        let window_start_dt = today_midnight - chrono::Duration::days(6);
+        let window_start_ts = window_start_dt.timestamp();
+        let window_end_ts = now_local.timestamp();
+        let window_secs = (window_end_ts - window_start_ts) as f64;
+        if window_secs <= 0.0 || quote.series.is_empty() || plot_w == 0 {
+            None
+        } else {
+            let plot_w_usize = plot_w as usize;
+            let n = quote.series_timestamps.len();
+            let first_val = quote
+                .series
+                .first()
+                .copied()
+                .unwrap_or(quote.previous_close);
+            let first_ts = quote.series_timestamps.first().copied().unwrap_or(i64::MAX);
+            let mut resampled: Vec<f64> = Vec::with_capacity(plot_w_usize);
+            let mut bar_idx: usize = 0;
+            for col in 0..plot_w_usize {
+                let frac = if plot_w_usize > 1 {
+                    col as f64 / (plot_w_usize - 1) as f64
+                } else {
+                    0.0
+                };
+                let slot_ts = window_start_ts + (frac * window_secs) as i64;
+                // Walk forward while the next bar's timestamp is still
+                // ≤ slot_ts; bar_idx ends up pointing at the most
+                // recent bar at or before slot_ts.
+                while bar_idx + 1 < n && quote.series_timestamps[bar_idx + 1] <= slot_ts {
+                    bar_idx += 1;
+                }
+                let value = if slot_ts < first_ts {
+                    first_val
+                } else {
+                    quote.series.get(bar_idx).copied().unwrap_or(first_val)
+                };
+                resampled.push(value);
+            }
+            let mut markers: Vec<(usize, String)> = Vec::with_capacity(7);
+            for i in 0..7 {
+                let day_midnight = window_start_dt + chrono::Duration::days(i);
+                let offset = (day_midnight.timestamp() - window_start_ts) as f64;
+                if offset < 0.0 || offset > window_secs {
+                    continue;
+                }
+                let frac = offset / window_secs;
+                let col = (frac * (plot_w as f64 - 1.0)).round() as i64;
+                if col < 0 || col >= plot_w as i64 {
+                    continue;
+                }
+                let label = match day_midnight.weekday() {
+                    chrono::Weekday::Mon => "Mon",
+                    chrono::Weekday::Tue => "Tue",
+                    chrono::Weekday::Wed => "Wed",
+                    chrono::Weekday::Thu => "Thu",
+                    chrono::Weekday::Fri => "Fri",
+                    chrono::Weekday::Sat => "Sat",
+                    chrono::Weekday::Sun => "Sun",
+                };
+                markers.push((col as usize, label.to_string()));
+            }
+            Some((resampled, markers))
+        }
+    } else {
+        None
+    };
+
+    let series_for_braille: &[f64] = match &week_window {
+        Some((resampled, _)) => resampled.as_slice(),
+        None => &quote.series,
+    };
+    let rows = braille::render_series(series_for_braille, plot_h, trace_w, min, max);
     for (i, row) in rows.iter().enumerate() {
         let rect = Rect {
             x: plot_x,
@@ -2564,6 +2644,106 @@ fn render_graph_panel(
         );
     }
 
+    // 1D: vertical time-marker guides at 6-hour clock intervals walking
+    // back from the most recent whole hour. The right edge of the plot
+    // is "now", the left edge is 24h ago — so a 13:00 marker when the
+    // wall clock reads 13:45 sits 45 minutes (≈ 3% of the plot width)
+    // in from the right; the next markers fall 6 / 12 / 18 hours back
+    // from there.
+    let day_markers: Vec<(usize, String)> = if matches!(period, Period::Day) {
+        use chrono::Timelike;
+        let now = chrono::Local::now();
+        let anchor = now
+            .with_minute(0)
+            .and_then(|t| t.with_second(0))
+            .and_then(|t| t.with_nanosecond(0))
+            .unwrap_or(now);
+        let mut out: Vec<(usize, String)> = Vec::new();
+        for i in 0..4 {
+            let marker = anchor - chrono::Duration::hours(i * 6);
+            let secs_before_now = (now - marker).num_seconds().max(0) as f64;
+            if secs_before_now > 86_400.0 {
+                continue;
+            }
+            let frac_from_left = 1.0 - secs_before_now / 86_400.0;
+            let col = (frac_from_left * (plot_w as f64 - 1.0)).round() as i64;
+            if col < 0 || col >= plot_w as i64 {
+                continue;
+            }
+            out.push((col as usize, marker.format("%H:%M").to_string()));
+        }
+        out
+    } else {
+        Vec::new()
+    };
+
+    // Calendar-aligned annotations for periods 1M and longer. 1D uses
+    // its own clock-time markers, 1W uses week_window's day markers,
+    // and `period_annotations` returns an empty list for either case.
+    // Legacy caches (pre-`series_timestamps`) also yield an empty list
+    // and the renderer falls back to the static label set below.
+    let annotations = if matches!(period, Period::Week) {
+        Vec::new()
+    } else {
+        period_annotations(period, &quote.series_timestamps)
+    };
+    if !annotations.is_empty() && quote.series_timestamps.len() >= 2 {
+        let n = quote.series_timestamps.len();
+        let faint = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM);
+        for ann in &annotations {
+            // Skip column 0 — the left edge is implicitly the start
+            // of the first unit; drawing a guide there would overlay
+            // the y-axis labels and look noisy.
+            if ann.bar_index == 0 {
+                continue;
+            }
+            let frac = ann.bar_index as f64 / (n - 1) as f64;
+            let col = (frac * (trace_w as f64 - 1.0)).round() as u16;
+            let col = col.min(trace_w.saturating_sub(1));
+            draw_vertical_guide(frame, plot_x + col, plot_top, plot_h, &rows, col, faint);
+        }
+    }
+
+    for (col, _) in &day_markers {
+        draw_vertical_guide(
+            frame,
+            plot_x + *col as u16,
+            plot_top,
+            plot_h,
+            &rows,
+            *col as u16,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        );
+    }
+
+    if let Some((_, week_markers)) = &week_window {
+        let faint = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM);
+        for (col, _) in week_markers {
+            // Same y-axis-overlap consideration as the annotation path:
+            // skip column 0 so the Sat guide doesn't sit on top of the
+            // y-axis labels. The label itself still renders below in
+            // the x-axis row, where the y-axis labels aren't an issue.
+            if *col == 0 {
+                continue;
+            }
+            draw_vertical_guide(
+                frame,
+                plot_x + *col as u16,
+                plot_top,
+                plot_h,
+                &rows,
+                *col as u16,
+                faint,
+            );
+        }
+    }
+
     // x-axis labels
     let xaxis_rect = Rect {
         x: plot_x,
@@ -2571,28 +2751,64 @@ fn render_graph_panel(
         width: plot_w,
         height: 1,
     };
-    // 1Y is a rolling 12-month window ending today — labels walk back
-    // from *this* month, two months at a time, 7 labels total. Static
-    // calendar-year labels (Jan Mar May Jul Sep Nov) would misalign
-    // any 1Y graph that doesn't start in January.
-    // YTD adds a `Dec` label at the right edge so the year visibly
-    // spans Jan→Dec; the trace itself only covers the elapsed
-    // fraction (see `trace_w` above).
-    let labels: Vec<String> = match period {
-        Period::Day => str_labels(&["00", "04", "08", "12", "16", "20"]),
-        Period::Week => str_labels(&["Mon", "Tue", "Wed", "Thu", "Fri"]),
-        Period::Month => str_labels(&["wk1", "wk2", "wk3", "wk4"]),
-        Period::SixMonth => str_labels(&["1mo", "2mo", "3mo", "4mo", "5mo", "6mo"]),
-        Period::YearToDate => str_labels(&["Jan", "Mar", "May", "Jul", "Sep", "Nov", "Dec"]),
-        Period::Year => rolling_year_month_labels(chrono::Local::now().date_naive()),
-        Period::ThreeYear => str_labels(&["-3y", "-2y", "-1y", "now"]),
-        Period::FiveYear => str_labels(&["-5y", "-4y", "-3y", "-2y", "-1y", "now"]),
-        Period::TenYear => str_labels(&["-10y", "-8y", "-6y", "-4y", "-2y", "now"]),
+    // 1D drives labels off the clock-time markers above; 1W and longer
+    // drive labels off the annotation list so the text lines up under
+    // each vertical guide. Legacy caches (empty `series_timestamps`)
+    // fall back to the static label set per period.
+    let line = if matches!(period, Period::Day) {
+        // 1D positions labels at the same columns the vertical guides
+        // sit at, so the text reads as labeling the line above.
+        let items: Vec<(usize, &str)> = day_markers
+            .iter()
+            .map(|(c, l)| (*c, l.as_str()))
+            .collect();
+        lay_out_x_axis_labels_at_cols(&items, plot_w as usize)
+    } else if let Some((_, week_markers)) = &week_window {
+        // 1W: 7 day-of-week labels under their guide columns.
+        let items: Vec<(usize, &str)> = week_markers
+            .iter()
+            .map(|(c, l)| (*c, l.as_str()))
+            .collect();
+        lay_out_x_axis_labels_at_cols(&items, plot_w as usize)
+    } else if !annotations.is_empty() && quote.series_timestamps.len() >= 2 {
+        // Place each annotation's label at the column matching its
+        // vertical guide. Every annotation lands a label, including
+        // the first (bar_index 0) — the leftmost label sits at column
+        // 0, so the user sees "Mon" or "Jan" at the start of the
+        // window even though the corresponding guide above was
+        // skipped to dodge the y-axis labels.
+        let n = quote.series_timestamps.len();
+        let cols: Vec<(usize, &str)> = annotations
+            .iter()
+            .map(|ann| {
+                let frac = if n <= 1 {
+                    0.0
+                } else {
+                    ann.bar_index as f64 / (n - 1) as f64
+                };
+                let col = (frac * (trace_w as f64 - 1.0)).round() as usize;
+                (col.min(trace_w.saturating_sub(1) as usize), ann.label.as_str())
+            })
+            .collect();
+        lay_out_x_axis_labels_at_cols(&cols, plot_w as usize)
+    } else {
+        // Legacy fallback for pre-`series_timestamps` cache snapshots:
+        // static label sets per period. Removable once all caches have
+        // refreshed at least once with timestamps populated.
+        let labels: Vec<String> = match period {
+            Period::Day => Vec::new(), // unreachable
+            Period::Week => str_labels(&["Mon", "Tue", "Wed", "Thu", "Fri"]),
+            Period::Month => str_labels(&["wk1", "wk2", "wk3", "wk4"]),
+            Period::SixMonth => str_labels(&["1mo", "2mo", "3mo", "4mo", "5mo", "6mo"]),
+            Period::YearToDate => str_labels(&["Jan", "Mar", "May", "Jul", "Sep", "Nov", "Dec"]),
+            Period::Year => rolling_year_month_labels(chrono::Local::now().date_naive()),
+            Period::ThreeYear => str_labels(&["-3y", "-2y", "-1y", "now"]),
+            Period::FiveYear => str_labels(&["-5y", "-4y", "-3y", "-2y", "-1y", "now"]),
+            Period::TenYear => str_labels(&["-10y", "-8y", "-6y", "-4y", "-2y", "now"]),
+        };
+        let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+        lay_out_x_axis_labels(&label_refs, plot_w as usize)
     };
-    let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
-    // Distribute labels so the first one's left edge is at column 0
-    // and the last one's right edge sits at the plot's right edge.
-    let line = lay_out_x_axis_labels(&label_refs, plot_w as usize);
     frame.render_widget(
         Paragraph::new(Span::styled(line, theme.text_dim)),
         xaxis_rect,

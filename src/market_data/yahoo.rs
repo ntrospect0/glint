@@ -13,10 +13,9 @@
 //!   responses. The [`ChartMeta`] struct is the union of fields stocks
 //!   and forex consume; every field is `#[serde(default)]` so a widget
 //!   that only reads a subset pays nothing for the unused fields.
-//! * Downsamplers for the closing-price series: [`downsample_pairs`]
-//!   for `(timestamp, value)` pairs (stocks; forex once it preserves
-//!   timestamps) and [`downsample_values`] for bare `Vec<f64>` (forex
-//!   today).
+//! * [`downsample_pairs`] for `(timestamp, value)` chart series. Both
+//!   stocks and forex use it; the paired form is what lets the
+//!   renderer place calendar-aligned vertical guides on the chart.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -218,22 +217,6 @@ pub fn downsample_pairs(pairs: Vec<(i64, f64)>, max: usize) -> Vec<(i64, f64)> {
     out
 }
 
-/// Bare-value variant of [`downsample_pairs`] for callers that don't
-/// carry timestamps. Both stocks and forex hit Yahoo at the same
-/// periodicities, so the cap and algorithm match exactly.
-pub fn downsample_values(series: Vec<f64>, max: usize) -> Vec<f64> {
-    if max == 0 || series.len() <= max {
-        return series;
-    }
-    let n = series.len();
-    let mut out = Vec::with_capacity(max);
-    for i in 0..max {
-        let idx = (i * (n - 1)) / (max - 1);
-        out.push(series[idx]);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,18 +274,4 @@ mod tests {
         assert_eq!(downsample_pairs(s.clone(), 0), s);
     }
 
-    #[test]
-    fn downsample_values_preserves_endpoints_and_caps_length() {
-        let s: Vec<f64> = (0..1200).map(|i| i as f64).collect();
-        let out = downsample_values(s, 240);
-        assert_eq!(out.len(), 240);
-        assert_eq!(out[0], 0.0);
-        assert_eq!(out[239], 1199.0);
-    }
-
-    #[test]
-    fn downsample_values_returns_input_when_already_under_cap() {
-        let s = vec![1.0, 2.0, 3.0];
-        assert_eq!(downsample_values(s.clone(), 10), s);
-    }
 }

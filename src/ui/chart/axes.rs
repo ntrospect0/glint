@@ -121,6 +121,80 @@ pub fn draw_reference_line(
     }
 }
 
+/// Place `(col, label)` pairs into a `width`-cell line so each label
+/// is centered on its requested column. Labels rendered in input
+/// order; an earlier label wins any overlap with a later one.
+/// Trailing labels that would extend past `width` are clamped so the
+/// rightmost label's right edge sits at exactly `width - 1`.
+pub fn lay_out_x_axis_labels_at_cols(items: &[(usize, &str)], width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut buf: Vec<char> = vec![' '; width];
+    for (col, label) in items {
+        let start = (*col).min(width.saturating_sub(1));
+        let chars: Vec<char> = label.chars().collect();
+        // Center the label on `col` so it visually anchors on the guide.
+        // Right edge would overflow off the chart for the rightmost label —
+        // clamp so the last label's right edge sits at width-1.
+        let half = chars.len() / 2;
+        let mut left = start.saturating_sub(half);
+        if left + chars.len() > width {
+            left = width.saturating_sub(chars.len());
+        }
+        // Skip if the slot is already painted (earlier label wins).
+        if buf[left..(left + chars.len()).min(width)]
+            .iter()
+            .any(|c| *c != ' ')
+        {
+            continue;
+        }
+        for (i, ch) in chars.iter().enumerate() {
+            if left + i >= width {
+                break;
+            }
+            buf[left + i] = *ch;
+        }
+    }
+    buf.iter().collect()
+}
+
+/// Draw a faint vertical `│` guide at column `trace_col` within the
+/// plot. Skips rows where the trace already painted a glyph at that
+/// column so the guide reads as "behind" the trace where they
+/// overlap. Used to mark calendar / time boundaries on intraday and
+/// long-window charts.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_vertical_guide(
+    frame: &mut Frame,
+    x: u16,
+    plot_top: u16,
+    plot_h: u16,
+    trace_rows: &[String],
+    trace_col: u16,
+    style: Style,
+) {
+    if plot_h == 0 {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    for row in 0..plot_h as usize {
+        let trace_owns_cell = trace_rows
+            .get(row)
+            .and_then(|s| s.chars().nth(trace_col as usize))
+            .map(|c| c != ' ')
+            .unwrap_or(false);
+        if trace_owns_cell {
+            continue;
+        }
+        let y = plot_top + row as u16;
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_char('│');
+            cell.set_style(style);
+        }
+    }
+}
+
 /// Suppress unused-import warnings when only some of this module's
 /// functions are referenced. The `Rect` re-export keeps signatures
 /// self-contained for future helpers that need the chart's rect

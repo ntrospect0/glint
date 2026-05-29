@@ -87,6 +87,7 @@ fn rate(base: &str, quote: &str, price: f64) -> ForexQuote {
         fifty_two_week_high: None,
         fifty_two_week_low: None,
         series: vec![],
+        series_timestamps: vec![],
         fetched_at: chrono::Local::now(),
     }
 }

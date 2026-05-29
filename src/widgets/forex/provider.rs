@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::market_data::{
-    yahoo::{self, downsample_values, ChartResponse},
+    yahoo::{self, ChartResponse},
     Period,
 };
 
@@ -59,6 +59,13 @@ pub struct ForexQuote {
     /// Closing-price series for the active period, used for graph + 30d
     /// rolling volatility + 1y change %.
     pub series: Vec<f64>,
+    /// Unix-second timestamps for each bar in `series`. Parallel to
+    /// `series`; either both are populated (post-this-commit caches)
+    /// or `series_timestamps` is empty (legacy caches). The renderer
+    /// uses these to compute calendar-aligned vertical guides for
+    /// periods 1W and longer.
+    #[serde(default)]
+    pub series_timestamps: Vec<i64>,
     pub fetched_at: chrono::DateTime<chrono::Local>,
 }
 
@@ -177,7 +184,22 @@ impl YahooForexProvider {
     /// layer above.
     async fn fetch_direct(&self, base: &str, quote: &str, period: Period) -> Result<ForexQuote> {
         let symbol = Self::symbol_for(base, quote);
-        let (interval, range) = period.yahoo_params();
+        // FX-specific window overrides:
+        //   1D — trailing 24-hour rolling window. Stocks uses
+        //        `range=2d` for its overnight-gap fallback; FX
+        //        trades 24/5 so there's no equivalent gap to fill
+        //        and `range=1d` IS the chart.
+        //   1W — trailing 7 calendar days. Yahoo's `range=5d` is
+        //        the stock-market trading week (5 sessions ≈ Mon–
+        //        Fri); for FX the user expects a full calendar
+        //        week. There's no native `7d` range, so we ask for
+        //        `1mo` of 30-minute bars and trim to the last 7
+        //        days client-side after the response lands.
+        let (interval, range) = match period {
+            Period::Day => ("5m", "1d"),
+            Period::Week => ("30m", "1mo"),
+            _ => period.yahoo_params(),
+        };
         let url = format!(
             "{base_url}/v8/finance/chart/{sym}?interval={interval}&range={range}",
             base_url = self.base_url.trim_end_matches('/'),
@@ -204,29 +226,51 @@ impl YahooForexProvider {
             .and_then(|mut r| r.pop())
             .with_context(|| format!("Yahoo returned no result for {symbol}"))?;
         let meta = result.meta;
-        let series: Vec<f64> = result
+        // Pair each close-price bar with its source timestamp before
+        // dropping null bars. Yahoo returns `null` close values for the
+        // few bars at FX-market closure boundaries (Saturday); we
+        // collapse to `(ts, price)` only for finite values so the two
+        // arrays stay aligned.
+        let timestamps_raw: Vec<i64> = result.timestamp.unwrap_or_default();
+        let closes_raw: Vec<Option<f64>> = result
             .indicators
             .and_then(|i| i.quote.into_iter().next())
-            .map(|q| q.close.into_iter().flatten().collect())
+            .map(|q| q.close)
             .unwrap_or_default();
+        let mut paired: Vec<(i64, f64)> = timestamps_raw
+            .iter()
+            .copied()
+            .zip(closes_raw.into_iter())
+            .filter_map(|(ts, v)| v.filter(|x| x.is_finite()).map(|v| (ts, v)))
+            .collect();
+
+        // 1W trim: Yahoo gave us a month of 30-minute bars (see the
+        // `range=1mo` override above). FX trades 24/5 so a full month
+        // covers ~4 weeks of continuous data; keep only the bars
+        // within the most recent 7 calendar days so the chart matches
+        // the "1W = trailing 7 days" semantic the user expects.
+        if matches!(period, Period::Week) {
+            let cutoff = chrono::Utc::now().timestamp() - 7 * 86_400;
+            paired = paired.into_iter().filter(|(ts, _)| *ts >= cutoff).collect();
+        }
 
         // Same 3-year trim trick Stocks uses: Yahoo doesn't ship a native
         // 3y range so we ask for 5y of daily bars and slice to ~the last
         // 3y client-side.
-        let series: Vec<f64> = if matches!(period, Period::ThreeYear) {
-            let keep = (series.len() * 3) / 5;
-            let skip = series.len().saturating_sub(keep);
-            series.into_iter().skip(skip).collect()
-        } else {
-            series
-        };
+        if matches!(period, Period::ThreeYear) {
+            let keep = (paired.len() * 3) / 5;
+            let skip = paired.len().saturating_sub(keep);
+            paired = paired.into_iter().skip(skip).collect();
+        }
 
         // Downsample before the series hits memory + disk cache. 240 is well
         // above any TUI pane width; multi-year daily traces compress 6–12×
         // with no perceptible chart-quality loss. USD-pivot synthesis (the
         // other producer of forex series) consumes already-downsampled legs,
         // so this is the single chokepoint.
-        let series = downsample_values(series, 240);
+        let paired = yahoo::downsample_pairs(paired, 240);
+        let series: Vec<f64> = paired.iter().map(|(_, v)| *v).collect();
+        let series_timestamps: Vec<i64> = paired.iter().map(|(ts, _)| *ts).collect();
 
         Ok(ForexQuote {
             symbol: meta.symbol.unwrap_or(symbol),
@@ -242,6 +286,7 @@ impl YahooForexProvider {
             fifty_two_week_high: meta.fifty_two_week_high,
             fifty_two_week_low: meta.fifty_two_week_low,
             series,
+            series_timestamps,
             fetched_at: chrono::Local::now(),
         })
     }
@@ -286,19 +331,24 @@ impl YahooForexProvider {
         // Element-wise series synthesis. Both legs come back at the
         // same periodicity (same `period` arg), so indices align.
         // Bars where the denominator is zero are dropped rather than
-        // producing NaN/inf glyphs in the graph.
+        // producing NaN/inf glyphs in the graph. Timestamps follow the
+        // base leg — both legs fetched at the same time at the same
+        // periodicity, so they're nominally identical, and on the rare
+        // bar-misalignment case (a single missing minute on one side)
+        // we'd rather have the base leg's tick than guess an average.
         let n = base_to_usd.series.len().min(quote_to_usd.series.len());
-        let series: Vec<f64> = (0..n)
-            .filter_map(|i| {
-                let b = base_to_usd.series[i];
-                let q = quote_to_usd.series[i];
-                if q > 0.0 && b.is_finite() {
-                    Some(b / q)
-                } else {
-                    None
+        let mut series: Vec<f64> = Vec::with_capacity(n);
+        let mut series_timestamps: Vec<i64> = Vec::with_capacity(n);
+        for i in 0..n {
+            let b = base_to_usd.series[i];
+            let q = quote_to_usd.series[i];
+            if q > 0.0 && b.is_finite() {
+                series.push(b / q);
+                if let Some(ts) = base_to_usd.series_timestamps.get(i).copied() {
+                    series_timestamps.push(ts);
                 }
-            })
-            .collect();
+            }
+        }
 
         Ok(ForexQuote {
             symbol: Self::symbol_for(base, quote),
@@ -311,6 +361,7 @@ impl YahooForexProvider {
             fifty_two_week_high: None,
             fifty_two_week_low: None,
             series,
+            series_timestamps,
             fetched_at: chrono::Local::now(),
         })
     }
@@ -339,6 +390,8 @@ fn invert_quote(q: ForexQuote, new_base: &str, new_quote: &str) -> ForexQuote {
         fifty_two_week_high: q.fifty_two_week_low.map(inv),
         fifty_two_week_low: q.fifty_two_week_high.map(inv),
         series: q.series.iter().map(|x| inv(*x)).collect(),
+        // Timestamps follow the swap unchanged — only the rate inverts.
+        series_timestamps: q.series_timestamps,
         fetched_at: q.fetched_at,
     }
 }
@@ -470,6 +523,7 @@ mod tests {
             fifty_two_week_high: None,
             fifty_two_week_low: None,
             series: vec![],
+            series_timestamps: vec![],
             fetched_at: chrono::Local::now(),
         };
         assert!((q.change() - 0.0100).abs() < 1e-9);
@@ -490,6 +544,7 @@ mod tests {
             fifty_two_week_high: Some(100_000.0),
             fifty_two_week_low: Some(50_000.0),
             series: vec![90_000.0, 89_000.0, 91_000.0],
+            series_timestamps: vec![],
             fetched_at: chrono::Local::now(),
         };
         let inverted = invert_quote(listed, "USD", "BTC");
@@ -524,6 +579,7 @@ mod tests {
             fifty_two_week_high: None,
             fifty_two_week_low: None,
             series: vec![0.0, -1.0, 100.0],
+            series_timestamps: vec![],
             fetched_at: chrono::Local::now(),
         };
         let inv = invert_quote(listed, "USD", "BTC");
@@ -555,6 +611,7 @@ mod tests {
             fifty_two_week_high: None,
             fifty_two_week_low: None,
             series: vec![1.10, 1.11, 1.09, 1.12],
+            series_timestamps: vec![],
             fetched_at: chrono::Local::now(),
         };
         let quote_to_usd = ForexQuote {
@@ -568,6 +625,7 @@ mod tests {
             fifty_two_week_high: None,
             fifty_two_week_low: None,
             series: vec![1.27, 1.28, 1.26, 1.29],
+            series_timestamps: vec![],
             fetched_at: chrono::Local::now(),
         };
         let price = base_to_usd.price / quote_to_usd.price;
@@ -594,6 +652,7 @@ mod tests {
             fifty_two_week_high: None,
             fifty_two_week_low: None,
             series: vec![],
+            series_timestamps: vec![],
             fetched_at: chrono::Local::now(),
         };
         assert_eq!(q.change_pct(), 0.0);
