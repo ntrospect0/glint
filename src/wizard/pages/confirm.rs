@@ -162,9 +162,6 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp) {
         "  README.md       — install, keybindings, color schemes, multi-instance",
     ));
     lines.push(Line::from("                    widgets, layout overview."));
-    lines.push(Line::from(
-        "  docs/glint-spec.md — full architecture spec + per-widget TOML reference.",
-    ));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Tip: every <widget>.toml is plain TOML — open it in your editor, save, and \
