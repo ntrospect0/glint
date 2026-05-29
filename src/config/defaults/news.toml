@@ -85,15 +85,6 @@ url = "http://feeds.marketwatch.com/marketwatch/topstories/"
 label = "CNBC Top"
 url = "https://www.cnbc.com/id/100003114/device/rss/rss.html"
 
-# WSJ / Barron's headline feeds are public; article bodies are paywalled
-# but your browser session opens them when you hit Enter.
-# [[feeds]]
-# label = "WSJ Markets"
-# url = "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"
-# [[feeds]]
-# label = "Barron's"
-# url = "https://feeds.a.dj.com/rss/RSSBarronsMain.xml"
-
 # ── Canada ───────────────────────────────────────────────────────────────────
 [[feeds]]
 label = "CBC News"
