@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 ntrospect0
 
-//! Wizard sub-page for composing a stack cell. See
-//! `docs/stack-spec.md` §6.
+//! Wizard sub-page for composing a stack cell.
 //!
 //! Pushed onto the wizard's history stack when the user picks "Stack"
 //! as a cell kind on the Assign page. Walks them through 3 slot
@@ -10,9 +9,9 @@
 //! page, plus a trailing "(skip)" entry. A trailing [ Save & Next ]
 //! button commits the choices and pops back to Assign.
 //!
-//! Empty slots are dropped at commit time per spec §1 ("no gaps"),
-//! and a single-element stack degrades to a regular single-widget
-//! cell so the user can't accidentally produce a tab-strip-of-one.
+//! Empty slots are dropped at commit time ("no gaps") and a
+//! single-element stack degrades to a regular single-widget cell so
+//! the user can't accidentally produce a tab-strip-of-one.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
