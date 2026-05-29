@@ -1396,16 +1396,47 @@ impl Widget for CalendarWidget {
             } else {
                 self.theme.text_dim
             };
-            spans.push(Span::styled("[Today]", today_style));
+            // Lowercase labels. On *inactive* tabs the first letter
+            // takes the scheme's selection-highlight style
+            // (`theme.text_selected`) to surface the t/d/w/m keyboard
+            // shortcuts. On the *active* tab the whole label runs in
+            // text_selected and the shortcut accent blends in — the
+            // hint is redundant when the user is already there.
+            // `[today]` follows the same rule via the already-computed
+            // today_style. Pulling from the scheme means user theme
+            // overrides flow through, and selection-highlight is
+            // visually distinct from the `text_shortcut` red used for
+            // the app-level `Shift+<letter>` widget-focus shortcuts.
+            let shortcut_style = self.theme.text_selected;
+            let today_active = self.current_view_contains_today();
+            let today_first_style = if today_active {
+                today_style
+            } else {
+                shortcut_style
+            };
+            spans.push(Span::styled("[", today_style));
+            spans.push(Span::styled("t", today_first_style));
+            spans.push(Span::styled("oday", today_style));
+            spans.push(Span::styled("]", today_style));
             spans.push(Span::raw(" "));
             for (v, label) in VIEW_TABS {
                 let active = *v == self.view;
-                let style = if active {
+                let base = if active {
                     self.theme.text_selected
                 } else {
                     self.theme.text_dim
                 };
-                spans.push(Span::styled(format!("[{label}]"), style));
+                let first_style = if active { base } else { shortcut_style };
+                spans.push(Span::styled("[", base));
+                let mut chars = label.chars();
+                if let Some(first) = chars.next() {
+                    spans.push(Span::styled(first.to_string(), first_style));
+                }
+                let rest: String = chars.collect();
+                if !rest.is_empty() {
+                    spans.push(Span::styled(rest, base));
+                }
+                spans.push(Span::styled("]", base));
                 spans.push(Span::raw(" "));
             }
             spans.push(Span::styled("  ←/→ nav  ·  o open", self.theme.text_dim));

@@ -170,18 +170,33 @@ impl ClockWidget {
         // but their click locations are way off to the left of where
         // they ought to be". Compute the centered start column once,
         // then walk from there.
+        //
+        // Labels render lowercase. On *inactive* tabs the first
+        // letter takes the scheme's selection-highlight style
+        // (`theme.text_selected`) to surface the c/s/t keyboard
+        // shortcuts (the rest of the label stays text_dim). On the
+        // *active* tab the whole label runs in text_selected and the
+        // shortcut accent blends in — the hint is redundant when the
+        // user is already there. Pulling from the scheme means user
+        // theme overrides flow through; selection-highlight is also
+        // visually distinct from the `text_shortcut` red used for the
+        // app-level `Shift+<letter>` widget-focus shortcuts.
         const SEP: &str = "  ";
+        let shortcut_style = self.theme.text_selected;
         let labels: Vec<String> = Mode::all()
             .iter()
-            .map(|m| format!("[{}]", m.label()))
+            .map(|m| m.label().to_ascii_lowercase())
             .collect();
-        let total_width: u16 = labels.iter().map(|l| l.chars().count() as u16).sum::<u16>()
+        let total_width: u16 = labels
+            .iter()
+            .map(|l| l.chars().count() as u16 + 2)
+            .sum::<u16>()
             + (labels.len().saturating_sub(1) as u16) * SEP.len() as u16;
         let start_x = area
             .x
             .saturating_add(area.width.saturating_sub(total_width) / 2);
 
-        let mut spans: Vec<Span> = Vec::with_capacity(Mode::all().len() * 2);
+        let mut spans: Vec<Span> = Vec::with_capacity(Mode::all().len() * 4 + 2);
         let mut hits: Vec<(Mode, u16, u16, u16)> = Vec::with_capacity(Mode::all().len());
         let mut x = start_x;
         for (i, (mode, label)) in Mode::all().iter().zip(labels.iter()).enumerate() {
@@ -189,15 +204,28 @@ impl ClockWidget {
                 spans.push(Span::raw(SEP));
                 x = x.saturating_add(SEP.len() as u16);
             }
-            let width = label.chars().count() as u16;
-            let style = if *mode == active {
+            let is_active = *mode == active;
+            let base = if is_active {
                 self.theme.text_selected
             } else {
                 self.theme.text_dim
             };
-            spans.push(Span::styled(label.clone(), style));
-            hits.push((*mode, x, x.saturating_add(width), area.y));
-            x = x.saturating_add(width);
+            // Drop the yellow shortcut accent on the active tab — when
+            // a tab is selected its whole label runs in text_selected.
+            let first_style = if is_active { base } else { shortcut_style };
+            let tab_w = label.chars().count() as u16 + 2;
+            spans.push(Span::styled("[", base));
+            let mut chars = label.chars();
+            if let Some(first) = chars.next() {
+                spans.push(Span::styled(first.to_string(), first_style));
+            }
+            let rest: String = chars.collect();
+            if !rest.is_empty() {
+                spans.push(Span::styled(rest, base));
+            }
+            spans.push(Span::styled("]", base));
+            hits.push((*mode, x, x.saturating_add(tab_w), area.y));
+            x = x.saturating_add(tab_w);
         }
         self.state.lock().expect("clock state poisoned").mode_tab_rects = hits;
         frame.render_widget(

@@ -16,9 +16,9 @@ use crate::theme::ColorScheme;
 use crate::ui::big_digits;
 
 pub(super) const VIEW_TABS: &[(CalendarView, &str)] = &[
-    (CalendarView::Day, "Day"),
-    (CalendarView::Week, "Week"),
-    (CalendarView::Month, "Month"),
+    (CalendarView::Day, "day"),
+    (CalendarView::Week, "week"),
+    (CalendarView::Month, "month"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]

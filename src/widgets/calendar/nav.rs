@@ -98,7 +98,7 @@ pub(super) fn content_rect_for(view: CalendarView, inner: Rect) -> Rect {
 /// view tabs separated by single spaces.
 pub(super) fn bottom_action_at(click_col: u16, hint_x: u16) -> Option<BottomAction> {
     let mut x = hint_x + 1; // leading space
-    let today_w = "Today".len() as u16 + 2;
+    let today_w = "today".len() as u16 + 2;
     if click_col >= x && click_col < x + today_w {
         return Some(BottomAction::Today);
     }
