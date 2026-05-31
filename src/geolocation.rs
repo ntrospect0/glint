@@ -10,7 +10,24 @@ use serde::Deserialize;
 pub struct GeoLocation {
     pub latitude: f64,
     pub longitude: f64,
+    /// The full `"<city>[, <admin1>][, <country>]"` display string.
+    /// The city portion may itself contain commas (e.g. "Washington, D.C.")
+    /// — splitting `label` on comma is therefore not safe; consumers
+    /// that need the city alone should use [`Self::city`] instead.
     pub label: String,
+    /// The geocoder's raw city name, exactly as returned (preserves
+    /// embedded commas). Used by the clock widget's world-clocks list
+    /// to show just the city name even when the full label is long.
+    pub city: String,
+    /// `"<city>, <admin1>"` — city + state/province, or just the
+    /// city when the geocoder didn't return an admin1. The middle
+    /// ground between [`Self::label`] (which adds the country and
+    /// gets long) and [`Self::city`] (which can be ambiguous
+    /// — multiple Springfields). Used by the weather widget's
+    /// carousel toggle so swapping between cities reads as
+    /// "Richmond, BC ↔ Tokyo, Tokyo" rather than mixing depth
+    /// per slot.
+    pub city_admin: String,
     /// IANA timezone string when the lookup returned one. Consumed by the
     /// clock widget's `:clock <city>` flow to set a transient secondary
     /// zone. `None` is normal for the IP-geolocation path which we don't
@@ -86,9 +103,12 @@ pub async fn by_name(name: &str) -> Result<GeoLocation> {
     let hit = results.into_iter().next().expect("non-empty checked above");
 
     let mut label = hit.name.clone();
+    let mut city_admin = hit.name.clone();
     if let Some(admin1) = hit.admin1.as_ref() {
         label.push_str(", ");
         label.push_str(admin1);
+        city_admin.push_str(", ");
+        city_admin.push_str(admin1);
     }
     if let Some(country) = hit.country.as_ref() {
         label.push_str(", ");
@@ -98,6 +118,8 @@ pub async fn by_name(name: &str) -> Result<GeoLocation> {
         latitude: hit.latitude,
         longitude: hit.longitude,
         label,
+        city: hit.name,
+        city_admin,
         timezone: hit.timezone,
     })
 }
@@ -518,12 +540,18 @@ pub async fn by_ip() -> Result<GeoLocation> {
         (Some(r), Some(c)) => format!("{city}, {r}, {c}"),
         (Some(r), None) => format!("{city}, {r}"),
         (None, Some(c)) => format!("{city}, {c}"),
-        (None, None) => city,
+        (None, None) => city.clone(),
+    };
+    let city_admin = match &resp.region {
+        Some(r) => format!("{city}, {r}"),
+        None => city.clone(),
     };
     Ok(GeoLocation {
         latitude: resp.latitude,
         longitude: resp.longitude,
         label,
+        city,
+        city_admin,
         timezone: resp.timezone,
     })
 }

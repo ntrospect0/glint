@@ -55,14 +55,14 @@ fn render_weather_toml_omits_blank_optionals_and_roundtrips() {
 fn default_widget_seeds_richmond_location() {
     let w = WeatherWidget::default();
     let st = w.state.lock().unwrap();
-    assert!(st.data.is_none());
+    assert!(st.data_by_key.is_empty());
     let loc = st
         .location
         .as_ref()
         .expect("default should bake in Richmond");
     assert_eq!(loc.latitude, 49.166);
     assert_eq!(loc.longitude, -123.133);
-    assert!(!st.inflight);
+    assert!(st.inflight_keys.is_empty());
     assert!(!st.locating);
 }
 
@@ -88,13 +88,19 @@ fn poll_interval_floors_to_thirty_seconds() {
         ..WeatherConfig::default()
     };
     let w = build_widget(cfg);
-    let interval = w
-        .state
-        .lock()
-        .expect("weather state poisoned")
-        .poll
-        .interval();
-    assert_eq!(interval, Duration::from_secs(30));
+    assert_eq!(w.poll_interval, Duration::from_secs(30));
+    // The home tracker (seeded in the constructor) inherits the
+    // floored interval — verify by pulling its entry out of the
+    // per-city map.
+    let st = w.state.lock().expect("weather state poisoned");
+    let home_key = loc_key(49.166, -123.133);
+    assert_eq!(
+        st.poll_by_key
+            .get(&home_key)
+            .expect("home tracker seeded")
+            .interval(),
+        Duration::from_secs(30),
+    );
 }
 
 #[test]
@@ -133,11 +139,198 @@ fn next_action_is_fetch_when_location_known_and_no_recent_attempt() {
     let w = build_widget(cfg);
     // Constructor applies a jitter offset so the first fire lands
     // inside the configured window instead of at t=0 (avoids the
-    // refresh-storm pile-up with other widgets). Mark dirty here
-    // so the test sees the "no recent attempt" branch under test
-    // rather than the jitter-deferred state.
-    w.state.lock().unwrap().poll.mark_dirty();
-    assert!(matches!(w.next_action(), NextAction::Fetch));
+    // refresh-storm pile-up with other widgets). Mark the home
+    // tracker dirty so the test sees the "no recent attempt"
+    // branch under test rather than the jitter-deferred state.
+    {
+        let mut st = w.state.lock().unwrap();
+        for t in st.poll_by_key.values_mut() {
+            t.mark_dirty();
+        }
+    }
+    assert!(matches!(w.next_action(), NextAction::Fetch(_, _)));
+}
+
+#[test]
+fn carousel_lists_home_then_extras() {
+    let cfg = WeatherConfig {
+        label: Some("Home".into()),
+        latitude: Some(49.166),
+        longitude: Some(-123.133),
+        cities: vec![
+            WeatherCity {
+                label: "Tokyo".into(),
+                latitude: 35.68,
+                longitude: 139.76,
+            },
+            WeatherCity {
+                label: "London".into(),
+                latitude: 51.51,
+                longitude: -0.13,
+            },
+        ],
+        ..WeatherConfig::default()
+    };
+    let w = build_widget(cfg);
+    let carousel = w.carousel();
+    assert_eq!(carousel.len(), 3);
+    assert!(matches!(carousel[0].kind, CityKind::Home));
+    assert_eq!(carousel[0].location.label, "Home");
+    assert!(matches!(carousel[1].kind, CityKind::Extra(0)));
+    assert_eq!(carousel[1].location.label, "Tokyo");
+    assert!(matches!(carousel[2].kind, CityKind::Extra(1)));
+    assert_eq!(carousel[2].location.label, "London");
+}
+
+#[test]
+fn select_delta_clamps_at_carousel_edges() {
+    let cfg = WeatherConfig {
+        label: Some("Home".into()),
+        latitude: Some(49.166),
+        longitude: Some(-123.133),
+        cities: vec![WeatherCity {
+            label: "Tokyo".into(),
+            latitude: 35.68,
+            longitude: 139.76,
+        }],
+        ..WeatherConfig::default()
+    };
+    let w = build_widget(cfg);
+    // From 0: right advances; second right is a no-op (clamped).
+    assert_eq!(w.select_delta(1), EventResult::Handled);
+    assert_eq!(w.state.lock().unwrap().selected, 1);
+    assert_eq!(w.select_delta(1), EventResult::Ignored);
+    assert_eq!(w.state.lock().unwrap().selected, 1);
+    // Left walks back to 0; another left is a no-op.
+    assert_eq!(w.select_delta(-1), EventResult::Handled);
+    assert_eq!(w.state.lock().unwrap().selected, 0);
+    assert_eq!(w.select_delta(-1), EventResult::Ignored);
+}
+
+#[test]
+fn select_delta_ignored_when_single_city() {
+    let cfg = WeatherConfig {
+        label: Some("Home".into()),
+        latitude: Some(49.166),
+        longitude: Some(-123.133),
+        ..WeatherConfig::default()
+    };
+    let w = build_widget(cfg);
+    assert_eq!(w.select_delta(1), EventResult::Ignored);
+    assert_eq!(w.select_delta(-1), EventResult::Ignored);
+}
+
+#[test]
+fn request_remove_noop_on_home_row() {
+    let cfg = WeatherConfig {
+        label: Some("Home".into()),
+        latitude: Some(49.166),
+        longitude: Some(-123.133),
+        cities: vec![WeatherCity {
+            label: "Tokyo".into(),
+            latitude: 35.68,
+            longitude: 139.76,
+        }],
+        ..WeatherConfig::default()
+    };
+    let w = build_widget(cfg);
+    // Cursor defaults to home (idx 0). `-` should refuse.
+    assert_eq!(w.request_remove_selected(), EventResult::Ignored);
+    assert!(w.state.lock().unwrap().confirm_remove.is_none());
+    // Swipe to the Extra and try again — modal should open.
+    w.select_delta(1);
+    assert_eq!(w.request_remove_selected(), EventResult::Handled);
+    assert_eq!(
+        w.state.lock().unwrap().confirm_remove.as_ref().unwrap().0,
+        "Tokyo"
+    );
+}
+
+#[test]
+fn request_remove_noop_on_lookup_row() {
+    let cfg = WeatherConfig {
+        label: Some("Home".into()),
+        latitude: Some(49.166),
+        longitude: Some(-123.133),
+        ..WeatherConfig::default()
+    };
+    let w = build_widget(cfg);
+    {
+        let mut st = w.state.lock().unwrap();
+        st.transient_location = Some(GeoLocation {
+            latitude: 35.68,
+            longitude: 139.76,
+            city: "Tokyo".into(),
+            city_admin: "Tokyo, Tokyo".into(),
+            label: "Tokyo, Tokyo, Japan".into(),
+            timezone: None,
+        });
+        st.selected = 1; // land on the transient
+    }
+    assert_eq!(w.request_remove_selected(), EventResult::Ignored);
+    assert!(w.state.lock().unwrap().confirm_remove.is_none());
+}
+
+#[test]
+#[ignore = "manual visualization helper — run with `cargo test dump_weather_glyphs -- --ignored --nocapture`"]
+fn dump_weather_glyphs() {
+    use super::icons::*;
+    use std::io::Write;
+    let all: &[(&str, &WeatherIcon)] = &[
+        ("CLOUD", &CLOUD),
+        ("RAIN", &RAIN),
+        ("FOG", &FOG),
+        ("THUNDER", &THUNDER),
+        ("SUN", &SUN),
+        ("SUN_CLOUD", &SUN_CLOUD),
+        ("SNOW", &SNOW),
+        ("SHOWERS", &SHOWERS),
+        ("MOON", &MOON),
+        ("WET_SNOW", &WET_SNOW),
+        ("TORNADO", &TORNADO),
+        ("MOON_CLOUD", &MOON_CLOUD),
+        ("LIGHTNING_BOLT", &LIGHTNING_BOLT),
+        ("THUNDER_SHOWERS", &THUNDER_SHOWERS),
+        ("SUN_STORM", &SUN_STORM),
+        ("THUNDER_RAIN", &THUNDER_RAIN),
+    ];
+    let path = "/tmp/weather_glyphs.txt";
+    let mut f = std::fs::File::create(path).expect("create dump file");
+    writeln!(f, "Weather glyph dump — half-block ASCII").unwrap();
+    writeln!(f, "Slot reserved: {} char rows (MAX_HEIGHT_CHARS)", MAX_HEIGHT_CHARS).unwrap();
+    writeln!(f, "═══════════════════════════════════════════════════════════════").unwrap();
+    for (name, icon) in all {
+        let char_rows = (icon.height as usize).div_ceil(2);
+        writeln!(
+            f,
+            "\n{name} — {}×{} px ({} char rows)",
+            icon.width, icon.height, char_rows
+        )
+        .unwrap();
+        for char_row in 0..char_rows {
+            let top_idx = char_row * 2;
+            let bot_idx = top_idx + 1;
+            let top_row = icon.pixels[top_idx];
+            let bot_row = if bot_idx < icon.pixels.len() {
+                icon.pixels[bot_idx]
+            } else {
+                &[]
+            };
+            let mut line = String::new();
+            for col in 0..(icon.width as usize) {
+                let top = top_row.get(col).and_then(|x| *x).is_some();
+                let bot = bot_row.get(col).and_then(|x| *x).is_some();
+                line.push(match (top, bot) {
+                    (false, false) => ' ',
+                    (true, false) => '▀',
+                    (false, true) => '▄',
+                    (true, true) => '█',
+                });
+            }
+            writeln!(f, "{line}").unwrap();
+        }
+    }
+    println!("Wrote weather glyph dump to {path}");
 }
 
 #[test]

@@ -190,4 +190,78 @@ impl ClockWidget {
             tracing::warn!(error = %err, "failed to persist clock state");
         }
     }
+
+    /// Rewrite the `[[secondary_timezones]]` blocks in this
+    /// instance's clock.toml to match `self.config.secondary_timezones`.
+    /// Strips every existing entry and re-emits the current list so
+    /// add/remove from the world-clock UI round-trips through disk
+    /// — comments and unrelated scalars are preserved by the merge
+    /// helper.
+    pub(super) fn persist_secondary_timezones(&self) {
+        use std::fmt::Write as _;
+        let stem = crate::widgets::widget_config_stem(super::config::KIND, &self.instance);
+        let path = match crate::config::config_dir() {
+            Ok(d) => d.join(format!("{stem}.toml")),
+            Err(err) => {
+                tracing::warn!(error = %err, "clock: could not resolve config dir");
+                return;
+            }
+        };
+        let original = if path.exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!(error = %err, "clock: failed to read {}", path.display());
+                    return;
+                }
+            }
+        } else {
+            String::new()
+        };
+        // Strip the existing entries and append the fresh list. The
+        // merge helper preserves comments + sibling scalars so users
+        // who hand-edited the file keep their notes.
+        let mut updated =
+            crate::wizard::toml_merge::strip_array_of_tables_blocks(&original, "secondary_timezones");
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        for sz in &self.config.secondary_timezones {
+            if !updated.is_empty() && !updated.ends_with("\n\n") {
+                updated.push('\n');
+            }
+            let _ = writeln!(updated, "[[secondary_timezones]]");
+            let _ = writeln!(updated, "label = {}", toml_quote(&sz.label));
+            let _ = writeln!(updated, "timezone = {}", toml_quote(&sz.timezone));
+        }
+        if let Some(parent) = path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                tracing::warn!(error = %err, "clock: failed to mkdir {}", parent.display());
+                return;
+            }
+        }
+        let tmp = path.with_extension("toml.tmp");
+        if let Err(err) = std::fs::write(&tmp, &updated) {
+            tracing::warn!(error = %err, "clock: failed to write {}", tmp.display());
+            return;
+        }
+        if let Err(err) = std::fs::rename(&tmp, &path) {
+            tracing::warn!(error = %err, "clock: failed to rename into place at {}", path.display());
+        }
+    }
+}
+
+fn toml_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

@@ -92,7 +92,13 @@ pub(super) struct ClockState {
     /// Override pinned by `:time <location>`. When Some, the big-digit display
     /// renders in that timezone and is tinted purple to make the override
     /// state unmistakable.
-    pub(super) transient_tz: Option<(String, Tz)>,
+    /// Triple of `(full label, short city, tz)`. The full label
+    /// (`"<city>, <admin>, <country>"`) feeds the title-bar metadata
+    /// row; the short city ("Tokyo", "Washington, D.C.") feeds the
+    /// world-clocks list so very long admin/country chains don't
+    /// push the time column off screen. The city portion preserves
+    /// any embedded commas the geocoder returned.
+    pub(super) transient_tz: Option<(String, String, Tz)>,
     /// True while a `:time <location>` geocoding request is in flight.
     pub(super) transient_searching: bool,
     /// Currently active big-digit gradient. Seeded from config at startup; the
@@ -107,6 +113,17 @@ pub(super) struct ClockState {
     /// clamp without re-deriving the layout. `0` when the full list fits (or
     /// when the world-clocks block isn't shown at all).
     pub(super) world_clock_max_scroll: usize,
+    /// Currently selected world-clock row (absolute index into the
+    /// `world_clock_entries` list). `None` = no selection visible —
+    /// the first j/k press lands the cursor on the first secondary
+    /// row; subsequent presses move it. Cleared when the widget
+    /// loses focus.
+    pub(super) world_clock_selected: Option<usize>,
+    /// `(display_label, iana_tz)` for the secondary timezone the
+    /// user has asked to remove. Set when `-` is pressed on a valid
+    /// row; cleared on confirm/cancel. Render branches on this to
+    /// show the confirm modal.
+    pub(super) confirm_remove: Option<(String, String)>,
     /// Currently visible mode (Clock/Stopwatch/Timer). Switched via c/s/t
     /// or by clicking the bottom tab strip.
     pub(super) mode: Mode,
@@ -381,8 +398,41 @@ impl ClockWidget {
                 st.gradient = st.gradient.next();
                 EventResult::Handled
             }
-            crossterm::event::KeyCode::Up => self.scroll_world_clocks(-1),
-            crossterm::event::KeyCode::Down => self.scroll_world_clocks(1),
+            // Up / Down arrows and vim-style k / j move the
+            // selection cursor across secondary world-clock rows.
+            // First press lands on the first secondary; clamps at
+            // edges. Mouse wheel still raw-scrolls the list, so a
+            // user who just wants to peek at hidden rows without
+            // engaging a selection has that option.
+            crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                self.move_world_clock_selection(-1)
+            }
+            crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                self.move_world_clock_selection(1)
+            }
+            // `-` while a secondary row is selected prompts for
+            // confirmation of removal; rejected silently when no
+            // row is selected (or the selected entry isn't a
+            // secondary — primary / transient rows can't be
+            // removed here, see clock_view::request_remove_selected).
+            crossterm::event::KeyCode::Char('-') => self.request_remove_selected(),
+            // `+` adds the active `:time`/`:clock` lookup to the
+            // permanent secondary list and persists. No-op when no
+            // lookup is active.
+            crossterm::event::KeyCode::Char('+') => self.add_transient_to_world_clocks(),
+            // Esc drops the selection cursor — the user's "I'm
+            // done navigating" signal. Falls through (Ignored) when
+            // no row is selected so Esc remains available to
+            // higher-level handlers (e.g. command bar dismissal).
+            crossterm::event::KeyCode::Esc => {
+                let mut st = self.state.lock().expect("clock state poisoned");
+                if st.world_clock_selected.is_some() {
+                    st.world_clock_selected = None;
+                    EventResult::Handled
+                } else {
+                    EventResult::Ignored
+                }
+            }
             _ => EventResult::Ignored,
         }
     }

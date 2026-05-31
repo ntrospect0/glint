@@ -5,6 +5,7 @@ pub mod icons;
 pub mod provider;
 
 use std::{
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -29,7 +30,9 @@ use crate::ui::{apply_title_row, MetadataEmphasis};
 
 use super::{AppContext, EventResult, Widget};
 
-use provider::{describe_code, icon_for_code, render_icon, OpenMeteoProvider, Units, WeatherData};
+use provider::{
+    describe_code, icon_for_code, render_icon_clipped, OpenMeteoProvider, Units, WeatherData,
+};
 
 /// Loaded from `~/.config/glint/weather.toml`.
 #[derive(Debug, Clone, Deserialize)]
@@ -61,6 +64,26 @@ pub struct WeatherConfig {
     /// `Shift+<letter>` focus shortcuts; falls back to `['w', 'e', 'a', 't', 'h', 'r']`.
     #[serde(default)]
     pub shortcuts: Vec<char>,
+
+    /// Extra cities the user has swiped onto the carousel. Persisted
+    /// as `[[cities]]` blocks. The widget's "home" city (the one
+    /// driven by the top-level `label` / `latitude` / `longitude` or
+    /// the IP geolocator) sits at carousel index 0; these entries
+    /// occupy 1..=N and can be added (`+` on an active `:weather`
+    /// lookup) or removed (`-` on the highlighted row).
+    #[serde(default)]
+    pub cities: Vec<WeatherCity>,
+}
+
+/// One extra city on the multi-city carousel. Stores the same triple
+/// the home city does (label + lat/lon) so each carousel slot can
+/// drive its own Open-Meteo fetch without re-geocoding the label on
+/// every refresh.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WeatherCity {
+    pub label: String,
+    pub latitude: f64,
+    pub longitude: f64,
 }
 
 fn default_units() -> Units {
@@ -87,6 +110,7 @@ impl Default for WeatherConfig {
             auto_locate: default_auto_locate(),
             colors: ColorScheme::default(),
             shortcuts: Vec::new(),
+            cities: Vec::new(),
         }
     }
 }
@@ -96,22 +120,112 @@ struct WeatherState {
     location: Option<GeoLocation>,
     locating: bool,
     geolocation_error: Option<String>,
-    data: Option<WeatherData>,
-    last_error: Option<String>,
-    poll: crate::polling::PollTracker,
-    inflight: bool,
-    /// Set by `:weather <city>` — when Some, overrides `location` for fetches.
-    /// Cleared by `x`.
+    /// Latest weather snapshot per city, keyed by [`loc_key`]. Lets
+    /// the user swipe across cached cities without flashing a "Loading…"
+    /// state each time. The currently-selected city's entry is what
+    /// the body renders.
+    data_by_key: HashMap<String, WeatherData>,
+    /// Last fetch error per city; cleared on each successful fetch.
+    /// Drives the "⚠ stale" footer on the data view.
+    error_by_key: HashMap<String, String>,
+    /// Per-city poll tracker; lazy-initialized when a new city
+    /// joins the carousel so each city polls on its own cadence
+    /// (independent jitter so the cities aren't all due at once).
+    poll_by_key: HashMap<String, crate::polling::PollTracker>,
+    /// Cities with an Open-Meteo fetch currently in flight. We only
+    /// allow one fetch per city; concurrent fetches across cities are
+    /// fine — the carousel may need them when the user is rapidly
+    /// swiping.
+    inflight_keys: HashSet<String>,
+    /// Set by `:weather <city>` — when Some, displays as the
+    /// trailing carousel entry overriding `selected` until the user
+    /// presses `+` (adopt) or `x` (discard).
     transient_location: Option<GeoLocation>,
     /// True while a `:weather <city>` lookup is in flight.
     transient_searching: bool,
+    /// Currently-selected carousel index — see [`WeatherWidget::carousel`].
+    /// `0` = home; `1..=N` = `config.cities[idx - 1]`; trailing entry
+    /// is the transient lookup when present.
+    selected: usize,
+    /// `(label, kind_id)` for the row pending removal confirmation.
+    /// We carry the label so the modal title doesn't drift if the
+    /// underlying list reshuffles between the request and the user
+    /// pressing `y` / Esc; the kind_id is the IANA-style key we use
+    /// to locate the entry in `config.cities` at confirm time.
+    confirm_remove: Option<(String, String)>,
     /// Display-state dirty bit drained by `take_dirty`. Set true by
     /// every async-task / tick-time mutation site so the main loop's
     /// dirty-flag gate triggers a redraw.
     dirty: bool,
 }
 
-const CACHE_KEY_CURRENT: &str = "current";
+/// Cache key for one city's weather data. Truncates to 4 decimal
+/// places of lat/lon (~11m precision) — enough to disambiguate
+/// individual cities without hashing trailing noise.
+fn loc_key(lat: f64, lon: f64) -> String {
+    format!("{lat:.4},{lon:.4}")
+}
+
+/// Layout constants shared between `render` (which decides whether
+/// to reserve the toggle / hint rows) and `render_with_art` (which
+/// applies the same threshold to decide whether to paint the icon
+/// at all). Kept at module scope so both paths agree exactly — a
+/// mismatch would have one path reserve a row the other path
+/// declined to use.
+const HEADER_ROWS: u16 = 3;
+const FIXED_ART_ROWS: u16 = 8;
+/// Number of rows between the art slot and the bottom block.
+const ART_TO_BOTTOM_SPACER: u16 = 1;
+/// Minimum essential bottom rows under the most compressed art
+/// layout (L3 — temp+feels merged into the header line, no blank
+/// padding between sections). 6 rows = humidity/wind, blank,
+/// "Next 3 days" header, 3 forecasts. The trailing blank + "Updated
+/// X ago" footer are bonus rows that drop out first when space is
+/// tight via ratatui's natural top-down `Paragraph` truncation.
+const MIN_BOTTOM_ROWS_L3: u16 = 6;
+/// Lowest body-height threshold under which any art layout fits
+/// (L3, the most aggressive compression). Below this, art is
+/// hidden and the body falls back to the no-art text layout.
+const ART_THRESHOLD: u16 =
+    HEADER_ROWS + FIXED_ART_ROWS + ART_TO_BOTTOM_SPACER + MIN_BOTTOM_ROWS_L3;
+
+/// Progressive compression tier for the art layout. Picked from
+/// `body_h` in [`pick_art_layout`]; each step buys 1 row of
+/// vertical space by removing one of the lowest-signal rows from
+/// the bottom block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtLayout {
+    /// Spacious: temp, feels, blank, humidity, blank, Next 3 days,
+    /// forecast×3 (+ optional blank + "Updated X ago").
+    Full,
+    /// Merge "temp" and "Feels like X" onto a single line.
+    CombinedTemp,
+    /// Also remove the blank between the temp/feels line and
+    /// humidity/wind.
+    TightSpacing,
+    /// Also move "<temp>, Feels like X" into the header line so it
+    /// reads `<emoji> <label> | <temp>, Feels like <feels>`.
+    TempInHeader,
+}
+
+/// Pick the compression tier given the body height after the toggle
+/// / hint rows have been subtracted. Returns `None` when even L3
+/// can't fit — caller falls back to the no-art text layout.
+fn pick_art_layout(body_h: u16) -> Option<ArtLayout> {
+    let base = HEADER_ROWS + FIXED_ART_ROWS + ART_TO_BOTTOM_SPACER;
+    let bottom = body_h.saturating_sub(base);
+    if bottom >= MIN_BOTTOM_ROWS_L3 + 3 {
+        Some(ArtLayout::Full)
+    } else if bottom >= MIN_BOTTOM_ROWS_L3 + 2 {
+        Some(ArtLayout::CombinedTemp)
+    } else if bottom >= MIN_BOTTOM_ROWS_L3 + 1 {
+        Some(ArtLayout::TightSpacing)
+    } else if bottom >= MIN_BOTTOM_ROWS_L3 {
+        Some(ArtLayout::TempInHeader)
+    } else {
+        None
+    }
+}
 
 pub struct WeatherWidget {
     id: String,
@@ -133,6 +247,10 @@ pub struct WeatherWidget {
     shortcut_prefs: Vec<char>,
     /// Persistent cache of the last successful WeatherData snapshot.
     cache: ScopedCache,
+    /// Resolved poll interval, clamped to the 30-second floor. Held
+    /// so the lazy `+`-add path can spin up a tracker for a newly-
+    /// adopted city without re-deriving it from `config`.
+    poll_interval: Duration,
 }
 
 impl Default for WeatherWidget {
@@ -156,31 +274,48 @@ impl WeatherWidget {
         // If the user specified explicit lat/lon, seed the location immediately
         // so we skip the geolocation hop.
         let initial_location = match (config.latitude, config.longitude) {
-            (Some(lat), Some(lon)) => Some(GeoLocation {
-                latitude: lat,
-                longitude: lon,
-                label: config
+            (Some(lat), Some(lon)) => {
+                let label = config
                     .label
                     .clone()
-                    .unwrap_or_else(|| format!("{lat:.3}, {lon:.3}")),
-                timezone: None,
-            }),
+                    .unwrap_or_else(|| format!("{lat:.3}, {lon:.3}"));
+                Some(GeoLocation {
+                    latitude: lat,
+                    longitude: lon,
+                    city: label.clone(),
+                    city_admin: label.clone(),
+                    label,
+                    timezone: None,
+                })
+            }
             _ => None,
         };
         let poll_interval = Duration::from_secs(config.poll_interval_secs.max(30));
         // Seed from cache so the first frame shows the previous reading.
+        // Each carousel slot (home + extras) gets its own poll tracker
+        // + cache slot keyed by lat/lon so swipes between cities don't
+        // collide and individual cities can be refreshed on their own
+        // cadence.
         let mut initial_state = WeatherState {
-            location: initial_location,
-            poll: crate::polling::PollTracker::new(poll_interval),
+            location: initial_location.clone(),
             ..WeatherState::default()
         };
-        if let Some(entry) = cache.load::<WeatherData>(CACHE_KEY_CURRENT) {
-            initial_state.poll.seed_from_cache_age(entry.age());
-            initial_state.data = Some(entry.value);
+        let mut seed_poll = |label: &str, lat: f64, lon: f64| {
+            let key = loc_key(lat, lon);
+            let mut tracker = crate::polling::PollTracker::new(poll_interval);
+            if let Some(entry) = cache.load::<WeatherData>(&Self::cache_key(&key)) {
+                tracker.seed_from_cache_age(entry.age());
+                initial_state.data_by_key.insert(key.clone(), entry.value);
+            }
+            tracker.apply_jitter(&format!("weather@{instance}/{label}"));
+            initial_state.poll_by_key.insert(key, tracker);
+        };
+        if let Some(home) = &initial_location {
+            seed_poll(&home.label, home.latitude, home.longitude);
         }
-        initial_state
-            .poll
-            .apply_jitter(&format!("weather@{instance}"));
+        for c in &config.cities {
+            seed_poll(&c.label, c.latitude, c.longitude);
+        }
         let state = Arc::new(Mutex::new(initial_state));
         let theme = app_theme.with_overrides(&config.colors);
         let shortcut_prefs = if config.shortcuts.is_empty() {
@@ -209,16 +344,268 @@ impl WeatherWidget {
             shortcut: None,
             shortcut_prefs,
             cache,
+            poll_interval,
+        }
+    }
+
+    /// Persistent-cache key for the weather payload of one city.
+    /// Namespaced with a `city:` prefix so a future schema change
+    /// can introduce sibling caches without colliding.
+    fn cache_key(loc_key: &str) -> String {
+        format!("city:{loc_key}")
+    }
+
+    /// Snapshot of the current carousel — home (idx 0), then the
+    /// user's extra cities in TOML order, then (optionally) the
+    /// `:weather <city>` lookup pinned to the trailing slot. Empty
+    /// when the IP-geolocator hasn't produced a home yet *and* no
+    /// lookup is active.
+    fn carousel(&self) -> Vec<CitySlot> {
+        let st = self.state.lock().expect("weather state poisoned");
+        let mut out: Vec<CitySlot> = Vec::with_capacity(1 + self.config.cities.len() + 1);
+        if let Some(home) = &st.location {
+            out.push(CitySlot {
+                kind: CityKind::Home,
+                location: home.clone(),
+            });
+        }
+        for (i, c) in self.config.cities.iter().enumerate() {
+            out.push(CitySlot {
+                kind: CityKind::Extra(i),
+                location: GeoLocation {
+                    latitude: c.latitude,
+                    longitude: c.longitude,
+                    city: c.label.clone(),
+                    city_admin: c.label.clone(),
+                    label: c.label.clone(),
+                    timezone: None,
+                },
+            });
+        }
+        if let Some(t) = &st.transient_location {
+            out.push(CitySlot {
+                kind: CityKind::Lookup,
+                location: t.clone(),
+            });
+        }
+        out
+    }
+
+    /// Move the carousel cursor by `delta` (negative = left). Clamps
+    /// at the ends; returns `Handled` only when the cursor actually
+    /// moves so a no-op press doesn't swallow the key from a parent
+    /// handler.
+    fn select_delta(&self, delta: i32) -> EventResult {
+        let total = self.carousel().len();
+        if total <= 1 {
+            return EventResult::Ignored;
+        }
+        let mut st = self.state.lock().expect("weather state poisoned");
+        let cur = st.selected.min(total - 1) as i32;
+        let next = (cur + delta).clamp(0, total as i32 - 1) as usize;
+        if next == st.selected.min(total - 1) {
+            return EventResult::Ignored;
+        }
+        st.selected = next;
+        st.dirty = true;
+        EventResult::Handled
+    }
+
+    /// `+` handler — adopt the `:weather <city>` lookup into the
+    /// permanent `config.cities` list, persist to weather.toml, and
+    /// land the selector on the new entry. No-op when no lookup is
+    /// active or the same coords are already tracked.
+    fn add_transient_to_cities(&mut self) -> EventResult {
+        let transient = {
+            let st = self.state.lock().expect("weather state poisoned");
+            st.transient_location.clone()
+        };
+        let Some(loc) = transient else {
+            return EventResult::Ignored;
+        };
+        let key = loc_key(loc.latitude, loc.longitude);
+        // Skip duplicates — adding the same coords twice leaves two
+        // rows ticking in lockstep and confuses navigation.
+        let already_tracked = self.config.cities.iter().any(|c| {
+            loc_key(c.latitude, c.longitude) == key
+        }) || self
+            .state
+            .lock()
+            .expect("weather state poisoned")
+            .location
+            .as_ref()
+            .map(|h| loc_key(h.latitude, h.longitude) == key)
+            .unwrap_or(false);
+        if already_tracked {
+            // Still discard the transient so `:weather Foo` on an
+            // already-tracked city resolves cleanly.
+            let mut st = self.state.lock().expect("weather state poisoned");
+            st.transient_location = None;
+            st.selected = 0;
+            st.dirty = true;
+            return EventResult::Handled;
+        }
+        self.config.cities.push(WeatherCity {
+            // Persist the "City, Admin1" form so swiping back to
+            // this entry reads the same way as it did mid-lookup —
+            // we don't want the carousel to silently lose the
+            // province/state hint after the user pressed `+`.
+            label: loc.city_admin.clone(),
+            latitude: loc.latitude,
+            longitude: loc.longitude,
+        });
+        self.persist_cities();
+        let new_idx = self.config.cities.len(); // home is 0, extras start at 1
+        let mut st = self.state.lock().expect("weather state poisoned");
+        st.transient_location = None;
+        st.selected = new_idx;
+        st.dirty = true;
+        EventResult::Handled
+    }
+
+    /// `-` handler — opens the confirm modal when the cursor is on
+    /// an Extra slot. Home and Lookup rows can't be removed via this
+    /// path (home is configured, lookup uses `x`).
+    fn request_remove_selected(&self) -> EventResult {
+        let entries = self.carousel();
+        if entries.is_empty() {
+            return EventResult::Ignored;
+        }
+        let st_sel = self
+            .state
+            .lock()
+            .expect("weather state poisoned")
+            .selected
+            .min(entries.len() - 1);
+        let slot = &entries[st_sel];
+        match slot.kind {
+            CityKind::Extra(_) => {}
+            CityKind::Home | CityKind::Lookup => return EventResult::Ignored,
+        }
+        let label = slot.location.label.clone();
+        let key = loc_key(slot.location.latitude, slot.location.longitude);
+        self.state
+            .lock()
+            .expect("weather state poisoned")
+            .confirm_remove = Some((label, key));
+        EventResult::Handled
+    }
+
+    fn confirm_remove_selected(&mut self) {
+        let key = match self
+            .state
+            .lock()
+            .expect("weather state poisoned")
+            .confirm_remove
+            .clone()
+        {
+            Some((_, k)) => k,
+            None => return,
+        };
+        let before = self.config.cities.len();
+        self.config
+            .cities
+            .retain(|c| loc_key(c.latitude, c.longitude) != key);
+        let removed = self.config.cities.len() < before;
+        let mut st = self.state.lock().expect("weather state poisoned");
+        st.confirm_remove = None;
+        if !removed {
+            return;
+        }
+        // Drop the per-city caches for the removed entry so a future
+        // re-add doesn't show a stale reading from a deleted past.
+        st.data_by_key.remove(&key);
+        st.error_by_key.remove(&key);
+        st.poll_by_key.remove(&key);
+        st.inflight_keys.remove(&key);
+        // Re-clamp the carousel cursor. Land on whichever neighbor
+        // is still in range so the user sees an obvious "the row
+        // you were on is gone" landing pad rather than a silent jump.
+        let new_total = 1 + self.config.cities.len() + {
+            if st.transient_location.is_some() { 1 } else { 0 }
+        };
+        if st.selected >= new_total {
+            st.selected = new_total.saturating_sub(1);
+        }
+        st.dirty = true;
+        drop(st);
+        self.persist_cities();
+    }
+
+    fn cancel_remove(&self) {
+        self.state
+            .lock()
+            .expect("weather state poisoned")
+            .confirm_remove = None;
+    }
+
+    /// Rewrite the `[[cities]]` blocks in this instance's
+    /// weather.toml to match `self.config.cities`. Mirrors the
+    /// clock-widget's `persist_secondary_timezones`: strips existing
+    /// entries, re-emits the current list, and preserves comments +
+    /// unrelated keys via the shared TOML-merge helper.
+    fn persist_cities(&self) {
+        use std::fmt::Write as _;
+        let stem = crate::widgets::widget_config_stem(KIND, &self.instance);
+        let path = match crate::config::config_dir() {
+            Ok(d) => d.join(format!("{stem}.toml")),
+            Err(err) => {
+                tracing::warn!(error = %err, "weather: could not resolve config dir");
+                return;
+            }
+        };
+        let original = if path.exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!(error = %err, "weather: failed to read {}", path.display());
+                    return;
+                }
+            }
+        } else {
+            String::new()
+        };
+        let mut updated =
+            crate::wizard::toml_merge::strip_array_of_tables_blocks(&original, "cities");
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        for c in &self.config.cities {
+            if !updated.is_empty() && !updated.ends_with("\n\n") {
+                updated.push('\n');
+            }
+            let _ = writeln!(updated, "[[cities]]");
+            let _ = writeln!(updated, "label = {}", toml_quote(&c.label));
+            let _ = writeln!(updated, "latitude = {}", c.latitude);
+            let _ = writeln!(updated, "longitude = {}", c.longitude);
+        }
+        if let Some(parent) = path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                tracing::warn!(error = %err, "weather: failed to mkdir {}", parent.display());
+                return;
+            }
+        }
+        let tmp = path.with_extension("toml.tmp");
+        if let Err(err) = std::fs::write(&tmp, &updated) {
+            tracing::warn!(error = %err, "weather: failed to write {}", tmp.display());
+            return;
+        }
+        if let Err(err) = std::fs::rename(&tmp, &path) {
+            tracing::warn!(error = %err, "weather: failed to rename into place at {}", path.display());
         }
     }
 
     /// What the widget should do on the next tick. Computed inside a single
-    /// short lock window. A transient location set by `:weather <city>` takes
-    /// priority over the configured (or IP-geolocated) `location`.
+    /// short lock window. Operates on the *currently selected* carousel
+    /// entry so swipes that land on a stale city schedule a refresh
+    /// for that city specifically; other cities' trackers tick on
+    /// their own.
     fn next_action(&self) -> NextAction {
+        let entries = self.carousel();
         let st = self.state.lock().expect("weather state poisoned");
-        let effective = st.transient_location.as_ref().or(st.location.as_ref());
-        if effective.is_none() {
+        // No carousel entries yet → either kick off IP geolocation or
+        // wait for one to finish.
+        if entries.is_empty() {
             if st.locating || st.transient_searching {
                 return NextAction::Wait;
             }
@@ -228,11 +615,21 @@ impl WeatherWidget {
                 NextAction::Wait
             };
         }
-        if st.inflight {
+        let selected = st.selected.min(entries.len() - 1);
+        let slot = &entries[selected];
+        let key = loc_key(slot.location.latitude, slot.location.longitude);
+        if st.inflight_keys.contains(&key) {
             return NextAction::Wait;
         }
-        if st.poll.is_due() {
-            NextAction::Fetch
+        // No tracker yet for this slot (lookup transient never got
+        // a seed, or a city just added) — treat as due so we kick
+        // off the first fetch immediately.
+        let due = match st.poll_by_key.get(&key) {
+            Some(t) => t.is_due(),
+            None => true,
+        };
+        if due {
+            NextAction::Fetch(slot.location.latitude, slot.location.longitude)
         } else {
             NextAction::Wait
         }
@@ -249,6 +646,7 @@ impl WeatherWidget {
         }
         let state = self.state.clone();
         let query = query.to_string();
+        let total_slots = self.carousel().len();
         tokio::spawn(async move {
             let result = crate::geolocation::by_name(&query).await;
             let mut st = state.lock().expect("weather state poisoned");
@@ -257,9 +655,12 @@ impl WeatherWidget {
             match result {
                 Ok(loc) => {
                     st.transient_location = Some(loc);
-                    // Clear cached weather + force refetch on the next tick.
-                    st.data = None;
-                    st.poll.mark_dirty();
+                    // Auto-select the freshly-loaded transient (now
+                    // the trailing carousel slot) so the body
+                    // immediately switches to it. `total_slots` was
+                    // captured before adding the transient — the
+                    // transient now sits at that index.
+                    st.selected = total_slots;
                 }
                 Err(err) => {
                     tracing::warn!(query = %query, error = %err, "weather geocoding failed");
@@ -268,13 +669,13 @@ impl WeatherWidget {
         });
     }
 
-    /// Clear the `:weather <city>` override and re-fetch with the configured
-    /// location.
+    /// Clear the `:weather <city>` override and bounce the selection
+    /// back to home so the user isn't left on a now-empty slot.
     fn clear_transient(&self) {
         let mut st = self.state.lock().expect("weather state poisoned");
         if st.transient_location.take().is_some() {
-            st.data = None;
-            st.poll.mark_dirty();
+            st.selected = 0;
+            st.dirty = true;
         }
     }
 
@@ -303,40 +704,49 @@ impl WeatherWidget {
         });
     }
 
-    fn spawn_refresh(&self) {
-        let (lat, lon) = {
-            let st = self.state.lock().expect("weather state poisoned");
-            let Some(loc) = st.transient_location.as_ref().or(st.location.as_ref()) else {
-                return;
-            };
-            (loc.latitude, loc.longitude)
-        };
+    fn spawn_refresh(&self, lat: f64, lon: f64) {
+        let key = loc_key(lat, lon);
         {
             let mut st = self.state.lock().expect("weather state poisoned");
-            st.inflight = true;
-            st.poll.mark_attempted();
+            st.inflight_keys.insert(key.clone());
+            // Lazy-init a poll tracker for cities that joined the
+            // carousel after the constructor ran (the `+`-add path,
+            // or the very first transient lookup).
+            let interval = self.poll_interval;
+            let instance = self.instance.clone();
+            let tracker = st
+                .poll_by_key
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    let mut t = crate::polling::PollTracker::new(interval);
+                    t.apply_jitter(&format!("weather@{instance}/{key}"));
+                    t
+                });
+            tracker.mark_attempted();
             st.dirty = true;
         }
         let units = self.config.units;
         let state = self.state.clone();
         let cache = self.cache.clone();
+        let cache_key = Self::cache_key(&key);
+        let key_clone = key.clone();
         tokio::spawn(async move {
             let provider = OpenMeteoProvider::new(lat, lon, units);
             let result = provider.fetch().await;
             let mut st = state.lock().expect("weather state poisoned");
-            st.inflight = false;
+            st.inflight_keys.remove(&key_clone);
             st.dirty = true;
             match result {
                 Ok(data) => {
-                    if let Err(err) = cache.store(CACHE_KEY_CURRENT, &data) {
+                    if let Err(err) = cache.store(&cache_key, &data) {
                         tracing::warn!(error = %err, "weather cache store failed");
                     }
-                    st.data = Some(data);
-                    st.last_error = None;
+                    st.data_by_key.insert(key_clone.clone(), data);
+                    st.error_by_key.remove(&key_clone);
                 }
                 Err(err) => {
-                    tracing::warn!(error = %err, "weather fetch failed");
-                    st.last_error = Some(err.to_string());
+                    tracing::warn!(error = %err, key = %key_clone, "weather fetch failed");
+                    st.error_by_key.insert(key_clone, err.to_string());
                 }
             }
         });
@@ -346,8 +756,72 @@ impl WeatherWidget {
 #[derive(Debug, Clone, Copy)]
 enum NextAction {
     Locate,
-    Fetch,
+    /// Refresh the city at the given `(latitude, longitude)`. Carries
+    /// the coords so the dispatch in `update()` doesn't need to
+    /// re-resolve the selection after dropping the state lock.
+    Fetch(f64, f64),
     Wait,
+}
+
+/// Origin of a carousel entry — drives both label styling (Home gets
+/// the focused-text color, Lookup gets the selected-text color) and
+/// `+`/`-` eligibility (only Extra rows can be removed; only Lookup
+/// can be adopted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CityKind {
+    Home,
+    Extra(usize),
+    Lookup,
+}
+
+/// One carousel slot. Cloned from the underlying `WeatherState` /
+/// `config.cities` data so the renderer + key handlers don't need
+/// to keep the state lock across the rest of the frame.
+#[derive(Debug, Clone)]
+struct CitySlot {
+    kind: CityKind,
+    location: GeoLocation,
+}
+
+impl WeatherWidget {
+    fn render_city_toggle(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        carousel: &[CitySlot],
+        selected_idx: usize,
+    ) {
+        let slot = &carousel[selected_idx];
+        // Arrows dim out at the ends to signal "no more in this direction"
+        // without hiding their slots — keeps the carousel width steady
+        // as the user swipes, so the city label doesn't jump horizontally.
+        let active_arrow = self.theme.text_dim;
+        let inactive_arrow = self.theme.text_dim.add_modifier(Modifier::DIM);
+        let has_prev = selected_idx > 0;
+        let has_next = selected_idx + 1 < carousel.len();
+        let left = Span::styled(
+            if has_prev { "◂ " } else { "  " },
+            if has_prev { active_arrow } else { inactive_arrow },
+        );
+        let right = Span::styled(
+            if has_next { " ▸" } else { "  " },
+            if has_next { active_arrow } else { inactive_arrow },
+        );
+        // Label color reflects the kind: Home in the focused-text
+        // accent (matches the clock widget's primary-row highlight),
+        // Lookup in the selected-text accent (the `:weather <city>`
+        // override read), and Extra in the default body color.
+        let label_style = match slot.kind {
+            CityKind::Home => self.theme.text_focused.add_modifier(Modifier::BOLD),
+            CityKind::Lookup => self.theme.text_selected.add_modifier(Modifier::BOLD),
+            CityKind::Extra(_) => Style::default().add_modifier(Modifier::BOLD),
+        };
+        let label = Span::styled(format!("[{}]", slot.location.city_admin), label_style);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![left, label, right])).alignment(Alignment::Center),
+            area,
+        );
+    }
 }
 
 #[async_trait]
@@ -371,7 +845,7 @@ impl Widget for WeatherWidget {
     async fn update(&mut self, _ctx: &AppContext) -> Result<()> {
         match self.next_action() {
             NextAction::Locate => self.spawn_geolocate(),
-            NextAction::Fetch => self.spawn_refresh(),
+            NextAction::Fetch(lat, lon) => self.spawn_refresh(lat, lon),
             NextAction::Wait => {}
         }
         Ok(())
@@ -383,50 +857,81 @@ impl Widget for WeatherWidget {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
+        let carousel = self.carousel();
         let snapshot = {
             let st = self.state.lock().expect("weather state poisoned");
-            // The override marker is the *italic* styling layered onto
-            // the title metadata, not a `(lookup)` suffix — the suffix
-            // would be the first thing tail-truncation eats, leaving
-            // the user with no visual signal that the displayed city
-            // isn't their default. The framework's `MetadataEmphasis`
-            // does the heavy lifting; we just hand it the raw label.
-            let (label, override_active) = match st.transient_location.as_ref() {
-                Some(l) => (Some(l.label.clone()), true),
-                None => (st.location.as_ref().map(|l| l.label.clone()), false),
-            };
-            // `revert_target` is populated only when an override is active.
-            // The default location (loaded from weather.toml) is what `x`
-            // brings us back to — surface its label so the hint reads
-            // "x: revert to Richmond, BC" rather than a vague "revert".
-            let revert_target = if override_active {
-                st.location.as_ref().map(|l| l.label.clone())
-            } else {
+            let selected = if carousel.is_empty() {
                 None
+            } else {
+                Some(st.selected.min(carousel.len() - 1))
+            };
+            let (data, last_error) = match selected {
+                Some(idx) => {
+                    let key = loc_key(
+                        carousel[idx].location.latitude,
+                        carousel[idx].location.longitude,
+                    );
+                    (
+                        st.data_by_key.get(&key).cloned(),
+                        st.error_by_key.get(&key).cloned(),
+                    )
+                }
+                None => (None, None),
+            };
+            // "Loading…" applies whenever the selected city is mid-fetch
+            // OR a `:weather <city>` lookup is itself resolving — both
+            // surface as the same in-flight signal to the user.
+            let inflight = match selected {
+                Some(idx) => {
+                    let key = loc_key(
+                        carousel[idx].location.latitude,
+                        carousel[idx].location.longitude,
+                    );
+                    st.inflight_keys.contains(&key)
+                }
+                None => false,
+            } || st.transient_searching;
+            // Some carousel slot must have attempted its first fetch
+            // before we can treat the empty-data state as "we tried
+            // and got nothing" vs "first reading still pending."
+            let attempted = match selected {
+                Some(idx) => {
+                    let key = loc_key(
+                        carousel[idx].location.latitude,
+                        carousel[idx].location.longitude,
+                    );
+                    st.poll_by_key
+                        .get(&key)
+                        .map(|t| t.has_attempted())
+                        .unwrap_or(false)
+                }
+                None => false,
             };
             Snapshot {
-                location_label: label,
+                location_label: selected.map(|i| carousel[i].location.label.clone()),
                 locating: st.locating,
                 geolocation_error: st.geolocation_error.clone(),
-                data: st.data.clone(),
-                last_error: st.last_error.clone(),
-                inflight: st.inflight || st.transient_searching,
-                attempted: st.poll.has_attempted(),
-                revert_target,
-                override_active,
+                data,
+                last_error,
+                inflight,
+                attempted,
             }
         };
-        let title_label = snapshot.location_label.clone();
+        // Title row drops the city metadata when the toggle bar is
+        // visible — the bar is the source of truth for which city
+        // we're viewing and a duplicate echo just wastes width. When
+        // no carousel exists yet (IP-geolocation still running), we
+        // fall back to the old "Locating…" metadata so the title row
+        // isn't bare.
         let title_prefix = if self.instance == "main" {
             "Weather".to_string()
         } else {
             format!("Weather ({})", self.instance)
         };
-        let metadata = title_label.or_else(|| Some("Locating…".to_string()));
-        let emphasis = if snapshot.override_active {
-            MetadataEmphasis::Emphasized
+        let metadata: Option<String> = if carousel.is_empty() {
+            Some("Locating…".to_string())
         } else {
-            MetadataEmphasis::Default
+            None
         };
         let block = apply_title_row(
             Block::default()
@@ -436,7 +941,7 @@ impl Widget for WeatherWidget {
             focused,
             &title_prefix,
             metadata.as_deref(),
-            emphasis,
+            MetadataEmphasis::Default,
             self.shortcut,
             &self.theme,
             area.width,
@@ -444,27 +949,89 @@ impl Widget for WeatherWidget {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Reserve a bottom row for the override hint when `:weather <city>`
-        // is active. Falls back to the full inner area when there's no
-        // override or the cell is too short to spare a row.
-        let (body_area, hint_area) = if snapshot.revert_target.is_some() && inner.height >= 2 {
-            let h = inner.height - 1;
-            (
-                Rect {
-                    x: inner.x,
-                    y: inner.y,
-                    width: inner.width,
-                    height: h,
-                },
-                Some(Rect {
-                    x: inner.x,
-                    y: inner.y + h,
-                    width: inner.width,
-                    height: 1,
-                }),
-            )
+        // Layout: optional helper-hint row, then the city-toggle row,
+        // then the body. The toggle is shown whenever a carousel
+        // exists (≥1 slot); the helper hint is shown when one of the
+        // contextual shortcuts (`+ add`, `- remove`) applies to the
+        // current selection. Both rows together claim the bottom of
+        // the cell; insufficient height drops them in order from the
+        // top so the body always wins the remaining space.
+        let show_toggle = !carousel.is_empty();
+        let selected_idx = if carousel.is_empty() {
+            None
         } else {
-            (inner, None)
+            Some(
+                self.state
+                    .lock()
+                    .expect("weather state poisoned")
+                    .selected
+                    .min(carousel.len() - 1),
+            )
+        };
+        let kind_at_selection = selected_idx.map(|i| carousel[i].kind);
+        let hint_parts: Vec<&str> = {
+            let mut v: Vec<&str> = Vec::with_capacity(2);
+            if matches!(kind_at_selection, Some(CityKind::Lookup)) {
+                v.push("+ add");
+                v.push("x revert");
+            }
+            if matches!(kind_at_selection, Some(CityKind::Extra(_))) {
+                v.push("- remove");
+            }
+            v
+        };
+        // Reserve the hint row whenever a carousel exists, *except*
+        // when doing so would tip the body past the art threshold —
+        // the weather glyph carries more visual signal than the
+        // small "- remove" / "+ add" hint, so we drop the hint to
+        // protect the icon. Always-reserving on Home matters too: a
+        // bare-toggle (no hint) on Home with a toggle+hint on Extra
+        // would shrink the body by one row between swipes and let
+        // CLOUD vanish while SUN survived.
+        let toggle_cost: u16 = if show_toggle { 1 } else { 0 };
+        let body_no_hint = inner.height.saturating_sub(toggle_cost);
+        let body_with_hint = body_no_hint.saturating_sub(1);
+        let art_fits_no_hint = body_no_hint >= ART_THRESHOLD;
+        let art_fits_with_hint = body_with_hint >= ART_THRESHOLD;
+        let has_data = snapshot.data.is_some();
+        // Default policy: reserve a hint row whenever a carousel
+        // exists, so layout stays stable across selections.
+        // Override: drop the hint when doing so salvages the icon.
+        let show_hint = show_toggle
+            && inner.height >= 3
+            && !(has_data && art_fits_no_hint && !art_fits_with_hint);
+
+        let mut body_h = inner.height;
+        let mut footer_y = inner.y + inner.height;
+        let toggle_area = if show_toggle && body_h >= 2 {
+            body_h -= 1;
+            footer_y -= 1;
+            Some(Rect {
+                x: inner.x,
+                y: footer_y,
+                width: inner.width,
+                height: 1,
+            })
+        } else {
+            None
+        };
+        let hint_area = if show_hint && body_h >= 2 {
+            body_h -= 1;
+            footer_y -= 1;
+            Some(Rect {
+                x: inner.x,
+                y: footer_y,
+                width: inner.width,
+                height: 1,
+            })
+        } else {
+            None
+        };
+        let body_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: body_h,
         };
 
         // When we have weather data, the ASCII art needs its own fixed-width
@@ -490,16 +1057,63 @@ impl Widget for WeatherWidget {
             frame.render_widget(body, body_area);
         }
 
-        if let (Some(area), Some(target)) = (hint_area, snapshot.revert_target.as_deref()) {
-            let hint = Line::from(Span::styled(
-                format!("x: revert to {target}"),
-                self.theme.text_dim,
-            ));
+        if let (Some(area), Some(idx)) = (toggle_area, selected_idx) {
+            self.render_city_toggle(frame, area, &carousel, idx);
+        }
+        if let Some(area) = hint_area {
+            let text = hint_parts.join(" · ");
+            let hint = Line::from(Span::styled(text, self.theme.text_dim));
             frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), area);
+        }
+
+        // Confirm-remove modal overlays everything else, so it goes last.
+        let pending = self
+            .state
+            .lock()
+            .expect("weather state poisoned")
+            .confirm_remove
+            .clone();
+        if let Some((label, _key)) = pending {
+            crate::ui::modal::render(
+                frame,
+                area,
+                &self.theme,
+                crate::ui::modal::ConfirmModal {
+                    title: " Remove city? ",
+                    target: &label,
+                    hint: None,
+                    max_width: 56,
+                },
+            );
+        }
+
+        // Losing focus dismisses any open confirm-remove modal —
+        // mirroring the clock widget's policy that a focus shift
+        // mid-prompt is an obvious cancel signal.
+        if !focused {
+            let mut st = self.state.lock().expect("weather state poisoned");
+            st.confirm_remove = None;
         }
     }
 
+
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        // Modal eats every keypress while open: y/Y commits, anything
+        // else cancels. Runs first so navigation keys don't bypass
+        // the prompt.
+        if self
+            .state
+            .lock()
+            .expect("weather state poisoned")
+            .confirm_remove
+            .is_some()
+        {
+            match crate::ui::modal::dispatch_key(key) {
+                crate::ui::modal::ConfirmChoice::Confirm => self.confirm_remove_selected(),
+                crate::ui::modal::ConfirmChoice::Cancel => self.cancel_remove(),
+            }
+            return EventResult::Handled;
+        }
         if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
             return EventResult::Ignored;
         }
@@ -510,11 +1124,23 @@ impl Widget for WeatherWidget {
                 return EventResult::Ignored;
             }
         }
-        if matches!(key.code, KeyCode::Char('x')) {
-            self.clear_transient();
-            EventResult::Handled
-        } else {
-            EventResult::Ignored
+        match key.code {
+            KeyCode::Char('x') => {
+                self.clear_transient();
+                EventResult::Handled
+            }
+            // Carousel navigation: vim-style + arrow keys both swipe
+            // between cities. Bare-letter so Shift+H/L pass through
+            // to the app-level focus dispatcher.
+            KeyCode::Char('h') | KeyCode::Left => self.select_delta(-1),
+            KeyCode::Char('l') | KeyCode::Right => self.select_delta(1),
+            // `+` adopts the `:weather <city>` lookup; `-` removes
+            // the highlighted Extra row (modal-confirmed). Both
+            // delegate to the carousel-aware helpers so they no-op
+            // on rows where the action doesn't apply.
+            KeyCode::Char('+') => self.add_transient_to_cities(),
+            KeyCode::Char('-') => self.request_remove_selected(),
+            _ => EventResult::Ignored,
         }
     }
 
@@ -529,8 +1155,15 @@ impl Widget for WeatherWidget {
                 Ok(true)
             }
             "refresh" => {
+                // Force-mark every per-city tracker so the next tick
+                // re-fetches everything we know about. Lazy-init isn't
+                // needed here — cities without a tracker haven't been
+                // viewed yet and will create one on their first visit.
                 let mut st = self.state.lock().expect("weather state poisoned");
-                st.poll.mark_dirty();
+                for t in st.poll_by_key.values_mut() {
+                    t.mark_dirty();
+                }
+                st.dirty = true;
                 Ok(true)
             }
             _ => Ok(false),
@@ -539,7 +1172,10 @@ impl Widget for WeatherWidget {
 
     fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
         vec![
-            ("x", "clear :weather lookup (return to default location)"),
+            ("←/→ / h/l", "swipe between cities"),
+            ("+", "add `:weather` lookup to city carousel"),
+            ("-", "remove highlighted city"),
+            ("x", "clear :weather lookup (return to home)"),
             (":weather <city>", "look up weather for a place"),
         ]
     }
@@ -560,7 +1196,13 @@ impl Widget for WeatherWidget {
         let app_theme = self.app_theme.clone();
         let cache = self.cache.clone();
         let instance = self.instance.clone();
+        // `assign_shortcuts` only runs once at startup, so a config
+        // reload (e.g. one triggered by our own `+`/`-` rewrite of
+        // weather.toml) must carry the assigned `Shift+<letter>`
+        // through manually — otherwise the title-bar accent vanishes.
+        let shortcut = self.shortcut;
         *self = Self::with_config(instance, new_config, app_theme, cache);
+        self.shortcut = shortcut;
         Ok(())
     }
 
@@ -570,13 +1212,21 @@ impl Widget for WeatherWidget {
     }
 
     fn poll_snapshot(&self) -> Option<crate::polling::PollSnapshot> {
-        Some(
-            self.state
-                .lock()
-                .expect("weather state poisoned")
-                .poll
-                .snapshot(),
-        )
+        // Surface the currently-selected city's tracker — that's the
+        // one whose freshness the user is staring at. Falls back to
+        // `None` when no carousel exists yet (IP geolocation still
+        // in flight).
+        let carousel = self.carousel();
+        if carousel.is_empty() {
+            return None;
+        }
+        let st = self.state.lock().ok()?;
+        let idx = st.selected.min(carousel.len() - 1);
+        let key = loc_key(
+            carousel[idx].location.latitude,
+            carousel[idx].location.longitude,
+        );
+        st.poll_by_key.get(&key).map(|t| t.snapshot())
     }
 
     fn shortcut_preferences(&self) -> &[char] {
@@ -592,14 +1242,19 @@ impl Widget for WeatherWidget {
     }
 
     fn title_metadata(&self) -> Option<String> {
-        // Active location label — transient override wins, falling
-        // back to the configured location. `None` until the first
-        // fetch resolves a location.
+        // With the multi-city toggle bar owning the "which city are
+        // we showing" affordance, we surface the active label only
+        // when no city has resolved yet — i.e. for the IP-geolocate
+        // / lookup-in-flight states the title still echoes useful
+        // status. Once we have a carousel, the bottom bar is the
+        // source of truth.
         let st = self.state.lock().ok()?;
-        st.transient_location
-            .as_ref()
-            .map(|l| l.label.clone())
-            .or_else(|| st.location.as_ref().map(|l| l.label.clone()))
+        if st.location.is_none() && st.transient_location.is_none() {
+            return None;
+        }
+        // Carousel is the source of truth for the visible city, so
+        // we don't repeat it in the title.
+        None
     }
 }
 
@@ -611,16 +1266,6 @@ struct Snapshot {
     last_error: Option<String>,
     inflight: bool,
     attempted: bool,
-    /// Label of the configured default location (typed at startup from
-    /// `weather.toml`). Populated only when a `:weather <city>` override is
-    /// active — used to drive the "x: revert to <default>" footer hint.
-    revert_target: Option<String>,
-    /// `true` when `:weather <city>` has displaced the configured
-    /// location. Drives `MetadataEmphasis::Emphasized` in the title row
-    /// so the italic styling tells the user at a glance that the
-    /// displayed city isn't their default, even when the city label
-    /// itself has been tail-truncated by a narrow widget cell.
-    override_active: bool,
 }
 
 fn render_with_art(
@@ -631,9 +1276,31 @@ fn render_with_art(
     units: Units,
     theme: &Theme,
 ) {
-    let (label, icon) = describe_code(data.weather_code);
+    let (label, icon_glyph) = describe_code(data.weather_code);
+    // Layout tier is keyed off the body height alone; falls back to
+    // L3 (the most aggressive compression) when even that doesn't
+    // fit so the caller can branch on `None` to drop the art
+    // entirely. `render` has already done that branch via
+    // `ART_THRESHOLD` so by the time we land here, `pick_art_layout`
+    // is guaranteed to be `Some`.
+    let layout = pick_art_layout(inner.height).unwrap_or(ArtLayout::TempInHeader);
 
-    // Header: top blank + condition label + blank.
+    // Temp + feels combined string — surfaced into the header on
+    // L3, and otherwise emitted as its own bottom-block line.
+    // Split into two strings so the leading temperature can keep
+    // its yellow+bold highlight even when the line is compressed.
+    let temp_str = format!("{:.0}{}", data.temperature, data.units.temp_symbol());
+    let feels_suffix = format!(
+        ", Feels like {:.0}{}",
+        data.apparent_temperature,
+        data.units.temp_symbol()
+    );
+    let temp_feels = format!("{temp_str}{feels_suffix}");
+    let temp_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    // Header: top blank + condition label (+ "| temp, feels" on L3) + blank.
     //
     // We center the icon + label manually instead of relying on
     // `Alignment::Center`. Ratatui's center math goes through
@@ -643,17 +1310,34 @@ fn render_with_art(
     // matches the real cell width for our icons (emoji + VS-16 = 2 chars,
     // bare "·" fallback = 1 char) so the hand-rolled padding lines up with
     // what the user actually sees.
-    let header_text = format!("{icon}  {label}");
+    let header_text = if layout == ArtLayout::TempInHeader {
+        format!("{icon_glyph}  {label}  |  {temp_feels}")
+    } else {
+        format!("{icon_glyph}  {label}")
+    };
     let visual_width = header_text.chars().count() as u16;
     let pad = inner.width.saturating_sub(visual_width) / 2;
-    let header_lines: Vec<Line<'_>> = vec![
-        Line::from(""),
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let header_content = if layout == ArtLayout::TempInHeader {
+        // Split the header into three spans so the leading
+        // temperature keeps its yellow+bold accent — same visual
+        // weight it carries in the spacier layouts — while the
+        // surrounding label + "Feels like X" stay in plain bold.
+        Line::from(vec![
+            Span::styled(
+                format!("{:pad$}{icon_glyph}  {label}  |  ", "", pad = pad as usize),
+                bold,
+            ),
+            Span::styled(temp_str.clone(), temp_style),
+            Span::styled(feels_suffix.clone(), bold),
+        ])
+    } else {
         Line::from(Span::styled(
-            format!("{:pad$}{header_text}", "", pad = pad as usize),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
+            format!("{:pad$}{icon_glyph}  {label}", "", pad = pad as usize),
+            bold,
+        ))
+    };
+    let header_lines: Vec<Line<'_>> = vec![Line::from(""), header_content, Line::from("")];
     let header_height: u16 = header_lines.len() as u16;
     let header_area = Rect {
         x: inner.x,
@@ -666,38 +1350,42 @@ fn render_with_art(
         header_area,
     );
 
-    // Art: pick the icon for the current weather + time-of-day, then carve
-    // out a sub-rect sized to *that* icon's actual dimensions. Using the
-    // icon's own height/width (rather than the worst-case maximum across
-    // all 16 glyphs) keeps the gap between the art and the temperature
-    // text tight regardless of which sprite is displayed.
-    //
-    // When the cell is short, the art is the first thing to go — temp,
-    // feels-like, humidity, wind, and forecast all communicate the actual
-    // weather; the glyph is decoration. `MIN_BOTTOM_ROWS_FOR_ART` is the
-    // approximate row count needed to show the full bottom block (temp +
-    // feels + blank + humidity/wind + blank + "Next 3 days" header + 3
-    // forecast rows + blank + footer = ~11). If we can't fit header + icon +
-    // that, drop the icon and let the bottom block use the freed rows.
-    const MIN_BOTTOM_ROWS_FOR_ART: u16 = 11;
+    // Art slot. Fixed-height; sprites taller than `FIXED_ART_ROWS`
+    // get a symmetric top/bottom crop via `render_icon_clipped`;
+    // shorter sprites get vertically centered inside the slot.
+    // Both directions of slack absorb into the slot rather than
+    // shifting the rows below, so the bottom block stays anchored
+    // at the same Y across cities. The "show art at all" decision
+    // was made in `render` via `ART_THRESHOLD`; here we just paint.
     let night = data.is_night(chrono::Local::now());
     let icon = icon_for_code(data.weather_code, night);
-    let icon_rows = (icon.height as u16).div_ceil(2);
+    let total_icon_rows = (icon.height as u16).div_ceil(2);
+    let drawn_icon_rows = total_icon_rows.min(FIXED_ART_ROWS);
     let icon_cols = (icon.width as u16).min(inner.width);
     let mut used_top = header_height;
-    if inner.height >= header_height + icon_rows + MIN_BOTTOM_ROWS_FOR_ART {
-        let art_x = inner.x + (inner.width.saturating_sub(icon_cols)) / 2;
-        let art_area = Rect {
-            x: art_x,
-            y: inner.y + header_height,
-            width: icon_cols,
-            height: icon_rows,
-        };
-        frame.render_widget(Paragraph::new(render_icon(icon)), art_area);
-        used_top = used_top.saturating_add(icon_rows).saturating_add(1); // +1 trailing blank
-    }
+    let art_x = inner.x + (inner.width.saturating_sub(icon_cols)) / 2;
+    // Center the drawn sprite (post-crop) inside the fixed slot.
+    let art_y = inner.y
+        + header_height
+        + FIXED_ART_ROWS.saturating_sub(drawn_icon_rows) / 2;
+    let art_area = Rect {
+        x: art_x,
+        y: art_y,
+        width: icon_cols,
+        height: drawn_icon_rows,
+    };
+    frame.render_widget(
+        Paragraph::new(render_icon_clipped(icon, Some(FIXED_ART_ROWS))),
+        art_area,
+    );
+    // Advance by the *slot* height (not the actual sprite height)
+    // plus a 1-row spacer so the bottom block starts at a stable Y
+    // regardless of which sprite is showing.
+    used_top = used_top.saturating_add(FIXED_ART_ROWS).saturating_add(ART_TO_BOTTOM_SPACER);
 
-    // Bottom section: temp, feels-like, humidity/wind, forecast, footer.
+    // Bottom section: temp/feels (or skip on L3), humidity/wind,
+    // forecast, footer. Inter-section blank rows are dropped on L2
+    // and L3 to claw back vertical space.
     if inner.height <= used_top {
         return;
     }
@@ -708,18 +1396,38 @@ fn render_with_art(
         height: inner.height - used_top,
     };
     let mut lines: Vec<Line<'_>> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        format!("{:.0}{}", data.temperature, data.units.temp_symbol()),
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(format!(
-        "Feels like {:.0}{}",
-        data.apparent_temperature,
-        data.units.temp_symbol()
-    )));
-    lines.push(Line::from(""));
+    // Temp/feels styling: the leading temperature is rendered in
+    // `temp_style` (yellow+bold) across every layout that keeps it
+    // in the body — `", Feels like X°C"` falls back to the default
+    // text style so the highlight cue stays on the primary reading.
+    match layout {
+        ArtLayout::Full => {
+            lines.push(Line::from(Span::styled(temp_str.clone(), temp_style)));
+            lines.push(Line::from(format!(
+                "Feels like {:.0}{}",
+                data.apparent_temperature,
+                data.units.temp_symbol()
+            )));
+            lines.push(Line::from(""));
+        }
+        ArtLayout::CombinedTemp => {
+            lines.push(Line::from(vec![
+                Span::styled(temp_str.clone(), temp_style),
+                Span::raw(feels_suffix.clone()),
+            ]));
+            lines.push(Line::from(""));
+        }
+        ArtLayout::TightSpacing => {
+            lines.push(Line::from(vec![
+                Span::styled(temp_str.clone(), temp_style),
+                Span::raw(feels_suffix.clone()),
+            ]));
+            // No blank between temp/feels and humidity/wind.
+        }
+        ArtLayout::TempInHeader => {
+            // Temp+feels live up in the header; nothing here.
+        }
+    }
     lines.push(Line::from(format!(
         "Humidity: {:.0}%   Wind: {:.0} {}",
         data.humidity,
@@ -820,6 +1528,24 @@ fn loading_lines(s: &Snapshot, theme: &Theme) -> Vec<Line<'static>> {
 /// shared [`crate::format::short_duration_label`].
 fn format_age(secs: i64) -> String {
     crate::format::short_duration_label(secs)
+}
+
+/// TOML scalar string quoter mirroring the clock widget's helper.
+/// Escapes `"`, `\`, and control bytes so a city label like
+/// `Washington, D.C.` round-trips cleanly through weather.toml.
+fn toml_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn weekday_short(w: chrono::Weekday) -> &'static str {

@@ -139,7 +139,11 @@ fn world_clock_entries_pin_local_during_time_override() {
     let w = build_widget(cfg);
     {
         let mut st = w.state.lock().unwrap();
-        st.transient_tz = Some(("Berlin".into(), "Europe/Berlin".parse::<Tz>().unwrap()));
+        st.transient_tz = Some((
+            "Berlin, Berlin, Germany".into(),
+            "Berlin".into(),
+            "Europe/Berlin".parse::<Tz>().unwrap(),
+        ));
     }
     let entries = w.world_clock_entries();
     assert_eq!(entries.len(), 3, "Local + override + 1 secondary");
@@ -253,6 +257,71 @@ fn scroll_world_clocks_clamps_and_passes_through_when_full_list_fits() {
         0,
         "scroll must clamp at 0"
     );
+}
+
+#[test]
+fn move_world_clock_selection_ignored_when_no_secondaries() {
+    let w = build_widget(ClockConfig::default());
+    assert_eq!(w.move_world_clock_selection(1), EventResult::Ignored);
+    assert_eq!(w.move_world_clock_selection(-1), EventResult::Ignored);
+    assert!(w.state.lock().unwrap().world_clock_selected.is_none());
+}
+
+#[test]
+fn first_press_lands_on_first_secondary_without_transient() {
+    let cfg = ClockConfig {
+        secondary_timezones: vec![
+            SecondaryTimezone {
+                label: "Tokyo".into(),
+                timezone: "Asia/Tokyo".into(),
+            },
+            SecondaryTimezone {
+                label: "London".into(),
+                timezone: "Europe/London".into(),
+            },
+        ],
+        ..ClockConfig::default()
+    };
+    let w = build_widget(cfg);
+    assert_eq!(w.move_world_clock_selection(1), EventResult::Handled);
+    // No transient → entries = [primary, Tokyo, London]; first
+    // selectable is idx 1.
+    assert_eq!(w.state.lock().unwrap().world_clock_selected, Some(1));
+    assert_eq!(w.move_world_clock_selection(1), EventResult::Handled);
+    assert_eq!(w.state.lock().unwrap().world_clock_selected, Some(2));
+    // Clamp at the bottom of the list.
+    assert_eq!(w.move_world_clock_selection(1), EventResult::Handled);
+    assert_eq!(w.state.lock().unwrap().world_clock_selected, Some(2));
+    // Walk back up and clamp at the top of the selectable range.
+    w.move_world_clock_selection(-1);
+    w.move_world_clock_selection(-1);
+    w.move_world_clock_selection(-1);
+    assert_eq!(w.state.lock().unwrap().world_clock_selected, Some(1));
+}
+
+#[test]
+fn first_press_lands_on_first_secondary_with_transient_skipping_local_and_lookup() {
+    use chrono_tz::Tz;
+    let cfg = ClockConfig {
+        secondary_timezones: vec![SecondaryTimezone {
+            label: "Tokyo".into(),
+            timezone: "Asia/Tokyo".into(),
+        }],
+        ..ClockConfig::default()
+    };
+    let w = build_widget(cfg);
+    {
+        let mut st = w.state.lock().unwrap();
+        st.transient_tz = Some((
+            "Berlin, Berlin, Germany".into(),
+            "Berlin".into(),
+            "Europe/Berlin".parse::<Tz>().unwrap(),
+        ));
+    }
+    // Entries with transient = [Local, Berlin, Tokyo]; first
+    // selectable should skip Local + Berlin and land at idx 2.
+    assert_eq!(w.move_world_clock_selection(1), EventResult::Handled);
+    assert_eq!(w.state.lock().unwrap().world_clock_selected, Some(2));
 }
 
 #[test]

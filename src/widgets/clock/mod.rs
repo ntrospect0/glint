@@ -233,6 +233,17 @@ impl Widget for ClockWidget {
         // hidden children, so a stale value means "not visible."
         self.last_render_at_millis
             .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
+        // Losing focus drops the world-clock selection cursor — the
+        // user has navigated away and the highlighted row would
+        // otherwise linger across tabs. Also dismiss any open
+        // confirm-remove modal: a focus shift mid-prompt is a clear
+        // cancel signal, and re-opening the prompt later would
+        // surprise the user.
+        if !focused {
+            let mut st = self.state.lock().expect("clock state poisoned");
+            st.world_clock_selected = None;
+            st.confirm_remove = None;
+        }
         let (transient, searching) = self.snapshot_transient();
         let mode = self.state.lock().expect("clock state poisoned").mode;
         let base = if self.instance == "main" {
@@ -252,7 +263,7 @@ impl Widget for ClockWidget {
         // the Clock view.
         let metadata = match mode {
             Mode::Clock => {
-                if let Some((label, _)) = &transient {
+                if let Some((label, _city, _tz)) = &transient {
                     Some(label.clone())
                 } else if searching {
                     Some("looking up…".to_string())
@@ -344,8 +355,48 @@ impl Widget for ClockWidget {
                 .mode_tab_rects
                 .clear();
         }
+
+        // Confirm-remove overlay paints last so it sits above the
+        // clock body. Only mounted when a removal is pending.
+        let pending = self
+            .state
+            .lock()
+            .expect("clock state poisoned")
+            .confirm_remove
+            .clone();
+        if let Some((label, _tz)) = pending {
+            crate::ui::modal::render(
+                frame,
+                area,
+                &self.theme,
+                crate::ui::modal::ConfirmModal {
+                    title: " Remove world clock? ",
+                    target: &label,
+                    hint: None,
+                    max_width: 48,
+                },
+            );
+        }
     }
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        // Confirm-remove modal eats every keystroke while open: `y`
+        // commits the removal, anything else cancels and dismisses.
+        // Runs before any other dispatch so mode-switch letters
+        // don't bypass the prompt.
+        if self
+            .state
+            .lock()
+            .expect("clock state poisoned")
+            .confirm_remove
+            .is_some()
+        {
+            match crate::ui::modal::dispatch_key(key) {
+                crate::ui::modal::ConfirmChoice::Confirm => self.confirm_remove_world_clock(),
+                crate::ui::modal::ConfirmChoice::Cancel => self.cancel_remove_world_clock(),
+            }
+            return EventResult::Handled;
+        }
+
         // Uppercase ASCII letters are reserved for the app-wide
         // `Shift+<letter>` focus-jump dispatcher — never consume them
         // here regardless of mode.
@@ -442,7 +493,9 @@ impl Widget for ClockWidget {
 
     fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
         vec![
-            ("↑ / ↓ / scroll", "scroll world clocks (when truncated)"),
+            ("↑/↓ / j/k", "select world clock (auto-scrolls)"),
+            ("-", "remove selected world clock"),
+            ("+", "add `:time` / `:clock` lookup to world clocks"),
             ("g", "cycle digit gradient style"),
             ("x", "clear :time lookup (return to local time)"),
             (":time <city>", "switch primary clock to that location"),
@@ -469,7 +522,15 @@ impl Widget for ClockWidget {
             serde_json::from_value(config).context("invalid clock config payload")?;
         let app_theme = self.app_theme.clone();
         let instance = self.instance.clone();
+        // Snapshot the assigned `Shift+<letter>` shortcut before
+        // we wholesale-replace `self`. `assign_shortcuts` runs once
+        // at startup, so a config-watcher-triggered apply_config
+        // (e.g. after `+`/`-` rewrites clock.toml) would otherwise
+        // drop the C-highlight from the title bar with no path to
+        // restore it.
+        let shortcut = self.shortcut;
         *self = Self::with_config(instance, new_config, app_theme);
+        self.shortcut = shortcut;
         Ok(())
     }
 
@@ -492,7 +553,7 @@ impl Widget for ClockWidget {
 
     fn title_metadata(&self) -> Option<String> {
         let (transient, searching) = self.snapshot_transient();
-        if let Some((label, _)) = transient {
+        if let Some((label, _city, _tz)) = transient {
             return Some(format!("{label} (lookup)"));
         }
         if searching {

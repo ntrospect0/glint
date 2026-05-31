@@ -261,23 +261,33 @@ pub fn icon_for_code(code: u32, night: bool) -> &'static WeatherIcon {
     }
 }
 
-/// Render a `WeatherIcon` as `(height+1)/2` Ratatui Lines using the half-
-/// block trick: two pixel rows collapse into one terminal row, with `fg`
+/// Render a `WeatherIcon` as Ratatui Lines using the half-block
+/// trick: two pixel rows collapse into one terminal row, with `fg`
 /// driving the top half and `bg` (when present) driving the bottom.
-pub fn render_icon(icon: &WeatherIcon) -> Vec<Line<'static>> {
+///
+/// `max_char_rows` clips the output vertically with a symmetric
+/// top/bottom crop — tall sprites (e.g. `MOON_CLOUD` at 10 char
+/// rows) trim one char row off each end to fit the weather widget's
+/// 8-row art slot. Pass `None` to render the full sprite.
+pub fn render_icon_clipped(icon: &WeatherIcon, max_char_rows: Option<u16>) -> Vec<Line<'static>> {
     let h = icon.height as usize;
     let w = icon.width as usize;
-    let char_rows = h.div_ceil(2);
+    let total_char_rows = h.div_ceil(2);
+    let char_rows = match max_char_rows {
+        Some(cap) => total_char_rows.min(cap as usize),
+        None => total_char_rows,
+    };
+    // Symmetric center-crop in *char-row* units so the half-block
+    // pairing stays intact — clipping at an odd pixel offset would
+    // shift every pair by one and break the silhouette.
+    let crop_top_char_rows = total_char_rows.saturating_sub(char_rows) / 2;
+    let crop_top_px = crop_top_char_rows * 2;
     let mut lines = Vec::with_capacity(char_rows);
     for char_row in 0..char_rows {
-        let top_idx = char_row * 2;
+        let top_idx = crop_top_px + char_row * 2;
         let bot_idx = top_idx + 1;
-        let top_row = icon.pixels[top_idx];
-        let bot_row = if bot_idx < h {
-            icon.pixels[bot_idx]
-        } else {
-            &[]
-        };
+        let top_row = icon.pixels.get(top_idx).copied().unwrap_or(&[]);
+        let bot_row = icon.pixels.get(bot_idx).copied().unwrap_or(&[]);
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(w);
         for col in 0..w {
             let top = top_row
@@ -389,7 +399,7 @@ mod tests {
     fn rendered_icon_dimensions_match_its_declared_size() {
         for code in [0, 1, 2, 3, 45, 48, 61, 75, 80, 95, 96, 9999] {
             let icon = icon_for_code(code, false);
-            let lines = render_icon(icon);
+            let lines = render_icon_clipped(icon, None);
             let expected_rows = (icon.height as usize).div_ceil(2);
             assert_eq!(
                 lines.len(),

@@ -26,7 +26,10 @@ use crate::ui::big_digits;
 use super::{ClockWidget, EventResult};
 
 impl ClockWidget {
-    pub(super) fn snapshot_transient(&self) -> (Option<(String, Tz)>, bool) {
+    /// `(Option<(full_label, _city, tz)>, searching)`. The full label
+    /// is what the title row shows; callers wanting just the city
+    /// name pull the second tuple element directly.
+    pub(super) fn snapshot_transient(&self) -> (Option<(String, String, Tz)>, bool) {
         let st = self.state.lock().expect("clock state poisoned");
         (st.transient_tz.clone(), st.transient_searching)
     }
@@ -39,7 +42,7 @@ impl ClockWidget {
             .expect("clock state poisoned")
             .transient_tz
             .as_ref()
-            .map(|(_, tz)| *tz)
+            .map(|(_, _, tz)| *tz)
             .or(self.tz)
     }
 
@@ -50,7 +53,10 @@ impl ClockWidget {
             // Setting an override prepends Local + the override onto the
             // world-clocks list, so any prior scroll offset no longer points
             // at the same entry — reset to the top for predictability.
+            // Same reasoning for the selection cursor: indices shift, so
+            // drop the cursor rather than leave it on a now-stale row.
             st.world_clock_scroll = 0;
+            st.world_clock_selected = None;
         }
         let state = self.state.clone();
         let query = query.to_string();
@@ -66,7 +72,7 @@ impl ClockWidget {
                     };
                     match tz_name.parse::<Tz>() {
                         Ok(tz) => {
-                            st.transient_tz = Some((loc.label.clone(), tz));
+                            st.transient_tz = Some((loc.label.clone(), loc.city.clone(), tz));
                         }
                         Err(_) => {
                             tracing::warn!(query = %query, tz = %tz_name, "unrecognized IANA timezone");
@@ -84,8 +90,10 @@ impl ClockWidget {
         let mut st = self.state.lock().expect("clock state poisoned");
         st.transient_tz = None;
         // Same reasoning as `lookup_location` — the list shape changes back,
-        // so reset the offset rather than leave it pointing somewhere stale.
+        // so reset the offset + selection rather than leave them pointing
+        // somewhere stale.
         st.world_clock_scroll = 0;
+        st.world_clock_selected = None;
     }
 
     /// Move the world-clocks view by `delta` rows (negative = up). Returns
@@ -100,6 +108,186 @@ impl ClockWidget {
         let max = st.world_clock_max_scroll;
         let next = (st.world_clock_scroll as i32 + delta).clamp(0, max as i32);
         st.world_clock_scroll = next as usize;
+        EventResult::Handled
+    }
+
+    /// Inclusive `(min, max)` range of selectable absolute indices
+    /// into [`world_clock_entries`]. Primary (idx 0) and the
+    /// `:time`/`:clock` transient row (idx 1 when present) are
+    /// excluded — only configured secondary timezones are
+    /// navigable. `None` when there are no secondaries to land on.
+    fn selectable_world_clock_range(&self) -> Option<(usize, usize)> {
+        if self.secondaries.is_empty() {
+            return None;
+        }
+        let has_transient = self
+            .state
+            .lock()
+            .expect("clock state poisoned")
+            .transient_tz
+            .is_some();
+        let start = if has_transient { 2 } else { 1 };
+        let end = start + self.secondaries.len() - 1;
+        Some((start, end))
+    }
+
+    /// j/k handler. First press materializes the selector at the
+    /// first secondary row; subsequent presses move it within the
+    /// selectable range. Render auto-scrolls the list to keep the
+    /// selected row visible.
+    pub(super) fn move_world_clock_selection(&self, delta: i32) -> EventResult {
+        let Some((min, max)) = self.selectable_world_clock_range() else {
+            return EventResult::Ignored;
+        };
+        let mut st = self.state.lock().expect("clock state poisoned");
+        let next = match st.world_clock_selected {
+            None => min,
+            Some(cur) => (cur as i32 + delta).clamp(min as i32, max as i32) as usize,
+        };
+        // Re-clamp in case the secondaries list shrank since the
+        // last navigation (e.g. user just removed a row); a stale
+        // index outside the new range would otherwise highlight the
+        // wrong row on the next render.
+        let clamped = next.clamp(min, max);
+        st.world_clock_selected = Some(clamped);
+        EventResult::Handled
+    }
+
+    /// `-` handler. Opens the confirm modal for the selected
+    /// secondary row. No-op when no row is selected or the
+    /// selected index isn't a secondary (defense in depth — the
+    /// key handler should already have routed `-` only to
+    /// secondaries).
+    pub(super) fn request_remove_selected(&self) -> EventResult {
+        let Some((min, max)) = self.selectable_world_clock_range() else {
+            return EventResult::Ignored;
+        };
+        let sel = match self
+            .state
+            .lock()
+            .expect("clock state poisoned")
+            .world_clock_selected
+        {
+            Some(i) if i >= min && i <= max => i,
+            _ => return EventResult::Ignored,
+        };
+        let sec_idx = sel - min;
+        let (label, tz) = match self.secondaries.get(sec_idx) {
+            Some(s) => (s.0.clone(), s.1.name().to_string()),
+            None => return EventResult::Ignored,
+        };
+        self.state
+            .lock()
+            .expect("clock state poisoned")
+            .confirm_remove = Some((label, tz));
+        EventResult::Handled
+    }
+
+    /// Apply a pending remove (set by [`Self::request_remove_selected`]).
+    /// Mutates `config.secondary_timezones`, rebuilds the parsed
+    /// `secondaries` list, persists the change to clock.toml, and
+    /// re-clamps the selection / scroll so the surviving rows stay
+    /// reachable.
+    pub(super) fn confirm_remove_world_clock(&mut self) {
+        let target_tz = match self
+            .state
+            .lock()
+            .expect("clock state poisoned")
+            .confirm_remove
+            .clone()
+        {
+            Some((_, tz)) => tz,
+            None => return,
+        };
+        let before = self.config.secondary_timezones.len();
+        self.config
+            .secondary_timezones
+            .retain(|s| s.timezone != target_tz);
+        let removed = self.config.secondary_timezones.len() < before;
+        // Always clear the modal slot; if nothing matched we still
+        // want the user dismissed back to the main view rather than
+        // stuck looking at a confirm overlay for a missing row.
+        self.state
+            .lock()
+            .expect("clock state poisoned")
+            .confirm_remove = None;
+        if !removed {
+            return;
+        }
+        self.secondaries.retain(|(_, tz)| tz.name() != target_tz);
+        self.persist_secondary_timezones();
+        // Re-clamp the selection. After removal the secondaries
+        // list is shorter; if the cursor was past the new end we
+        // pin it to the last surviving row; if it was the only row
+        // we clear the cursor entirely.
+        let new_range = self.selectable_world_clock_range();
+        let mut st = self.state.lock().expect("clock state poisoned");
+        st.world_clock_selected = match (new_range, st.world_clock_selected) {
+            (Some((min, max)), Some(cur)) => Some(cur.clamp(min, max)),
+            (Some((min, _)), None) => Some(min),
+            (None, _) => None,
+        };
+        // World-clock list shrank, so any cached max-scroll is stale.
+        // Render re-derives it on next frame; this clamp keeps the
+        // intermediate state self-consistent.
+        st.world_clock_scroll = 0;
+        st.world_clock_max_scroll = 0;
+    }
+
+    pub(super) fn cancel_remove_world_clock(&self) {
+        self.state
+            .lock()
+            .expect("clock state poisoned")
+            .confirm_remove = None;
+    }
+
+    /// `+` handler. Adds the active `:time`/`:clock` transient
+    /// lookup to the permanent secondary list, persists, clears
+    /// the transient (the row now lives in the secondaries block),
+    /// and lands the selector on the freshly-added entry.
+    pub(super) fn add_transient_to_world_clocks(&mut self) -> EventResult {
+        let (city, tz) = {
+            let st = self.state.lock().expect("clock state poisoned");
+            match &st.transient_tz {
+                Some((_full, city, tz)) => (city.clone(), *tz),
+                None => return EventResult::Ignored,
+            }
+        };
+        let tz_name = tz.name().to_string();
+        // Skip if the same IANA zone is already in the list — adding
+        // a duplicate would leave the secondaries list with two rows
+        // that tick in lockstep and confuse the user.
+        if self
+            .config
+            .secondary_timezones
+            .iter()
+            .any(|s| s.timezone == tz_name)
+        {
+            // Still clear the transient so `:clock <city>` on an
+            // already-tracked city resolves to "you're done" rather
+            // than a stuck lookup row.
+            let mut st = self.state.lock().expect("clock state poisoned");
+            st.transient_tz = None;
+            return EventResult::Handled;
+        }
+        self.config
+            .secondary_timezones
+            .push(super::config::SecondaryTimezone {
+                label: city.clone(),
+                timezone: tz_name.clone(),
+            });
+        self.secondaries.push((city, tz));
+        self.persist_secondary_timezones();
+        let new_range = self.selectable_world_clock_range();
+        let mut st = self.state.lock().expect("clock state poisoned");
+        st.transient_tz = None;
+        // Selection lands on the newly-added (now last) entry so
+        // the user sees a clear confirmation that the add stuck.
+        if let Some((_, max)) = new_range {
+            st.world_clock_selected = Some(max);
+        }
+        st.world_clock_scroll = 0;
+        st.world_clock_max_scroll = 0;
         EventResult::Handled
     }
 
@@ -181,9 +369,14 @@ impl ClockWidget {
         }
 
         let (primary_label, primary_str) = match transient {
-            Some((label, tz)) => {
+            // World-clocks list uses the short city name (second
+            // element of the transient triple). Full label stays
+            // available to the title-bar metadata path. Embedded
+            // commas in compound city names (e.g. "Washington, D.C.")
+            // are preserved by the geocoder and pass through here.
+            Some((_full_label, city, tz)) => {
                 let t = now.with_timezone(&tz);
-                (label, format_clock_entry(&t))
+                (city, format_clock_entry(&t))
             }
             None => match self.tz {
                 Some(tz) => {
@@ -212,7 +405,7 @@ impl ClockWidget {
         &self,
         frame: &mut Frame,
         inner: Rect,
-        transient: Option<&(String, Tz)>,
+        transient: Option<&(String, String, Tz)>,
     ) {
         let now = chrono::Utc::now();
         let (time, ampm, date) = self.render_strings(now);
@@ -260,13 +453,21 @@ impl ClockWidget {
 
         // World clocks block — show as many entries as fit, scroll the rest
         // with ↑/↓ and mouse-wheel. Primary timezone leads so the user can
-        // see local time alongside the rest of the world. The transient
-        // footer (when a `:time` override is active) eats the bottom row, so
-        // the available height for the body shrinks by 1 in that case —
-        // factor that into the fit calculation, otherwise the last clock
-        // entry would be clipped by the footer.
+        // see local time alongside the rest of the world. The contextual
+        // footer (revert/add/remove hints — see the hint-build block
+        // below) eats the bottom row, so the available height for the
+        // body shrinks by 1 in that case — factor that into the fit
+        // calculation, otherwise the last clock entry would be clipped
+        // by the footer.
         let clocks = self.world_clock_entries();
-        let body_h = if transient.is_some() {
+        let selection_active = self
+            .state
+            .lock()
+            .expect("clock state poisoned")
+            .world_clock_selected
+            .is_some();
+        let show_footer = transient.is_some() || selection_active;
+        let body_h = if show_footer {
             inner.height.saturating_sub(1)
         } else {
             inner.height
@@ -280,13 +481,26 @@ impl ClockWidget {
             if avail_clocks >= 1 {
                 let visible_count = avail_clocks.min(clocks.len());
                 let max_scroll = clocks.len().saturating_sub(visible_count);
-                let scroll = {
+                let (scroll, selected) = {
                     let mut st = self.state.lock().expect("clock state poisoned");
                     st.world_clock_max_scroll = max_scroll;
+                    // Auto-scroll: if the selected row would land
+                    // outside the visible window, slide the window
+                    // so it's in view. j/k driven movement happens
+                    // in the key handler — this is just the
+                    // viewport-adjust half that needs the render-
+                    // time geometry.
+                    if let Some(sel) = st.world_clock_selected {
+                        if sel < st.world_clock_scroll {
+                            st.world_clock_scroll = sel;
+                        } else if sel >= st.world_clock_scroll + visible_count {
+                            st.world_clock_scroll = sel + 1 - visible_count;
+                        }
+                    }
                     if st.world_clock_scroll > max_scroll {
                         st.world_clock_scroll = max_scroll;
                     }
-                    st.world_clock_scroll
+                    (st.world_clock_scroll, st.world_clock_selected)
                 };
                 let visible_end = scroll + visible_count;
                 let has_above = scroll > 0;
@@ -307,11 +521,27 @@ impl ClockWidget {
                     self.theme.text_dim,
                 )));
 
-                let max_label = clocks
+                // Reserve enough width for the longest time column
+                // (icon + HH:MM + weekday + month + day, ~18 cells).
+                // The label column gets whatever inner.width leaves
+                // over after the 2-cell gap and 2-cell selector
+                // prefix; long city names get truncated with an
+                // ellipsis so the time always stays on screen.
+                let time_w = clocks
+                    .iter()
+                    .map(|(_, t)| t.chars().count())
+                    .max()
+                    .unwrap_or(0);
+                let widest_label = clocks
                     .iter()
                     .map(|(l, _)| l.chars().count())
                     .max()
                     .unwrap_or(0);
+                // 2 cells for the leading "▸ " / "  " selector
+                // marker, 2 cells of gap between label and time.
+                let available_label_w =
+                    (inner.width as usize).saturating_sub(time_w + 4);
+                let max_label = widest_label.min(available_label_w).max(1);
                 // Local — and whichever entry the big-digit display is showing
                 // — get colored so the user can see at a glance which row
                 // matches the big clock. Local picks up `text.focused` from
@@ -338,7 +568,15 @@ impl ClockWidget {
                     } else {
                         Style::default()
                     };
-                    let line = format!("{:<width$}  {}", label, time_str, width = max_label);
+                    let prefix = if selected == Some(idx) { "▸ " } else { "  " };
+                    let display_label = truncate_with_ellipsis(label, max_label);
+                    let line = format!(
+                        "{}{:<width$}  {}",
+                        prefix,
+                        display_label,
+                        time_str,
+                        width = max_label
+                    );
                     lines.push(Line::from(Span::styled(line, style)));
                 }
             } else {
@@ -351,11 +589,24 @@ impl ClockWidget {
             }
         }
 
-        // When a `:time <city>` override is active, append a footer hint
-        // pinned to the bottom of the cell so the user has an obvious
-        // escape route back to Local time.
+        // Build the footer hint from whatever contextual shortcuts
+        // are currently meaningful: revert / add when a `:time`
+        // lookup is active, remove when the selector cursor is
+        // on a secondary row. Empty when neither applies, in which
+        // case the body claims the full inner area.
+        let mut hints: Vec<&str> = Vec::with_capacity(3);
         if transient.is_some() {
-            let hint = Line::from(Span::styled("x: revert to Local", self.theme.text_dim));
+            hints.push("x revert to Local");
+            hints.push("+ add timezone");
+        }
+        if selection_active {
+            hints.push("- remove");
+        }
+        if !show_footer {
+            let body = Paragraph::new(lines).alignment(Alignment::Center);
+            frame.render_widget(body, inner);
+        } else {
+            let hint = Line::from(Span::styled(hints.join(" · "), self.theme.text_dim));
             let body = Paragraph::new(lines).alignment(Alignment::Center);
             let body_h = inner.height.saturating_sub(1);
             let body_area = Rect {
@@ -372,11 +623,26 @@ impl ClockWidget {
             };
             frame.render_widget(body, body_area);
             frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), hint_area);
-        } else {
-            let body = Paragraph::new(lines).alignment(Alignment::Center);
-            frame.render_widget(body, inner);
         }
     }
+}
+
+/// Trim `s` to at most `max_width` characters, appending an ellipsis
+/// to mark the truncation. `max_width <= 1` collapses to a bare "…"
+/// — callers should guarantee at least a minimal label budget before
+/// calling. Counts unicode `char`s rather than bytes so multibyte
+/// city names (e.g. "São Paulo") trim correctly.
+fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_width {
+        return s.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+    let mut out: String = s.chars().take(max_width - 1).collect();
+    out.push('…');
+    out
 }
 
 fn format_clock_entry<T: TimeZone>(t: &DateTime<T>) -> String
