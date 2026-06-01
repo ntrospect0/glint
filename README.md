@@ -5,22 +5,27 @@ calendar, weather, news, email, notes, system resources, image gallery —
 all in one grid you compose yourself. Written in Rust with
 [ratatui](https://ratatui.rs).
 
-```text
-┌─ ▶ Clock ◀ ──────────────┐ ┌─ Calendar ─ [google] Sun May 24, 2026 ─┐
-│        09:42             │ │  Mon  Tue  Wed  Thu  Fri  Sat  Sun     │
-│      Sun May 24          │ │   1    2    3    4    5    6    7      │
-└──────────────────────────┘ │   8 …                                  │
-┌─ Weather ─ Richmond, BC ─┐ └────────────────────────────────────────┘
-│  14°C  partly cloudy     │ ┌─ News ─ Email ─ Notes ── 47 articles ──┐
-│  feels 13° · wind 12 km/h│ │  ▸ Anthropic ships Sonnet 4.7 …        │
-└──────────────────────────┘ │    The Verge · 12m ago                 │
-┌─ Stocks ─ Forex ── 1Y ──┐ │  ▸ Fed minutes: rate path unchanged    │
-│  ▸ AAPL    $214.30 +1.2%│ │    Reuters · 1h ago                    │
-│    NVDA    $129.18 −0.4%│ └────────────────────────────────────────┘
-└──────────────────────────┘ ┌─ Gallery ──────────────────────────────┐
-                             │  [your inline image rotates here]      │
-                             └────────────────────────────────────────┘
-```
+https://github.com/user-attachments/assets/31f79aef-412c-44fb-bd72-c684e6aa9185
+
+*A live capture — keyboard shortcuts driving focus, view changes, and
+widget interaction across the dashboard.*
+
+![Composed glint dashboard with clock, weather, calendar, news, stocks, resources, and gallery widgets in the tokyonight scheme](docs/screenshots/glint-demo1.png)
+
+*A composed dashboard — clock + weather on the left, a calendar / email
+/ notes stack and a stocks / forex / WSJ stack on the right, system
+resources and a rotating gallery filling the rest. `tokyonight` scheme.*
+
+![The same layout with the calendar rotated to week view, weather expanded to a 3-day forecast, and the WSJ news widget scrolling the latest articles](docs/screenshots/glint-demo2.png)
+
+*Same layout, different views — calendar in week mode, weather showing
+the 3-day forecast, the gallery rotating its next image, and the WSJ
+feed scrolling the latest articles in the middle stack.*
+
+![A different 5-pane layout in the chalktone scheme, focused on the WSJ widget with an NVDA stock chart open](docs/screenshots/glint-demo3.png)
+
+*A different 5-pane layout in the `chalktone` scheme, focused on the
+WSJ stack with an NVDA chart open in stocks on the right.*
 
 Everything is opt-in, locally configured, and persists in plain TOML
 under `~/.config/glint/` — no accounts, no telemetry, no cloud
@@ -139,6 +144,11 @@ The wizard walks you through:
    tickers, calendar providers, mailbox folders, gallery image paths.
 5. **OAuth flows** (where needed) — Gmail, Outlook, Google Calendar all
    captured inline through the wizard with copy-paste instructions.
+
+![Setup wizard layout step — picking a 5-pane preset such as "Sidebar + 2x2"](docs/screenshots/glint-setup.png)
+
+*The wizard's layout step — pick a pane count, then a preset; widget
+assignment follows on the next page.*
 
 Re-run any time with `glint --setup`. Every section has an
 **Edit / Skip** gate; skipping leaves that TOML untouched, so hand-edits
