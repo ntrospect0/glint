@@ -1055,21 +1055,138 @@ impl CalendarWidget {
                 let wrap_width = col_area.width.saturating_sub(1) as usize;
                 for e in day_events {
                     let color = self.colors.resolve(&e.source, &e.calendar);
-                    let prefix = if e.all_day {
-                        "•".to_string()
+                    // Prefix slot: HH:MM (5 chars) for timed events, a
+                    // bullet for all-day. Trailing space separates it
+                    // from the title. Timestamps render in `Color::Gray`
+                    // so the times don't blend into the per-calendar
+                    // title color line-to-line — matches the day-view
+                    // and month-agenda time column.
+                    let (prefix_str, prefix_style) = if e.all_day {
+                        ("• ".to_string(), Style::default().fg(color))
                     } else {
-                        format!("{:02}:{:02}", e.start.hour(), e.start.minute())
+                        (
+                            format!("{:02}:{:02} ", e.start.hour(), e.start.minute()),
+                            Style::default().fg(Color::Gray),
+                        )
                     };
-                    // Combine the prefix and title so the wrap function
-                    // accounts for the prefix's column cost on line 1.
-                    // Wrapping the bare title and then prepending the
-                    // prefix pushed line 1 past the column edge, which
-                    // ratatui silently truncated.
-                    let combined = format!("{prefix} {}", e.title);
-                    let title_lines = wrap_event_title(&combined, wrap_width, 3);
-                    for line in title_lines {
-                        event_lines
-                            .push(Line::from(Span::styled(line, Style::default().fg(color))));
+                    let prefix_w = prefix_str.chars().count();
+                    // Title wraps with two budgets: line 1 leaves room
+                    // for the prefix; continuation lines reserve 1
+                    // column for the hanging-indent space so wrapped
+                    // text aligns just under the title (not the time)
+                    // and reads as "more of the same event."
+                    let line1_budget = wrap_width.saturating_sub(prefix_w).max(1);
+                    let cont_budget = wrap_width.saturating_sub(1).max(1);
+                    const MAX_LINES: usize = 3;
+                    let title_chars: Vec<char> = e.title.chars().collect();
+                    let mut wrapped: Vec<String> = Vec::new();
+                    let mut idx = 0;
+                    for line_i in 0..MAX_LINES {
+                        if idx >= title_chars.len() {
+                            break;
+                        }
+                        // Continuation lines skip any leading whitespace
+                        // so wraps mid-word don't leave a phantom indent.
+                        if line_i > 0 {
+                            while idx < title_chars.len()
+                                && title_chars[idx].is_whitespace()
+                            {
+                                idx += 1;
+                            }
+                            if idx >= title_chars.len() {
+                                break;
+                            }
+                        }
+                        let budget = if line_i == 0 { line1_budget } else { cont_budget };
+                        let end = (idx + budget).min(title_chars.len());
+                        wrapped.push(title_chars[idx..end].iter().collect());
+                        idx = end;
+                    }
+                    if idx < title_chars.len() {
+                        // Ran out of line budget — ellipsize the last
+                        // line in place so width stays invariant.
+                        let budget = if wrapped.len() == 1 {
+                            line1_budget
+                        } else {
+                            cont_budget
+                        };
+                        if let Some(last) = wrapped.last_mut() {
+                            let count = last.chars().count();
+                            if count < budget {
+                                last.push('…');
+                            } else if !last.ends_with('…') {
+                                let mut tail: Vec<char> = last.chars().collect();
+                                tail.pop();
+                                tail.push('…');
+                                *last = tail.into_iter().collect();
+                            }
+                        }
+                    }
+                    if wrapped.is_empty() {
+                        // Edge case: empty title — still emit the
+                        // prefix line so the time is visible.
+                        event_lines.push(Line::from(Span::styled(prefix_str, prefix_style)));
+                    } else {
+                        let title_style = Style::default().fg(color);
+                        for (i, chunk) in wrapped.into_iter().enumerate() {
+                            if i == 0 {
+                                event_lines.push(Line::from(vec![
+                                    Span::styled(prefix_str.clone(), prefix_style),
+                                    Span::styled(chunk, title_style),
+                                ]));
+                            } else {
+                                event_lines.push(Line::from(vec![
+                                    Span::raw(" ".to_string()),
+                                    Span::styled(chunk, title_style),
+                                ]));
+                            }
+                        }
+                    }
+                    // Location row(s), dim styled to match the
+                    // day-view agenda's `cont_indent + text_dim`
+                    // formatting. Wraps under the same 1-space
+                    // hanging-indent budget as the title so the
+                    // visual stack reads cleanly.
+                    if let Some(loc) = &e.location {
+                        let loc_chars: Vec<char> = loc.chars().collect();
+                        let mut loc_idx = 0;
+                        for line_i in 0..MAX_LINES {
+                            if loc_idx >= loc_chars.len() {
+                                break;
+                            }
+                            if line_i > 0 {
+                                while loc_idx < loc_chars.len()
+                                    && loc_chars[loc_idx].is_whitespace()
+                                {
+                                    loc_idx += 1;
+                                }
+                                if loc_idx >= loc_chars.len() {
+                                    break;
+                                }
+                            }
+                            let end = (loc_idx + cont_budget).min(loc_chars.len());
+                            let mut chunk: String = loc_chars[loc_idx..end].iter().collect();
+                            loc_idx = end;
+                            // Ellipsize the last line of the location
+                            // when it spills past MAX_LINES so width
+                            // stays invariant — same behavior as the
+                            // title wrap above.
+                            if line_i + 1 == MAX_LINES && loc_idx < loc_chars.len() {
+                                let count = chunk.chars().count();
+                                if count < cont_budget {
+                                    chunk.push('…');
+                                } else if !chunk.ends_with('…') {
+                                    let mut tail: Vec<char> = chunk.chars().collect();
+                                    tail.pop();
+                                    tail.push('…');
+                                    chunk = tail.into_iter().collect();
+                                }
+                            }
+                            event_lines.push(Line::from(vec![
+                                Span::raw(" ".to_string()),
+                                Span::styled(chunk, self.theme.text_dim),
+                            ]));
+                        }
                     }
                 }
             }

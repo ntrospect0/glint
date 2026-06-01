@@ -1201,8 +1201,26 @@ impl Widget for WeatherWidget {
         // weather.toml) must carry the assigned `Shift+<letter>`
         // through manually — otherwise the title-bar accent vanishes.
         let shortcut = self.shortcut;
+        // Snapshot the carousel cursor too. Without this, a
+        // `+`-driven file-watcher reload bounces the user back to
+        // home after they just adopted a new city — the new
+        // `WeatherState` defaults `selected` to 0 and the freshly-
+        // added entry's row falls out of view.
+        let prior_selected = self
+            .state
+            .lock()
+            .expect("weather state poisoned")
+            .selected;
         *self = Self::with_config(instance, new_config, app_theme, cache);
         self.shortcut = shortcut;
+        // Clamp the restored cursor against the new carousel length
+        // — `-` may have shrunk it, or the file may have been hand-
+        // edited to a shorter list.
+        let total = 1 + self.config.cities.len();
+        if total > 0 {
+            let mut st = self.state.lock().expect("weather state poisoned");
+            st.selected = prior_selected.min(total - 1);
+        }
         Ok(())
     }
 
