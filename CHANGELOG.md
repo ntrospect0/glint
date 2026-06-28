@@ -4,7 +4,7 @@ All notable changes to glint are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions track
 the `Cargo.toml` `version` field.
 
-## [0.2.1] — unreleased
+## [0.3.0] — unreleased
 
 The 0.2 release is the structural refactor of glint into a plugin-style
 platform: registries for widgets, auth providers, and LLM providers
@@ -16,6 +16,16 @@ on memory, HTTP, and rendering.
 ### Added
 
 #### Widgets
+- **Multiple accounts of the same provider in Calendar.** A `[[providers]]`
+  block can now carry an `account = "<label>"` field, so a work Outlook
+  and a personal Outlook (or two Google accounts) coexist in one calendar.
+  Tokens are stored per-account (`…_oauth_token.<account>.toml`); authorize
+  extra accounts with `glint --auth microsoft:<label>`. A named account's
+  `source` is provider-namespaced as `kind/label` (e.g. `outlook/work`),
+  so per-calendar colors don't collide — even across providers. The
+  setup wizard stays single-account per provider (the default account);
+  extra accounts are hand-added to `calendar.toml` and survive wizard
+  re-runs untouched. See `docs/multi-account-spec.md`.
 - **Forex widget** (`widget-forex`). Watchlist of fiat pairs against
   a configurable primary, intraday + multi-year graphs, period toggle
   shared with Stocks, swap-primary with `s` or Enter (`:fx <code>`
@@ -114,6 +124,16 @@ on memory, HTTP, and rendering.
 
 ### Changed
 
+- **OAuth token filenames are now account-scoped.**
+  `google_oauth_token.toml` / `microsoft_oauth_token.toml` became
+  `…_oauth_token.default.toml` (the `default` segment is the account
+  label). Config files are unaffected — an `account` field on a
+  `[[providers]]` block is optional and defaults to `default`. Existing
+  source builds keep working via a read fallback: when the
+  account-scoped file is absent, the default account reads the legacy
+  unsuffixed file, and the next token refresh writes the new name (a
+  one-time self-migration). Client-config files (`*_oauth_client.toml`)
+  are unchanged.
 - **Renamed widget kind `sticky` → `notes`** (display name was
   already "Notes"). Module path, Cargo feature, type names, config
   filenames, and layout-cell values all moved. No back-compat
