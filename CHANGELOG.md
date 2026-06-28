@@ -4,7 +4,7 @@ All notable changes to glint are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions track
 the `Cargo.toml` `version` field.
 
-## [0.2.0] — unreleased
+## [0.2.1] — unreleased
 
 The 0.2 release is the structural refactor of glint into a plugin-style
 platform: registries for widgets, auth providers, and LLM providers
