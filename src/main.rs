@@ -216,10 +216,16 @@ fn prompt_yes_no(question: &str) -> Result<bool> {
 }
 
 async fn run_auth(target: &str) -> Result<()> {
-    match auth::registry::find(target) {
-        Some(provider) => (provider.run)().await,
+    // `provider:account` selects a named account; a bare `provider` means
+    // the default account — e.g. `--auth outlook:work` vs `--auth outlook`.
+    let (name, account) = match target.split_once(':') {
+        Some((name, account)) => (name, account),
+        None => (target, auth::DEFAULT_ACCOUNT),
+    };
+    match auth::registry::find(name) {
+        Some(provider) => (provider.run)(account).await,
         None => Err(anyhow!(
-            "unknown auth provider {target:?}. Known providers: {}",
+            "unknown auth provider {name:?}. Known providers: {}",
             auth::registry::names_csv()
         )),
     }

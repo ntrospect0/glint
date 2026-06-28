@@ -369,8 +369,12 @@ fn run_oauth_for_provider(provider_name: &str) -> Result<()> {
             crate::auth::registry::names_csv()
         )
     })?;
+    // The wizard only ever authenticates the default account; extra
+    // accounts are added via `glint --auth <provider>:<label>`.
     let handle = tokio::runtime::Handle::current();
-    tokio::task::block_in_place(|| handle.block_on((provider.run)()))
+    tokio::task::block_in_place(|| {
+        handle.block_on((provider.run)(crate::auth::DEFAULT_ACCOUNT))
+    })
 }
 
 /// Pre-fetch any remote option lists the provider exposes via

@@ -24,8 +24,10 @@ use std::pin::Pin;
 use anyhow::Result;
 
 /// Boxed async flow stored behind a function pointer so the registry can
-/// hold heterogenous provider flows in a `const`.
-pub type AuthFlow = fn() -> Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+/// hold heterogenous provider flows in a `const`. The `account` label
+/// selects which account's token the flow writes (`"default"` for the
+/// wizard and bare `--auth <provider>`).
+pub type AuthFlow = fn(account: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
 /// Pre-populates a remote-option list after auth completes. Returns
 /// `(option_key, options)` where `option_key` matches the
@@ -108,19 +110,21 @@ pub struct AuthRequirement {
     pub scope_hints: &'static [&'static str],
 }
 
-fn run_google() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+fn run_google(account: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    let account = account.to_string();
     Box::pin(async move {
         let client = super::google::OAuthClientConfig::load()?;
-        super::google::flow::run(&client).await?;
+        super::google::flow::run(&client, &account).await?;
         println!("Google authorization complete.");
         Ok(())
     })
 }
 
-fn run_microsoft() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+fn run_microsoft(account: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    let account = account.to_string();
     Box::pin(async move {
         let client = super::microsoft::OAuthClientConfig::load()?;
-        super::microsoft::flow::run(&client).await?;
+        super::microsoft::flow::run(&client, &account).await?;
         println!("Microsoft authorization complete.");
         Ok(())
     })
@@ -128,8 +132,9 @@ fn run_microsoft() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
 
 /// IMAP credentials are written to disk by the wizard's OAuthSetup page
 /// itself; there is no browser handshake. The `run` callback exists only
-/// to satisfy the shared dispatch path.
-fn run_imap() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+/// to satisfy the shared dispatch path. IMAP is single-account, so the
+/// label is ignored.
+fn run_imap(_account: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(async move { Ok(()) })
 }
 

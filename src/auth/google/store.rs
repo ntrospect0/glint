@@ -7,13 +7,21 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::auth::DEFAULT_ACCOUNT;
 use crate::credentials;
 
 /// Filename for the user-supplied OAuth client credentials.
 pub const CLIENT_FILE: &str = "google_oauth_client.toml";
 
-/// Filename for the persisted access/refresh token pair.
-pub const TOKEN_FILE: &str = "google_oauth_token.toml";
+/// Token filename for `account` — `google_oauth_token.<account>.toml`. The
+/// client config stays a single shared file; only the token is per-account.
+fn token_file(account: &str) -> String {
+    format!("google_oauth_token.{account}.toml")
+}
+
+/// Pre-0.3.0 filename for the (single) account's token. Read as a fallback
+/// for the default account so source upgrades don't force a re-auth.
+const LEGACY_TOKEN_FILE: &str = "google_oauth_token.toml";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OAuthClientConfig {
@@ -59,12 +67,34 @@ fn default_token_type() -> String {
 }
 
 impl GoogleToken {
-    pub fn load() -> Result<Option<Self>> {
-        credentials::load(TOKEN_FILE)
+    /// Load the token for a named account (e.g. `"work"`).
+    pub fn load_account(account: &str) -> Result<Option<Self>> {
+        if let Some(token) = credentials::load(&token_file(account))? {
+            return Ok(Some(token));
+        }
+        // Legacy fallback: before 0.3.0 the default account's token lived in
+        // an unsuffixed file. Read it so a source upgrade doesn't force a
+        // re-auth; the next token refresh saves to the account-scoped name.
+        if account == DEFAULT_ACCOUNT {
+            return credentials::load(LEGACY_TOKEN_FILE);
+        }
+        Ok(None)
     }
 
+    /// Save the token under a named account.
+    pub fn save_account(&self, account: &str) -> Result<PathBuf> {
+        credentials::save(&token_file(account), self)
+    }
+
+    /// Load the default account's token. Used by callers that aren't
+    /// account-aware (the Email widget, post-auth folder pre-fetch).
+    pub fn load() -> Result<Option<Self>> {
+        Self::load_account(DEFAULT_ACCOUNT)
+    }
+
+    /// Save the default account's token.
     pub fn save(&self) -> Result<PathBuf> {
-        credentials::save(TOKEN_FILE, self)
+        self.save_account(DEFAULT_ACCOUNT)
     }
 
     /// True if the access token is within `slack` seconds of expiring (or

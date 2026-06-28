@@ -32,7 +32,7 @@ fn default_token_type() -> String {
 /// 3. Accept the redirect, parse ?code= and ?state=
 /// 4. Exchange the code for an access+refresh token at /token
 /// 5. Persist via `GoogleToken::save`
-pub async fn run(client: &OAuthClientConfig) -> Result<GoogleToken> {
+pub async fn run(client: &OAuthClientConfig, account: &str) -> Result<GoogleToken> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("failed to bind loopback port for OAuth redirect")?;
@@ -58,7 +58,7 @@ pub async fn run(client: &OAuthClientConfig) -> Result<GoogleToken> {
     }
 
     let token = exchange_code(client, &redirect_uri, &code).await?;
-    let path = token.save()?;
+    let path = token.save_account(account)?;
     eprintln!("Saved Google OAuth token to {}", path.display());
     Ok(token)
 }

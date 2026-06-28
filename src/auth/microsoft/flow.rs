@@ -33,7 +33,7 @@ fn default_token_type() -> String {
 ///   - tenant goes in the URL path (default `common`)
 ///   - response uses PKCE: code_challenge + code_verifier in place of a
 ///     client_secret. Azure desktop apps don't require a secret.
-pub async fn run(client: &OAuthClientConfig) -> Result<MicrosoftToken> {
+pub async fn run(client: &OAuthClientConfig, account: &str) -> Result<MicrosoftToken> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("failed to bind loopback port for OAuth redirect")?;
@@ -66,7 +66,7 @@ pub async fn run(client: &OAuthClientConfig) -> Result<MicrosoftToken> {
     }
 
     let token = exchange_code(client, &redirect_uri, &code, &verifier).await?;
-    let path = token.save()?;
+    let path = token.save_account(account)?;
     eprintln!("Saved Microsoft OAuth token to {}", path.display());
     Ok(token)
 }
