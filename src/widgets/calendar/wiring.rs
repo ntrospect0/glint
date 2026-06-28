@@ -53,7 +53,7 @@ pub(super) fn build_provider(
     }
     let entries: Vec<ProviderEntry> = config.providers.clone();
 
-    let mut built: Vec<(Arc<dyn CalendarProvider>, &'static str)> = Vec::new();
+    let mut built: Vec<(Arc<dyn CalendarProvider>, String)> = Vec::new();
     let mut hints: Vec<String> = Vec::new();
     for entry in &entries {
         match build_entry(entry, config) {
@@ -73,7 +73,7 @@ pub(super) fn build_provider(
         return (local, "local".into(), hint);
     }
 
-    let labels: Vec<&'static str> = built.iter().map(|(_, l)| *l).collect();
+    let labels: Vec<&str> = built.iter().map(|(_, l)| l.as_str()).collect();
     let source_label = labels.join("+");
     let hint = if hints.is_empty() {
         None
@@ -90,12 +90,13 @@ pub(super) fn build_provider(
     (provider, source_label, hint)
 }
 
-/// Build one provider entry. Returns Ok with a static label on success, Err
-/// with a human-readable hint string on configuration failure.
+/// Build one provider entry. Returns Ok with the entry's source label on
+/// success, Err with a human-readable hint string on configuration failure.
 fn build_entry(
     entry: &ProviderEntry,
     config: &CalendarConfig,
-) -> Result<(Arc<dyn CalendarProvider>, &'static str), String> {
+) -> Result<(Arc<dyn CalendarProvider>, String), String> {
+    let source = entry.source_label();
     match entry.kind {
         ProviderKind::Local => {
             let file = LocalCalendarFile {
@@ -103,49 +104,87 @@ fn build_entry(
             };
             let p =
                 LocalCalendarProvider::from_file(file).map_err(|e| format!("local events: {e}"))?;
-            Ok((Arc::new(p), "local"))
+            Ok((Arc::new(p), source))
         }
-        ProviderKind::Google => build_google_entry(&entry.calendar_ids).map(|p| (p, "google")),
-        ProviderKind::Outlook => build_outlook_entry(&entry.calendar_ids).map(|p| (p, "outlook")),
+        ProviderKind::Google => build_google_entry(entry, &source).map(|p| (p, source)),
+        ProviderKind::Outlook => build_outlook_entry(entry, &source).map(|p| (p, source)),
         ProviderKind::Caldav => {
             let urls = if entry.calendar_ids.is_empty() {
                 config.caldav.calendars.clone()
             } else {
                 entry.calendar_ids.clone()
             };
-            build_caldav_entry(urls).map(|p| (p, "caldav"))
+            build_caldav_entry(urls).map(|p| (p, source))
         }
     }
 }
 
-fn build_outlook_entry(calendar_ids: &[String]) -> Result<Arc<dyn CalendarProvider>, String> {
+/// `glint --auth` argument for a provider + account: `microsoft` for the
+/// default account, `microsoft:work` for a named one.
+fn auth_arg(provider: &str, account: &str) -> String {
+    if account == crate::auth::DEFAULT_ACCOUNT {
+        provider.to_string()
+    } else {
+        format!("{provider}:{account}")
+    }
+}
+
+fn build_outlook_entry(
+    entry: &ProviderEntry,
+    source: &str,
+) -> Result<Arc<dyn CalendarProvider>, String> {
     let client = MicrosoftClientConfig::load().map_err(|err| {
         tracing::warn!(error = %err, "microsoft_oauth_client.toml missing or invalid");
         "Drop microsoft_oauth_client.toml in ~/.config/glint/credentials/".to_string()
     })?;
-    let token = MicrosoftToken::load()
+    let account = entry.account_label();
+    let token = MicrosoftToken::load_account(account)
         .map_err(|err| format!("Outlook token unreadable: {err}"))?
-        .ok_or_else(|| "Run `glint --auth microsoft` to connect Microsoft Outlook".to_string())?;
-    OutlookCalendarProvider::new(client, token, calendar_ids.to_vec())
-        .map(|p| Arc::new(p) as Arc<dyn CalendarProvider>)
-        .map_err(|err| format!("Outlook init failed: {err}"))
+        .ok_or_else(|| {
+            format!(
+                "Run `glint --auth {}` to connect Microsoft Outlook",
+                auth_arg("microsoft", account)
+            )
+        })?;
+    OutlookCalendarProvider::new(
+        client,
+        token,
+        entry.calendar_ids.clone(),
+        source.to_string(),
+        account.to_string(),
+    )
+    .map(|p| Arc::new(p) as Arc<dyn CalendarProvider>)
+    .map_err(|err| format!("Outlook init failed: {err}"))
 }
 
-fn build_google_entry(calendar_ids: &[String]) -> Result<Arc<dyn CalendarProvider>, String> {
+fn build_google_entry(
+    entry: &ProviderEntry,
+    source: &str,
+) -> Result<Arc<dyn CalendarProvider>, String> {
     let client = GoogleClientConfig::load().map_err(|err| {
         tracing::warn!(error = %err, "google_oauth_client.toml missing or invalid");
         "Drop google_oauth_client.toml in ~/.config/glint/credentials/".to_string()
     })?;
-    let token = match GoogleToken::load() {
+    let account = entry.account_label();
+    let token = match GoogleToken::load_account(account) {
         Ok(Some(t)) => t,
         Ok(None) => {
-            return Err("Run `glint --auth google` to connect Google Calendar".into());
+            return Err(format!(
+                "Run `glint --auth {}` to connect Google Calendar",
+                auth_arg("google", account)
+            ));
         }
         Err(err) => return Err(format!("Google token unreadable: {err}")),
     };
-    GoogleCalendarProvider::new(client, token, calendar_ids.to_vec())
-        .map(|p| Arc::new(p) as Arc<dyn CalendarProvider>)
-        .map_err(|err| format!("Google init failed: {err}"))
+    GoogleCalendarProvider::new(
+        client,
+        token,
+        entry.calendar_ids.clone(),
+        source.to_string(),
+        account.to_string(),
+    )
+    .map(|p| Arc::new(p) as Arc<dyn CalendarProvider>)
+    .map_err(|err| format!("Google init failed: {err}"))
 }
 
 fn build_caldav_entry(urls: Vec<String>) -> Result<Arc<dyn CalendarProvider>, String> {

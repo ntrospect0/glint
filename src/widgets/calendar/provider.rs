@@ -14,10 +14,13 @@ pub struct Event {
     pub start: DateTime<Local>,
     pub end: DateTime<Local>,
     pub all_day: bool,
-    /// The backend that produced this event: "google", "outlook", "caldav",
-    /// "local". Used together with `calendar` so the color-assignment map can
-    /// disambiguate accounts that share a calendar id (e.g. both Google and
-    /// Outlook have a calendar named "primary").
+    /// Identity of the provider entry that produced this event. The default
+    /// account reads as the provider kind ("google", "outlook", "caldav",
+    /// "local"); a named multi-account entry reads as its `account` label
+    /// ("work"). Used together with `calendar` so the color-assignment map
+    /// can disambiguate accounts that share a calendar id (e.g. both Google
+    /// and Outlook have a calendar named "primary", or work + personal
+    /// Outlook both have "primary").
     pub source: String,
     pub calendar: String,
     pub location: Option<String>,

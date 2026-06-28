@@ -303,10 +303,12 @@ use super::colors::CalendarColors;
             providers: vec![
                 ProviderEntry {
                     kind: ProviderKind::Google,
+                    account: None,
                     calendar_ids: vec!["primary".into()],
                 },
                 ProviderEntry {
                     kind: ProviderKind::Outlook,
+                    account: None,
                     calendar_ids: vec!["primary".into()],
                 },
             ],
@@ -326,6 +328,7 @@ use super::colors::CalendarColors;
         let cfg = CalendarConfig {
             providers: vec![ProviderEntry {
                 kind: ProviderKind::Google,
+                account: None,
                 calendar_ids: vec!["primary".into()],
             }],
             calendar_colors: overrides,
@@ -340,6 +343,7 @@ use super::colors::CalendarColors;
         let cfg = CalendarConfig {
             providers: vec![ProviderEntry {
                 kind: ProviderKind::Google,
+                account: None,
                 calendar_ids: vec!["a".into(), "b".into()],
             }],
             color_palette: vec!["red".into(), "green".into()],

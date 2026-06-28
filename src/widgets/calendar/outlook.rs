@@ -31,6 +31,11 @@ pub struct OutlookCalendarProvider {
     /// Calendar IDs to fetch. Empty (or "primary") means the user's default
     /// calendar via `/me/calendarView`.
     calendar_ids: Vec<String>,
+    /// `source` stamped on every event (the account label, or `"outlook"`
+    /// for the default account) so multi-account colors don't collide.
+    source: String,
+    /// Account label whose token file this provider refreshes into.
+    account: String,
 }
 
 impl OutlookCalendarProvider {
@@ -38,6 +43,8 @@ impl OutlookCalendarProvider {
         client: OAuthClientConfig,
         token: MicrosoftToken,
         calendar_ids: Vec<String>,
+        source: String,
+        account: String,
     ) -> Result<Self> {
         let http = crate::http::shared();
         Ok(Self {
@@ -45,6 +52,8 @@ impl OutlookCalendarProvider {
             client,
             token: Arc::new(Mutex::new(token)),
             calendar_ids,
+            source,
+            account,
         })
     }
 
@@ -52,7 +61,7 @@ impl OutlookCalendarProvider {
         let mut t = self.token.lock().await;
         if t.is_expired(60) {
             let fresh = flow::refresh(&self.client, &t).await?;
-            fresh.save()?;
+            fresh.save_account(&self.account)?;
             *t = fresh;
         }
         Ok(t.access_token.clone())
@@ -102,7 +111,7 @@ impl OutlookCalendarProvider {
                 .await
                 .context("failed to deserialize Graph calendarView response")?;
             for raw in parsed.value {
-                if let Some(ev) = raw.into_event(&calendar_label) {
+                if let Some(ev) = raw.into_event(&calendar_label, &self.source) {
                     events.push(ev);
                 }
             }
@@ -188,7 +197,7 @@ struct GraphTimeRef {
 }
 
 impl RawGraphEvent {
-    fn into_event(self, calendar_label: &str) -> Option<Event> {
+    fn into_event(self, calendar_label: &str, source: &str) -> Option<Event> {
         if self.is_cancelled {
             return None;
         }
@@ -218,7 +227,7 @@ impl RawGraphEvent {
             start,
             end,
             all_day,
-            source: "outlook".into(),
+            source: source.into(),
             calendar: calendar_label.to_string(),
             location,
         })
@@ -275,7 +284,7 @@ mod tests {
             is_all_day: false,
             is_cancelled: false,
         };
-        let e = raw.into_event("primary").unwrap();
+        let e = raw.into_event("primary", "outlook").unwrap();
         assert_eq!(e.title, "Standup");
         assert_eq!(e.location.as_deref(), Some("Teams"));
         assert!(!e.all_day);
@@ -298,7 +307,7 @@ mod tests {
             is_all_day: true,
             is_cancelled: false,
         };
-        let e = raw.into_event("primary").unwrap();
+        let e = raw.into_event("primary", "outlook").unwrap();
         assert!(e.all_day);
         assert_eq!(e.title, "Vacation");
     }
@@ -319,6 +328,6 @@ mod tests {
             is_all_day: false,
             is_cancelled: true,
         };
-        assert!(raw.into_event("primary").is_none());
+        assert!(raw.into_event("primary", "outlook").is_none());
     }
 }

@@ -20,6 +20,11 @@ pub struct GoogleCalendarProvider {
     client: OAuthClientConfig,
     token: Arc<Mutex<GoogleToken>>,
     calendar_ids: Vec<String>,
+    /// `source` stamped on every event (the account label, or `"google"`
+    /// for the default account) so multi-account colors don't collide.
+    source: String,
+    /// Account label whose token file this provider refreshes into.
+    account: String,
 }
 
 impl GoogleCalendarProvider {
@@ -27,6 +32,8 @@ impl GoogleCalendarProvider {
         client: OAuthClientConfig,
         token: GoogleToken,
         calendar_ids: Vec<String>,
+        source: String,
+        account: String,
     ) -> Result<Self> {
         let http = crate::http::shared();
         Ok(Self {
@@ -38,6 +45,8 @@ impl GoogleCalendarProvider {
             } else {
                 calendar_ids
             },
+            source,
+            account,
         })
     }
 
@@ -45,7 +54,7 @@ impl GoogleCalendarProvider {
         let mut t = self.token.lock().await;
         if t.is_expired(60) {
             let fresh = flow::refresh(&self.client, &t).await?;
-            fresh.save()?;
+            fresh.save_account(&self.account)?;
             *t = fresh;
         }
         Ok(t.access_token.clone())
@@ -87,7 +96,7 @@ impl GoogleCalendarProvider {
             .context("failed to deserialize calendar events response")?;
         let mut out = Vec::with_capacity(parsed.items.len());
         for raw in parsed.items {
-            if let Some(ev) = raw.into_event(calendar_id) {
+            if let Some(ev) = raw.into_event(calendar_id, &self.source) {
                 out.push(ev);
             }
         }
@@ -145,7 +154,7 @@ struct GoogleTimeRef {
 }
 
 impl RawGoogleEvent {
-    fn into_event(self, calendar_id: &str) -> Option<Event> {
+    fn into_event(self, calendar_id: &str, source: &str) -> Option<Event> {
         if matches!(self.status.as_deref(), Some("cancelled")) {
             return None;
         }
@@ -176,7 +185,7 @@ impl RawGoogleEvent {
             start,
             end,
             all_day,
-            source: "google".into(),
+            source: source.into(),
             calendar: calendar_id.to_string(),
             location: self.location,
         })
@@ -209,7 +218,7 @@ mod tests {
             },
             status: None,
         };
-        let e = raw.into_event("primary").unwrap();
+        let e = raw.into_event("primary", "google").unwrap();
         assert_eq!(e.title, "Standup");
         assert_eq!(e.location.as_deref(), Some("Zoom"));
         assert!(!e.all_day);
@@ -231,7 +240,7 @@ mod tests {
             },
             status: None,
         };
-        let e = raw.into_event("primary").unwrap();
+        let e = raw.into_event("primary", "google").unwrap();
         assert!(e.all_day);
         assert_eq!(e.title, "Conference");
     }
@@ -251,6 +260,6 @@ mod tests {
             },
             status: Some("cancelled".into()),
         };
-        assert!(raw.into_event("primary").is_none());
+        assert!(raw.into_event("primary", "google").is_none());
     }
 }

@@ -82,7 +82,7 @@ impl CalendarColors {
         let mut assigned: HashMap<(String, String), usize> = HashMap::new();
         let mut next_idx: usize = 0;
         for entry in &entries {
-            let source = provider_kind_label(entry.kind);
+            let source = entry.source_label();
             let ids: Vec<String> = if entry.calendar_ids.is_empty() {
                 // An empty list means "the provider's default calendar".
                 // Each provider names that default slightly differently, but

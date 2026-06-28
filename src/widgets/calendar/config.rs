@@ -128,10 +128,39 @@ impl FirstDayOfWeek {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderEntry {
     pub kind: ProviderKind,
+    /// Account label for same-provider multi-account (e.g. a work Outlook
+    /// alongside a personal one). Omitted ⇒ the `"default"` account. The
+    /// label names which `…_oauth_token.<account>.toml` to use and, when
+    /// non-default, becomes this entry's `source` so colors don't collide.
+    /// Only Google and Outlook are account-aware today.
+    #[serde(default)]
+    pub account: Option<String>,
     /// Google IDs, Outlook IDs, or CalDAV URLs. Empty = the provider's default
     /// (Google `"primary"`, Outlook default, every CalDAV calendar).
     #[serde(default)]
     pub calendar_ids: Vec<String>,
+}
+
+impl ProviderEntry {
+    /// Token-storage account label — the explicit `account`, or `"default"`.
+    pub(super) fn account_label(&self) -> &str {
+        self.account.as_deref().unwrap_or(crate::auth::DEFAULT_ACCOUNT)
+    }
+
+    /// Identity used for the cell title + color keys. The default account
+    /// reads as the provider kind (`"outlook"`) so existing single-account
+    /// configs and `calendar_colors` keys are unaffected; a named account is
+    /// provider-namespaced as `kind/account` (`"outlook/work"`) so it stays
+    /// grouped under its provider and never collides with a same-label
+    /// account of a different kind. `/` (not `:`) because `:` already
+    /// separates source from calendar in `calendar_colors` keys.
+    pub(super) fn source_label(&self) -> String {
+        let kind = super::colors::provider_kind_label(self.kind);
+        match &self.account {
+            Some(a) if a != crate::auth::DEFAULT_ACCOUNT => format!("{kind}/{a}"),
+            _ => kind.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -308,23 +337,31 @@ pub(super) fn render_calendar_toml(
         },
     )];
 
-    // Build [[providers]] blocks. For each selected source, reuse the
-    // user's existing block (preserving calendar_ids etc.) when one
-    // exists, else emit a minimal default.
+    // Build [[providers]] blocks. The wizard's `sources` toggle is keyed by
+    // kind, but a kind can have several blocks (multi-account — e.g. work +
+    // personal Outlook hand-added to calendar.toml). So we *preserve* rather
+    // than rebuild: every existing block of a still-selected kind is kept
+    // verbatim (account label and all); unticked kinds drop out; a freshly
+    // ticked kind with no existing block gets one default block.
     let selected_kinds: Vec<String> = match values.get("sources") {
         Some(WizardValue::MultiChoice(items)) => items.clone(),
         _ => vec!["local".into()],
     };
-    let existing_blocks: HashMap<String, String> =
+    let existing_blocks: HashMap<String, Vec<String>> =
         existing_provider_blocks_by_kind(existing.unwrap_or(""));
 
     let mut provider_blocks = String::new();
     for kind in &selected_kinds {
-        if let Some(block) = existing_blocks.get(kind) {
-            provider_blocks.push_str("\n");
-            provider_blocks.push_str(block);
-        } else {
-            provider_blocks.push_str(&format!("\n[[providers]]\nkind = \"{kind}\"\n"));
+        match existing_blocks.get(kind) {
+            Some(blocks) => {
+                for block in blocks {
+                    provider_blocks.push_str("\n");
+                    provider_blocks.push_str(block);
+                }
+            }
+            None => {
+                provider_blocks.push_str(&format!("\n[[providers]]\nkind = \"{kind}\"\n"));
+            }
         }
     }
 
@@ -347,12 +384,13 @@ pub(super) fn render_calendar_toml(
     out
 }
 
-/// Pull each existing `[[providers]]` block out of the text, keyed by
-/// canonicalised kind (apple/icloud → caldav, etc.) so a re-render can
-/// preserve the user's `calendar_ids` lists when they keep that
-/// source ticked.
-fn existing_provider_blocks_by_kind(text: &str) -> HashMap<String, String> {
-    let mut out: HashMap<String, String> = HashMap::new();
+/// Pull the existing `[[providers]]` blocks out of the text, grouped by
+/// canonicalised kind (apple/icloud → caldav, etc.) and kept in file order.
+/// A kind maps to *all* its blocks so a re-render preserves multiple
+/// same-kind accounts (a hand-added second Outlook survives the wizard),
+/// each retaining its `account` label and `calendar_ids`.
+fn existing_provider_blocks_by_kind(text: &str) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
     let Ok(doc) = toml::from_str::<toml::Value>(text) else {
         return out;
     };
@@ -370,11 +408,18 @@ fn existing_provider_blocks_by_kind(text: &str) -> HashMap<String, String> {
             "local" => "local",
             _ => continue,
         };
-        // Re-emit the block from the parsed Value so we don't have to
-        // line-scan the source for boundaries. Manual emit keeps the
-        // output predictable (kind first, then calendar_ids).
+        // Re-emit each block from the parsed Value so we don't have to
+        // line-scan the source for boundaries. Manual emit keeps the output
+        // predictable (kind, then account, then calendar_ids) and carries
+        // forward the fields that encode user intent.
         let mut block = String::from("[[providers]]\n");
         block.push_str(&format!("kind = \"{canonical}\"\n"));
+        if let Some(account) = entry.get("account").and_then(|v| v.as_str()) {
+            block.push_str(&format!(
+                "account = \"{}\"\n",
+                account.replace('"', "\\\"")
+            ));
+        }
         if let Some(ids) = entry.get("calendar_ids").and_then(|v| v.as_array()) {
             let items: Vec<String> = ids
                 .iter()
@@ -385,7 +430,142 @@ fn existing_provider_blocks_by_kind(text: &str) -> HashMap<String, String> {
                 block.push_str(&format!("calendar_ids = [{}]\n", items.join(", ")));
             }
         }
-        out.insert(canonical.to_string(), block);
+        out.entry(canonical.to_string()).or_default().push(block);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wizard::descriptor::WizardValue;
+
+    // A hand-edited calendar.toml with two Outlook accounts: the default
+    // plus a hand-added "work" account with its own calendar_ids.
+    const TWO_OUTLOOK: &str = "\
+poll_interval_secs = 90
+
+[[providers]]
+kind = \"outlook\"
+
+[[providers]]
+kind = \"outlook\"
+account = \"work\"
+calendar_ids = [\"AAMk-work-cal\"]
+";
+
+    #[test]
+    fn multi_account_outlook_survives_wizard_save() {
+        let doc: toml::Value = toml::from_str(TWO_OUTLOOK).unwrap();
+        let values = load_calendar_from_toml(&doc);
+
+        // The wizard toggle collapses both blocks to a single "outlook" tick…
+        match values.get("sources") {
+            Some(WizardValue::MultiChoice(items)) => {
+                assert_eq!(items, &vec!["outlook".to_string()]);
+            }
+            other => panic!("expected sources MultiChoice, got {other:?}"),
+        }
+
+        // …but a re-render preserves BOTH blocks, including the hand-added
+        // work account and its calendar_ids.
+        let rendered = render_calendar_toml(&values, Some(TWO_OUTLOOK));
+        let parsed: toml::Value = toml::from_str(&rendered).unwrap();
+        let providers = parsed
+            .get("providers")
+            .and_then(|v| v.as_array())
+            .expect("providers array");
+        assert_eq!(
+            providers.len(),
+            2,
+            "both outlook blocks must survive a wizard save:\n{rendered}"
+        );
+        let accounts: Vec<Option<&str>> = providers
+            .iter()
+            .map(|p| p.get("account").and_then(|v| v.as_str()))
+            .collect();
+        assert!(accounts.contains(&None), "default account block missing");
+        assert!(
+            accounts.contains(&Some("work")),
+            "work account block missing"
+        );
+        // The work block keeps its calendar_ids.
+        let work = providers
+            .iter()
+            .find(|p| p.get("account").and_then(|v| v.as_str()) == Some("work"))
+            .unwrap();
+        assert_eq!(
+            work.get("calendar_ids")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str()),
+            Some("AAMk-work-cal")
+        );
+        assert_eq!(
+            parsed.get("poll_interval_secs").and_then(|v| v.as_integer()),
+            Some(90)
+        );
+    }
+
+    #[test]
+    fn unticking_outlook_drops_all_its_accounts() {
+        let doc: toml::Value = toml::from_str(TWO_OUTLOOK).unwrap();
+        let mut values = load_calendar_from_toml(&doc);
+        // User unticks Outlook in the wizard, leaving only local.
+        values.insert(
+            "sources".into(),
+            WizardValue::MultiChoice(vec!["local".into()]),
+        );
+        let rendered = render_calendar_toml(&values, Some(TWO_OUTLOOK));
+        let parsed: toml::Value = toml::from_str(&rendered).unwrap();
+        let providers = parsed
+            .get("providers")
+            .and_then(|v| v.as_array())
+            .expect("providers array");
+        for p in providers {
+            assert_ne!(
+                p.get("kind").and_then(|v| v.as_str()),
+                Some("outlook"),
+                "unticked outlook should leave no outlook blocks:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_label_defaults_to_kind_but_names_account() {
+        let default = ProviderEntry {
+            kind: ProviderKind::Outlook,
+            account: None,
+            calendar_ids: vec![],
+        };
+        assert_eq!(default.source_label(), "outlook");
+        assert_eq!(default.account_label(), "default");
+
+        // An explicit account = "default" still colors as the kind.
+        let explicit_default = ProviderEntry {
+            kind: ProviderKind::Outlook,
+            account: Some("default".into()),
+            calendar_ids: vec![],
+        };
+        assert_eq!(explicit_default.source_label(), "outlook");
+
+        // A named account is provider-namespaced for its source/color key,
+        // but its *token* account label stays the bare string.
+        let work = ProviderEntry {
+            kind: ProviderKind::Outlook,
+            account: Some("work".into()),
+            calendar_ids: vec![],
+        };
+        assert_eq!(work.source_label(), "outlook/work");
+        assert_eq!(work.account_label(), "work");
+
+        // Same label under a different provider gets a distinct source.
+        let g_work = ProviderEntry {
+            kind: ProviderKind::Google,
+            account: Some("work".into()),
+            calendar_ids: vec![],
+        };
+        assert_eq!(g_work.source_label(), "google/work");
+        assert_ne!(g_work.source_label(), work.source_label());
+    }
 }
