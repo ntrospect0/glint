@@ -65,7 +65,7 @@ You'll create a Google Cloud project, enable the two APIs glint uses, configure 
 ### What's stored where
 
 - **Client credentials** → `~/.config/glint/credentials/google_oauth_client.toml` (your responsibility to back up if you reinstall).
-- **Access + refresh token** → `~/.config/glint/credentials/google_oauth_token.toml` (auto-refreshed; safe to delete to force re-auth).
+- **Access + refresh token** → `~/.config/glint/credentials/google_oauth_token.default.toml` (auto-refreshed; safe to delete to force re-auth). The `default` segment is the account label — see [Multiple calendar accounts](#multiple-calendar-accounts-same-provider) to add more.
 
 ---
 
@@ -103,7 +103,61 @@ Note: Microsoft uses **PKCE**, so there's no Client Secret to handle — just th
 ### What's stored where
 
 - **Client config** → `~/.config/glint/credentials/microsoft_oauth_client.toml`.
-- **Access + refresh token** → `~/.config/glint/credentials/microsoft_oauth_token.toml`.
+- **Access + refresh token** → `~/.config/glint/credentials/microsoft_oauth_token.default.toml`. The `default` segment is the account label — see [Multiple calendar accounts](#multiple-calendar-accounts-same-provider) to add more.
+
+---
+
+## Multiple calendar accounts (same provider)
+
+The Calendar widget can show **two or more accounts of the same provider** at once — e.g. a work Outlook *and* a personal Outlook, or two Google accounts. (Different providers — Google + Outlook + CalDAV — have always merged; this adds *same-provider* accounts.)
+
+The setup wizard manages one **default** account per provider — the account you authorize on its *Authorize* page. Extra accounts are added by hand, in two steps.
+
+### 1. Authorize each extra account
+
+Give the account a label and run the auth flow from a terminal:
+
+```sh
+glint --auth microsoft:work       # an extra Outlook account labelled "work"
+glint --auth google:personal      # an extra Google account labelled "personal"
+```
+
+The provider name is `microsoft` or `google` (the same names the wizard uses — note `microsoft`, not `outlook`); the part after the `:` is your label. A bare `glint --auth microsoft` with no label authorizes the **default** account, exactly as the wizard does.
+
+The browser opens as usual. If you're already signed into another account, choose **"Use another account"** (or use a private window) so you land on the right one. The token is written to `~/.config/glint/credentials/microsoft_oauth_token.<label>.toml` — one file per account. The shared `microsoft_oauth_client.toml` (your app registration) serves all of them, so you don't repeat the Azure / Google Cloud setup.
+
+Keep labels simple — letters, digits, hyphens (e.g. `work`, `team-eu`). Avoid `:` in a label; it collides with the color-key format below.
+
+### 2. Add a provider block per account
+
+Edit `~/.config/glint/calendar.toml` and add one `[[providers]]` block per account, each with an `account = "<label>"` field. Omit `account` (or set it to `"default"`) for the wizard-managed default account:
+
+```toml
+# Default Outlook account (managed by the wizard; account omitted)
+[[providers]]
+kind = "outlook"
+calendar_ids = ["primary"]
+
+# Extra Outlook account "work"
+[[providers]]
+kind = "outlook"
+account = "work"
+calendar_ids = ["primary"]
+```
+
+No restart needed — live config reload picks it up. And the wizard won't clobber these hand-added blocks if you run it again: it preserves every `[[providers]]` block whose source stays ticked.
+
+### Colors per account
+
+Each account gets its own `calendar_colors` key. The **default** account is keyed by its provider kind (`outlook`, `google`); a **named** account is keyed `kind/label`, so accounts never share a color — even a Google and an Outlook account that happen to use the same label:
+
+```toml
+[calendar_colors]
+"outlook:primary" = "#4097e4"        # default Outlook
+"outlook/work:primary" = "#3fb950"   # the "work" account
+```
+
+Use `/` between kind and label, not `:` — the first `:` in a color key separates the source from the calendar id.
 
 ---
 
@@ -305,9 +359,9 @@ This wipes everything — config, tokens, cache. The wizard seeds fresh defaults
 │   └── <instance>/<id>.md        # each note as a plain markdown file
 └── credentials/                  # 0600-mode
     ├── google_oauth_client.toml
-    ├── google_oauth_token.toml
+    ├── google_oauth_token.default.toml      # .<account>.toml per account
     ├── microsoft_oauth_client.toml
-    ├── microsoft_oauth_token.toml
+    ├── microsoft_oauth_token.default.toml    # .<account>.toml per account
     ├── caldav.toml
     ├── imap.toml
     ├── anthropic_key.toml

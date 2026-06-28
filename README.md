@@ -231,7 +231,7 @@ All files live under `~/.config/glint/`:
 | `gallery.toml` | image paths or globs, rotation cadence, rescan interval |
 | `notes.toml` | per-widget shortcut + colour overrides (notes themselves live under `notes/`) |
 | `llm.toml` | active LLM provider (`anthropic` or `openai`), model, rate limit, cache size |
-| `credentials/` | OAuth tokens + API keys (`*_oauth_client.toml`, `*_oauth_token.toml`, `anthropic_key.toml`, `openai_key.toml`, `caldav.toml`, `imap.toml`) — 0600 perms |
+| `credentials/` | OAuth tokens + API keys (`*_oauth_client.toml`, `*_oauth_token.<account>.toml`, `anthropic_key.toml`, `openai_key.toml`, `caldav.toml`, `imap.toml`) — 0600 perms |
 | `notes/<instance>/` | one `.md` file per note, `mtime` sorts the list |
 
 Most fields have sensible defaults; you only have to set what you care
