@@ -122,6 +122,38 @@ git pull
 make install PREFIX=~/.local   # or sudo make install
 ```
 
+### macOS app icon (optional)
+
+<img src="assets/icon/glint.png" alt="glint app icon" width="96" align="right" />
+
+glint is a terminal program, but on macOS you can wrap it in a
+double-clickable app that opens it in your terminal — handy for the
+Dock or Spotlight. The icon assets live in
+[`assets/icon/`](assets/icon/) (`glint.png` and `glint.icns`).
+
+With glint on your `$PATH`:
+
+```sh
+./assets/icon/install-macos-app.sh
+```
+
+This builds `~/Applications/Glint.app` with the icon above, launching
+glint in `~`. First open may need a right-click → **Open** (the bundle
+isn't code-signed).
+
+The script auto-detects an installed terminal and supports **Kitty,
+Ghostty, WezTerm, Alacritty, Rio** (launched directly) and **iTerm2,
+Apple Terminal** (via AppleScript). Force one with the `TERMINAL` env
+var:
+
+```sh
+TERMINAL=alacritty ./assets/icon/install-macos-app.sh
+```
+
+Warp, Hyper, and Tabby expose no command to run a program in a new
+window, so they aren't supported — add a case to the script if your
+terminal isn't listed.
+
 ---
 
 ## Quickstart
