@@ -579,3 +579,111 @@ use super::colors::CalendarColors;
         let refs: Vec<&Event> = events.iter().collect();
         assert_eq!(w.first_future_event_line(&refs, 60, now), Some(0));
     }
+
+    /// The pure rollover-gating helper: no new day → no roll; an
+    /// unfocused (or idle-focused) widget is due; a focused, recently-
+    /// active widget defers.
+    #[test]
+    fn auto_roll_due_gates_on_focus_and_idle() {
+        use super::state::auto_roll_due;
+        let day0 = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap();
+        let day1 = NaiveDate::from_ymd_opt(2026, 6, 23).unwrap();
+        let day3 = NaiveDate::from_ymd_opt(2026, 6, 25).unwrap();
+        let active = std::time::Duration::from_secs(10);
+        let idle = AUTO_ROLL_FOCUSED_IDLE + std::time::Duration::from_secs(1);
+
+        // Same day → never due, regardless of focus/idle.
+        assert!(!auto_roll_due(day0, day0, false, idle));
+        assert!(!auto_roll_due(day0, day0, true, active));
+        // Clock ran backward (TZ / NTP) → not due; caller resyncs.
+        assert!(!auto_roll_due(day0, day1, false, idle));
+
+        // Unfocused → due immediately, however many days elapsed.
+        assert!(auto_roll_due(day1, day0, false, active));
+        assert!(auto_roll_due(day3, day0, false, active));
+
+        // Focused: defer while active, allow once idle past the grace.
+        assert!(!auto_roll_due(day1, day0, true, active));
+        assert!(auto_roll_due(day1, day0, true, idle));
+    }
+
+    /// An unfocused widget left showing "today" snaps to the real today
+    /// when `maybe_auto_roll` runs after the date has advanced — even
+    /// across several midnights (machine slept over a weekend).
+    #[test]
+    fn unfocused_widget_snaps_to_today() {
+        let mut w = build_widget(CalendarConfig::default());
+        let today = Local::now().date_naive();
+        w.anchor = today - ChronoDuration::days(2);
+        w.rollover_date = today - ChronoDuration::days(2);
+        w.is_focused
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        w.maybe_auto_roll();
+        assert_eq!(w.anchor, today, "should snap to the real today");
+        assert_eq!(w.rollover_date, today, "baseline advances with the anchor");
+    }
+
+    /// A view parked on a future date snaps home to today on rollover
+    /// (not advanced by one) so an unattended dashboard returns to the
+    /// live day.
+    #[test]
+    fn auto_roll_snaps_a_future_view_to_today() {
+        let mut w = build_widget(CalendarConfig::default());
+        let today = Local::now().date_naive();
+        // As of "yesterday" the user had parked the view 5 days ahead.
+        w.anchor = today + ChronoDuration::days(5);
+        w.rollover_date = today - ChronoDuration::days(1);
+        w.is_focused
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        w.maybe_auto_roll();
+        assert_eq!(w.anchor, today, "future view should snap home to today");
+    }
+
+    /// A view navigated into the past also snaps home to today when the
+    /// day rolls over unattended — every stale view returns to the live
+    /// day, not just today-or-future ones.
+    #[test]
+    fn auto_roll_snaps_a_past_view_to_today() {
+        let mut w = build_widget(CalendarConfig::default());
+        let today = Local::now().date_naive();
+        w.anchor = today - ChronoDuration::days(10);
+        // Baseline as of "yesterday" — a real day has since elapsed.
+        w.rollover_date = today - ChronoDuration::days(1);
+        w.is_focused
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        w.maybe_auto_roll();
+        assert_eq!(w.anchor, today, "past view should snap home to today");
+        assert_eq!(w.rollover_date, today, "baseline resyncs with the anchor");
+    }
+
+    /// A focused widget with recent activity must not roll mid-use — the
+    /// pending delta is held until the user goes idle.
+    #[test]
+    fn focused_active_widget_defers_rollover() {
+        let mut w = build_widget(CalendarConfig::default());
+        let start = Local::now().date_naive() - ChronoDuration::days(1);
+        w.anchor = start;
+        w.rollover_date = start;
+        w.is_focused
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        w.last_activity = Instant::now();
+        w.maybe_auto_roll();
+        assert_eq!(w.anchor, start, "active focused widget must not roll");
+        assert_eq!(w.rollover_date, start, "deferral keeps the pending delta");
+    }
+
+    /// A user reposition re-bases the rollover baseline so a later
+    /// auto-roll advances from where the user landed, not a stale date —
+    /// no surprise extra-day drift after pressing a navigation key.
+    #[test]
+    fn user_navigation_rebases_the_rollover_baseline() {
+        let mut w = build_widget(CalendarConfig::default());
+        w.rollover_date = Local::now().date_naive() - ChronoDuration::days(3);
+        // 'l' / Right advances the anchor by one day in Day view.
+        w.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            w.rollover_date,
+            Local::now().date_naive(),
+            "navigating re-bases the baseline to today"
+        );
+    }

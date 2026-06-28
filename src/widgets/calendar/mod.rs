@@ -56,6 +56,13 @@ use crate::ui::{apply_title_row, big_digits, MetadataEmphasis};
 /// reasons, "no web-viewable calendar configured" notices).
 const STATUS_TTL: Duration = Duration::from_millis(2500);
 
+/// How long a *focused* calendar must sit without key/mouse activity
+/// before the day-rollover auto-advance is allowed to fire. Keeps the
+/// view from jumping out from under someone actively reading or
+/// navigating it as midnight passes. An unfocused calendar rolls
+/// immediately — see `maybe_auto_roll`.
+pub(super) const AUTO_ROLL_FOCUSED_IDLE: Duration = Duration::from_secs(5 * 60);
+
 
 pub struct CalendarWidget {
     id: String,
@@ -119,6 +126,23 @@ pub struct CalendarWidget {
     /// `update()` finds the slot drained. Lets idle ticks skip the
     /// state lock entirely. See the same field on `StocksWidget`.
     feedback_pending: AtomicBool,
+    /// Local date the anchor was last positioned as-of — set on
+    /// construction, advanced by the auto-roll, and resynced whenever
+    /// the user repositions the anchor. `maybe_auto_roll` compares it
+    /// against the real local date: once a day has passed unattended it
+    /// snaps the (now stale) view home to today.
+    rollover_date: NaiveDate,
+    /// Instant of the last key/mouse interaction with this widget. The
+    /// auto-roll uses it to hold off while the calendar is focused and
+    /// the user is active, only advancing after [`AUTO_ROLL_FOCUSED_IDLE`]
+    /// of quiet.
+    last_activity: Instant,
+    /// Mirror of the most recent `render(focused)` flag — render is the
+    /// only place the widget learns whether it's focused, and focus only
+    /// changes on redraw-forcing events, so the last-rendered value is
+    /// still current at tick time. Read by `maybe_auto_roll` to pick the
+    /// immediate (unfocused) vs. idle-gated (focused) path.
+    is_focused: AtomicBool,
 }
 
 
@@ -161,12 +185,13 @@ impl CalendarWidget {
         } else {
             format!("Calendar ({instance})")
         };
+        let today = Local::now().date_naive();
         Self {
             id,
             instance,
             display_name_cache,
             view: config.default_view,
-            anchor: Local::now().date_naive(),
+            anchor: today,
             provider,
             source_label,
             auth_hint,
@@ -183,6 +208,9 @@ impl CalendarWidget {
             first_day_of_week: config.first_day_of_week.as_weekday(),
             configured_provider_kinds: config.providers.iter().map(|p| p.kind).collect(),
             feedback_pending: AtomicBool::new(false),
+            rollover_date: today,
+            last_activity: Instant::now(),
+            is_focused: AtomicBool::new(false),
         }
     }
 
@@ -1443,6 +1471,10 @@ impl Widget for CalendarWidget {
     }
 
     async fn update(&mut self, _ctx: &AppContext) -> Result<()> {
+        // Track the real calendar day so an unattended widget rolls to
+        // the new day at midnight instead of going stale. Runs before
+        // the poll check so a fresh anchor's range is fetched this tick.
+        self.maybe_auto_roll();
         if self.is_due() {
             self.spawn_refresh();
         }
@@ -1468,6 +1500,10 @@ impl Widget for CalendarWidget {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
+        // Stash focus for `maybe_auto_roll` — render is the only place
+        // the widget is told whether it's focused, and focus only shifts
+        // on redraw-forcing events, so this stays current between draws.
+        self.is_focused.store(focused, Ordering::Relaxed);
         let metadata = self.title_metadata_string();
         let block = apply_title_row(
             Block::default()
@@ -1574,6 +1610,7 @@ impl Widget for CalendarWidget {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        self.last_activity = Instant::now();
         if key.modifiers != KeyModifiers::NONE && key.modifiers != KeyModifiers::SHIFT {
             return EventResult::Ignored;
         }
@@ -1591,7 +1628,8 @@ impl Widget for CalendarWidget {
             }
         }
         let step = self.nav_step();
-        match key.code {
+        let anchor_before = self.anchor;
+        let result = match key.code {
             KeyCode::Char('d') => {
                 self.view = CalendarView::Day;
                 self.reset_agenda_scroll();
@@ -1660,10 +1698,108 @@ impl Widget for CalendarWidget {
                 EventResult::Handled
             }
             _ => EventResult::Ignored,
+        };
+        // A user reposition re-bases the auto-roll: future day-rollovers
+        // advance from where the user just landed, not from a stale date.
+        if self.anchor != anchor_before {
+            self.rollover_date = Local::now().date_naive();
         }
+        result
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> EventResult {
+        self.last_activity = Instant::now();
+        let anchor_before = self.anchor;
+        let result = self.handle_mouse_event(mouse, area);
+        if self.anchor != anchor_before {
+            self.rollover_date = Local::now().date_naive();
+        }
+        result
+    }
+
+    fn handle_command(&mut self, _cmd: &str, _args: &[&str]) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("d / w / m", "switch view: day / week / month"),
+            ("← / → / h / l", "previous / next (per view)"),
+            ("↑ / ↓ / j / k", "scroll the day's agenda"),
+            ("PgUp / PgDn", "scroll agenda ±10 lines"),
+            ("wheel", "scroll the day's agenda"),
+            ("t", "jump to today"),
+            ("o", "open calendar in browser (picker when multiple configured)"),
+            ("g", "cycle digit gradient style (today's date)"),
+            (
+                "click day",
+                "week: open in day view; month: select for agenda",
+            ),
+            ("click tab", "switch view / today"),
+        ]
+    }
+
+    fn config(&self) -> serde_json::Value {
+        serde_json::json!({
+            "default_view": self.view,
+            "poll_interval_secs": self
+                .state
+                .lock()
+                .expect("calendar state poisoned")
+                .poll
+                .interval()
+                .as_secs(),
+            "provider": self.source_label,
+        })
+    }
+
+    fn apply_config(&mut self, config: serde_json::Value) -> Result<()> {
+        let new_config: CalendarConfig =
+            serde_json::from_value(config).context("invalid calendar config payload")?;
+        let app_theme = self.app_theme.clone();
+        let cache = self.cache.clone();
+        let instance = self.instance.clone();
+        *self = Self::with_config(instance, new_config, app_theme, cache);
+        Ok(())
+    }
+
+    fn set_app_theme(&mut self, theme: Arc<Theme>) {
+        self.theme = theme.with_overrides(&self.colors_override);
+        self.app_theme = theme;
+    }
+
+    fn poll_snapshot(&self) -> Option<crate::polling::PollSnapshot> {
+        Some(
+            self.state
+                .lock()
+                .expect("calendar state poisoned")
+                .poll
+                .snapshot(),
+        )
+    }
+
+    fn shortcut_preferences(&self) -> &[char] {
+        &self.shortcut_prefs
+    }
+
+    fn set_shortcut(&mut self, shortcut: Option<char>) {
+        self.shortcut = shortcut;
+    }
+
+    fn shortcut(&self) -> Option<char> {
+        self.shortcut
+    }
+
+    fn title_metadata(&self) -> Option<String> {
+        Some(self.title_metadata_string())
+    }
+}
+
+impl CalendarWidget {
+    /// Mouse-event body for [`Widget::handle_mouse`]. Split out so the
+    /// trait method can wrap it with the activity-stamp + rollover
+    /// re-base bookkeeping around the early returns inside.
+    fn handle_mouse_event(&mut self, mouse: MouseEvent, area: Rect) -> EventResult {
         // Vertical scroll walks the selected day's agenda. Horizontal
         // scroll walks the anchor by the same view-stride ←/→ does,
         // gated through `consume_horizontal_scroll`: axis-locked off
@@ -1772,83 +1908,6 @@ impl Widget for CalendarWidget {
             }
         }
         EventResult::Ignored
-    }
-
-    fn handle_command(&mut self, _cmd: &str, _args: &[&str]) -> Result<bool> {
-        Ok(false)
-    }
-
-    fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("d / w / m", "switch view: day / week / month"),
-            ("← / → / h / l", "previous / next (per view)"),
-            ("↑ / ↓ / j / k", "scroll the day's agenda"),
-            ("PgUp / PgDn", "scroll agenda ±10 lines"),
-            ("wheel", "scroll the day's agenda"),
-            ("t", "jump to today"),
-            ("o", "open calendar in browser (picker when multiple configured)"),
-            ("g", "cycle digit gradient style (today's date)"),
-            (
-                "click day",
-                "week: open in day view; month: select for agenda",
-            ),
-            ("click tab", "switch view / today"),
-        ]
-    }
-
-    fn config(&self) -> serde_json::Value {
-        serde_json::json!({
-            "default_view": self.view,
-            "poll_interval_secs": self
-                .state
-                .lock()
-                .expect("calendar state poisoned")
-                .poll
-                .interval()
-                .as_secs(),
-            "provider": self.source_label,
-        })
-    }
-
-    fn apply_config(&mut self, config: serde_json::Value) -> Result<()> {
-        let new_config: CalendarConfig =
-            serde_json::from_value(config).context("invalid calendar config payload")?;
-        let app_theme = self.app_theme.clone();
-        let cache = self.cache.clone();
-        let instance = self.instance.clone();
-        *self = Self::with_config(instance, new_config, app_theme, cache);
-        Ok(())
-    }
-
-    fn set_app_theme(&mut self, theme: Arc<Theme>) {
-        self.theme = theme.with_overrides(&self.colors_override);
-        self.app_theme = theme;
-    }
-
-    fn poll_snapshot(&self) -> Option<crate::polling::PollSnapshot> {
-        Some(
-            self.state
-                .lock()
-                .expect("calendar state poisoned")
-                .poll
-                .snapshot(),
-        )
-    }
-
-    fn shortcut_preferences(&self) -> &[char] {
-        &self.shortcut_prefs
-    }
-
-    fn set_shortcut(&mut self, shortcut: Option<char>) {
-        self.shortcut = shortcut;
-    }
-
-    fn shortcut(&self) -> Option<char> {
-        self.shortcut
-    }
-
-    fn title_metadata(&self) -> Option<String> {
-        Some(self.title_metadata_string())
     }
 }
 

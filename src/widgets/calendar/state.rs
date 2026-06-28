@@ -12,7 +12,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate};
 use ratatui::layout::Rect;
 
 use super::config::CalendarView;
@@ -22,6 +22,7 @@ use super::nav::{
 };
 use super::provider::Event;
 use super::CalendarWidget;
+use super::AUTO_ROLL_FOCUSED_IDLE;
 use super::STATUS_TTL;
 use crate::ui::big_digits;
 use crate::ui::status::{live_value, TimedFeedback};
@@ -40,6 +41,28 @@ pub(super) const HORIZONTAL_SCROLL_COOLDOWN: Duration = Duration::from_millis(20
 /// deliberate horizontal flick after the user clearly stops vertical
 /// scrolling still gets through.
 pub(super) const VERTICAL_AXIS_LOCK_WINDOW: Duration = Duration::from_millis(700);
+
+/// Whether the day-rollover snap should fire now. Pure so the focus/
+/// idle gating is unit-testable without a wall clock:
+/// - `today <= rollover_date` → `false` (no new day; or the clock ran
+///   backward, which the caller resyncs separately).
+/// - focused and active within [`AUTO_ROLL_FOCUSED_IDLE`] → `false`
+///   (defer so the view doesn't jump mid-interaction).
+/// - otherwise → `true`.
+///
+/// What to do *when* it fires (snap to today vs. leave a past view
+/// frozen) is the caller's call — see `maybe_auto_roll`.
+pub(super) fn auto_roll_due(
+    today: NaiveDate,
+    rollover_date: NaiveDate,
+    focused: bool,
+    idle: Duration,
+) -> bool {
+    if today <= rollover_date {
+        return false;
+    }
+    !(focused && idle < AUTO_ROLL_FOCUSED_IDLE)
+}
 
 #[derive(Default)]
 pub(super) struct CalendarState {
@@ -332,6 +355,45 @@ impl CalendarWidget {
         let max = st.week_col_scroll_max[dow] as i32;
         let next = (st.week_col_scroll[dow] as i32 + delta).clamp(0, max);
         st.week_col_scroll[dow] = next as u16;
+    }
+
+    /// Keep an unattended calendar from going stale as the clock crosses
+    /// midnight. Called every tick from `update`.
+    ///
+    /// When the local date moves past [`rollover_date`](CalendarWidget) —
+    /// midnight, or several midnights after the machine slept — the
+    /// anchor snaps home to the new today regardless of where it was
+    /// (today, a future date, or a past date the user had navigated to),
+    /// so an always-on dashboard returns to the live day. The snap is
+    /// immediate when the widget is unfocused; when it's focused we hold
+    /// off until [`AUTO_ROLL_FOCUSED_IDLE`] of no key/mouse activity so the
+    /// view never jumps out from under someone actively using it. The
+    /// gating decision lives in the pure [`auto_roll_due`] helper.
+    ///
+    /// `rollover_date` advances only here and on user reposition (see
+    /// `handle_key` / `handle_mouse`), so a view the user repositioned
+    /// *as of today* is left alone until the next unattended midnight.
+    pub(super) fn maybe_auto_roll(&mut self) {
+        let today = Local::now().date_naive();
+        let focused = self.is_focused.load(Ordering::Relaxed);
+        if !auto_roll_due(today, self.rollover_date, focused, self.last_activity.elapsed()) {
+            // Resync the baseline downward if the clock moved backward (a
+            // timezone shift / NTP correction) so we don't snap on the
+            // rebound; otherwise leave everything untouched.
+            if today < self.rollover_date {
+                self.rollover_date = today;
+            }
+            return;
+        }
+        self.rollover_date = today;
+        if self.anchor != today {
+            self.anchor = today;
+            self.reset_agenda_scroll();
+            self.mark_dirty_if_uncovered();
+            // Display dirty bit so the new day repaints — `update` runs
+            // on a tick, otherwise gated out by `take_dirty`.
+            self.state.lock().expect("calendar state poisoned").dirty = true;
+        }
     }
 
     pub(super) fn snapshot_events(&self) -> Vec<Arc<Event>> {
