@@ -3,6 +3,7 @@
 
 pub mod layout;
 pub mod migrate;
+pub mod profiles;
 pub mod types;
 pub mod watcher;
 

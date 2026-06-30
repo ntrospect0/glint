@@ -357,13 +357,18 @@ struct StoredEntry<T> {
 }
 
 fn default_dir() -> Result<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-        if !xdg.is_empty() {
-            return Ok(PathBuf::from(xdg).join("glint"));
-        }
-    }
-    let home = dirs::home_dir().context("could not locate user home directory")?;
-    Ok(home.join(".cache").join("glint"))
+    let base = match std::env::var("XDG_CACHE_HOME") {
+        Ok(xdg) if !xdg.is_empty() => PathBuf::from(xdg).join("glint"),
+        _ => dirs::home_dir()
+            .context("could not locate user home directory")?
+            .join(".cache")
+            .join("glint"),
+    };
+    // Scope the cache to the active profile so fetched payloads don't bleed
+    // across profiles; `--clear-cache` then scopes to the active profile too.
+    Ok(base
+        .join("profiles")
+        .join(crate::config::active_profile()))
 }
 
 /// Replace path-unfriendly characters in a kind / instance / key segment so

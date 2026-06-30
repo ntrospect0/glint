@@ -65,6 +65,10 @@ struct Cli {
     #[arg(long, short = 'p', value_name = "NAME")]
     profile: Option<String>,
 
+    /// List the profiles found under `profiles/`, then exit.
+    #[arg(long)]
+    list_profiles: bool,
+
     /// Path to a config file (overrides the default XDG location).
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
@@ -110,6 +114,25 @@ fn main() -> Result<()> {
         if cli.init {
             let path = config::init_default_config()?;
             println!("Initialized config at {}", path.display());
+            return Ok(());
+        }
+        if cli.list_profiles {
+            let active = config::active_profile();
+            for name in config::profiles::list()? {
+                let mut marks: Vec<&str> = Vec::new();
+                if name == active {
+                    marks.push("active");
+                }
+                if name == config::DEFAULT_PROFILE {
+                    marks.push("default");
+                }
+                let suffix = if marks.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", marks.join(", "))
+                };
+                println!("{name}{suffix}");
+            }
             return Ok(());
         }
         // --clear-cache / --clear-cache-forced fire before the rest of startup
