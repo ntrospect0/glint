@@ -2,10 +2,12 @@
 // Copyright (C) 2026 ntrospect0
 
 pub mod layout;
+pub mod migrate;
 pub mod types;
 pub mod watcher;
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 
@@ -92,11 +94,64 @@ fn format_string_array_literal(items: &[String]) -> String {
     format!("[{}]", parts.join(", "))
 }
 
-/// Returns `~/.config/glint/` on every platform (overridable with
-/// `$XDG_CONFIG_HOME`). The XDG Base Directory layout is what the spec
-/// promises, so we use it consistently rather than falling back to
-/// `~/Library/Application Support/` on macOS or `%APPDATA%` on Windows.
-pub fn config_dir() -> Result<PathBuf> {
+/// The default profile name. Always exists; cannot be deleted.
+pub const DEFAULT_PROFILE: &str = "default";
+
+static ACTIVE_PROFILE: OnceLock<String> = OnceLock::new();
+static CONFIG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// The active profile name. **Read-only**: this never initializes the lock
+/// (no `get_or_init`), so an early read can't silently pin `"default"` and
+/// turn a later [`set_active_profile`] into a no-op. Falls back to
+/// [`DEFAULT_PROFILE`] until `main` sets it.
+pub fn active_profile() -> &'static str {
+    ACTIVE_PROFILE
+        .get()
+        .map(String::as_str)
+        .unwrap_or(DEFAULT_PROFILE)
+}
+
+/// Set the active profile. Called **exactly once** in `main`, before any
+/// config access. Panics on a second call so an accidental re-set is loud
+/// rather than a silent wrong-tree.
+pub fn set_active_profile(name: impl Into<String>) {
+    ACTIVE_PROFILE
+        .set(name.into())
+        .expect("active profile set more than once");
+}
+
+/// Point the per-profile config dir at an explicit directory, bypassing
+/// profile resolution. Used by `--config <FILE>` (explicit single-file mode)
+/// to resolve sibling files from the file's own directory. Set once.
+pub fn set_config_dir_override(dir: PathBuf) {
+    let _ = CONFIG_DIR_OVERRIDE.set(dir);
+}
+
+/// Validate a profile name: ASCII-alphanumeric start, then
+/// alphanumeric/`-`/`_`, 1–64 chars, no path separators.
+pub fn validate_profile_name(name: &str) -> Result<()> {
+    let ok = (1..=64).contains(&name.len())
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !ok {
+        anyhow::bail!(
+            "invalid profile name {name:?}: use letters, digits, '-' or '_' \
+             (1–64 chars, no leading dash, no path separators)"
+        );
+    }
+    Ok(())
+}
+
+/// The glint root — `~/.config/glint/` (overridable with `$XDG_CONFIG_HOME`).
+/// This is the **global layer** shared across profiles. The XDG Base
+/// Directory layout is what the spec promises, so we use it consistently
+/// rather than `~/Library/Application Support/` (macOS) or `%APPDATA%`.
+pub fn glint_root() -> Result<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
             return Ok(PathBuf::from(xdg).join("glint"));
@@ -104,6 +159,17 @@ pub fn config_dir() -> Result<PathBuf> {
     }
     let home = dirs::home_dir().context("could not locate user home directory")?;
     Ok(home.join(".config").join("glint"))
+}
+
+/// The active profile's config directory — `<glint_root>/profiles/<active>`.
+/// Every per-profile path (widget configs, credentials, runtime/wizard
+/// state, notes, log) resolves under this. An explicit `--config` override
+/// short-circuits to that file's directory.
+pub fn config_dir() -> Result<PathBuf> {
+    if let Some(dir) = CONFIG_DIR_OVERRIDE.get() {
+        return Ok(dir.clone());
+    }
+    Ok(glint_root()?.join("profiles").join(active_profile()))
 }
 
 /// Returns the path to the main config file (`config.toml`).
@@ -393,5 +459,28 @@ jump_url_template = "https://example.com/{ticker}"
         assert!(updated.contains(r#"indices = ["^DJI", "^GSPC"]"#));
         assert!(updated.contains("# Press `j`"));
         assert!(updated.contains("jump_url_template"));
+    }
+
+    #[test]
+    fn profile_name_validation() {
+        for ok in ["default", "work", "travel-eu", "p_2", "A1"] {
+            assert!(validate_profile_name(ok).is_ok(), "{ok:?} should be valid");
+        }
+        for bad in ["", "-lead", "_lead", "has space", "a/b", "a.b", "café"] {
+            assert!(
+                validate_profile_name(bad).is_err(),
+                "{bad:?} should be invalid"
+            );
+        }
+        // 64 ok, 65 too long.
+        assert!(validate_profile_name(&"a".repeat(64)).is_ok());
+        assert!(validate_profile_name(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn active_profile_defaults_without_set() {
+        // In the test process the OnceLock is never set → reads the default.
+        // (Read-only accessor must not pin the lock.)
+        assert_eq!(active_profile(), DEFAULT_PROFILE);
     }
 }

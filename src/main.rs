@@ -58,14 +58,49 @@ struct Cli {
     #[arg(long, value_name = "TARGET", num_args = 0..=1, default_missing_value = "*")]
     clear_cache_forced: Option<String>,
 
+    /// Profile to use — an isolated config tree under
+    /// `~/.config/glint/profiles/<name>/`. Defaults to "default". Also
+    /// settable via the GLINT_PROFILE environment variable. Mutually
+    /// exclusive with --config.
+    #[arg(long, short = 'p', value_name = "NAME")]
+    profile: Option<String>,
+
     /// Path to a config file (overrides the default XDG location).
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
-    init_tracing();
     let cli = Cli::parse();
+
+    // Resolve and lock the active profile BEFORE any config access (incl.
+    // init_tracing, which logs into the profile dir). The set-once lock makes
+    // an accidental early/second set loud rather than a silent wrong-tree.
+    let profile = if cli.config.is_some() {
+        if cli.profile.is_some() {
+            return Err(anyhow!("--config cannot be combined with --profile"));
+        }
+        // Explicit single-file mode resolves siblings from the file's dir.
+        config::DEFAULT_PROFILE.to_string()
+    } else {
+        cli.profile
+            .clone()
+            .or_else(|| std::env::var("GLINT_PROFILE").ok().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| config::DEFAULT_PROFILE.to_string())
+    };
+    config::validate_profile_name(&profile)?;
+    config::set_active_profile(profile);
+
+    if let Some(path) = cli.config.as_deref() {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            config::set_config_dir_override(parent.to_path_buf());
+        }
+    } else {
+        // Migrate a pre-profiles flat layout into profiles/default/.
+        config::migrate::migrate_if_needed()?;
+    }
+
+    init_tracing();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -106,6 +141,18 @@ fn main() -> Result<()> {
         }
         if let Some(target) = cli.auth.as_deref() {
             return run_auth(target).await;
+        }
+
+        // A non-default profile must already exist to launch into — don't
+        // silently first-run-create it. `--profile X --setup` creates it.
+        if cli.config.is_none()
+            && config::active_profile() != config::DEFAULT_PROFILE
+            && !looks_initialized()
+        {
+            let p = config::active_profile();
+            return Err(anyhow!(
+                "profile {p:?} not found. Create it with: glint --profile {p} --setup"
+            ));
         }
 
         // First-run UX: drop into the setup wizard before opening the TUI.
