@@ -69,6 +69,23 @@ struct Cli {
     #[arg(long)]
     list_profiles: bool,
 
+    /// Create a new profile, then exit. Add --from <SRC> to clone an existing
+    /// profile's config (credentials are not copied — re-authorize the clone).
+    #[arg(long, value_name = "NAME")]
+    new_profile: Option<String>,
+
+    /// Source profile to clone when creating with --new-profile.
+    #[arg(long, value_name = "SRC", requires = "new_profile")]
+    from: Option<String>,
+
+    /// Rename a profile: --rename-profile OLD:NEW. Then exit.
+    #[arg(long, value_name = "OLD:NEW")]
+    rename_profile: Option<String>,
+
+    /// Delete a profile (not "default" or the active one), then exit.
+    #[arg(long, value_name = "NAME")]
+    delete_profile: Option<String>,
+
     /// Path to a config file (overrides the default XDG location).
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
@@ -133,6 +150,27 @@ fn main() -> Result<()> {
                 };
                 println!("{name}{suffix}");
             }
+            return Ok(());
+        }
+        if let Some(name) = cli.new_profile.as_deref() {
+            config::profiles::create(name, cli.from.as_deref())?;
+            match cli.from.as_deref() {
+                Some(src) => println!("Created profile {name:?} (cloned config from {src:?}). Re-authorize its accounts with `glint --profile {name} --auth <provider>`."),
+                None => println!("Created profile {name:?}. Configure it with `glint --profile {name} --setup`."),
+            }
+            return Ok(());
+        }
+        if let Some(spec) = cli.rename_profile.as_deref() {
+            let (old, new) = spec
+                .split_once(':')
+                .ok_or_else(|| anyhow!("use --rename-profile OLD:NEW"))?;
+            config::profiles::rename(old, new)?;
+            println!("Renamed profile {old:?} → {new:?}.");
+            return Ok(());
+        }
+        if let Some(name) = cli.delete_profile.as_deref() {
+            config::profiles::delete(name)?;
+            println!("Deleted profile {name:?} (and its cache).");
             return Ok(());
         }
         // --clear-cache / --clear-cache-forced fire before the rest of startup

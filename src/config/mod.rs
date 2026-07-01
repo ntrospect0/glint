@@ -229,8 +229,15 @@ pub const DEFAULT_CALENDAR_TOML: &str = include_str!("defaults/calendar.toml");
 /// Create `~/.config/glint/` and seed the default config files if they do not
 /// already exist. Returns the path of the main `config.toml`.
 pub fn init_default_config() -> Result<PathBuf> {
-    // ── Global layer (root): the theme library + OAuth client registrations,
-    // shared across every profile. ──
+    seed_global_layer()?;
+    let dir = config_dir()?;
+    seed_profile_dir(&dir)?;
+    Ok(dir.join("config.toml"))
+}
+
+/// Seed the shared **global layer** at the glint root: the colorscheme
+/// library and the OAuth client-registration templates. Idempotent.
+pub(crate) fn seed_global_layer() -> Result<()> {
     let root = glint_root()?;
     std::fs::create_dir_all(&root)
         .with_context(|| format!("failed to create glint root at {}", root.display()))?;
@@ -244,15 +251,16 @@ pub fn init_default_config() -> Result<PathBuf> {
         &global_creds.join("microsoft_oauth_client.toml"),
         DEFAULT_MICROSOFT_CLIENT_TEMPLATE,
     )?;
+    Ok(())
+}
 
-    // ── Per-profile layer (active profile): layout + widget configs +
-    // account-level credentials. ──
-    let dir = config_dir()?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create config directory at {}", dir.display()))?;
-
-    let main = dir.join("config.toml");
-    seed(&main, DEFAULT_CONFIG_TOML)?;
+/// Seed a **profile directory** with the default per-profile config + account
+/// credential templates. Parameterized on `dir` so it can seed any profile
+/// (the active one, or a freshly-created one). Idempotent.
+pub(crate) fn seed_profile_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create profile dir {}", dir.display()))?;
+    seed(&dir.join("config.toml"), DEFAULT_CONFIG_TOML)?;
     seed(&dir.join("clock.toml"), DEFAULT_CLOCK_TOML)?;
     seed(&dir.join("weather.toml"), DEFAULT_WEATHER_TOML)?;
     seed(&dir.join("calendar.toml"), DEFAULT_CALENDAR_TOML)?;
@@ -260,17 +268,21 @@ pub fn init_default_config() -> Result<PathBuf> {
     seed(&dir.join("stocks.toml"), DEFAULT_STOCKS_TOML)?;
     seed(&dir.join("llm.toml"), DEFAULT_LLM_TOML)?;
 
-    let credentials = crate::credentials::dir()?;
+    let creds = dir.join("credentials");
+    std::fs::create_dir_all(&creds)
+        .with_context(|| format!("failed to create {}", creds.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&creds, std::fs::Permissions::from_mode(0o700));
+    }
     seed_credentials(
-        &credentials.join("anthropic_key.toml"),
+        &creds.join("anthropic_key.toml"),
         DEFAULT_ANTHROPIC_KEY_TEMPLATE,
     )?;
-    seed_credentials(
-        &credentials.join("openai_key.toml"),
-        DEFAULT_OPENAI_KEY_TEMPLATE,
-    )?;
-    seed_credentials(&credentials.join("caldav.toml"), DEFAULT_CALDAV_TEMPLATE)?;
-    Ok(main)
+    seed_credentials(&creds.join("openai_key.toml"), DEFAULT_OPENAI_KEY_TEMPLATE)?;
+    seed_credentials(&creds.join("caldav.toml"), DEFAULT_CALDAV_TEMPLATE)?;
+    Ok(())
 }
 
 fn seed_credentials(path: &Path, contents: &str) -> Result<()> {
