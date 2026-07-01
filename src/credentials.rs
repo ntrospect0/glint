@@ -29,28 +29,51 @@ use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-/// Returns `~/.config/glint/credentials/`, creating it (mode `0700`
-/// on Unix) on first use. Idempotent — safe to call repeatedly.
+/// The **per-profile** credentials dir — `<config_dir>/credentials/`,
+/// created mode `0700` on first use. Holds account-level secrets (tokens,
+/// CalDAV, IMAP, LLM keys). Idempotent.
 pub fn dir() -> Result<PathBuf> {
-    let path = crate::config::config_dir()?.join("credentials");
+    ensure_0700(crate::config::config_dir()?.join("credentials"))
+}
+
+/// The **global** credentials dir — `<glint_root>/credentials/`, shared
+/// across profiles. Holds app-level OAuth *client registrations* (the
+/// Azure / Google app, not any account). Created mode `0700`.
+pub fn global_dir() -> Result<PathBuf> {
+    ensure_0700(crate::config::glint_root()?.join("credentials"))
+}
+
+fn ensure_0700(path: PathBuf) -> Result<PathBuf> {
     std::fs::create_dir_all(&path)
         .with_context(|| format!("failed to create credentials dir {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // Best-effort: a chmod failure on an existing dir we don't
-        // own (rare; would indicate an installed-as-root scenario)
-        // shouldn't crash the auth flow.
+        // Best-effort: a chmod failure on an existing dir we don't own
+        // (rare; installed-as-root) shouldn't crash the auth flow.
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
     }
     Ok(path)
 }
 
-/// Resolve a credentials basename to its absolute path under the
-/// credentials directory. Does *not* create the file. Returns an
-/// error only if the credentials dir itself can't be resolved.
+/// True for files that live in the **global** credentials dir (shared across
+/// profiles): the OAuth client registrations. Everything else — tokens,
+/// CalDAV, IMAP, LLM keys — is per-profile.
+fn is_global(filename: &str) -> bool {
+    filename.ends_with("_oauth_client.toml")
+}
+
+/// Resolve a credentials basename to its tier-correct absolute path: the
+/// global dir for client registrations, the per-profile dir otherwise. Does
+/// *not* create the file. Every load/save/template call funnels through here,
+/// so tiering is enforced in one place rather than at each call site.
 pub fn path(filename: &str) -> Result<PathBuf> {
-    Ok(dir()?.join(filename))
+    let base = if is_global(filename) {
+        global_dir()?
+    } else {
+        dir()?
+    };
+    Ok(base.join(filename))
 }
 
 /// Load a TOML-serialised credentials value by basename. Returns:

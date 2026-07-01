@@ -229,6 +229,24 @@ pub const DEFAULT_CALENDAR_TOML: &str = include_str!("defaults/calendar.toml");
 /// Create `~/.config/glint/` and seed the default config files if they do not
 /// already exist. Returns the path of the main `config.toml`.
 pub fn init_default_config() -> Result<PathBuf> {
+    // ── Global layer (root): the theme library + OAuth client registrations,
+    // shared across every profile. ──
+    let root = glint_root()?;
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("failed to create glint root at {}", root.display()))?;
+    seed(&root.join("colorschemes.toml"), DEFAULT_COLORSCHEMES_TOML)?;
+    let global_creds = crate::credentials::global_dir()?;
+    seed_credentials(
+        &global_creds.join("google_oauth_client.toml"),
+        DEFAULT_GOOGLE_CLIENT_TEMPLATE,
+    )?;
+    seed_credentials(
+        &global_creds.join("microsoft_oauth_client.toml"),
+        DEFAULT_MICROSOFT_CLIENT_TEMPLATE,
+    )?;
+
+    // ── Per-profile layer (active profile): layout + widget configs +
+    // account-level credentials. ──
     let dir = config_dir()?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create config directory at {}", dir.display()))?;
@@ -241,10 +259,7 @@ pub fn init_default_config() -> Result<PathBuf> {
     seed(&dir.join("news.toml"), DEFAULT_NEWS_TOML)?;
     seed(&dir.join("stocks.toml"), DEFAULT_STOCKS_TOML)?;
     seed(&dir.join("llm.toml"), DEFAULT_LLM_TOML)?;
-    seed(&dir.join("colorschemes.toml"), DEFAULT_COLORSCHEMES_TOML)?;
 
-    // Credentials live in their own subdirectory (created with 0700) so they
-    // can be locked down with one chmod.
     let credentials = crate::credentials::dir()?;
     seed_credentials(
         &credentials.join("anthropic_key.toml"),
@@ -255,14 +270,6 @@ pub fn init_default_config() -> Result<PathBuf> {
         DEFAULT_OPENAI_KEY_TEMPLATE,
     )?;
     seed_credentials(&credentials.join("caldav.toml"), DEFAULT_CALDAV_TEMPLATE)?;
-    seed_credentials(
-        &credentials.join("google_oauth_client.toml"),
-        DEFAULT_GOOGLE_CLIENT_TEMPLATE,
-    )?;
-    seed_credentials(
-        &credentials.join("microsoft_oauth_client.toml"),
-        DEFAULT_MICROSOFT_CLIENT_TEMPLATE,
-    )?;
     Ok(main)
 }
 

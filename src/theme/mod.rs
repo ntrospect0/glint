@@ -35,7 +35,7 @@ use anyhow::{Context, Result};
 use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Deserializer};
 
-use crate::config::config_dir;
+use crate::config::{config_dir, glint_root};
 
 /// A single style declaration, decoupled from Ratatui's [`Style`] so we can
 /// distinguish "absent" (inherit) from "explicit default". Convert into a
@@ -307,20 +307,34 @@ pub struct ColorSchemesFile {
     pub schemes: HashMap<String, ColorScheme>,
 }
 
+/// Path to the **global** colorscheme library at the glint root. This is
+/// shared across profiles; a profile may add/override schemes via its own
+/// `colorschemes.toml` (see [`load_schemes_file`]).
 pub fn colorschemes_path() -> Result<PathBuf> {
-    Ok(config_dir()?.join("colorschemes.toml"))
+    Ok(glint_root()?.join("colorschemes.toml"))
 }
 
-/// Load and parse `~/.config/glint/colorschemes.toml`. Returns an empty
-/// `ColorSchemesFile` if the file does not exist (callers fall back to
-/// built-in defaults). Used by `:scheme` for both lookup and listing
-/// available scheme names on a mistyped query.
+/// Load the colorscheme library: the global root file as a base, with an
+/// optional per-profile `<config_dir>/colorschemes.toml` overlaid — schemes
+/// merge by name, profile definitions winning on collision. A missing file
+/// at either tier contributes nothing. Callers fall back to built-in
+/// defaults when the merged set lacks the requested scheme.
 pub fn load_schemes_file() -> Result<ColorSchemesFile> {
-    let path = colorschemes_path()?;
+    let mut merged = read_schemes_file(&colorschemes_path()?)?;
+    let profile_override = config_dir()?.join("colorschemes.toml");
+    if profile_override.exists() {
+        for (name, scheme) in read_schemes_file(&profile_override)?.schemes {
+            merged.schemes.insert(name, scheme); // profile wins
+        }
+    }
+    Ok(merged)
+}
+
+fn read_schemes_file(path: &std::path::Path) -> Result<ColorSchemesFile> {
     if !path.exists() {
         return Ok(ColorSchemesFile::default());
     }
-    let contents = std::fs::read_to_string(&path)
+    let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
 }

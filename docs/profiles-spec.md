@@ -189,35 +189,46 @@ refuse to auto-migrate, leaving both in place for the user to resolve. (This
 also covers a half-migrated tree from an interrupted run + a fresh-seeded
 default.)
 
-**Procedure (stage-and-publish):**
+**Procedure (copy → publish → clean up).** Migration **copies** rather than
+moves, so the flat originals stay intact until the published copy exists — a
+crash at any point leaves a working flat layout for the next run to redo. A
+`.migrating` intent marker distinguishes a resumable in-progress migration
+from a genuinely ambiguous layout.
 
-1. Acquire a root migration lock (so two first-launch processes don't race).
+1. Record intent: write a `.migrating` marker under the root.
 2. Stage into `profiles/.default.partial/` (create it + a `credentials/`
-   subdir at **0700 before any token lands**):
-   - Move per-profile files: `config.toml`, all root `*.toml` **except
+   subdir at **0700 before any token lands**) by **copying**:
+   - Per-profile files: `config.toml`, all root `*.toml` **except
      `colorschemes.toml`**, `.runtime_state.toml`, `.wizard_state.toml`, and
      `glint.log`.
-   - Move per-profile **notes**: `config_dir()/notes/` (old tier-3) and
+   - Per-profile **notes**: `config_dir()/notes/` (old tier-3) and
      `~/.glint/notes/` (old default tier-2) → `notes/`. A user-set absolute
-     `notes_dir` is left as-is (documented as deliberately shared).
-   - Move **credentials** with a **deny-list**: move *everything* under
+     `notes_dir` is left as-is (documented as deliberately shared). (Notes
+     adoption is handled at the notes resolver too.)
+   - **credentials** with a **deny-list**: copy *everything* under
      `credentials/` **except `*_oauth_client.toml`** (so tokens, `caldav.toml`,
      `imap.toml`, LLM keys all move; future credential files move by
-     default). Preserve 0600 file modes.
+     default). `std::fs::copy` preserves the 0600 file mode.
 3. **Leave at the root (global):** `colorschemes.toml`,
    `credentials/*_oauth_client.toml`.
-4. **Atomically publish:** `rename("profiles/.default.partial", "profiles/default")`.
-   This single rename is the commit point — there is no observable
-   half-migrated `profiles/default/`.
-5. Write the `.profiles-migrated` marker; release the lock.
+4. **Atomically publish:** `rename("profiles/.default.partial", "profiles/default")` —
+   the single commit point; there is no observable half-migrated
+   `profiles/default/`.
+5. Write the `.profiles-migrated` marker, **then** delete the flat originals
+   (globals excepted), then clear `.migrating`.
+
+A companion `hoist_globals` step pulls the colorscheme library + client
+registrations back up to the root for any tree an interim (move-based) build
+left them inside `profiles/default/`.
 
 **Properties:**
 
-- **Crash-safe / resumable.** A crash before the publish leaves only
-  `profiles/.default.partial/` (never read). The next run still sees the flat
-  `config.toml`, deletes the stale staging dir, and redoes the move. There is
-  **no dir-presence short-circuit** — completion is the published
-  `profiles/default/` + marker, produced atomically.
+- **Crash-safe / resumable.** Because originals are copied (never destroyed)
+  until the published copy exists, a crash before publish leaves the flat
+  layout intact and the staging dir (only ever copies) is discarded and
+  redone. A crash after publish but before cleanup is recognised via the
+  `.migrating` marker and finalized (marker → delete originals). Completion is
+  the `.profiles-migrated` marker, not dir-presence.
 - **Composes with multi-account.** The 0.3.0 legacy-token read fallback moves
   into `profiles/default/credentials/` and keeps resolving there.
 - **Symlinks:** if a moved file (e.g. a dotfiles-managed `config.toml`) is a
