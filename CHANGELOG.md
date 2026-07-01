@@ -4,7 +4,41 @@ All notable changes to glint are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions track
 the `Cargo.toml` `version` field.
 
-## [0.3.0] — unreleased
+## [0.3.5] — unreleased
+
+**Profiles.** `glint --profile <name>` (or `-p <name>`, or
+`GLINT_PROFILE`) runs an isolated config tree, so one machine can hold a
+focused **work** dashboard, a stripped-down **travel** view, etc. — each
+with its own layout, widgets, theme, and accounts. Without a profile,
+glint uses `"default"`.
+
+### Added
+
+- **Per-profile config trees** under `~/.config/glint/profiles/<name>/`:
+  layout, widget configs, the selected theme, account tokens, notes,
+  runtime/wizard state, cache, and log are all per-profile.
+- **Shared global layer** at the glint root: the colorscheme **library**
+  (`colorschemes.toml`, with optional per-profile overrides merged by
+  name) and the OAuth **client registrations** (`*_oauth_client.toml`) —
+  define/register once, use from every profile.
+- **Profile management CLI:** `--list-profiles`, `--new-profile <name>`
+  (`--from <src>` to clone a profile's *config*, credentials excluded),
+  `--rename-profile OLD:NEW`, `--delete-profile <name>`. Guards: names
+  are validated, case-insensitive collisions rejected (macOS folds
+  case), and `default` / the active profile can't be renamed/deleted.
+
+### Changed
+
+- **On-disk layout migrates automatically.** The first launch after
+  upgrading moves a flat `~/.config/glint/` into `profiles/default/`,
+  leaving the shared colorscheme library + client registrations at the
+  root. Crash-safe: it copies before it deletes, so an interrupted
+  migration leaves the existing config intact.
+- **Cache, notes, and logs are now per-profile.** Notes previously
+  defaulted to a shared `~/.glint/notes`; the default profile adopts any
+  existing one on first run, and other profiles start empty.
+
+## [0.3.0]
 
 The 0.2 release is the structural refactor of glint into a plugin-style
 platform: registries for widgets, auth providers, and LLM providers
