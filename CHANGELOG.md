@@ -21,6 +21,9 @@ glint uses `"default"`.
   (`colorschemes.toml`, with optional per-profile overrides merged by
   name) and the OAuth **client registrations** (`*_oauth_client.toml`) —
   define/register once, use from every profile.
+- **Active-profile indicator** in the dashboard status bar — a
+  `Profile: <name>` segment shown for any non-default profile so the
+  active context is unmistakable (the default profile is unchanged).
 - **Profile management CLI:** `--list-profiles`, `--new-profile <name>`
   (`--from <src>` to clone a profile's *config*, credentials excluded),
   `--rename-profile OLD:NEW`, `--delete-profile <name>`. Guards: names
