@@ -92,6 +92,12 @@ struct Cli {
     #[arg(long)]
     migrate_profiles: bool,
 
+    /// Remove leftover flat config files at the root after migrating (the
+    /// duplicates of profiles/default/), then exit. Keeps the global layer
+    /// (colorschemes + client registrations) and the profiles/ tree.
+    #[arg(long)]
+    cleanup_flat_config: bool,
+
     /// Path to a config file (overrides the default XDG location).
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
@@ -185,8 +191,25 @@ fn main() -> Result<()> {
             println!(
                 "Copied {copied} item(s) into {}.\n\
                  The flat files at the root are left in place so an older \
-                 glint keeps working — remove them once you've fully switched.",
+                 glint keeps working — remove them once you've fully switched \
+                 with `glint --cleanup-flat-config`.",
                 dest.display()
+            );
+            return Ok(());
+        }
+        if cli.cleanup_flat_config {
+            let migrated = config::glint_root()
+                .map(|r| r.join("profiles").join(config::DEFAULT_PROFILE).exists())
+                .unwrap_or(false);
+            if !migrated {
+                return Err(anyhow!(
+                    "not migrated yet — run `glint --migrate-profiles` first"
+                ));
+            }
+            let n = config::migrate::remove_flat_originals()?;
+            println!(
+                "Removed {n} leftover flat file(s) from the root \
+                 (the colorscheme library, client registrations, and profiles/ are kept)."
             );
             return Ok(());
         }
