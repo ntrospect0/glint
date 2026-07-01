@@ -79,6 +79,60 @@ pub(crate) fn migrate_to_profiles_at(root: &Path) -> Result<(PathBuf, usize)> {
     Ok((published, count))
 }
 
+/// Remove the per-profile flat files from the root, leaving the global-layer
+/// files (colorschemes.toml, `*_oauth_client.toml`) and the `profiles/` tree.
+/// Returns the number of top-level items removed. Idempotent.
+///
+/// **Only** call this after the flat config has been copied into
+/// `profiles/default/` (they're the same files) and with the user's explicit
+/// consent — it removes files an older flat binary would otherwise read.
+pub fn remove_flat_originals() -> Result<usize> {
+    remove_flat_originals_at(&glint_root()?)
+}
+
+pub(crate) fn remove_flat_originals_at(root: &Path) -> Result<usize> {
+    let mut removed = 0usize;
+    for entry in std::fs::read_dir(root).with_context(|| format!("read {}", root.display()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy();
+        // Keep the profiles tree and the global-layer root file.
+        if name == "profiles" || is_global_root_file(&name_s) {
+            continue;
+        }
+        let path = entry.path();
+        if name_s == "credentials" {
+            // Remove per-profile credential files; keep client registrations.
+            if let Ok(rd) = std::fs::read_dir(&path) {
+                for e in rd.flatten() {
+                    if is_global_client_file(&e.file_name().to_string_lossy()) {
+                        continue;
+                    }
+                    let p = e.path();
+                    let ok = if p.is_dir() {
+                        std::fs::remove_dir_all(&p)
+                    } else {
+                        std::fs::remove_file(&p)
+                    };
+                    if ok.is_ok() {
+                        removed += 1;
+                    }
+                }
+            }
+        } else {
+            let ok = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            if ok.is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// Copy the per-profile portion of a flat root into `staging`, leaving the
 /// global-layer files (colorschemes.toml, `*_oauth_client.toml`) at the root.
 /// Returns the number of top-level items copied.
@@ -229,6 +283,24 @@ mod tests {
         let root = temp_root("noflat");
         let err = migrate_to_profiles_at(&root).unwrap_err();
         assert!(err.to_string().contains("no flat config"), "got: {err}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn remove_flat_originals_keeps_globals_and_profiles() {
+        let root = temp_root("remove");
+        seed_flat(&root);
+        fs::create_dir_all(root.join("profiles/default")).unwrap();
+        let removed = remove_flat_originals_at(&root).unwrap();
+        assert!(removed >= 2, "removed {removed}");
+        // Per-profile flat files gone.
+        assert!(!root.join("config.toml").exists());
+        assert!(!root.join("clock.toml").exists());
+        assert!(!root.join("credentials/caldav.toml").exists());
+        // Globals + the profiles tree kept.
+        assert!(root.join("colorschemes.toml").exists());
+        assert!(root.join("credentials/google_oauth_client.toml").exists());
+        assert!(root.join("profiles/default").exists());
         fs::remove_dir_all(&root).ok();
     }
 }

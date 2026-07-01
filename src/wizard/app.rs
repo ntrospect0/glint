@@ -150,12 +150,20 @@ pub fn run_wizard(show_manager: bool) -> Result<WizardOutcome> {
     // stale or partial buffer from *masking* real config it happens to lack.
     let mut state = storage::load()?.unwrap_or_default();
     super::hydrate::hydrate_from_disk(&mut state);
-    // A bare `--setup` opens the Profile Manager first; `--profile X --setup`
-    // edits the active profile directly. A resume buffer does NOT skip the
-    // Manager — picking a profile lands on Welcome, which offers Resume when
-    // that profile has an interrupted buffer.
+    // A bare `--setup` opens the Profile Manager. If a flat (pre-profiles)
+    // config or its leftover duplicates sit at the root, prompt to migrate /
+    // clean up first (which unlocks the Manager). `--profile X --setup` edits
+    // the active profile directly. A resume buffer does NOT skip the Manager —
+    // picking a profile lands on Welcome, which offers Resume.
     let initial_page = if show_manager {
-        Page::Manager
+        let flat_present = crate::config::glint_root()
+            .map(|r| r.join("config.toml").exists())
+            .unwrap_or(false);
+        if flat_present {
+            Page::MigratePrompt
+        } else {
+            Page::Manager
+        }
     } else {
         flow::start_page(&state)
     };
@@ -385,6 +393,14 @@ pub fn run_wizard(show_manager: bool) -> Result<WizardOutcome> {
                     Err(err) => app.feedback = Some(format!("Error: {err}")),
                 }
             }
+            PageAction::EnterManager => {
+                app.page = Page::Manager;
+                app.history.clear();
+                app.text_buffer.clear();
+                // on_enter sets the focus/mode; app.feedback is preserved so a
+                // migrate/cleanup success message carries into the Manager.
+                super::pages::on_enter(&mut app);
+            }
         }
     }
 }
@@ -540,9 +556,9 @@ fn render_header(frame: &mut Frame, area: Rect, app: &WizardApp) {
         ),
     ]);
 
-    // The Profile Manager is the front page, not a numbered step — show just
-    // the title, no progress bar.
-    let lines: Vec<Line> = if matches!(app.page, Page::Manager) {
+    // The Manager / migration prompt are front pages, not numbered steps —
+    // show just the title, no progress bar.
+    let lines: Vec<Line> = if matches!(app.page, Page::Manager | Page::MigratePrompt) {
         vec![title_line]
     } else {
         let current = flow::current_step(&app.page, &app.state);

@@ -14,6 +14,7 @@ pub mod confirm;
 pub mod global;
 pub mod layout;
 pub mod manager;
+pub mod migrate_prompt;
 pub mod oauth_setup;
 pub mod preview;
 pub mod welcome;
@@ -28,6 +29,9 @@ use super::app::WizardApp;
 /// a fixed position; `Widget(i)` indexes into `WizardState.assignments`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Page {
+    /// Migration / cleanup prompt shown ahead of the Manager when a flat
+    /// config (or its leftovers) is present. Not part of the linear flow.
+    MigratePrompt,
     /// Profile Manager — the front page for a bare `--setup`, listing
     /// profiles to pick one to configure. Not part of the linear flow.
     Manager,
@@ -67,6 +71,7 @@ impl Page {
     /// Stable page id used in state files (resume) and completion tracking.
     pub fn id(&self) -> String {
         match self {
+            Page::MigratePrompt => "migrate-prompt".into(),
             Page::Manager => "manager".into(),
             Page::Welcome => "welcome".into(),
             Page::Global => "global".into(),
@@ -88,6 +93,7 @@ impl Page {
     /// Human title shown in the wizard header.
     pub fn title(&self, state: &super::state::WizardState) -> String {
         match self {
+            Page::MigratePrompt => "Profiles".into(),
             Page::Manager => "Profiles".into(),
             Page::Welcome => "Welcome".into(),
             Page::Global => "Global settings".into(),
@@ -156,6 +162,8 @@ pub enum PageAction {
     /// (re-hydrate from its config) and drop into the normal flow. The app
     /// loop performs the retarget + navigation.
     EnterProfileEdit(String),
+    /// From the migration prompt: proceed into the Profile Manager.
+    EnterManager,
 }
 
 /// Dispatch a key event to the active page's `handle_key`.
@@ -164,6 +172,7 @@ pub fn dispatch_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
     // message visible refresh it inside their handler.
     app.feedback = None;
     match app.page.clone() {
+        Page::MigratePrompt => migrate_prompt::handle_key(key, app),
         Page::Manager => manager::handle_key(key, app),
         Page::Welcome => welcome::handle_key(key, app),
         Page::Global => global::handle_key(key, app),
@@ -183,6 +192,7 @@ pub fn dispatch_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
 /// Render the active page's body into `area`.
 pub fn render_body(frame: &mut Frame, area: Rect, app: &WizardApp) {
     match &app.page {
+        Page::MigratePrompt => migrate_prompt::render(frame, area, app),
         Page::Manager => manager::render(frame, area, app),
         Page::Welcome => welcome::render(frame, area, app),
         Page::Global => global::render(frame, area, app),
