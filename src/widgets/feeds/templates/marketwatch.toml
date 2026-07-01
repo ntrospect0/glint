@@ -25,17 +25,14 @@ default_commands = ["mw"]
 # redirects to these dowjones.io endpoints. MarketWatch's older
 # industry-specific feeds (healthcare, biotech, pharma, retail,
 # telecom, software, real estate) all 404 as of May 2026 — coverage
-# has been consolidated into the four general-purpose streams below.
+# has been consolidated into the three general-purpose streams below.
+# The Market Pulse stream (mw_marketpulse) was dropped in June 2026: the
+# feed still resolves but is no longer updated.
 # Add new slugs here if MarketWatch restores topical feeds.
 
 [[feeds]]
 topic = "Top Stories"
 url = "https://feeds.content.dowjones.io/public/rss/mw_topstories"
-default = true
-
-[[feeds]]
-topic = "Market Pulse"
-url = "https://feeds.content.dowjones.io/public/rss/mw_marketpulse"
 default = true
 
 [[feeds]]
