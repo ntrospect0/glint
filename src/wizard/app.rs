@@ -136,21 +136,17 @@ impl WizardApp {
 /// confirmation page; `Quit` if they bail out early (state file kept so
 /// the next `--setup` offers Resume).
 pub fn run_wizard() -> Result<WizardOutcome> {
-    // Load resume state if present. On version mismatch / corruption,
-    // storage::load returns None — we silently start fresh.
+    // Load the resume buffer if present (None on version mismatch /
+    // corruption / no prior run), then ALWAYS backfill from disk.
     //
-    // When there's no resume buffer (fresh launch OR previous wizard
-    // completed), pre-seed the empty state from the user's existing
-    // on-disk configs so re-running `--setup` after a prior install
-    // surfaces the current values as defaults rather than zero state.
-    let state = match storage::load()? {
-        Some(resumed) => resumed,
-        None => {
-            let mut fresh = super::state::WizardState::default();
-            super::hydrate::hydrate_from_disk(&mut fresh);
-            fresh
-        }
-    };
+    // `hydrate_from_disk` is additive — every field it seeds is guarded by a
+    // "does the state already have this?" check ("resume values win"), so
+    // running it over a resumed buffer only fills the gaps. This is what makes
+    // a re-run of `--setup` surface current on-disk values (e.g. an existing
+    // API key, the configured theme) as defaults, and — crucially — stops a
+    // stale or partial buffer from *masking* real config it happens to lack.
+    let mut state = storage::load()?.unwrap_or_default();
+    super::hydrate::hydrate_from_disk(&mut state);
     let mut app = WizardApp::new(state);
     super::pages::on_enter(&mut app);
 
