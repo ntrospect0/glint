@@ -403,6 +403,15 @@ apply); optionally also watch `glint_root()/colorschemes.toml` later.
    relaunch).
 2. **Cache path shape** — `…/glint/profiles/<name>/` vs `…/glint-<name>/`.
 3. **Version** — 0.3.5 as requested vs 0.4.0 by scope.
+4. **Leftover flat files after migration** *(to revisit)* — `--migrate-profiles`
+   leaves the flat originals in place for safety, but they're then dead
+   duplicates at the root (the binary reads `profiles/default/`; edits to the
+   flat files silently do nothing) — confusing. Must **not** auto-delete (that
+   caused a real data-loss incident: the old flat binary re-seeded defaults
+   over an "empty" root). Options: a separate explicit cleanup step
+   (`--remove-flat-config`); move the flat originals aside to a timestamped
+   backup on migrate; or leave a breadcrumb pointer. Prefer user-driven +
+   reversible.
 
 ## Phased plan
 
