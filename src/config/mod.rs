@@ -170,7 +170,22 @@ pub fn config_dir() -> Result<PathBuf> {
     if let Some(dir) = CONFIG_DIR_OVERRIDE.get() {
         return Ok(dir.clone());
     }
-    Ok(glint_root()?.join("profiles").join(active_profile()))
+    let root = glint_root()?;
+    let profile = active_profile();
+    let profile_dir = root.join("profiles").join(profile);
+    // Legacy flat-layout fallback for the DEFAULT profile: if it hasn't been
+    // migrated (no profiles/default/) but a flat `config.toml` sits at the
+    // root, read the flat layout *in place*. This lets a pre-profiles install
+    // keep working — and stay interoperable with an older flat binary —
+    // without any automatic, destructive migration. Opt in explicitly with
+    // `--migrate-profiles`.
+    if profile == DEFAULT_PROFILE
+        && !profile_dir.exists()
+        && root.join("config.toml").exists()
+    {
+        return Ok(root);
+    }
+    Ok(profile_dir)
 }
 
 /// Returns the path to the main config file (`config.toml`).

@@ -1,9 +1,10 @@
 # Profiles — functional & technical spec
 
 Status: **draft / not yet implemented** — target 0.3.5
-Revised after an adversarial review: migration is now stage-and-publish
-atomic, profile resolution has a hard set-once invariant, clone is
-config-only, and OAuth client registrations are global-only.
+Revised after an adversarial review and dogfooding: migration is
+**opt-in and non-destructive** (a flat config is read in place; a stray
+run can't wipe it), profile resolution has a hard set-once invariant,
+clone is config-only, and OAuth client registrations are global-only.
 
 > Version note: this touches the CLI surface, the on-disk layout, a one-time
 > migration, and the setup wizard. By semver feel it's closer to a **0.4.0**
@@ -177,64 +178,54 @@ When the active profile ≠ `default`, surface its name in the running TUI
   TUI.
 - No live profile-switching inside one process — switching means relaunch.
 
-## Migration (one-time, automatic, atomic)
+## Migration (opt-in, non-destructive)
 
-**Trigger:** a **flat layout** — `config.toml` present at the root. (Not
-"`profiles/` absent": a stray `profiles/` dir must never mask a real flat
-config.)
+> **Why not automatic.** An earlier design migrated on first launch (copy →
+> publish → *delete the flat originals*). Dogfooding proved that unsafe: when a
+> pre-profiles **flat binary** and the new **profiles binary** share one
+> config dir, the profiles binary relocates the flat config, the flat binary
+> then sees an "empty" root, treats it as a first run, and **re-seeds
+> defaults** over it — destroying the real config (and its tokens). Migration
+> is therefore opt-in and never deletes.
 
-**Ambiguity guard:** if both root `config.toml` and
-`profiles/default/config.toml` exist, **do not pick one** — log loudly and
-refuse to auto-migrate, leaving both in place for the user to resolve. (This
-also covers a half-migrated tree from an interrupted run + a fresh-seeded
-default.)
+**Flat layouts are read in place.** The default profile's `config_dir()`
+falls back to the flat root when `profiles/default/` doesn't exist but a root
+`config.toml` does (see *Resolution*). So a pre-profiles install keeps working
+untouched, and a profiles binary can share the directory with an older flat
+binary safely — neither moves anything.
 
-**Procedure (copy → publish → clean up).** Migration **copies** rather than
-moves, so the flat originals stay intact until the published copy exists — a
-crash at any point leaves a working flat layout for the next run to redo. A
-`.migrating` intent marker distinguishes a resumable in-progress migration
-from a genuinely ambiguous layout.
+**Opt-in migration — `glint --migrate-profiles`:**
 
-1. Record intent: write a `.migrating` marker under the root.
-2. Stage into `profiles/.default.partial/` (create it + a `credentials/`
-   subdir at **0700 before any token lands**) by **copying**:
+1. Guard: bail if there's no root `config.toml`, or if `profiles/default/`
+   already exists (nothing to do).
+2. **Copy** the per-profile portion of the flat root into
+   `profiles/.default.partial/`:
    - Per-profile files: `config.toml`, all root `*.toml` **except
-     `colorschemes.toml`**, `.runtime_state.toml`, `.wizard_state.toml`, and
-     `glint.log`.
-   - Per-profile **notes**: `config_dir()/notes/` (old tier-3) and
-     `~/.glint/notes/` (old default tier-2) → `notes/`. A user-set absolute
-     `notes_dir` is left as-is (documented as deliberately shared). (Notes
-     adoption is handled at the notes resolver too.)
+     `colorschemes.toml`**, `.runtime_state.toml`, `.wizard_state.toml`,
+     `glint.log`, `notes/`.
    - **credentials** with a **deny-list**: copy *everything* under
-     `credentials/` **except `*_oauth_client.toml`** (so tokens, `caldav.toml`,
-     `imap.toml`, LLM keys all move; future credential files move by
-     default). `std::fs::copy` preserves the 0600 file mode.
+     `credentials/` **except `*_oauth_client.toml`**. `std::fs::copy`
+     preserves the 0600 file mode; the new `credentials/` is created 0700.
 3. **Leave at the root (global):** `colorschemes.toml`,
    `credentials/*_oauth_client.toml`.
-4. **Atomically publish:** `rename("profiles/.default.partial", "profiles/default")` —
-   the single commit point; there is no observable half-migrated
-   `profiles/default/`.
-5. Write the `.profiles-migrated` marker, **then** delete the flat originals
-   (globals excepted), then clear `.migrating`.
-
-A companion `hoist_globals` step pulls the colorscheme library + client
-registrations back up to the root for any tree an interim (move-based) build
-left them inside `profiles/default/`.
+4. **Atomically publish:** `rename("profiles/.default.partial", "profiles/default")`.
+5. **Stop.** The flat originals are **left in place** — an older flat binary
+   keeps working. The user removes the root `*.toml` themselves once fully
+   switched.
 
 **Properties:**
 
-- **Crash-safe / resumable.** Because originals are copied (never destroyed)
-  until the published copy exists, a crash before publish leaves the flat
-  layout intact and the staging dir (only ever copies) is discarded and
-  redone. A crash after publish but before cleanup is recognised via the
-  `.migrating` marker and finalized (marker → delete originals). Completion is
-  the `.profiles-migrated` marker, not dir-presence.
-- **Composes with multi-account.** The 0.3.0 legacy-token read fallback moves
-  into `profiles/default/credentials/` and keeps resolving there.
-- **Symlinks:** if a moved file (e.g. a dotfiles-managed `config.toml`) is a
-  symlink, log a warning — the link is moved and still points at its target,
-  but the user's `~/.config/glint/config.toml` path changes.
-- `--config` mode never migrates (explicit flat mode).
+- **Non-destructive.** Nothing at the root is ever deleted, so an interrupted
+  run leaves both the flat layout and (at worst) a discardable
+  `.default.partial` staging dir; re-running redoes the copy.
+- **No cross-binary hazard.** Because the flat files survive and are read in
+  place until the user migrates, a stray run of the profiles binary against a
+  flat install can't strand or wipe it.
+- **Composes with multi-account.** The 0.3.0 legacy-token read fallback is
+  copied into `profiles/default/credentials/` and keeps resolving there.
+- `--config` mode is unaffected (explicit single-file mode).
+- **Notes:** `~/.glint/notes` adoption into the profile is handled at the
+  notes resolver (see below), independent of this copy.
 
 ## Technical design
 
@@ -246,6 +237,13 @@ Split `config::config_dir()` (`src/config/mod.rs:99`):
 pub fn glint_root() -> Result<PathBuf>;   // $XDG_CONFIG_HOME/glint | ~/.config/glint  (global layer)
 pub fn config_dir() -> Result<PathBuf>;   // glint_root()?/profiles/<active>           (per-profile)
 ```
+
+`config_dir()` has one **legacy flat-layout fallback**: for the *default*
+profile, when `profiles/default/` doesn't exist but a root `config.toml` does,
+it returns the **root** — so a pre-profiles flat install is read in place with
+no migration (and stays interoperable with an older flat binary). Named
+profiles always resolve to `profiles/<name>/`. Migration (opt-in) is what
+later creates `profiles/default/`, after which the fallback no longer applies.
 
 Active profile is a **set-once, read-only** process global — there is one
 active profile per process and no live switching:

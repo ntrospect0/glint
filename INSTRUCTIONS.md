@@ -363,7 +363,15 @@ Cloning copies configuration but **not** credentials — authorize the clone's a
 
 ### Upgrading from a pre-profiles install
 
-The first launch after upgrading migrates your existing flat `~/.config/glint/` into `profiles/default/` automatically: layout, widget configs, notes, and account tokens move in; the shared colorscheme library and client registrations stay at the root. The migration copies before it deletes, so an interrupted run leaves your existing config intact.
+Your existing flat `~/.config/glint/` **keeps working as-is** — the default profile reads it in place, so nothing moves and nothing is deleted, and glint stays interoperable with an older flat binary sharing the same directory.
+
+Migrating into the `profiles/` layout is **opt-in and non-destructive**. When you're ready:
+
+```sh
+glint --migrate-profiles
+```
+
+That **copies** your flat config into `profiles/default/` and **leaves the originals in place** (so an older binary still works). The shared colorscheme library + OAuth client registrations stay at the root either way. Once you've fully switched to the profiles-aware binary, delete the leftover root `*.toml` yourself.
 
 ---
 

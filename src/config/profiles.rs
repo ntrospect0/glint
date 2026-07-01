@@ -43,6 +43,12 @@ pub(crate) fn list_in(profiles_dir: &Path) -> Vec<String> {
             names.push(name);
         }
     }
+    // `default` always exists conceptually — as profiles/default/ once
+    // migrated, or as the flat root layout before that — so it's always
+    // listed even when the directory isn't present yet.
+    if !names.iter().any(|n| n == DEFAULT_PROFILE) {
+        names.push(DEFAULT_PROFILE.to_string());
+    }
     // `default` sorts first (false < true), the rest alphabetically.
     names.sort_by(|a, b| (a != DEFAULT_PROFILE, a).cmp(&(b != DEFAULT_PROFILE, b)));
     names

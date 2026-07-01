@@ -86,6 +86,12 @@ struct Cli {
     #[arg(long, value_name = "NAME")]
     delete_profile: Option<String>,
 
+    /// Migrate a pre-profiles flat config into profiles/default/, then exit.
+    /// Copies (never deletes) the flat files, so an older flat binary keeps
+    /// working; remove the root *.toml yourself once you've fully switched.
+    #[arg(long)]
+    migrate_profiles: bool,
+
     /// Path to a config file (overrides the default XDG location).
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
@@ -116,10 +122,11 @@ fn main() -> Result<()> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             config::set_config_dir_override(parent.to_path_buf());
         }
-    } else {
-        // Migrate a pre-profiles flat layout into profiles/default/.
-        config::migrate::migrate_if_needed()?;
     }
+    // NOTE: migration into profiles/default/ is NOT automatic. A flat layout
+    // is read in place (see config::config_dir) so a pre-profiles install
+    // keeps working and stays interoperable with an older flat binary. Opt in
+    // with `--migrate-profiles` (handled in the dispatch block below).
 
     init_tracing();
 
@@ -171,6 +178,16 @@ fn main() -> Result<()> {
         if let Some(name) = cli.delete_profile.as_deref() {
             config::profiles::delete(name)?;
             println!("Deleted profile {name:?} (and its cache).");
+            return Ok(());
+        }
+        if cli.migrate_profiles {
+            let (dest, copied) = config::migrate::migrate_to_profiles()?;
+            println!(
+                "Copied {copied} item(s) into {}.\n\
+                 The flat files at the root are left in place so an older \
+                 glint keeps working — remove them once you've fully switched.",
+                dest.display()
+            );
             return Ok(());
         }
         // --clear-cache / --clear-cache-forced fire before the rest of startup

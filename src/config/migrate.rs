@@ -1,35 +1,32 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 ntrospect0
 
-//! One-time migration of the pre-profiles flat config layout into the
-//! two-tier profiles layout.
+//! Opt-in, non-destructive migration of a pre-profiles flat config into
+//! `profiles/default/`.
 //!
-//! Pre-0.3.5 glint stored everything flat under `~/.config/glint/`. Profiles
-//! splits that into a **global layer** at the root (the colorscheme library +
-//! OAuth client registrations) and a **per-profile layer** under
-//! `profiles/<name>/`. An existing flat install is migrated into
-//! `profiles/default/` on first launch, with the global files left at the
-//! root.
+//! Migration is deliberately **not automatic**. Automatic-on-launch migration
+//! is unsafe when an older flat binary and the new profiles binary share one
+//! config directory: the new binary relocates the flat config, the old one
+//! then sees an "empty" flat dir and re-seeds defaults, and the real config is
+//! lost. Instead:
 //!
-//! ## Crash-safety: copy, publish, then clean up
+//! - a flat layout is read **in place** for the default profile until you opt
+//!   in (see [`crate::config::config_dir`]), and
+//! - `glint --migrate-profiles` **copies** the flat per-profile files into
+//!   `profiles/default/` and **leaves the originals**, so an older flat binary
+//!   keeps working. Remove the root `*.toml` yourself once you've fully
+//!   switched.
 //!
-//! The migration **copies** per-profile files into a staging dir, atomically
-//! renames staging → `profiles/default/` (the single commit point), writes a
-//! `.profiles-migrated` marker, and only *then* removes the flat originals.
-//! Because originals are never destroyed until the published copy exists, a
-//! crash at any point is safe: the flat layout is still intact and the next
-//! run redoes the copy. A `.migrating` intent marker distinguishes a
-//! resumable in-progress migration from a genuinely ambiguous layout.
+//! Copy → atomic publish (`rename` staging → `profiles/default/`). Nothing at
+//! the root is ever deleted, so the operation is inherently safe to interrupt.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use super::{glint_root, DEFAULT_PROFILE};
 
 const STAGING_DIR: &str = ".default.partial";
-const MIGRATED_MARKER: &str = ".profiles-migrated";
-const MIGRATING_MARKER: &str = ".migrating";
 
 /// Root-level files that belong to the GLOBAL layer and stay at the root.
 fn is_global_root_file(name: &str) -> bool {
@@ -42,131 +39,58 @@ fn is_global_client_file(name: &str) -> bool {
     name.ends_with("_oauth_client.toml")
 }
 
-/// Run the flat→profiles migration and the interim-layout hoist if needed.
-pub fn migrate_if_needed() -> Result<()> {
-    let root = glint_root()?;
-    flat_to_profiles(&root)?;
-    hoist_globals(&root)?;
-    Ok(())
+/// Copy the flat layout into `profiles/default/`. Returns the published
+/// directory and the number of top-level items copied. Non-destructive: the
+/// flat originals are left in place.
+pub fn migrate_to_profiles() -> Result<(PathBuf, usize)> {
+    migrate_to_profiles_at(&glint_root()?)
 }
 
-/// Copy-based, crash-safe migration of a flat layout into `profiles/default/`,
-/// leaving the global-layer files at the root. Pure core, parameterized on
-/// the glint root for testability.
-pub(crate) fn flat_to_profiles(root: &Path) -> Result<()> {
-    let flat_config = root.join("config.toml");
-    let marker = root.join(MIGRATED_MARKER);
-    let migrating = root.join(MIGRATING_MARKER);
-    let profiles = root.join("profiles");
-    let published = profiles.join(DEFAULT_PROFILE);
-    let staging = profiles.join(STAGING_DIR);
-
-    let resuming = migrating.exists();
-    if !resuming {
-        // Fully migrated already, or nothing flat to migrate.
-        if marker.exists() || !flat_config.exists() {
-            return Ok(());
-        }
-        // Ambiguity: a populated profiles/default we didn't create, sitting
-        // next to a flat config → refuse to guess.
-        if published.join("config.toml").exists() {
-            anyhow::bail!(
-                "ambiguous config: found both a flat {} and {}.\n\
-                 Refusing to auto-migrate — move or remove one, then relaunch.",
-                flat_config.display(),
-                published.join("config.toml").display()
-            );
-        }
+/// Pure core, parameterized on the glint root for testability.
+pub(crate) fn migrate_to_profiles_at(root: &Path) -> Result<(PathBuf, usize)> {
+    if !root.join("config.toml").exists() {
+        anyhow::bail!("no flat config.toml at {} to migrate", root.display());
     }
-
-    // Record intent so a crash mid-migration is recognised as resumable
-    // (not ambiguous) on the next run.
-    std::fs::create_dir_all(&profiles)
-        .with_context(|| format!("failed to create {}", profiles.display()))?;
-    let _ = std::fs::write(&migrating, "1\n");
-    eprintln!("glint: migrating flat config into profiles/{DEFAULT_PROFILE}/ …");
-
-    // Build + publish the profile if it isn't there yet. Copy (never move):
-    // the flat originals stay intact until the published copy exists.
-    if !published.exists() {
-        if staging.exists() {
-            // Staging only ever holds copies — safe to discard and redo.
-            std::fs::remove_dir_all(&staging)
-                .with_context(|| format!("failed to clear staging {}", staging.display()))?;
-        }
-        copy_flat_into(root, &staging)?;
-        std::fs::rename(&staging, &published).with_context(|| {
-            format!(
-                "failed to publish {} -> {}",
-                staging.display(),
-                published.display()
-            )
-        })?;
-    }
-
-    // Published copy exists → finalize: mark done, remove the flat originals
-    // (globals excepted), clear the in-progress marker.
-    let _ = std::fs::write(&marker, "1\n");
-    cleanup_flat_originals(root)?;
-    let _ = std::fs::remove_file(&migrating);
-    eprintln!("glint: migrated flat config into profiles/{DEFAULT_PROFILE}/.");
-    Ok(())
-}
-
-/// Pull global-layer files that an interim (move-based) build left inside
-/// `profiles/default/` back up to the root. Best-effort and idempotent.
-pub(crate) fn hoist_globals(root: &Path) -> Result<()> {
     let published = root.join("profiles").join(DEFAULT_PROFILE);
-    if !published.exists() {
-        return Ok(());
+    if published.exists() {
+        anyhow::bail!("{} already exists — nothing to migrate", published.display());
     }
-    // colorschemes.toml → root (don't clobber an existing root copy).
-    let src = published.join("colorschemes.toml");
-    let dst = root.join("colorschemes.toml");
-    if src.exists() && !dst.exists() {
-        let _ = std::fs::rename(&src, &dst);
+
+    let staging = root.join("profiles").join(STAGING_DIR);
+    if staging.exists() {
+        // Staging only ever holds copies — safe to discard and redo.
+        std::fs::remove_dir_all(&staging)
+            .with_context(|| format!("failed to clear staging {}", staging.display()))?;
     }
-    // OAuth client registrations → root/credentials/ (the global creds dir).
-    let src_creds = published.join("credentials");
-    if let Ok(rd) = std::fs::read_dir(&src_creds) {
-        let dst_creds = root.join("credentials");
-        for e in rd.flatten() {
-            let name = e.file_name();
-            if !is_global_client_file(&name.to_string_lossy()) {
-                continue;
-            }
-            let _ = std::fs::create_dir_all(&dst_creds);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &dst_creds,
-                    std::fs::Permissions::from_mode(0o700),
-                );
-            }
-            let dst_file = dst_creds.join(&name);
-            if !dst_file.exists() {
-                let _ = std::fs::rename(e.path(), dst_file);
-            }
-        }
-    }
-    Ok(())
+    std::fs::create_dir_all(root.join("profiles"))
+        .with_context(|| format!("failed to create {}", root.join("profiles").display()))?;
+
+    let count = copy_flat_into(root, &staging)?;
+
+    // Atomic publish: the single commit point.
+    std::fs::rename(&staging, &published).with_context(|| {
+        format!(
+            "failed to publish {} -> {}",
+            staging.display(),
+            published.display()
+        )
+    })?;
+    // Non-destructive by design: flat originals are LEFT in place.
+    Ok((published, count))
 }
 
 /// Copy the per-profile portion of a flat root into `staging`, leaving the
-/// global-layer files (colorschemes.toml, `*_oauth_client.toml`) untouched.
-fn copy_flat_into(root: &Path, staging: &Path) -> Result<()> {
+/// global-layer files (colorschemes.toml, `*_oauth_client.toml`) at the root.
+/// Returns the number of top-level items copied.
+fn copy_flat_into(root: &Path, staging: &Path) -> Result<usize> {
     std::fs::create_dir_all(staging)
         .with_context(|| format!("failed to create staging {}", staging.display()))?;
+    let mut copied = 0usize;
     for entry in std::fs::read_dir(root).with_context(|| format!("read {}", root.display()))? {
         let entry = entry?;
         let name = entry.file_name();
         let name_s = name.to_string_lossy();
-        if name == "profiles"
-            || name_s == MIGRATED_MARKER
-            || name_s == MIGRATING_MARKER
-            || is_global_root_file(&name_s)
-        {
+        if name == "profiles" || is_global_root_file(&name_s) {
             continue;
         }
         let from = entry.path();
@@ -178,11 +102,12 @@ fn copy_flat_into(root: &Path, staging: &Path) -> Result<()> {
         } else {
             copy_file(&from, &to)?;
         }
+        copied += 1;
     }
-    Ok(())
+    Ok(copied)
 }
 
-/// Copy `credentials/`, moving everything **except** the global client
+/// Copy `credentials/`, taking everything **except** the global client
 /// registrations (which stay at the root). Keeps 0700 on the new dir.
 fn copy_credentials_into(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)
@@ -204,45 +129,6 @@ fn copy_credentials_into(src: &Path, dst: &Path) -> Result<()> {
             copy_dir_all(&from, &to)?;
         } else {
             copy_file(&from, &to)?;
-        }
-    }
-    Ok(())
-}
-
-/// Remove the flat originals from the root after a successful publish,
-/// leaving the global-layer files in place. Idempotent.
-fn cleanup_flat_originals(root: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_s = name.to_string_lossy();
-        if name == "profiles"
-            || name_s == MIGRATED_MARKER
-            || name_s == MIGRATING_MARKER
-            || is_global_root_file(&name_s)
-        {
-            continue;
-        }
-        let path = entry.path();
-        if name_s == "credentials" {
-            // Remove the per-profile credential files; keep client regs + dir.
-            if let Ok(rd) = std::fs::read_dir(&path) {
-                for e in rd.flatten() {
-                    if is_global_client_file(&e.file_name().to_string_lossy()) {
-                        continue;
-                    }
-                    let p = e.path();
-                    let _ = if p.is_dir() {
-                        std::fs::remove_dir_all(&p)
-                    } else {
-                        std::fs::remove_file(&p)
-                    };
-                }
-            }
-        } else if path.is_dir() {
-            let _ = std::fs::remove_dir_all(&path);
-        } else {
-            let _ = std::fs::remove_file(&path);
         }
     }
     Ok(())
@@ -281,7 +167,6 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
 
     fn temp_root(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -291,7 +176,6 @@ mod tests {
         p
     }
 
-    // A flat root: per-profile files + global files.
     fn seed_flat(root: &Path) {
         fs::write(root.join("config.toml"), "version = 1\n").unwrap();
         fs::write(root.join("clock.toml"), "x = 1\n").unwrap();
@@ -303,97 +187,48 @@ mod tests {
     }
 
     #[test]
-    fn partitions_flat_tree_globals_stay_at_root() {
-        let root = temp_root("partition");
+    fn copies_non_destructively_and_keeps_globals_at_root() {
+        let root = temp_root("copy");
         seed_flat(&root);
-        flat_to_profiles(&root).unwrap();
+        let (published, count) = migrate_to_profiles_at(&root).unwrap();
+        assert!(count >= 2);
 
-        let def = root.join("profiles/default");
-        // Per-profile files copied down…
-        assert!(def.join("config.toml").exists());
-        assert!(def.join("clock.toml").exists());
-        assert!(def.join("credentials/google_oauth_token.default.toml").exists());
-        assert!(def.join("credentials/caldav.toml").exists());
-        // …and removed from the root.
-        assert!(!root.join("config.toml").exists());
-        assert!(!root.join("clock.toml").exists());
-        assert!(!root.join("credentials/caldav.toml").exists());
+        // Per-profile files are copied down…
+        assert!(published.join("config.toml").exists());
+        assert!(published.join("clock.toml").exists());
+        assert!(published.join("credentials/google_oauth_token.default.toml").exists());
+        assert!(published.join("credentials/caldav.toml").exists());
 
-        // Globals STAY at the root, and are NOT copied into the profile.
+        // …and the flat originals are STILL at the root (non-destructive).
+        assert!(root.join("config.toml").exists(), "flat config kept");
+        assert!(root.join("clock.toml").exists(), "flat widget kept");
+        assert!(root.join("credentials/caldav.toml").exists(), "flat cred kept");
+
+        // Globals stay at the root and are NOT copied into the profile.
         assert!(root.join("colorschemes.toml").exists());
         assert!(root.join("credentials/google_oauth_client.toml").exists());
-        assert!(!def.join("colorschemes.toml").exists());
-        assert!(!def.join("credentials/google_oauth_client.toml").exists());
+        assert!(!published.join("colorschemes.toml").exists());
+        assert!(!published.join("credentials/google_oauth_client.toml").exists());
 
-        assert!(root.join(MIGRATED_MARKER).exists());
-        assert!(!root.join(MIGRATING_MARKER).exists());
-        assert!(!root.join("profiles/.default.partial").exists());
+        assert!(!root.join("profiles/.default.partial").exists(), "staging consumed");
         fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn is_idempotent() {
-        let root = temp_root("idem");
-        seed_flat(&root);
-        flat_to_profiles(&root).unwrap();
-        flat_to_profiles(&root).unwrap(); // second run: marker present → no-op
-        assert!(root.join("profiles/default/config.toml").exists());
-        assert!(root.join("colorschemes.toml").exists());
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn ambiguous_layout_is_refused() {
-        let root = temp_root("ambig");
-        fs::write(root.join("config.toml"), "flat\n").unwrap();
-        fs::create_dir_all(root.join("profiles/default")).unwrap();
-        fs::write(root.join("profiles/default/config.toml"), "already\n").unwrap();
-        let err = flat_to_profiles(&root).unwrap_err();
-        assert!(err.to_string().contains("ambiguous"), "got: {err}");
-        // The flat config is untouched (copy-based never destroys it).
-        assert_eq!(fs::read_to_string(root.join("config.toml")).unwrap(), "flat\n");
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn resumes_after_publish_without_marker() {
-        // Simulate a crash after publish but before the marker/cleanup: the
-        // profile is published, the .migrating marker is present, originals
-        // still at root. A re-run must finalize, not bail as ambiguous.
-        let root = temp_root("resume");
+    fn refuses_when_already_migrated() {
+        let root = temp_root("already");
         seed_flat(&root);
         fs::create_dir_all(root.join("profiles/default")).unwrap();
-        fs::write(root.join("profiles/default/config.toml"), "version = 1\n").unwrap();
-        fs::write(root.join(MIGRATING_MARKER), "1\n").unwrap();
-
-        flat_to_profiles(&root).unwrap();
-        assert!(root.join(MIGRATED_MARKER).exists());
-        assert!(!root.join(MIGRATING_MARKER).exists());
-        assert!(!root.join("config.toml").exists(), "originals cleaned up");
-        assert!(root.join("colorschemes.toml").exists(), "global kept");
+        let err = migrate_to_profiles_at(&root).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {err}");
         fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn hoist_pulls_interim_globals_back_to_root() {
-        // A tree an interim move-based build produced: globals inside the
-        // profile. hoist_globals moves them back to the root.
-        let root = temp_root("hoist");
-        let def = root.join("profiles/default");
-        fs::create_dir_all(def.join("credentials")).unwrap();
-        fs::write(def.join("colorschemes.toml"), "schemes\n").unwrap();
-        fs::write(def.join("credentials/microsoft_oauth_client.toml"), "client\n").unwrap();
-        fs::write(def.join("credentials/microsoft_oauth_token.default.toml"), "tok\n").unwrap();
-
-        hoist_globals(&root).unwrap();
-        assert!(root.join("colorschemes.toml").exists(), "colorschemes hoisted");
-        assert!(!def.join("colorschemes.toml").exists());
-        assert!(
-            root.join("credentials/microsoft_oauth_client.toml").exists(),
-            "client reg hoisted"
-        );
-        // The token stays in the profile.
-        assert!(def.join("credentials/microsoft_oauth_token.default.toml").exists());
+    fn refuses_without_flat_config() {
+        let root = temp_root("noflat");
+        let err = migrate_to_profiles_at(&root).unwrap_err();
+        assert!(err.to_string().contains("no flat config"), "got: {err}");
         fs::remove_dir_all(&root).ok();
     }
 }

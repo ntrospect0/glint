@@ -29,11 +29,13 @@ glint uses `"default"`.
 
 ### Changed
 
-- **On-disk layout migrates automatically.** The first launch after
-  upgrading moves a flat `~/.config/glint/` into `profiles/default/`,
-  leaving the shared colorscheme library + client registrations at the
-  root. Crash-safe: it copies before it deletes, so an interrupted
-  migration leaves the existing config intact.
+- **On-disk layout — flat configs keep working; migration is opt-in.** A
+  pre-profiles flat `~/.config/glint/` is read **in place** by the default
+  profile (no automatic move), so an older flat binary can share the
+  directory safely. Migrate into `profiles/default/` explicitly with
+  `glint --migrate-profiles`, which **copies** the flat config and
+  **leaves the originals** (remove them yourself once switched). The
+  shared colorscheme library + client registrations stay at the root.
 - **Cache, notes, and logs are now per-profile.** Notes previously
   defaulted to a shared `~/.glint/notes`; the default profile adopts any
   existing one on first run, and other profiles start empty.
