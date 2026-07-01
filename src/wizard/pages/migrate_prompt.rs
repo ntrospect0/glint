@@ -102,16 +102,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp) {
         lines.push(Line::from(vec![
             Span::styled("  [M]", style::key_hint()),
             Span::styled("igrate  ", style::label()),
-            Span::styled(
-                "— move into profiles/default/ and enable multiple profiles",
-                style::value_idle(),
-            ),
+            Span::styled("(recommended) ", style::value_focused()),
+            Span::styled("— enable multiple profiles", style::value_idle()),
         ]));
         lines.push(Line::from(vec![
             Span::styled("  [K]", style::key_hint()),
             Span::styled("eep flat", style::label()),
             Span::styled(
-                "  — stay single-profile (edit the default config only)",
+                "  — single profile for now (you can migrate anytime)",
                 style::value_idle(),
             ),
         ]));
