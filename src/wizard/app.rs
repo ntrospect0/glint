@@ -147,8 +147,10 @@ pub fn run_wizard(show_manager: bool) -> Result<WizardOutcome> {
     let mut state = storage::load()?.unwrap_or_default();
     super::hydrate::hydrate_from_disk(&mut state);
     // A bare `--setup` opens the Profile Manager first; `--profile X --setup`
-    // (or a resume buffer) skips it and edits the active profile directly.
-    let initial_page = if show_manager && state.last_page.is_none() {
+    // edits the active profile directly. A resume buffer does NOT skip the
+    // Manager — picking a profile lands on Welcome, which offers Resume when
+    // that profile has an interrupted buffer.
+    let initial_page = if show_manager {
         Page::Manager
     } else {
         flow::start_page(&state)
