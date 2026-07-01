@@ -102,6 +102,9 @@ pub struct WizardApp {
     /// next render of the corresponding widget page can present them as
     /// checkboxes. Cleared on wizard exit — these are session-scoped.
     pub remote_options: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// Sub-mode of the Profile Manager front page (list ↔ name entry ↔
+    /// delete confirm). Ignored on every other page.
+    pub manager_mode: super::pages::manager::Mode,
 }
 
 impl WizardApp {
@@ -127,6 +130,7 @@ impl WizardApp {
             themes: load_available_themes(),
             oauth_capture: std::collections::HashMap::new(),
             remote_options: std::collections::HashMap::new(),
+            manager_mode: super::pages::manager::Mode::default(),
         }
     }
 }

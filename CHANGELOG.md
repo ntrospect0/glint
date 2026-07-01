@@ -24,6 +24,10 @@ glint uses `"default"`.
 - **Active-profile indicator** in the dashboard status bar — a
   `Profile: <name>` segment shown for any non-default profile so the
   active context is unmistakable (the default profile is unchanged).
+- **Profile Manager in the setup wizard.** A bare `glint --setup` opens a
+  front page listing your profiles: pick one to configure, or create /
+  clone / rename / delete right there (same ops as the CLI, with a delete
+  confirmation). `glint --profile X --setup` edits X directly.
 - **Profile management CLI:** `--list-profiles`, `--new-profile <name>`
   (`--from <src>` to clone a profile's *config*, credentials excluded),
   `--rename-profile OLD:NEW`, `--delete-profile <name>`. Guards: names
