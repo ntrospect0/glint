@@ -13,6 +13,7 @@ pub mod assign_stack;
 pub mod confirm;
 pub mod global;
 pub mod layout;
+pub mod manager;
 pub mod oauth_setup;
 pub mod preview;
 pub mod welcome;
@@ -27,6 +28,9 @@ use super::app::WizardApp;
 /// a fixed position; `Widget(i)` indexes into `WizardState.assignments`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Page {
+    /// Profile Manager — the front page for a bare `--setup`, listing
+    /// profiles to pick one to configure. Not part of the linear flow.
+    Manager,
     Welcome,
     Global,
     Layout,
@@ -63,6 +67,7 @@ impl Page {
     /// Stable page id used in state files (resume) and completion tracking.
     pub fn id(&self) -> String {
         match self {
+            Page::Manager => "manager".into(),
             Page::Welcome => "welcome".into(),
             Page::Global => "global".into(),
             Page::Layout => "layout".into(),
@@ -83,6 +88,7 @@ impl Page {
     /// Human title shown in the wizard header.
     pub fn title(&self, state: &super::state::WizardState) -> String {
         match self {
+            Page::Manager => "Profiles".into(),
             Page::Welcome => "Welcome".into(),
             Page::Global => "Global settings".into(),
             Page::Layout => "Layout".into(),
@@ -146,6 +152,10 @@ pub enum PageAction {
     /// focus after committing) so the user doesn't have to manually
     /// Tab back through cells they've already configured.
     AssignStackDone { cell_index: usize },
+    /// From the Profile Manager: re-target the wizard at the named profile
+    /// (re-hydrate from its config) and drop into the normal flow. The app
+    /// loop performs the retarget + navigation.
+    EnterProfileEdit(String),
 }
 
 /// Dispatch a key event to the active page's `handle_key`.
@@ -154,6 +164,7 @@ pub fn dispatch_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
     // message visible refresh it inside their handler.
     app.feedback = None;
     match app.page.clone() {
+        Page::Manager => manager::handle_key(key, app),
         Page::Welcome => welcome::handle_key(key, app),
         Page::Global => global::handle_key(key, app),
         Page::Layout => layout::handle_key(key, app),
@@ -172,6 +183,7 @@ pub fn dispatch_key(key: KeyEvent, app: &mut WizardApp) -> PageAction {
 /// Render the active page's body into `area`.
 pub fn render_body(frame: &mut Frame, area: Rect, app: &WizardApp) {
     match &app.page {
+        Page::Manager => manager::render(frame, area, app),
         Page::Welcome => welcome::render(frame, area, app),
         Page::Global => global::render(frame, area, app),
         Page::Layout => layout::render(frame, area, app),
@@ -194,6 +206,7 @@ pub fn render_body(frame: &mut Frame, area: Rect, app: &WizardApp) {
 /// when editing.
 pub fn on_enter(app: &mut WizardApp) {
     match app.page.clone() {
+        Page::Manager => manager::on_enter(app),
         Page::Widget(i) => widget::on_enter(app, i, None),
         Page::Assign => assign::on_enter(app),
         Page::OAuthSetup { provider } => oauth_setup::on_enter(app, &provider),

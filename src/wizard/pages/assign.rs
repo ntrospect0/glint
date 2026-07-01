@@ -443,7 +443,7 @@ mod tests {
                 },
             ],
         });
-        let mut app = WizardApp::new(state);
+        let mut app = WizardApp::new(state, crate::wizard::pages::Page::Welcome);
         app.focus = 0;
         assert_eq!(current_value_index(&app), position_of(STACK_VALUE));
     }
@@ -458,7 +458,7 @@ mod tests {
             instance: "main".into(),
             stack_children: Vec::new(),
         });
-        let mut app = WizardApp::new(state);
+        let mut app = WizardApp::new(state, crate::wizard::pages::Page::Welcome);
         app.focus = 0;
         assert_eq!(current_value_index(&app), position_of("stocks"));
     }
@@ -481,7 +481,7 @@ mod tests {
     fn tab_app_with_options(highlight_value: &'static str) -> WizardApp {
         let mut state = WizardState::default();
         state.assignments = empty_cells(3);
-        let mut app = WizardApp::new(state);
+        let mut app = WizardApp::new(state, crate::wizard::pages::Page::Welcome);
         app.focus = 0;
         // Position the cursor on the requested option without touching
         // commit semantics — mirrors what ↑/↓ navigation would do.
@@ -516,7 +516,7 @@ mod tests {
         let mut state = WizardState::default();
         state.assignments = empty_cells(2);
         state.assignments[0].kind = "stocks".into();
-        let mut app = WizardApp::new(state);
+        let mut app = WizardApp::new(state, crate::wizard::pages::Page::Welcome);
         app.focus = 0;
         app.lookup_offset = position_of(STACK_VALUE);
         let r = handle_key(press(KeyCode::Tab), &mut app);
@@ -535,7 +535,7 @@ mod tests {
         // (not OpenAssignStack) keeps Enter as a "next cell" key.
         let mut state = WizardState::default();
         state.assignments = empty_cells(2);
-        let mut app = WizardApp::new(state);
+        let mut app = WizardApp::new(state, crate::wizard::pages::Page::Welcome);
         app.focus = 0;
         app.lookup_offset = position_of(STACK_VALUE);
         let r = handle_key(press(KeyCode::Enter), &mut app);
@@ -549,7 +549,7 @@ mod tests {
         // the assign-page comment: Space is the dedicated stack key.
         let mut state = WizardState::default();
         state.assignments = empty_cells(2);
-        let mut app = WizardApp::new(state);
+        let mut app = WizardApp::new(state, crate::wizard::pages::Page::Welcome);
         app.focus = 0;
         app.lookup_offset = position_of(STACK_VALUE);
         let r = handle_key(press(KeyCode::Char(' ')), &mut app);
@@ -585,7 +585,7 @@ mod tests {
             instance: "main".into(),
             stack_children: Vec::new(),
         });
-        let mut app = WizardApp::new(state);
+        let mut app = WizardApp::new(state, crate::wizard::pages::Page::Welcome);
         app.focus = 0;
         assert_eq!(current_value_index(&app), position_of(EMPTY_VALUE));
     }

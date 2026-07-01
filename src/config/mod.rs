@@ -8,7 +8,7 @@ pub mod types;
 pub mod watcher;
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use anyhow::{Context, Result};
 
@@ -99,7 +99,7 @@ fn format_string_array_literal(items: &[String]) -> String {
 pub const DEFAULT_PROFILE: &str = "default";
 
 static ACTIVE_PROFILE: OnceLock<String> = OnceLock::new();
-static CONFIG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+static CONFIG_DIR_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
 
 /// The active profile name. **Read-only**: this never initializes the lock
 /// (no `get_or_init`), so an early read can't silently pin `"default"` and
@@ -122,10 +122,13 @@ pub fn set_active_profile(name: impl Into<String>) {
 }
 
 /// Point the per-profile config dir at an explicit directory, bypassing
-/// profile resolution. Used by `--config <FILE>` (explicit single-file mode)
-/// to resolve sibling files from the file's own directory. Set once.
+/// profile resolution. Used by `--config <FILE>` (single-file mode) and by
+/// the wizard's Profile Manager, which re-targets it to edit a chosen
+/// profile. Re-settable (unlike the active profile).
 pub fn set_config_dir_override(dir: PathBuf) {
-    let _ = CONFIG_DIR_OVERRIDE.set(dir);
+    if let Ok(mut w) = CONFIG_DIR_OVERRIDE.write() {
+        *w = Some(dir);
+    }
 }
 
 /// Validate a profile name: ASCII-alphanumeric start, then
@@ -167,22 +170,28 @@ pub fn glint_root() -> Result<PathBuf> {
 /// state, notes, log) resolves under this. An explicit `--config` override
 /// short-circuits to that file's directory.
 pub fn config_dir() -> Result<PathBuf> {
-    if let Some(dir) = CONFIG_DIR_OVERRIDE.get() {
-        return Ok(dir.clone());
+    if let Ok(guard) = CONFIG_DIR_OVERRIDE.read() {
+        if let Some(dir) = guard.as_ref() {
+            return Ok(dir.clone());
+        }
     }
+    resolve_profile_dir(active_profile())
+}
+
+/// The on-disk directory for a named profile, **ignoring** any config-dir
+/// override. The wizard's Profile Manager uses this to target a chosen
+/// profile. Named profiles are `profiles/<name>/`; the default profile has a
+/// legacy flat-layout fallback:
+///
+/// If the default profile hasn't been migrated (no `profiles/default/`) but a
+/// flat `config.toml` sits at the root, resolve to the **root** — so a
+/// pre-profiles install is read in place, interoperable with an older flat
+/// binary, without any automatic destructive migration. Opt in explicitly
+/// with `--migrate-profiles`.
+pub fn resolve_profile_dir(profile: &str) -> Result<PathBuf> {
     let root = glint_root()?;
-    let profile = active_profile();
     let profile_dir = root.join("profiles").join(profile);
-    // Legacy flat-layout fallback for the DEFAULT profile: if it hasn't been
-    // migrated (no profiles/default/) but a flat `config.toml` sits at the
-    // root, read the flat layout *in place*. This lets a pre-profiles install
-    // keep working — and stay interoperable with an older flat binary —
-    // without any automatic, destructive migration. Opt in explicitly with
-    // `--migrate-profiles`.
-    if profile == DEFAULT_PROFILE
-        && !profile_dir.exists()
-        && root.join("config.toml").exists()
-    {
+    if profile == DEFAULT_PROFILE && !profile_dir.exists() && root.join("config.toml").exists() {
         return Ok(root);
     }
     Ok(profile_dir)

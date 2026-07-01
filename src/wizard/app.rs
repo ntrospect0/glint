@@ -105,8 +105,7 @@ pub struct WizardApp {
 }
 
 impl WizardApp {
-    pub fn new(state: WizardState) -> Self {
-        let page = flow::start_page(&state);
+    pub fn new(state: WizardState, page: Page) -> Self {
         // Seed the wizard's color palette: whatever theme the user already
         // picked (resumed state) wins, otherwise we boot on the wizard's
         // default scheme so even the first frame looks "themed" rather
@@ -135,7 +134,7 @@ impl WizardApp {
 /// Run the new TUI wizard. Returns `Completed` once the user finishes the
 /// confirmation page; `Quit` if they bail out early (state file kept so
 /// the next `--setup` offers Resume).
-pub fn run_wizard() -> Result<WizardOutcome> {
+pub fn run_wizard(show_manager: bool) -> Result<WizardOutcome> {
     // Load the resume buffer if present (None on version mismatch /
     // corruption / no prior run), then ALWAYS backfill from disk.
     //
@@ -147,7 +146,14 @@ pub fn run_wizard() -> Result<WizardOutcome> {
     // stale or partial buffer from *masking* real config it happens to lack.
     let mut state = storage::load()?.unwrap_or_default();
     super::hydrate::hydrate_from_disk(&mut state);
-    let mut app = WizardApp::new(state);
+    // A bare `--setup` opens the Profile Manager first; `--profile X --setup`
+    // (or a resume buffer) skips it and edits the active profile directly.
+    let initial_page = if show_manager && state.last_page.is_none() {
+        Page::Manager
+    } else {
+        flow::start_page(&state)
+    };
+    let mut app = WizardApp::new(state, initial_page);
     super::pages::on_enter(&mut app);
 
     let mut terminal = enter_tui().context("failed to initialize wizard terminal")?;
@@ -341,6 +347,38 @@ pub fn run_wizard() -> Result<WizardOutcome> {
                     super::pages::on_enter(&mut app);
                 }
             }
+            PageAction::EnterProfileEdit(name) => {
+                // Re-target the wizard at the chosen profile: point
+                // config_dir() at it (via the re-settable override),
+                // re-hydrate the wizard state from that profile's config,
+                // then drop into the normal flow at Welcome. The active
+                // profile (set-once) is unchanged.
+                match crate::config::resolve_profile_dir(&name) {
+                    Ok(dir) => {
+                        crate::config::set_config_dir_override(dir);
+                        let mut fresh = super::state::WizardState::default();
+                        super::hydrate::hydrate_from_disk(&mut fresh);
+                        app.state = fresh;
+                        // Repaint in the profile's selected theme.
+                        let scheme = match app.state.global_get("theme") {
+                            Some(super::descriptor::WizardValue::Choice(s)) if !s.is_empty() => {
+                                s.clone()
+                            }
+                            _ => style::DEFAULT_SCHEME.to_string(),
+                        };
+                        style::set_active_scheme(&scheme);
+                        app.page = Page::Welcome;
+                        app.history.clear();
+                        app.focus = 0;
+                        app.text_buffer.clear();
+                        app.lookup_offset = 0;
+                        app.layout_phase = LayoutPhase::default();
+                        app.feedback = None;
+                        super::pages::on_enter(&mut app);
+                    }
+                    Err(err) => app.feedback = Some(format!("Error: {err}")),
+                }
+            }
         }
     }
 }
@@ -487,33 +525,40 @@ fn render(frame: &mut Frame, app: &WizardApp) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &WizardApp) {
-    let current = flow::current_step(&app.page, &app.state);
-    let total = flow::total_steps(&app.state);
-    let (filled, empty) = style::progress_chars(current, total);
-    let pct = if total == 0 {
-        0
-    } else {
-        (current.min(total) * 100) / total
-    };
+    let title_line = Line::from(vec![
+        Span::styled(" glint setup ", style::section_header()),
+        Span::raw(" — "),
+        Span::styled(
+            app.page.title(&app.state),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]);
 
-    let lines: Vec<Line> = vec![
-        Line::from(vec![
-            Span::styled(" glint setup ", style::section_header()),
-            Span::raw(" — "),
-            Span::styled(
-                app.page.title(&app.state),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(filled, style::progress_filled()),
-            Span::styled(empty, style::progress_empty()),
-            Span::raw("  "),
-            Span::styled(format!("step {current}/{total}"), style::key_hint_desc()),
-            Span::raw("  "),
-            Span::styled(format!("({pct}%)"), style::key_hint_desc()),
-        ]),
-    ];
+    // The Profile Manager is the front page, not a numbered step — show just
+    // the title, no progress bar.
+    let lines: Vec<Line> = if matches!(app.page, Page::Manager) {
+        vec![title_line]
+    } else {
+        let current = flow::current_step(&app.page, &app.state);
+        let total = flow::total_steps(&app.state);
+        let (filled, empty) = style::progress_chars(current, total);
+        let pct = if total == 0 {
+            0
+        } else {
+            (current.min(total) * 100) / total
+        };
+        vec![
+            title_line,
+            Line::from(vec![
+                Span::styled(filled, style::progress_filled()),
+                Span::styled(empty, style::progress_empty()),
+                Span::raw("  "),
+                Span::styled(format!("step {current}/{total}"), style::key_hint_desc()),
+                Span::raw("  "),
+                Span::styled(format!("({pct}%)"), style::key_hint_desc()),
+            ]),
+        ]
+    };
     let header = Paragraph::new(lines).block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, area);
 }

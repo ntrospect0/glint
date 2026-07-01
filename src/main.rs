@@ -215,7 +215,9 @@ fn main() -> Result<()> {
             // Without this, fresh installs hit the theme picker with no
             // colorschemes.toml on disk and the scheme list is empty.
             config::init_default_config()?;
-            return wizard::run();
+            // Bare `--setup` opens the Profile Manager first; an explicit
+            // `--profile X --setup` edits X directly.
+            return wizard::run(cli.profile.is_none());
         }
         if let Some(target) = cli.auth.as_deref() {
             return run_auth(target).await;
@@ -242,7 +244,9 @@ fn main() -> Result<()> {
             eprintln!("(You can re-run `glint --setup` later to make changes.)");
             eprintln!();
             config::init_default_config()?;
-            wizard::run()?;
+            // First run (no config) — go straight into the wizard for the
+            // default profile; the Manager would only list "default".
+            wizard::run(false)?;
             eprintln!();
             eprintln!("Launching glint…");
         }
