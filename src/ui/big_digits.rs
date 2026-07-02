@@ -5,7 +5,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// 3-wide × 5-tall block-character font used by the clock and calendar widgets
 /// to render numeric values (digits 0-9, `:`) at a glance.
@@ -22,7 +22,7 @@ const GLYPH_WIDTH: usize = 3;
 /// (brightness fade, hue rotation, near-white top, neutral fade) but the
 /// color comes from the active color scheme. Change scheme → big digits
 /// follow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Gradient {
     #[default]

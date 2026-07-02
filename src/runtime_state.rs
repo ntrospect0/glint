@@ -130,6 +130,11 @@ pub struct ClockEntry {
     /// from the widget crate's type churn.
     #[serde(default)]
     pub mode: Option<String>,
+    /// Big-digit gradient style at the time of last save. `None` falls back
+    /// to the configured `gradient` in `clock.toml` on next launch, so the
+    /// `g` cycle survives restarts without shadowing an unset config.
+    #[serde(default)]
+    pub gradient: Option<crate::ui::big_digits::Gradient>,
 }
 
 /// Per-stocks-instance persisted state.
@@ -289,6 +294,22 @@ impl RuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clock_gradient_round_trips_through_toml() {
+        // Every gradient must survive a serialize → deserialize cycle, so the
+        // `g` toggle persists across restarts (regression: ClockEntry had no
+        // gradient field and the choice was lost).
+        for g in crate::ui::big_digits::Gradient::ALL {
+            let entry = ClockEntry {
+                gradient: Some(g),
+                ..Default::default()
+            };
+            let toml = toml::to_string(&entry).unwrap();
+            let back: ClockEntry = toml::from_str(&toml).unwrap();
+            assert_eq!(back.gradient, Some(g), "gradient {g:?} did not round-trip");
+        }
+    }
 
     #[test]
     fn snapshot_round_trips() {

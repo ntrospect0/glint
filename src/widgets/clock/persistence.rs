@@ -114,6 +114,11 @@ pub(super) fn hydrate_state(state: &mut ClockState, id: &str) {
             state.mode = m;
         }
     }
+    // Restore the big-digit gradient chosen via `g`. Absent (never toggled)
+    // ⇒ keep the config-seeded value already in `state`.
+    if let Some(gradient) = entry.gradient {
+        state.gradient = gradient;
+    }
 }
 
 impl ClockWidget {
@@ -184,6 +189,9 @@ impl ClockWidget {
         // back on the Clock / Stopwatch / Timer view they were
         // using.
         entry.mode = Some(st.mode.persist_key().to_string());
+
+        // Big-digit gradient style cycled with `g`.
+        entry.gradient = Some(st.gradient);
 
         drop(st);
         if let Err(err) = crate::runtime_state::save(&state) {

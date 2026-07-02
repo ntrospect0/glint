@@ -394,8 +394,12 @@ impl ClockWidget {
                 EventResult::Handled
             }
             crossterm::event::KeyCode::Char('g') => {
-                let mut st = self.state.lock().expect("clock state poisoned");
-                st.gradient = st.gradient.next();
+                {
+                    let mut st = self.state.lock().expect("clock state poisoned");
+                    st.gradient = st.gradient.next();
+                }
+                // Persist so the chosen gradient survives a restart.
+                self.persist_clock_state();
                 EventResult::Handled
             }
             // Up / Down arrows and vim-style k / j move the
