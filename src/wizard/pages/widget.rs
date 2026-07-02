@@ -183,7 +183,7 @@ pub fn handle_key(
             | Some(WizardFieldKind::Bool { .. })
     );
     if focused_is_options {
-        return handle_options_key(key, app, &widget_id, &wd);
+        return handle_options_key(key, app, cell_idx, child_idx, &kind, &widget_id, &wd);
     }
 
     match key.code {
@@ -259,9 +259,13 @@ pub fn handle_key(
 /// the page (subject to the required-fields gate). The selected row
 /// index is stored in `app.lookup_offset` (shared with the Lookup
 /// dropdown handler).
+#[allow(clippy::too_many_arguments)]
 fn handle_options_key(
     key: KeyEvent,
     app: &mut WizardApp,
+    cell_idx: usize,
+    child_idx: Option<usize>,
+    kind: &str,
     widget_id: &str,
     wd: &WizardDescriptor,
 ) -> PageAction {
@@ -282,6 +286,7 @@ fn handle_options_key(
         }
         KeyCode::Char(' ') => {
             commit_option_selection(app, widget_id, field);
+            apply_instance_from_field(app, cell_idx, child_idx, kind, field, widget_id);
             PageAction::Stay
         }
         KeyCode::Enter => {
@@ -292,10 +297,80 @@ fn handle_options_key(
             // button. To advance the page, the user lands on the
             // button (the trailing focus slot) and presses Enter there.
             commit_option_selection(app, widget_id, field);
+            // Move focus with the still-current widget_id (values intact),
+            // then re-key if this selection just defined a new instance.
             move_focus(app, widget_id, wd, 1, wd.focus_total());
+            apply_instance_from_field(app, cell_idx, child_idx, kind, field, widget_id);
             PageAction::Stay
         }
         _ => PageAction::Stay,
+    }
+}
+
+/// The field whose chosen value becomes a widget's *instance*, so multiple
+/// cells of the same kind get distinct configs instead of overwriting one
+/// another. Feeds is keyed by its source (`feeds@marketwatch.toml`,
+/// `feeds@wsj.toml`). Other widgets are single-instance in the wizard; add a
+/// kind here if it grows a per-source/per-account split worth surfacing.
+fn instance_defining_field(kind: &str) -> Option<&'static str> {
+    match kind {
+        "feeds" => Some("source"),
+        _ => None,
+    }
+}
+
+/// If `field` is the instance-defining field for `kind`, set the cell (or
+/// stack child)'s `instance` to the just-chosen value and move its buffered
+/// values under the new `widget_id`. This is what lets a feeds widget in one
+/// cell (MarketWatch) coexist with a feeds widget in another (WSJ) rather than
+/// both collapsing onto a single `feeds` config.
+fn apply_instance_from_field(
+    app: &mut WizardApp,
+    cell_idx: usize,
+    child_idx: Option<usize>,
+    kind: &str,
+    field: &WizardField,
+    old_widget_id: &str,
+) {
+    if instance_defining_field(kind) != Some(field.key) {
+        return;
+    }
+    let new_instance = match app.state.widget_get(old_widget_id, field.key) {
+        Some(WizardValue::Choice(v)) if !v.is_empty() => v.clone(),
+        _ => return,
+    };
+    let new_widget_id = {
+        let Some(assignment) = app.state.assignments.get_mut(cell_idx) else {
+            return;
+        };
+        match child_idx {
+            None => {
+                if assignment.instance == new_instance {
+                    return;
+                }
+                assignment.instance = new_instance;
+                assignment.widget_id()
+            }
+            Some(k) => {
+                let Some(child) = assignment.stack_children.get_mut(k) else {
+                    return;
+                };
+                if child.instance == new_instance {
+                    return;
+                }
+                child.instance = new_instance;
+                child.widget_id()
+            }
+        }
+    };
+    if new_widget_id != old_widget_id {
+        if let Some(vals) = app.state.widget_values.remove(old_widget_id) {
+            app.state
+                .widget_values
+                .entry(new_widget_id)
+                .or_default()
+                .extend(vals);
+        }
     }
 }
 
@@ -1741,5 +1816,54 @@ mod tests {
         // Filter that matches only a real value drops the blank entry.
         let out = filtered_lookup_options(&f, "vancouver");
         assert!(out.iter().all(|(v, _)| !v.is_empty()));
+    }
+
+    // Regression: two feeds widgets in a stack must NOT collapse onto one
+    // `feeds` config. Picking a source becomes the instance, so they land in
+    // feeds@marketwatch / feeds@wsj instead of overwriting each other.
+    #[test]
+    fn feeds_source_defines_instance_per_stack_child() {
+        use crate::wizard::state::{CellAssignment, StackChild, WizardState};
+
+        let mut state = WizardState::default();
+        state.assignments.push(CellAssignment {
+            cell_index: 0,
+            kind: String::new(),
+            instance: "main".into(),
+            stack_children: vec![
+                StackChild {
+                    kind: "feeds".into(),
+                    instance: "main".into(),
+                },
+                StackChild {
+                    kind: "feeds".into(),
+                    instance: "main".into(),
+                },
+            ],
+        });
+        let mut app = WizardApp::new(state, crate::wizard::pages::Page::Welcome);
+
+        let wd = (registry::find("feeds").unwrap().wizard)();
+        let source = wd.fields.iter().find(|f| f.key == "source").unwrap();
+
+        // Child 0 picks MarketWatch (both children currently key on "feeds").
+        app.state
+            .widget_set("feeds", "source", WizardValue::Choice("marketwatch".into()));
+        apply_instance_from_field(&mut app, 0, Some(0), "feeds", source, "feeds");
+        assert_eq!(app.state.assignments[0].stack_children[0].instance, "marketwatch");
+        assert!(app.state.widget_values.contains_key("feeds@marketwatch"));
+        assert!(!app.state.widget_values.contains_key("feeds"));
+
+        // Child 1 picks WSJ — independent key, no collision with child 0.
+        app.state
+            .widget_set("feeds", "source", WizardValue::Choice("wsj".into()));
+        apply_instance_from_field(&mut app, 0, Some(1), "feeds", source, "feeds");
+        assert_eq!(app.state.assignments[0].stack_children[1].instance, "wsj");
+        assert!(app.state.widget_values.contains_key("feeds@wsj"));
+        assert!(app.state.widget_values.contains_key("feeds@marketwatch"));
+        assert_eq!(
+            app.state.assignments[0].widget_id(),
+            "stack:feeds@marketwatch+feeds@wsj"
+        );
     }
 }
