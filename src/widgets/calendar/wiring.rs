@@ -119,13 +119,24 @@ fn build_entry(
     }
 }
 
-/// `glint --auth` argument for a provider + account: `microsoft` for the
-/// default account, `microsoft:work` for a named one.
-fn auth_arg(provider: &str, account: &str) -> String {
-    if account == crate::auth::DEFAULT_ACCOUNT {
+/// The `glint … --auth …` command to suggest for a provider + account.
+///
+/// The `--auth` target is `microsoft` for the default account, `microsoft:work`
+/// for a named one. Crucially, when a non-default profile is active the command
+/// includes `--profile <name>` — otherwise the token would be written to the
+/// *default* profile's credentials, and this profile's calendar would keep
+/// asking to authorize.
+fn auth_command(provider: &str, account: &str) -> String {
+    let target = if account == crate::auth::DEFAULT_ACCOUNT {
         provider.to_string()
     } else {
         format!("{provider}:{account}")
+    };
+    let profile = crate::config::active_profile();
+    if profile == crate::config::DEFAULT_PROFILE {
+        format!("glint --auth {target}")
+    } else {
+        format!("glint --profile {profile} --auth {target}")
     }
 }
 
@@ -142,8 +153,8 @@ fn build_outlook_entry(
         .map_err(|err| format!("Outlook token unreadable: {err}"))?
         .ok_or_else(|| {
             format!(
-                "Run `glint --auth {}` to connect Microsoft Outlook",
-                auth_arg("microsoft", account)
+                "Run `{}` to connect Microsoft Outlook",
+                auth_command("microsoft", account)
             )
         })?;
     OutlookCalendarProvider::new(
@@ -170,8 +181,8 @@ fn build_google_entry(
         Ok(Some(t)) => t,
         Ok(None) => {
             return Err(format!(
-                "Run `glint --auth {}` to connect Google Calendar",
-                auth_arg("google", account)
+                "Run `{}` to connect Google Calendar",
+                auth_command("google", account)
             ));
         }
         Err(err) => return Err(format!("Google token unreadable: {err}")),
