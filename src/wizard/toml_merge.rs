@@ -195,6 +195,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clock_gradient_write_back_replaces_and_inserts() {
+        // default profile: gradient present (with a trailing comment) plus a
+        // sibling scalar and a table — value is replaced, siblings/table kept.
+        let with_key =
+            "timezone = \"local\"\ngradient = \"hue_shift\"  # normal | subtle\n\n[colors]\nfg = \"#fff\"\n";
+        let out = merge_top_level_scalars(&with_key, &[("gradient", "\"glow\"".into())]);
+        assert!(out.contains("gradient = \"glow\""));
+        assert!(!out.contains("hue_shift"));
+        assert!(out.contains("timezone = \"local\""));
+        assert!(out.contains("[colors]"));
+
+        // ipad profile: no gradient key — it's inserted into the top-level
+        // scalar zone (before any table header).
+        let without_key = "timezone = \"local\"\n\n[colors]\nfg = \"#fff\"\n";
+        let out = merge_top_level_scalars(&without_key, &[("gradient", "\"glow\"".into())]);
+        assert!(out.contains("gradient = \"glow\""));
+        let gi = out.find("gradient").unwrap();
+        let ci = out.find("[colors]").unwrap();
+        assert!(gi < ci, "gradient must land before the [colors] table");
+    }
+
+    #[test]
     fn replaces_existing_scalar_in_place() {
         let text =
             "poll_interval_secs = 900\nshow_topic_labels = true\n\n[[feeds]]\nlabel = \"BBC\"\n";

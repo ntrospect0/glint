@@ -5,7 +5,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// 3-wide × 5-tall block-character font used by the clock and calendar widgets
 /// to render numeric values (digits 0-9, `:`) at a glance.
@@ -22,7 +22,7 @@ const GLYPH_WIDTH: usize = 3;
 /// (brightness fade, hue rotation, near-white top, neutral fade) but the
 /// color comes from the active color scheme. Change scheme → big digits
 /// follow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Gradient {
     #[default]
@@ -60,6 +60,20 @@ impl Gradient {
     pub fn next(self) -> Gradient {
         let i = Self::ALL.iter().position(|g| *g == self).unwrap_or(0);
         Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    /// TOML value string (matches the `#[serde(rename_all = "snake_case")]`
+    /// deserialize names), for writing the choice back into `clock.toml` /
+    /// `calendar.toml`. Note `label()` uses a hyphen (`hue-shift`) for display
+    /// — this is the on-disk form (`hue_shift`).
+    pub fn persist_key(self) -> &'static str {
+        match self {
+            Gradient::Normal => "normal",
+            Gradient::Subtle => "subtle",
+            Gradient::HueShift => "hue_shift",
+            Gradient::Glow => "glow",
+            Gradient::Fade => "fade",
+        }
     }
 }
 

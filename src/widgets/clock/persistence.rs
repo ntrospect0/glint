@@ -114,11 +114,6 @@ pub(super) fn hydrate_state(state: &mut ClockState, id: &str) {
             state.mode = m;
         }
     }
-    // Restore the big-digit gradient chosen via `g`. Absent (never toggled)
-    // ⇒ keep the config-seeded value already in `state`.
-    if let Some(gradient) = entry.gradient {
-        state.gradient = gradient;
-    }
 }
 
 impl ClockWidget {
@@ -190,12 +185,45 @@ impl ClockWidget {
         // using.
         entry.mode = Some(st.mode.persist_key().to_string());
 
-        // Big-digit gradient style cycled with `g`.
-        entry.gradient = Some(st.gradient);
-
         drop(st);
         if let Err(err) = crate::runtime_state::save(&state) {
             tracing::warn!(error = %err, "failed to persist clock state");
+        }
+    }
+
+    /// Write the big-digit `gradient` back to this instance's clock.toml so
+    /// the `g` cycle survives restarts. clock.toml stays the single source of
+    /// truth (hand-edits win, no runtime-state shadowing); the merge helper
+    /// preserves sibling scalars, tables, and comments — only the `gradient`
+    /// assignment is rewritten.
+    pub(super) fn persist_gradient(&self) {
+        let gradient = self.state.lock().expect("clock state poisoned").gradient;
+        let stem = crate::widgets::widget_config_stem(super::config::KIND, &self.instance);
+        let path = match crate::config::config_dir() {
+            Ok(d) => d.join(format!("{stem}.toml")),
+            Err(err) => {
+                tracing::warn!(error = %err, "clock: could not resolve config dir");
+                return;
+            }
+        };
+        let original = std::fs::read_to_string(&path).unwrap_or_default();
+        let value = format!("\"{}\"", gradient.persist_key());
+        let updated =
+            crate::wizard::toml_merge::merge_top_level_scalars(&original, &[("gradient", value)]);
+
+        if let Some(parent) = path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                tracing::warn!(error = %err, "clock: failed to mkdir {}", parent.display());
+                return;
+            }
+        }
+        let tmp = path.with_extension("toml.tmp");
+        if let Err(err) = std::fs::write(&tmp, &updated) {
+            tracing::warn!(error = %err, "clock: failed to write {}", tmp.display());
+            return;
+        }
+        if let Err(err) = std::fs::rename(&tmp, &path) {
+            tracing::warn!(error = %err, "clock: failed to replace {}", path.display());
         }
     }
 

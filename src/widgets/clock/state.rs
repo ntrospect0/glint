@@ -398,8 +398,9 @@ impl ClockWidget {
                     let mut st = self.state.lock().expect("clock state poisoned");
                     st.gradient = st.gradient.next();
                 }
-                // Persist so the chosen gradient survives a restart.
-                self.persist_clock_state();
+                // Write the choice back to clock.toml so it survives a restart
+                // (config stays authoritative — no runtime-state shadowing).
+                self.persist_gradient();
                 EventResult::Handled
             }
             // Up / Down arrows and vim-style k / j move the
