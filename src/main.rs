@@ -62,7 +62,7 @@ struct Cli {
     /// `~/.config/glint/profiles/<name>/`. Defaults to "default". Also
     /// settable via the GLINT_PROFILE environment variable. Mutually
     /// exclusive with --config.
-    #[arg(long, short = 'p', value_name = "NAME")]
+    #[arg(long, short = 'p', visible_alias = "p", value_name = "NAME")]
     profile: Option<String>,
 
     /// List the profiles found under `profiles/`, then exit.
