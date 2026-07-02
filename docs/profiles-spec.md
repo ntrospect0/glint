@@ -1,15 +1,14 @@
 # Profiles — functional & technical spec
 
-Status: **draft / not yet implemented** — target 0.3.5
+Status: **implemented — 0.4.0**
 Revised after an adversarial review and dogfooding: migration is
 **opt-in and non-destructive** (a flat config is read in place; a stray
 run can't wipe it), profile resolution has a hard set-once invariant,
 clone is config-only, and OAuth client registrations are global-only.
 
-> Version note: this touches the CLI surface, the on-disk layout, a one-time
-> migration, and the setup wizard. By semver feel it's closer to a **0.4.0**
-> minor than a 0.3.5 patch. Flagged; the version field is the maintainer's
-> call.
+> Version note: shipped as **0.4.0** — it touches the CLI surface, the
+> on-disk layout, a one-time migration, and the setup wizard, so it's a minor
+> release rather than a patch.
 
 ## Motivation
 
@@ -402,7 +401,6 @@ apply); optionally also watch `glint_root()/colorschemes.toml` later.
    `glint_root()/colorschemes.toml` too, or require relaunch (current lean:
    relaunch).
 2. **Cache path shape** — `…/glint/profiles/<name>/` vs `…/glint-<name>/`.
-3. **Version** — 0.3.5 as requested vs 0.4.0 by scope.
 4. **Leftover flat files after migration** *(resolved)* — the CLI
    `--migrate-profiles` stays copy-only (safe for scripting), and the flat
    duplicates are removed only by an **explicit, consented** step: the

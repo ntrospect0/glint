@@ -4,7 +4,7 @@ All notable changes to glint are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions track
 the `Cargo.toml` `version` field.
 
-## [0.3.5] — unreleased
+## [0.4.0] — unreleased
 
 **Profiles.** `glint --profile <name>` (or `-p <name>`, or
 `GLINT_PROFILE`) runs an isolated config tree, so one machine can hold a

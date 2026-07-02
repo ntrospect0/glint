@@ -351,27 +351,30 @@ Everything a profile owns — layout, widget configs, the selected theme, accoun
 
 ### Managing profiles
 
-```sh
-glint --list-profiles                     # list profiles (marks default + active)
-glint --new-profile work                  # create, then: glint --profile work --setup
-glint --new-profile staging --from work   # clone work's CONFIG (re-authorize accounts)
-glint --rename-profile work:job           # OLD:NEW
-glint --delete-profile job                # not "default" or the active profile
-```
-
-Cloning copies configuration but **not** credentials — authorize the clone's accounts with `glint --profile <name> --auth <provider>`.
+Run `glint --setup` and you land on the **Profile Manager** — it lists your profiles and lets you pick one to configure, or **create, clone, rename, and delete** them right there. Cloning copies a profile's configuration (not its credentials — you authorize the clone's accounts afterward). To jump straight into configuring one profile, use `glint --profile <name> --setup`.
 
 ### Upgrading from a pre-profiles install
 
-Your existing flat `~/.config/glint/` **keeps working as-is** — the default profile reads it in place, so nothing moves and nothing is deleted, and glint stays interoperable with an older flat binary sharing the same directory.
+Your existing flat `~/.config/glint/` **keeps working as-is** — the default profile reads it in place, so nothing moves or is deleted until you choose. The first time you run `glint --setup`, glint notices the flat layout and offers to migrate:
 
-Migrating into the `profiles/` layout is **opt-in and non-destructive**. When you're ready:
+- **Migrate** (recommended) — moves your config into `profiles/default/`, tidies away the old flat duplicates, and unlocks creating and switching between multiple profiles.
+- **Keep flat** — stays single-profile for now; you can migrate any time (the prompt reappears on the next `--setup`).
+
+Migration is non-destructive: your config is copied into `profiles/default/` *before* anything is removed, and the shared colorscheme library + OAuth client registrations always stay at the root.
+
+### Command-line management (advanced)
+
+Everything the Profile Manager does is also scriptable — handy for automation or headless setups:
 
 ```sh
-glint --migrate-profiles
+glint --list-profiles                     # list profiles (marks default + active)
+glint --new-profile work                  # create (then `glint --profile work --setup`)
+glint --new-profile staging --from work   # clone work's config (re-authorize accounts)
+glint --rename-profile old:new
+glint --delete-profile name               # not "default" or the active profile
+glint --migrate-profiles                  # copy a flat config into profiles/default/ (copy-only)
+glint --cleanup-flat-config               # remove leftover flat duplicates after migrating
 ```
-
-That **copies** your flat config into `profiles/default/` and **leaves the originals in place** (so an older binary still works). The shared colorscheme library + OAuth client registrations stay at the root either way. Once you've fully switched to the profiles-aware binary, delete the leftover root `*.toml` yourself.
 
 ---
 
