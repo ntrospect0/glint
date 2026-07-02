@@ -356,14 +356,35 @@ struct StoredEntry<T> {
     value: T,
 }
 
-fn default_dir() -> Result<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-        if !xdg.is_empty() {
-            return Ok(PathBuf::from(xdg).join("glint"));
-        }
+/// The cache root for all profiles: `$XDG_CACHE_HOME/glint/` (or
+/// `~/.cache/glint/`), before the per-profile segment.
+fn cache_base() -> Result<PathBuf> {
+    match std::env::var("XDG_CACHE_HOME") {
+        Ok(xdg) if !xdg.is_empty() => Ok(PathBuf::from(xdg).join("glint")),
+        _ => Ok(dirs::home_dir()
+            .context("could not locate user home directory")?
+            .join(".cache")
+            .join("glint")),
     }
-    let home = dirs::home_dir().context("could not locate user home directory")?;
-    Ok(home.join(".cache").join("glint"))
+}
+
+fn default_dir() -> Result<PathBuf> {
+    // Scope the cache to the active profile so fetched payloads don't bleed
+    // across profiles; `--clear-cache` then scopes to the active profile too.
+    Ok(cache_base()?
+        .join("profiles")
+        .join(crate::config::active_profile()))
+}
+
+/// Remove a named profile's cache segment. Called when a profile is deleted
+/// so its (potentially large) cached payloads don't orphan. No-op if absent.
+pub fn remove_profile_cache(profile: &str) -> Result<()> {
+    let dir = cache_base()?.join("profiles").join(profile);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("failed to remove cache {}", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// Replace path-unfriendly characters in a kind / instance / key segment so

@@ -2495,13 +2495,14 @@ fn resolve_root_or_emergency(
                 instance = %instance,
                 rejected = %rejected.display(),
                 using = %root.display(),
-                "notes: configured dir unwritable; using ~/.glint/notes"
+                "notes: configured dir unwritable; using per-profile notes dir"
             );
             (
-                root,
+                root.clone(),
                 Some(format!(
-                    "Notes dir {} unwritable — using ~/.glint/notes",
-                    rejected.display()
+                    "Notes dir {} unwritable — using {}",
+                    rejected.display(),
+                    root.display()
                 )),
             )
         }
@@ -2510,11 +2511,11 @@ fn resolve_root_or_emergency(
                 instance = %instance,
                 rejected = ?rejected,
                 using = %root.display(),
-                "notes: configured + ~/.glint/notes both unwritable; using legacy ~/.config/glint/notes"
+                "notes: configured + per-profile dirs unwritable; using shared legacy ~/.glint/notes"
             );
             (
-                root,
-                Some("Notes dir fallback — using ~/.config/glint/notes".to_string()),
+                root.clone(),
+                Some(format!("Notes dir fallback — using {}", root.display())),
             )
         }
         Err(err) => {

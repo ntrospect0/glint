@@ -40,7 +40,7 @@ use anyhow::Result;
 /// Public entry point. Runs the wizard; returns `Ok(())` regardless of
 /// whether the user completed or quit mid-flow (state file is preserved
 /// across quits so the next call resumes).
-pub fn run() -> Result<()> {
-    let _ = app::run_wizard()?;
+pub fn run(show_manager: bool) -> Result<()> {
+    let _ = app::run_wizard(show_manager)?;
     Ok(())
 }

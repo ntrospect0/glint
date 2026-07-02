@@ -1534,7 +1534,7 @@ mod tests {
             instance: "main".into(),
             stack_children: Vec::new(),
         });
-        let mut app = WizardApp::new(state);
+        let mut app = WizardApp::new(state, crate::wizard::pages::Page::Welcome);
         app.page = Page::Widget(0);
         app.focus = 0;
 
@@ -1605,7 +1605,7 @@ mod tests {
             instance: "main".into(),
             stack_children: Vec::new(),
         });
-        let mut app = WizardApp::new(state);
+        let mut app = WizardApp::new(state, crate::wizard::pages::Page::Welcome);
         app.focus = 0;
         let wd = wd_fn();
         populate_textlist_buffer(&mut app, "stocks", &wd);
@@ -1666,7 +1666,7 @@ mod tests {
             instance: "main".into(),
             stack_children: Vec::new(),
         });
-        let mut app = WizardApp::new(state);
+        let mut app = WizardApp::new(state, crate::wizard::pages::Page::Welcome);
         app.focus = 0;
 
         populate_textlist_buffer(&mut app, "stocks", &wd);

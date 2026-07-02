@@ -313,10 +313,11 @@ pub fn needs_credential_capture(provider_name: &str) -> bool {
     let Some(spec) = provider.credentials else {
         return false;
     };
-    let Ok(dir) = crate::credentials::dir() else {
+    // Route through credentials::path so client registrations resolve from
+    // the shared global dir, not the per-profile one.
+    let Ok(path) = crate::credentials::path(spec.filename) else {
         return true;
     };
-    let path = dir.join(spec.filename);
     let Ok(text) = std::fs::read_to_string(&path) else {
         return true;
     };

@@ -42,6 +42,11 @@ dashboard on first launch.
   widget or a **stack** of widgets you cycle between with `.` / `,`.
 - **Multi-instance** — run the same widget kind in several panes
   (`stocks@watchlist1` + `stocks@watchlist2`, `clock@home` + `clock@office`).
+- **Profiles** — `glint --profile work` (or `-p work`) runs an isolated
+  config tree: its own layout, widgets, theme, and accounts. Create,
+  switch, and manage them from the setup wizard (`glint --setup`). The
+  colorscheme library and OAuth app registrations are shared; everything
+  else is per-profile. See [INSTRUCTIONS.md → Profiles](INSTRUCTIONS.md#profiles).
 - **Live config reload** — edit any widget's TOML and the dashboard
   picks it up without a restart.
 - **Theming** — nine bundled colour schemes; per-widget colour overrides;

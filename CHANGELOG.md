@@ -4,7 +4,52 @@ All notable changes to glint are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions track
 the `Cargo.toml` `version` field.
 
-## [0.3.0] — unreleased
+## [0.4.0] — unreleased
+
+**Profiles.** `glint --profile <name>` (or `-p <name>`, or
+`GLINT_PROFILE`) runs an isolated config tree, so one machine can hold a
+focused **work** dashboard, a stripped-down **travel** view, etc. — each
+with its own layout, widgets, theme, and accounts. Without a profile,
+glint uses `"default"`.
+
+### Added
+
+- **Per-profile config trees** under `~/.config/glint/profiles/<name>/`:
+  layout, widget configs, the selected theme, account tokens, notes,
+  runtime/wizard state, cache, and log are all per-profile.
+- **Shared global layer** at the glint root: the colorscheme **library**
+  (`colorschemes.toml`, with optional per-profile overrides merged by
+  name) and the OAuth **client registrations** (`*_oauth_client.toml`) —
+  define/register once, use from every profile.
+- **Active-profile indicator** in the dashboard status bar — a
+  `Profile: <name>` segment shown for any non-default profile so the
+  active context is unmistakable (the default profile is unchanged).
+- **Profile Manager in the setup wizard.** A bare `glint --setup` opens a
+  front page listing your profiles: pick one to configure, or create /
+  clone / rename / delete right there (same ops as the CLI, with a delete
+  confirmation). `glint --profile X --setup` edits X directly.
+- **Profile management CLI:** `--list-profiles`, `--new-profile <name>`
+  (`--from <src>` to clone a profile's *config*, credentials excluded),
+  `--rename-profile OLD:NEW`, `--delete-profile <name>`. Guards: names
+  are validated, case-insensitive collisions rejected (macOS folds
+  case), and `default` / the active profile can't be renamed/deleted.
+
+### Changed
+
+- **On-disk layout — flat configs keep working; migration is opt-in.** A
+  pre-profiles flat `~/.config/glint/` is read **in place** by the default
+  profile (no automatic move), so an older flat binary can share the
+  directory safely. Migrate into `profiles/default/` explicitly — via the
+  `--setup` migration prompt (recommended), or `glint --migrate-profiles`.
+  The wizard prompt migrates *and* removes the now-dead flat duplicates;
+  the CLI copies and leaves them (clean up later with
+  `glint --cleanup-flat-config`). The shared colorscheme library + client
+  registrations always stay at the root.
+- **Cache, notes, and logs are now per-profile.** Notes previously
+  defaulted to a shared `~/.glint/notes`; the default profile adopts any
+  existing one on first run, and other profiles start empty.
+
+## [0.3.0]
 
 The 0.2 release is the structural refactor of glint into a plugin-style
 platform: registries for widgets, auth providers, and LLM providers

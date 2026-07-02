@@ -2,10 +2,13 @@
 // Copyright (C) 2026 ntrospect0
 
 pub mod layout;
+pub mod migrate;
+pub mod profiles;
 pub mod types;
 pub mod watcher;
 
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 
 use anyhow::{Context, Result};
 
@@ -92,11 +95,67 @@ fn format_string_array_literal(items: &[String]) -> String {
     format!("[{}]", parts.join(", "))
 }
 
-/// Returns `~/.config/glint/` on every platform (overridable with
-/// `$XDG_CONFIG_HOME`). The XDG Base Directory layout is what the spec
-/// promises, so we use it consistently rather than falling back to
-/// `~/Library/Application Support/` on macOS or `%APPDATA%` on Windows.
-pub fn config_dir() -> Result<PathBuf> {
+/// The default profile name. Always exists; cannot be deleted.
+pub const DEFAULT_PROFILE: &str = "default";
+
+static ACTIVE_PROFILE: OnceLock<String> = OnceLock::new();
+static CONFIG_DIR_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// The active profile name. **Read-only**: this never initializes the lock
+/// (no `get_or_init`), so an early read can't silently pin `"default"` and
+/// turn a later [`set_active_profile`] into a no-op. Falls back to
+/// [`DEFAULT_PROFILE`] until `main` sets it.
+pub fn active_profile() -> &'static str {
+    ACTIVE_PROFILE
+        .get()
+        .map(String::as_str)
+        .unwrap_or(DEFAULT_PROFILE)
+}
+
+/// Set the active profile. Called **exactly once** in `main`, before any
+/// config access. Panics on a second call so an accidental re-set is loud
+/// rather than a silent wrong-tree.
+pub fn set_active_profile(name: impl Into<String>) {
+    ACTIVE_PROFILE
+        .set(name.into())
+        .expect("active profile set more than once");
+}
+
+/// Point the per-profile config dir at an explicit directory, bypassing
+/// profile resolution. Used by `--config <FILE>` (single-file mode) and by
+/// the wizard's Profile Manager, which re-targets it to edit a chosen
+/// profile. Re-settable (unlike the active profile).
+pub fn set_config_dir_override(dir: PathBuf) {
+    if let Ok(mut w) = CONFIG_DIR_OVERRIDE.write() {
+        *w = Some(dir);
+    }
+}
+
+/// Validate a profile name: ASCII-alphanumeric start, then
+/// alphanumeric/`-`/`_`, 1–64 chars, no path separators.
+pub fn validate_profile_name(name: &str) -> Result<()> {
+    let ok = (1..=64).contains(&name.len())
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !ok {
+        anyhow::bail!(
+            "invalid profile name {name:?}: use letters, digits, '-' or '_' \
+             (1–64 chars, no leading dash, no path separators)"
+        );
+    }
+    Ok(())
+}
+
+/// The glint root — `~/.config/glint/` (overridable with `$XDG_CONFIG_HOME`).
+/// This is the **global layer** shared across profiles. The XDG Base
+/// Directory layout is what the spec promises, so we use it consistently
+/// rather than `~/Library/Application Support/` (macOS) or `%APPDATA%`.
+pub fn glint_root() -> Result<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
             return Ok(PathBuf::from(xdg).join("glint"));
@@ -104,6 +163,38 @@ pub fn config_dir() -> Result<PathBuf> {
     }
     let home = dirs::home_dir().context("could not locate user home directory")?;
     Ok(home.join(".config").join("glint"))
+}
+
+/// The active profile's config directory — `<glint_root>/profiles/<active>`.
+/// Every per-profile path (widget configs, credentials, runtime/wizard
+/// state, notes, log) resolves under this. An explicit `--config` override
+/// short-circuits to that file's directory.
+pub fn config_dir() -> Result<PathBuf> {
+    if let Ok(guard) = CONFIG_DIR_OVERRIDE.read() {
+        if let Some(dir) = guard.as_ref() {
+            return Ok(dir.clone());
+        }
+    }
+    resolve_profile_dir(active_profile())
+}
+
+/// The on-disk directory for a named profile, **ignoring** any config-dir
+/// override. The wizard's Profile Manager uses this to target a chosen
+/// profile. Named profiles are `profiles/<name>/`; the default profile has a
+/// legacy flat-layout fallback:
+///
+/// If the default profile hasn't been migrated (no `profiles/default/`) but a
+/// flat `config.toml` sits at the root, resolve to the **root** — so a
+/// pre-profiles install is read in place, interoperable with an older flat
+/// binary, without any automatic destructive migration. Opt in explicitly
+/// with `--migrate-profiles`.
+pub fn resolve_profile_dir(profile: &str) -> Result<PathBuf> {
+    let root = glint_root()?;
+    let profile_dir = root.join("profiles").join(profile);
+    if profile == DEFAULT_PROFILE && !profile_dir.exists() && root.join("config.toml").exists() {
+        return Ok(root);
+    }
+    Ok(profile_dir)
 }
 
 /// Returns the path to the main config file (`config.toml`).
@@ -162,41 +253,60 @@ pub const DEFAULT_CALENDAR_TOML: &str = include_str!("defaults/calendar.toml");
 /// Create `~/.config/glint/` and seed the default config files if they do not
 /// already exist. Returns the path of the main `config.toml`.
 pub fn init_default_config() -> Result<PathBuf> {
+    seed_global_layer()?;
     let dir = config_dir()?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create config directory at {}", dir.display()))?;
+    seed_profile_dir(&dir)?;
+    Ok(dir.join("config.toml"))
+}
 
-    let main = dir.join("config.toml");
-    seed(&main, DEFAULT_CONFIG_TOML)?;
+/// Seed the shared **global layer** at the glint root: the colorscheme
+/// library and the OAuth client-registration templates. Idempotent.
+pub(crate) fn seed_global_layer() -> Result<()> {
+    let root = glint_root()?;
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("failed to create glint root at {}", root.display()))?;
+    seed(&root.join("colorschemes.toml"), DEFAULT_COLORSCHEMES_TOML)?;
+    let global_creds = crate::credentials::global_dir()?;
+    seed_credentials(
+        &global_creds.join("google_oauth_client.toml"),
+        DEFAULT_GOOGLE_CLIENT_TEMPLATE,
+    )?;
+    seed_credentials(
+        &global_creds.join("microsoft_oauth_client.toml"),
+        DEFAULT_MICROSOFT_CLIENT_TEMPLATE,
+    )?;
+    Ok(())
+}
+
+/// Seed a **profile directory** with the default per-profile config + account
+/// credential templates. Parameterized on `dir` so it can seed any profile
+/// (the active one, or a freshly-created one). Idempotent.
+pub(crate) fn seed_profile_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create profile dir {}", dir.display()))?;
+    seed(&dir.join("config.toml"), DEFAULT_CONFIG_TOML)?;
     seed(&dir.join("clock.toml"), DEFAULT_CLOCK_TOML)?;
     seed(&dir.join("weather.toml"), DEFAULT_WEATHER_TOML)?;
     seed(&dir.join("calendar.toml"), DEFAULT_CALENDAR_TOML)?;
     seed(&dir.join("news.toml"), DEFAULT_NEWS_TOML)?;
     seed(&dir.join("stocks.toml"), DEFAULT_STOCKS_TOML)?;
     seed(&dir.join("llm.toml"), DEFAULT_LLM_TOML)?;
-    seed(&dir.join("colorschemes.toml"), DEFAULT_COLORSCHEMES_TOML)?;
 
-    // Credentials live in their own subdirectory (created with 0700) so they
-    // can be locked down with one chmod.
-    let credentials = crate::credentials::dir()?;
+    let creds = dir.join("credentials");
+    std::fs::create_dir_all(&creds)
+        .with_context(|| format!("failed to create {}", creds.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&creds, std::fs::Permissions::from_mode(0o700));
+    }
     seed_credentials(
-        &credentials.join("anthropic_key.toml"),
+        &creds.join("anthropic_key.toml"),
         DEFAULT_ANTHROPIC_KEY_TEMPLATE,
     )?;
-    seed_credentials(
-        &credentials.join("openai_key.toml"),
-        DEFAULT_OPENAI_KEY_TEMPLATE,
-    )?;
-    seed_credentials(&credentials.join("caldav.toml"), DEFAULT_CALDAV_TEMPLATE)?;
-    seed_credentials(
-        &credentials.join("google_oauth_client.toml"),
-        DEFAULT_GOOGLE_CLIENT_TEMPLATE,
-    )?;
-    seed_credentials(
-        &credentials.join("microsoft_oauth_client.toml"),
-        DEFAULT_MICROSOFT_CLIENT_TEMPLATE,
-    )?;
-    Ok(main)
+    seed_credentials(&creds.join("openai_key.toml"), DEFAULT_OPENAI_KEY_TEMPLATE)?;
+    seed_credentials(&creds.join("caldav.toml"), DEFAULT_CALDAV_TEMPLATE)?;
+    Ok(())
 }
 
 fn seed_credentials(path: &Path, contents: &str) -> Result<()> {
@@ -393,5 +503,28 @@ jump_url_template = "https://example.com/{ticker}"
         assert!(updated.contains(r#"indices = ["^DJI", "^GSPC"]"#));
         assert!(updated.contains("# Press `j`"));
         assert!(updated.contains("jump_url_template"));
+    }
+
+    #[test]
+    fn profile_name_validation() {
+        for ok in ["default", "work", "travel-eu", "p_2", "A1"] {
+            assert!(validate_profile_name(ok).is_ok(), "{ok:?} should be valid");
+        }
+        for bad in ["", "-lead", "_lead", "has space", "a/b", "a.b", "café"] {
+            assert!(
+                validate_profile_name(bad).is_err(),
+                "{bad:?} should be invalid"
+            );
+        }
+        // 64 ok, 65 too long.
+        assert!(validate_profile_name(&"a".repeat(64)).is_ok());
+        assert!(validate_profile_name(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn active_profile_defaults_without_set() {
+        // In the test process the OnceLock is never set → reads the default.
+        // (Read-only accessor must not pin the lock.)
+        assert_eq!(active_profile(), DEFAULT_PROFILE);
     }
 }

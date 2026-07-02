@@ -5,8 +5,9 @@
 //!
 //! The directory layout is `<root>/<instance>/<id>.md`, where `root`
 //! is whatever [`resolve_root`] decided on at widget mount: the user's
-//! configured `notes_dir` if it could be created, falling back to
-//! `~/.glint/notes`, then to the legacy `~/.config/glint/notes`.
+//! configured `notes_dir` if it could be created, otherwise the
+//! per-profile `<config_dir>/notes`, falling back to the shared legacy
+//! `~/.glint/notes`.
 //!
 //! One Markdown file per note. The on-disk layout is intentionally plain:
 //! users can `cat` a note, hand-edit it, back the directory up with git,
@@ -75,18 +76,18 @@ pub fn new_id() -> String {
 /// anything other than the happy path took effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
-    /// The configured `notes_dir` succeeded (or no override was given
-    /// and the built-in `~/.glint/notes` default succeeded — these
-    /// share a tier from the widget's perspective).
+    /// The happy path: the configured `notes_dir` succeeded, or no
+    /// override was given and the per-profile `<config_dir>/notes`
+    /// default succeeded — these share a tier from the widget's view.
     Configured,
-    /// The configured `notes_dir` was set but couldn't be created;
-    /// `~/.glint/notes` worked as a fallback. Carries the rejected
-    /// path so the toast can quote it.
+    /// The configured `notes_dir` was set but couldn't be created; the
+    /// per-profile default worked as a fallback. Carries the rejected
+    /// configured path so the toast can quote it.
     FellBackToDefault { rejected: PathBuf },
-    /// Neither the configured override nor `~/.glint/notes` could be
-    /// created; we landed on the legacy `~/.config/glint/notes`.
-    /// Carries every path that was tried so the toast / log can
-    /// surface the full story.
+    /// Neither the configured override nor the per-profile default could
+    /// be created; we landed on the shared legacy `~/.glint/notes`.
+    /// Carries every path that was tried so the toast / log can surface
+    /// the full story.
     FellBackToLegacy { rejected: Vec<PathBuf> },
 }
 
@@ -116,12 +117,12 @@ pub fn resolve_root(configured: Option<&str>) -> Result<(PathBuf, Resolution)> {
         rejected.push(path.clone());
     }
 
-    // ── Tier 2: ~/.glint/notes. ──
-    let glint_home = home_join(".glint").map(|p| p.join("notes"));
-    if let Some(path) = glint_home.as_ref() {
-        if try_mkdir_p(path) {
-            // If the user didn't configure anything, this is the
-            // happy path — no fallback occurred.
+    // ── Tier 2 (default): per-profile <config_dir>/notes. ──
+    if let Ok(path) = crate::config::config_dir().map(|p| p.join("notes")) {
+        // The default profile inherits a pre-profiles ~/.glint/notes once.
+        adopt_legacy_notes(&path);
+        if try_mkdir_p(&path) {
+            // No configured override → this is the happy path.
             return Ok((
                 path.clone(),
                 if rejected.is_empty() {
@@ -133,12 +134,11 @@ pub fn resolve_root(configured: Option<&str>) -> Result<(PathBuf, Resolution)> {
                 },
             ));
         }
-        rejected.push(path.clone());
+        rejected.push(path);
     }
 
-    // ── Tier 3: ~/.config/glint/notes (XDG-aware). ──
-    let legacy = crate::config::config_dir().map(|p| p.join("notes"));
-    if let Ok(path) = legacy {
+    // ── Tier 3 (legacy fallback): ~/.glint/notes (shared, pre-profiles). ──
+    if let Some(path) = home_join(".glint").map(|p| p.join("notes")) {
         if try_mkdir_p(&path) {
             return Ok((path, Resolution::FellBackToLegacy { rejected }));
         }
@@ -153,6 +153,39 @@ pub fn resolve_root(configured: Option<&str>) -> Result<(PathBuf, Resolution)> {
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+/// One-time adoption of a pre-profiles `~/.glint/notes` into the default
+/// profile's per-profile notes dir. Only the default profile inherits it
+/// (the single pre-profiles install *was* "default"); other profiles start
+/// empty. Best-effort — a failed move just leaves the legacy dir in place
+/// (where Tier 3 can still find it).
+fn adopt_legacy_notes(per_profile: &Path) {
+    if crate::config::active_profile() != crate::config::DEFAULT_PROFILE {
+        return;
+    }
+    if per_profile.exists() {
+        return;
+    }
+    let Some(legacy) = home_join(".glint").map(|p| p.join("notes")) else {
+        return;
+    };
+    if !legacy.exists() {
+        return;
+    }
+    if let Some(parent) = per_profile.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::rename(&legacy, per_profile) {
+        Ok(()) => tracing::info!(
+            from = %legacy.display(),
+            to = %per_profile.display(),
+            "notes: adopted pre-profiles ~/.glint/notes into the default profile"
+        ),
+        Err(err) => {
+            tracing::warn!(error = %err, "notes: could not adopt legacy ~/.glint/notes")
+        }
+    }
 }
 
 fn try_mkdir_p(path: &Path) -> bool {

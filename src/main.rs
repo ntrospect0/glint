@@ -58,14 +58,83 @@ struct Cli {
     #[arg(long, value_name = "TARGET", num_args = 0..=1, default_missing_value = "*")]
     clear_cache_forced: Option<String>,
 
+    /// Profile to use — an isolated config tree under
+    /// `~/.config/glint/profiles/<name>/`. Defaults to "default". Also
+    /// settable via the GLINT_PROFILE environment variable. Mutually
+    /// exclusive with --config.
+    #[arg(long, short = 'p', value_name = "NAME")]
+    profile: Option<String>,
+
+    /// List the profiles found under `profiles/`, then exit.
+    #[arg(long)]
+    list_profiles: bool,
+
+    /// Create a new profile, then exit. Add --from <SRC> to clone an existing
+    /// profile's config (credentials are not copied — re-authorize the clone).
+    #[arg(long, value_name = "NAME")]
+    new_profile: Option<String>,
+
+    /// Source profile to clone when creating with --new-profile.
+    #[arg(long, value_name = "SRC", requires = "new_profile")]
+    from: Option<String>,
+
+    /// Rename a profile: --rename-profile OLD:NEW. Then exit.
+    #[arg(long, value_name = "OLD:NEW")]
+    rename_profile: Option<String>,
+
+    /// Delete a profile (not "default" or the active one), then exit.
+    #[arg(long, value_name = "NAME")]
+    delete_profile: Option<String>,
+
+    /// Migrate a pre-profiles flat config into profiles/default/, then exit.
+    /// Copies (never deletes) the flat files, so an older flat binary keeps
+    /// working; remove the root *.toml yourself once you've fully switched.
+    #[arg(long)]
+    migrate_profiles: bool,
+
+    /// Remove leftover flat config files at the root after migrating (the
+    /// duplicates of profiles/default/), then exit. Keeps the global layer
+    /// (colorschemes + client registrations) and the profiles/ tree.
+    #[arg(long)]
+    cleanup_flat_config: bool,
+
     /// Path to a config file (overrides the default XDG location).
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
-    init_tracing();
     let cli = Cli::parse();
+
+    // Resolve and lock the active profile BEFORE any config access (incl.
+    // init_tracing, which logs into the profile dir). The set-once lock makes
+    // an accidental early/second set loud rather than a silent wrong-tree.
+    let profile = if cli.config.is_some() {
+        if cli.profile.is_some() {
+            return Err(anyhow!("--config cannot be combined with --profile"));
+        }
+        // Explicit single-file mode resolves siblings from the file's dir.
+        config::DEFAULT_PROFILE.to_string()
+    } else {
+        cli.profile
+            .clone()
+            .or_else(|| std::env::var("GLINT_PROFILE").ok().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| config::DEFAULT_PROFILE.to_string())
+    };
+    config::validate_profile_name(&profile)?;
+    config::set_active_profile(profile);
+
+    if let Some(path) = cli.config.as_deref() {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            config::set_config_dir_override(parent.to_path_buf());
+        }
+    }
+    // NOTE: migration into profiles/default/ is NOT automatic. A flat layout
+    // is read in place (see config::config_dir) so a pre-profiles install
+    // keeps working and stays interoperable with an older flat binary. Opt in
+    // with `--migrate-profiles` (handled in the dispatch block below).
+
+    init_tracing();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -75,6 +144,73 @@ fn main() -> Result<()> {
         if cli.init {
             let path = config::init_default_config()?;
             println!("Initialized config at {}", path.display());
+            return Ok(());
+        }
+        if cli.list_profiles {
+            let active = config::active_profile();
+            for name in config::profiles::list()? {
+                let mut marks: Vec<&str> = Vec::new();
+                if name == active {
+                    marks.push("active");
+                }
+                if name == config::DEFAULT_PROFILE {
+                    marks.push("default");
+                }
+                let suffix = if marks.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", marks.join(", "))
+                };
+                println!("{name}{suffix}");
+            }
+            return Ok(());
+        }
+        if let Some(name) = cli.new_profile.as_deref() {
+            config::profiles::create(name, cli.from.as_deref())?;
+            match cli.from.as_deref() {
+                Some(src) => println!("Created profile {name:?} (cloned config from {src:?}). Re-authorize its accounts with `glint --profile {name} --auth <provider>`."),
+                None => println!("Created profile {name:?}. Configure it with `glint --profile {name} --setup`."),
+            }
+            return Ok(());
+        }
+        if let Some(spec) = cli.rename_profile.as_deref() {
+            let (old, new) = spec
+                .split_once(':')
+                .ok_or_else(|| anyhow!("use --rename-profile OLD:NEW"))?;
+            config::profiles::rename(old, new)?;
+            println!("Renamed profile {old:?} → {new:?}.");
+            return Ok(());
+        }
+        if let Some(name) = cli.delete_profile.as_deref() {
+            config::profiles::delete(name)?;
+            println!("Deleted profile {name:?} (and its cache).");
+            return Ok(());
+        }
+        if cli.migrate_profiles {
+            let (dest, copied) = config::migrate::migrate_to_profiles()?;
+            println!(
+                "Copied {copied} item(s) into {}.\n\
+                 The flat files at the root are left in place so an older \
+                 glint keeps working — remove them once you've fully switched \
+                 with `glint --cleanup-flat-config`.",
+                dest.display()
+            );
+            return Ok(());
+        }
+        if cli.cleanup_flat_config {
+            let migrated = config::glint_root()
+                .map(|r| r.join("profiles").join(config::DEFAULT_PROFILE).exists())
+                .unwrap_or(false);
+            if !migrated {
+                return Err(anyhow!(
+                    "not migrated yet — run `glint --migrate-profiles` first"
+                ));
+            }
+            let n = config::migrate::remove_flat_originals()?;
+            println!(
+                "Removed {n} leftover flat file(s) from the root \
+                 (the colorscheme library, client registrations, and profiles/ are kept)."
+            );
             return Ok(());
         }
         // --clear-cache / --clear-cache-forced fire before the rest of startup
@@ -102,10 +238,24 @@ fn main() -> Result<()> {
             // Without this, fresh installs hit the theme picker with no
             // colorschemes.toml on disk and the scheme list is empty.
             config::init_default_config()?;
-            return wizard::run();
+            // Bare `--setup` opens the Profile Manager first; an explicit
+            // `--profile X --setup` edits X directly.
+            return wizard::run(cli.profile.is_none());
         }
         if let Some(target) = cli.auth.as_deref() {
             return run_auth(target).await;
+        }
+
+        // A non-default profile must already exist to launch into — don't
+        // silently first-run-create it. `--profile X --setup` creates it.
+        if cli.config.is_none()
+            && config::active_profile() != config::DEFAULT_PROFILE
+            && !looks_initialized()
+        {
+            let p = config::active_profile();
+            return Err(anyhow!(
+                "profile {p:?} not found. Create it with: glint --profile {p} --setup"
+            ));
         }
 
         // First-run UX: drop into the setup wizard before opening the TUI.
@@ -117,7 +267,9 @@ fn main() -> Result<()> {
             eprintln!("(You can re-run `glint --setup` later to make changes.)");
             eprintln!();
             config::init_default_config()?;
-            wizard::run()?;
+            // First run (no config) — go straight into the wizard for the
+            // default profile; the Manager would only list "default".
+            wizard::run(false)?;
             eprintln!();
             eprintln!("Launching glint…");
         }

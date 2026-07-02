@@ -47,6 +47,12 @@ fn page_from_id(id: &str) -> Option<Page> {
 /// page for an empty cell.
 pub fn next_page(current: &Page, state: &WizardState) -> Option<Page> {
     match current {
+        // Manager is the front page, not part of the linear flow — it
+        // transitions via PageAction::EnterProfileEdit, not Advance.
+        Page::Manager => None,
+        // "Keep flat" on the migration prompt Advances into single-default
+        // editing (Welcome); other choices use EnterManager.
+        Page::MigratePrompt => Some(Page::Welcome),
         Page::Welcome => Some(Page::Global),
         Page::Global => Some(Page::Layout),
         Page::Layout => Some(Page::Assign),
@@ -94,6 +100,8 @@ pub fn next_page(current: &Page, state: &WizardState) -> Option<Page> {
 /// the visited-history stack is empty.
 pub fn prev_page(current: &Page, state: &WizardState) -> Option<Page> {
     match current {
+        Page::Manager => None,
+        Page::MigratePrompt => None,
         Page::Welcome => None,
         Page::Global => Some(Page::Welcome),
         Page::Layout => Some(Page::Global),
@@ -241,6 +249,8 @@ fn last_config_pos_before(state: &WizardState, before: usize) -> Option<ConfigPo
 pub fn current_step(current: &Page, state: &WizardState) -> usize {
     let populated = populated_count(state);
     match current {
+        Page::Manager => 0,
+        Page::MigratePrompt => 0,
         Page::Welcome => 1,
         Page::Global => 2,
         Page::Layout => 3,

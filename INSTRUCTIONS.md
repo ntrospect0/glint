@@ -338,37 +338,72 @@ This wipes everything — config, tokens, cache. The wizard seeds fresh defaults
 
 ---
 
+## Profiles
+
+Run glint in several isolated contexts — a focused **work** dashboard, a stripped-down **travel** view — each with its own layout, widgets, theme, and accounts:
+
+```sh
+glint --profile work        # or: glint -p work
+glint                       # the "default" profile
+```
+
+Everything a profile owns — layout, widget configs, the selected theme, account tokens, notes, cache — is isolated under `~/.config/glint/profiles/<name>/`. Two things are **shared** across all profiles, so you define/register them once: the colorscheme **library** (`colorschemes.toml`) and the OAuth **client registrations** (`*_oauth_client.toml` — the Azure/Google *app*, not your account tokens). You can also select a profile with `GLINT_PROFILE=work` instead of the flag.
+
+### Managing profiles
+
+Run `glint --setup` and you land on the **Profile Manager** — it lists your profiles and lets you pick one to configure, or **create, clone, rename, and delete** them right there. Cloning copies a profile's configuration (not its credentials — you authorize the clone's accounts afterward). To jump straight into configuring one profile, use `glint --profile <name> --setup`.
+
+### Upgrading from a pre-profiles install
+
+Your existing flat `~/.config/glint/` **keeps working as-is** — the default profile reads it in place, so nothing moves or is deleted until you choose. The first time you run `glint --setup`, glint notices the flat layout and offers to migrate:
+
+- **Migrate** (recommended) — moves your config into `profiles/default/`, tidies away the old flat duplicates, and unlocks creating and switching between multiple profiles.
+- **Keep flat** — stays single-profile for now; you can migrate any time (the prompt reappears on the next `--setup`).
+
+Migration is non-destructive: your config is copied into `profiles/default/` *before* anything is removed, and the shared colorscheme library + OAuth client registrations always stay at the root.
+
+### Command-line management (advanced)
+
+Everything the Profile Manager does is also scriptable — handy for automation or headless setups:
+
+```sh
+glint --list-profiles                     # list profiles (marks default + active)
+glint --new-profile work                  # create (then `glint --profile work --setup`)
+glint --new-profile staging --from work   # clone work's config (re-authorize accounts)
+glint --rename-profile old:new
+glint --delete-profile name               # not "default" or the active profile
+glint --migrate-profiles                  # copy a flat config into profiles/default/ (copy-only)
+glint --cleanup-flat-config               # remove leftover flat duplicates after migrating
+```
+
+---
+
 ## What lives where on disk
 
 ```
-~/.config/glint/
-├── config.toml                   # [global] + [layout] + [[layout.cells]]
-├── clock.toml                    # primary timezone, secondary clocks
-├── calendar.toml                 # providers, calendar_ids, [[events]]
-├── email.toml                    # provider, folders, summarize_with_llm
-├── news.toml                     # [[feeds]], [[topics]], summarize
-├── stocks.toml                   # indices, watchlist
-├── forex.toml                    # primary, watchlist, crypto_watchlist
-├── weather.toml                  # lat/lon, units
-├── gallery.toml                  # image dirs, rotation
-├── resources.toml                # poll cadence, top-N processes
-├── notes.toml                    # per-instance shortcuts + colors
-├── llm.toml                      # active provider, model, limits
-├── colorschemes.toml             # named [schemes.*] palettes
-├── notes/                        # one folder per notes-widget instance
-│   └── <instance>/<id>.md        # each note as a plain markdown file
-└── credentials/                  # 0600-mode
-    ├── google_oauth_client.toml
-    ├── google_oauth_token.default.toml      # .<account>.toml per account
-    ├── microsoft_oauth_client.toml
-    ├── microsoft_oauth_token.default.toml    # .<account>.toml per account
-    ├── caldav.toml
-    ├── imap.toml
-    ├── anthropic_key.toml
-    └── openai_key.toml
+~/.config/glint/                      # GLOBAL layer — shared across profiles
+├── colorschemes.toml                 # named [schemes.*] palettes (the library)
+├── credentials/                      # 0700-mode
+│   ├── google_oauth_client.toml      # OAuth app registrations (shared)
+│   └── microsoft_oauth_client.toml
+└── profiles/
+    ├── default/                      # PER-PROFILE layer (the default profile)
+    │   ├── config.toml               # [global] + [layout] + [[layout.cells]]
+    │   ├── clock.toml  calendar.toml  news.toml  stocks.toml  forex.toml
+    │   ├── weather.toml  gallery.toml  resources.toml  email.toml
+    │   ├── notes.toml  llm.toml
+    │   ├── colorschemes.toml          # OPTIONAL per-profile scheme overrides
+    │   ├── credentials/               # per-profile account secrets (0700)
+    │   │   ├── google_oauth_token.<account>.toml
+    │   │   ├── microsoft_oauth_token.<account>.toml
+    │   │   ├── caldav.toml  imap.toml
+    │   │   ├── anthropic_key.toml  openai_key.toml
+    │   ├── notes/<instance>/<id>.md   # each note as a plain markdown file
+    │   └── .runtime_state.toml  .wizard_state.toml  glint.log
+    └── work/  travel/  …             # other profiles, same shape
 ```
 
-Every `.toml` is plain text — edit in your favourite editor and either restart glint or hit `:reload` from the runtime command bar. The wizard preserves keys it doesn't manage (custom feeds, topic keywords, per-widget color overrides, etc.) across `--setup` re-runs.
+Every `.toml` is plain text — edit in your favourite editor and either restart glint or hit `:reload` from the runtime command bar. The wizard preserves keys it doesn't manage (custom feeds, topic keywords, per-widget color overrides, etc.) across `--setup` re-runs, and preserves other profiles' `[[providers]]` blocks it doesn't own.
 
 ---
 

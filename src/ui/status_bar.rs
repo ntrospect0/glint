@@ -13,7 +13,10 @@ use ratatui::{
 use crate::theme::Theme;
 
 /// Bottom-of-screen status bar:
-/// `glint vX.Y.Z │ HH:MM:SS │ Focus: <id> │ Scheme: <name> │ Tab: switch · ? help · q quit`
+/// `glint vX.Y.Z │ [Profile: <name> │] HH:MM:SS │ Focus: <id> │ Scheme: <name> │ Tab: switch · ? help · q quit`
+///
+/// The `Profile:` segment appears only for a non-default profile, so the
+/// default dashboard is visually unchanged.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -29,8 +32,22 @@ pub fn render(
     let dim = Style::default().add_modifier(Modifier::DIM);
     let sep = Span::styled("│", dim);
 
-    let line = Line::from(vec![
-        Span::styled(format!(" glint v{version} "), dim),
+    let mut spans: Vec<Span> = vec![Span::styled(format!(" glint v{version} "), dim)];
+
+    // Active-profile indicator — surfaced right after the version so the
+    // context is the first thing read. Hidden for the default profile.
+    let profile = crate::config::active_profile();
+    if profile != crate::config::DEFAULT_PROFILE {
+        spans.push(sep.clone());
+        spans.push(Span::styled(" Profile: ", dim));
+        spans.push(Span::styled(
+            profile.to_string(),
+            theme.text_selected.add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" ", dim));
+    }
+
+    spans.extend([
         sep.clone(),
         Span::styled(format!(" {clock} "), dim),
         sep.clone(),
@@ -43,8 +60,8 @@ pub fn render(
         Span::styled(" ", dim),
         sep,
         Span::styled(" Tab: switch · ? help · q quit ", dim),
-    ])
-    .alignment(Alignment::Left);
+    ]);
 
+    let line = Line::from(spans).alignment(Alignment::Left);
     frame.render_widget(Paragraph::new(line), area);
 }
