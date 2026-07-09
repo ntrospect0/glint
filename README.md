@@ -58,6 +58,13 @@ dashboard on first launch.
 - **Keyboard-first, mouse-friendly** — `Tab` cycles widgets,
   `Shift+<letter>` jumps to a widget by its shortcut letter, `:` opens
   a command bar, click anywhere to focus.
+- **Focus Zoom** — press `z` to enlarge the focused widget into a
+  centered frame over a dimmed backdrop, then `z` (or `Esc`) to return
+  exactly where you were. Given the room, every widget paints a richer
+  **Full-tier** view — reading panes, multi-column grids, a
+  wall-calendar month with per-day event dots — so a cramped cell
+  becomes fully legible without leaving the terminal. Retarget the zoom
+  to another widget with `Tab` or `Shift+<letter>` without exiting.
 - **No cloud component**: every credential lives on disk under
   `~/.config/glint/credentials/` (0600 perms). API calls go directly
   from your machine to the upstream service.
@@ -354,10 +361,18 @@ Then `:scheme my_scheme` (persisted to `[global] theme`).
 | `Tab` / `Shift+Tab` | cycle focused widget |
 | `Shift+<letter>` | jump focus to a widget by its shortcut letter (lit in title) |
 | `click cell` | focus that widget |
+| `z` / `Shift+Z` | zoom the focused widget in / out (Focus Zoom) |
+| `Esc` | exit zoom — a first `Esc` clears the widget's own mode (e.g. Notes insert), a second exits |
 | `.` / `,` | rotate the active widget in a stack pane |
 | `:` | open the command bar |
 | `?` | toggle help overlay (scrollable) |
 | `q` / `Ctrl+C` | quit |
+
+While zoomed, `Tab` / `Shift+Tab` and `Shift+<letter>` **retarget** the
+zoom to another widget instead of moving focus; clicking a dimmed
+backdrop widget retargets to it, and clicking the empty margin exits.
+State (selection, scroll, active tab, warm data) is preserved entering
+*and* leaving zoom — it's a resize, not a reset.
 
 ### Command bar (`:`)
 
@@ -377,7 +392,7 @@ Then `:scheme my_scheme` (persisted to `[global] theme`).
 |---|---|
 | **Stocks** | `↑/↓` select ticker · `←/→` cycle graph period · `c` % ↔ $ · `Enter` open in browser · `1–9` jump period · `y` yank value |
 | **Forex** | `↑/↓` select pair · `←/→` cycle period · `s` / `Enter` make selected primary (crypto seeds amount=1) · `c` edit amount · `y` yank |
-| **Calendar** | `d` / `w` / `m` day/week/month · `←/→` navigate · `t` today |
+| **Calendar** | `d` / `w` / `m` day/week/month · `h` / `l` prev/next period · `←↑↓→` move the selected day (month view) · `j` / `k` scroll the day agenda · `t` today · click a day to select it · `o` open in browser |
 | **Weather** | `:weather <city>` retarget · `x` revert to default |
 | **Clock** | `:time <city>` retarget · `x` revert to local |
 | **News** | `↑/↓` select · `←/→` filter tabs · `e` expand · `s` LLM summary · `Enter` open · `x` clear search |

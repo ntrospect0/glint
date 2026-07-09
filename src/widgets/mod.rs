@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 ntrospect0
 
+pub mod view_tier;
+pub use view_tier::ViewTier;
+
 #[cfg(feature = "widget-calendar")]
 pub mod calendar;
 #[cfg(feature = "widget-clock")]
@@ -289,6 +292,19 @@ pub trait Widget: Send + Sync {
         false
     }
 
+    /// Returns `true` while the widget is actively capturing text input —
+    /// i.e., a navigation key like `Tab` or `Shift+<letter>` should be
+    /// treated as a literal character rather than a focus gesture.
+    ///
+    /// The zoom retarget-suppression logic calls this on the currently-zoomed
+    /// widget before acting on `Tab` / `Shift+<letter>` / mouse-backdrop-click.
+    /// Default returns `false` (retarget is allowed). Widgets with a text-entry
+    /// mode (notes, any future search bar, etc.) should override and return
+    /// `true` while that mode is active.
+    fn is_capturing_text(&self) -> bool {
+        false
+    }
+
     /// Drain any "please bring me to the front" signal the widget has
     /// queued internally. The app polls this each tick; when `Some`,
     /// it promotes the named widget the same way `Shift+<letter>`
@@ -350,6 +366,23 @@ impl WidgetManager {
 
     pub fn ids(&self) -> &[String] {
         &self.order
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Collect every terminal cell symbol from a `TestBackend` buffer into
+    /// one flat string (row-major, no separators). Useful for substring
+    /// presence checks in widget render tests.
+    pub(crate) fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        let mut out = String::with_capacity((area.width * area.height) as usize);
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                out.push_str(buf[(x, y)].symbol());
+            }
+        }
+        out
     }
 }
 

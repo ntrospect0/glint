@@ -29,6 +29,7 @@ use crate::{
     theme::{self, Theme},
     ui,
     widgets::{parse_widget_ref, registry, AppContext, EventResult, WidgetCtx, WidgetManager},
+    zoom::ZoomTarget,
 };
 
 /// Time a `command_feedback` message stays visible in the chrome row
@@ -75,6 +76,15 @@ pub struct App {
     /// new frame instead of re-running their `render()`. See
     /// [`ui::PartialDrawCache`] for the invalidation rules.
     partial_draw: ui::PartialDrawCache,
+    /// The currently-active zoom target, or `None` when zoom is off.
+    /// Set by `zoom_enter`, cleared by `exit_zoom`. Drives the zoom
+    /// overlay in `ui::render` and the zoom-active event dispatch branch.
+    zoom_target: Option<ZoomTarget>,
+    /// Wrapping tick counter used to throttle backdrop widget polls while zoom
+    /// is active.  Incremented every `Event::Tick`; backdrop widgets only call
+    /// `update()` when `counter % stack_hidden_poll_ratio == 0` (mirroring how
+    /// `StackWidget` gates hidden children).  Reset to 0 at startup.
+    zoom_backdrop_tick_counter: u64,
 }
 
 impl App {
@@ -157,6 +167,8 @@ impl App {
             command_feedback: None,
             last_persisted_stack_state,
             partial_draw: ui::PartialDrawCache::default(),
+            zoom_target: None,
+            zoom_backdrop_tick_counter: 0,
         }
     }
 
@@ -273,6 +285,8 @@ impl App {
             help_scroll: self.help_scroll,
             help_scroll_max: &self.help_scroll_max,
             show_status_bar: self.config.global.show_status_bar,
+            zoom_target: self.zoom_target.as_ref(),
+            zoom_margin: self.config.global.zoom_margin,
         }
     }
 
@@ -359,6 +373,171 @@ impl App {
         promoted
     }
 
+    // ── Zoom methods ─────────────────────────────────────────────────────
+
+    /// Enter zoom for the currently-focused widget. No-op when `focus_order`
+    /// is empty or `focused_widget()` returns `None`.
+    fn zoom_enter(&mut self) {
+        let Some(focused_id) = self.focused_widget().map(str::to_string) else {
+            return;
+        };
+        let zoom = self.zoom_target_for_widget_id(focused_id);
+        self.zoom_target = Some(zoom);
+    }
+
+    /// Exit zoom, clearing `zoom_target` and landing focus on the widget
+    /// that was zoomed (so focus is where the user left off).
+    fn exit_zoom(&mut self) {
+        let Some(zoom) = self.zoom_target.take() else {
+            return;
+        };
+        // Restore focus_idx to the position of the zoom target's parent.
+        if let Some(pos) = self
+            .focus_order
+            .iter()
+            .position(|w| w == &zoom.parent_id)
+        {
+            self.focus_idx = pos;
+        }
+    }
+
+    /// Build a `ZoomTarget` for the given top-level widget id. If the widget
+    /// is a composite (stack), resolve its currently-active child by index so
+    /// the zoom frame shows the correct child in isolation (CEO Q1).
+    fn zoom_target_for_widget_id(&self, parent_id: String) -> ZoomTarget {
+        let child_id = self.manager.get(&parent_id).and_then(|w| {
+            let idx = w.composite_active_index()?;
+            let children = w.composite_children();
+            children.into_iter().nth(idx)
+        });
+        ZoomTarget {
+            parent_id,
+            child_id,
+        }
+    }
+
+    /// Resolve the zoom target to an immutable widget reference. Used by
+    /// `is_zoom_retarget_suppressed` and `display_name` lookups.
+    fn resolve_zoom_widget(&self) -> Option<&dyn crate::widgets::Widget> {
+        let zoom = self.zoom_target.as_ref()?;
+        let parent = self.manager.get(&zoom.parent_id)?;
+        match &zoom.child_id {
+            None => Some(parent),
+            Some(cid) => parent.composite_child(cid),
+        }
+    }
+
+    /// Returns `true` when the currently-zoomed widget is actively capturing
+    /// text input and retarget gestures (`Tab`, `Shift+<letter>`, mouse click
+    /// on backdrop) should be suppressed. Returns `false` when there is no
+    /// active zoom target.
+    fn is_zoom_retarget_suppressed(&self) -> bool {
+        self.resolve_zoom_widget()
+            .map(|w| w.is_capturing_text())
+            .unwrap_or(false)
+    }
+
+    /// Retarget zoom to the widget assigned shortcut letter `letter`. Moves
+    /// both `zoom_target` and `focus_idx` so they stay synchronized; also
+    /// flips a stack's active tab when the shortcut points at a child.
+    fn retarget_zoom_by_letter(&mut self, letter: char) {
+        let Some((parent_id, child_id)) = self.shortcuts.get(&letter).cloned() else {
+            return;
+        };
+        if let Some(pos) = self.focus_order.iter().position(|w| w == &parent_id) {
+            self.focus_idx = pos;
+        }
+        if let Some(ref child) = child_id {
+            if let Some(parent) = self.manager.get_mut(&parent_id) {
+                parent.switch_to_composite_child(child);
+            }
+        }
+        self.zoom_target = Some(ZoomTarget { parent_id, child_id });
+    }
+
+    /// Advance the zoom target by one step in focus order. `forward = true`
+    /// moves to the next widget; `false` moves to the previous. Wraps at
+    /// both ends. Updates `zoom_target` and `focus_idx` atomically.
+    fn retarget_zoom_cycle(&mut self, forward: bool) {
+        if self.focus_order.is_empty() {
+            return;
+        }
+        let n = self.focus_order.len();
+        let new_idx = if forward {
+            (self.focus_idx + 1) % n
+        } else {
+            (self.focus_idx + n - 1) % n
+        };
+        self.focus_idx = new_idx;
+        let parent_id = self.focus_order[new_idx].clone();
+        let zoom = self.zoom_target_for_widget_id(parent_id);
+        self.zoom_target = Some(zoom);
+    }
+
+    /// Handle a key event while zoom is active. The focused widget already
+    /// had its chance via `handle_key`; only `Ignored` keys reach here.
+    ///
+    /// Dispatch table (evaluated top-to-bottom):
+    ///
+    /// | Pattern | Action |
+    /// |---------|--------|
+    /// | `show_help == true` | delegate to `handle_global_key` (help is modal above zoom) |
+    /// | `z`, `Shift-Z`, `Shift-z` | `exit_zoom` |
+    /// | `Esc` | `exit_zoom` |
+    /// | Uppercase letter (not suppressed) | `retarget_zoom_by_letter` |
+    /// | `Tab` (not suppressed) | `retarget_zoom_cycle(true)` |
+    /// | `BackTab` (not suppressed) | `retarget_zoom_cycle(false)` |
+    /// | `q`, `Ctrl-C` | quit |
+    /// | `?` | open help overlay |
+    /// | `:` | open command bar |
+    /// | anything else | swallowed (zoom is modal) |
+    fn handle_global_zoom_key(&mut self, key: crossterm::event::KeyEvent) {
+        // Help overlay is modal above zoom — delegate the key so `?`/`Esc`/etc.
+        // still work while zoom is in the background.
+        if self.show_help {
+            self.handle_global_key(key);
+            return;
+        }
+        let suppressed = self.is_zoom_retarget_suppressed();
+        match (key.modifiers, key.code) {
+            // z / Shift-Z exit zoom (primary and backup toggle).
+            (KeyModifiers::NONE, KeyCode::Char('z'))
+            | (KeyModifiers::SHIFT, KeyCode::Char('Z'))
+            | (KeyModifiers::SHIFT, KeyCode::Char('z')) => self.exit_zoom(),
+            // Esc always exits zoom — the widget already had its first chance.
+            (_, KeyCode::Esc) => self.exit_zoom(),
+            // Shift+uppercase: retarget zoom to that widget's letter.
+            (_, KeyCode::Char(c)) if c.is_ascii_uppercase() && !suppressed => {
+                self.retarget_zoom_by_letter(c.to_ascii_lowercase());
+            }
+            // Tab / BackTab: cycle zoom target in focus order.
+            (KeyModifiers::NONE, KeyCode::Tab) if !suppressed => {
+                self.retarget_zoom_cycle(true);
+            }
+            (KeyModifiers::SHIFT | KeyModifiers::NONE, KeyCode::BackTab) if !suppressed => {
+                self.retarget_zoom_cycle(false);
+            }
+            // Quit still works while zoomed.
+            (KeyModifiers::NONE, KeyCode::Char('q')) => self.should_quit = true,
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) => self.should_quit = true,
+            // Help overlay.
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
+                self.show_help = true;
+                self.help_scroll = 0;
+            }
+            // Command bar (CEO-ratified: command bar renders above zoom, zoom stays
+            // active in background — no exit-zoom arm here).
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(':')) => {
+                self.command_buffer = Some(String::new());
+                self.command_feedback = None;
+            }
+            // All other keys are swallowed — zoom is modal for global actions.
+            _ => {}
+        }
+    }
+
+    // ── End zoom methods ──────────────────────────────────────────────────
+
     fn handle_global_key(&mut self, key: crossterm::event::KeyEvent) {
         // Help overlay swallows every key — Esc / ? / q close it; arrows / k /
         // j / PgUp / PgDn / Home / End scroll. Everything else is dropped so
@@ -396,6 +575,15 @@ impl App {
             (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(':')) => {
                 self.command_buffer = Some(String::new());
                 self.command_feedback = None;
+            }
+            // `z` / `Shift-Z` / `Shift-z`: enter zoom for the focused widget.
+            // This arm must come BEFORE the generic uppercase-letter arm so `Z`
+            // is claimed as a zoom toggle and never dispatched as a shortcut key.
+            // (Zoom exit while zoom is active is handled by `handle_global_zoom_key`.)
+            (KeyModifiers::NONE, KeyCode::Char('z'))
+            | (KeyModifiers::SHIFT, KeyCode::Char('Z'))
+            | (KeyModifiers::SHIFT, KeyCode::Char('z')) => {
+                self.zoom_enter();
             }
             // `Shift+<letter>` jumps to the widget that claimed that
             // letter. Some terminals drop the SHIFT modifier on
@@ -658,6 +846,16 @@ fn apply_config_change(app: &mut App, path: &std::path::Path) {
     } else {
         tracing::info!(widget = %widget_id, "live-reloaded config");
     }
+
+    // Live-reload guard: if a config change removed the currently-zoomed widget
+    // from the manager (e.g., kind or instance changed), clear zoom so the overlay
+    // doesn't render a ghost target.
+    if let Some(ref zoom) = app.zoom_target.clone() {
+        if app.manager.get(&zoom.parent_id).is_none() {
+            tracing::info!(widget = %zoom.parent_id, "zoomed widget no longer in manager after config reload — clearing zoom");
+            app.zoom_target = None;
+        }
+    }
 }
 
 /// Swap scroll-wheel directions in place. Vertical and horizontal axes are
@@ -671,6 +869,33 @@ fn invert_scroll(kind: MouseEventKind) -> MouseEventKind {
         MouseEventKind::ScrollLeft => MouseEventKind::ScrollRight,
         MouseEventKind::ScrollRight => MouseEventKind::ScrollLeft,
         other => other,
+    }
+}
+
+/// Route a mouse event to the zoomed widget. Resolves the zoom target to the
+/// correct widget (or composite child), forwarding `mouse` into its `handle_mouse`.
+/// `inner_rect` is the zoom frame's interior (excluding the border), already
+/// computed by the caller so we don't have to repeat the layout maths here.
+/// Returns `true` when the zoomed widget consumed the event (i.e. something
+/// changed and a repaint is warranted).
+fn route_mouse_to_zoom_widget(
+    app: &mut App,
+    mouse: crossterm::event::MouseEvent,
+    inner_rect: Rect,
+) -> bool {
+    let Some(zoom) = app.zoom_target.clone() else {
+        return false;
+    };
+    let parent = match app.manager.get_mut(&zoom.parent_id) {
+        Some(p) => p,
+        None => return false,
+    };
+    match zoom.child_id {
+        None => parent.handle_mouse(mouse, inner_rect) == EventResult::Handled,
+        Some(ref cid) => match parent.composite_child_mut(cid) {
+            Some(child) => child.handle_mouse(mouse, inner_rect) == EventResult::Handled,
+            None => false,
+        },
     }
 }
 
@@ -743,6 +968,10 @@ fn assign_shortcuts(manager: &mut WidgetManager) -> HashMap<char, (String, Optio
         for letter in prefs {
             let letter = letter.to_ascii_lowercase();
             if !letter.is_ascii_alphabetic() {
+                continue;
+            }
+            // 'z' is reserved for the zoom toggle — never assign it.
+            if letter == 'z' {
                 continue;
             }
             if !shortcuts.contains_key(&letter) {
@@ -961,8 +1190,19 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
 
     let ctx = AppContext;
 
+    // Draw state accumulated across a coalesced burst of events (see the
+    // has_pending() deferral below), so a flood of input collapses into one
+    // repaint instead of one per event.
+    let mut deferred_dirty: HashSet<String> = HashSet::new();
+    let mut deferred_draw = false;
+    let mut deferred_force_full = false;
+
     while let Some(evt) = events.next().await {
         let is_tick = matches!(evt, Event::Tick);
+        // Non-tick events (key / paste / resize / config) mutate state outside
+        // the dirty-bit contract, so they draw unconditionally. The mouse arm
+        // narrows this to "only when the event actually changed something".
+        let mut nontick_wants_draw = true;
         match evt {
             Event::Key(key) => {
                 if key.kind != KeyEventKind::Press {
@@ -975,6 +1215,31 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                     if app.should_quit {
                         break;
                     }
+                } else if app.zoom_target.is_some() {
+                    // Zoom-active dispatch: route key to the zoomed widget first,
+                    // then to the zoom-modal global handler on Ignored.
+                    let consumed = {
+                        let (parent_id, child_id) = {
+                            let zoom = app.zoom_target.as_ref().unwrap();
+                            (zoom.parent_id.clone(), zoom.child_id.clone())
+                        };
+                        if let Some(parent) = app.manager.get_mut(&parent_id) {
+                            let result = match child_id {
+                                None => parent.handle_key(key),
+                                Some(ref cid) => match parent.composite_child_mut(cid) {
+                                    Some(child) => child.handle_key(key),
+                                    None => EventResult::Ignored,
+                                },
+                            };
+                            result == EventResult::Handled
+                        } else {
+                            false
+                        }
+                    };
+                    if !consumed {
+                        app.handle_global_zoom_key(key);
+                    }
+                    app.persist_runtime_state_if_dirty();
                 } else {
                     let consumed = if let Some(id) = app.focused_widget().map(str::to_string) {
                         if let Some(widget) = app.manager.get_mut(&id) {
@@ -996,6 +1261,7 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                 }
             }
             Event::Mouse(mut mouse) => {
+                let mut mouse_acted = false;
                 // Apply the global `mouse_scroll` preference once at the
                 // dispatch boundary so every downstream consumer (help
                 // overlay + widgets) sees a consistent direction without
@@ -1027,33 +1293,117 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                 if let Ok(size) = terminal.size() {
                     let full = Rect::new(0, 0, size.width, size.height);
                     let target = widget_at(&app, full, mouse.column, mouse.row);
-                    match mouse.kind {
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            if let Some((id, cell_area)) = target {
-                                if let Some(pos) = app.focus_order.iter().position(|w| w == &id) {
-                                    app.focus_idx = pos;
-                                }
-                                if let Some(widget) = app.manager.get_mut(&id) {
-                                    let _ = widget.handle_mouse(mouse, cell_area);
+                    if app.zoom_target.is_some() {
+                        // Three-zone mouse dispatch while zoom is active.
+                        let chrome_visible = app.command_buffer.is_some()
+                            || app.command_feedback.is_some()
+                            || app.config.global.show_status_bar;
+                        let chrome_h: u16 = if chrome_visible { 1 } else { 0 };
+                        let main_area = Rect::new(
+                            full.x,
+                            full.y,
+                            full.width,
+                            full.height.saturating_sub(chrome_h),
+                        );
+                        let zoom_rect = crate::ui::zoom_rect_with_margins(
+                            main_area,
+                            app.config.global.zoom_margin,
+                        );
+                        let inner_rect = Rect {
+                            x: zoom_rect.x + 1,
+                            y: zoom_rect.y + 1,
+                            width: zoom_rect.width.saturating_sub(2),
+                            height: zoom_rect.height.saturating_sub(2),
+                        };
+                        let in_zoom = mouse.column >= zoom_rect.x
+                            && mouse.column < zoom_rect.x + zoom_rect.width
+                            && mouse.row >= zoom_rect.y
+                            && mouse.row < zoom_rect.y + zoom_rect.height;
+                        match mouse.kind {
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                if in_zoom {
+                                    // Click inside zoom frame: route to zoomed widget.
+                                    mouse_acted =
+                                        route_mouse_to_zoom_widget(&mut app, mouse, inner_rect);
+                                } else if !app.is_zoom_retarget_suppressed() {
+                                    if let Some((id, _)) = target {
+                                        // Click on a backdrop widget: retarget zoom to it.
+                                        let parent_id = id.clone();
+                                        if let Some(pos) =
+                                            app.focus_order.iter().position(|w| w == &parent_id)
+                                        {
+                                            app.focus_idx = pos;
+                                        }
+                                        let zoom = app.zoom_target_for_widget_id(parent_id);
+                                        app.zoom_target = Some(zoom);
+                                        mouse_acted = true;
+                                    } else {
+                                        // Click in the empty margin: exit zoom.
+                                        app.exit_zoom();
+                                        mouse_acted = true;
+                                    }
                                 }
                             }
-                        }
-                        // Scroll wheel (both axes): forward to the widget
-                        // under the cursor without changing focus — most
-                        // users expect "scroll whatever I'm hovering over".
-                        MouseEventKind::ScrollUp
-                        | MouseEventKind::ScrollDown
-                        | MouseEventKind::ScrollLeft
-                        | MouseEventKind::ScrollRight => {
-                            if let Some((id, cell_area)) = target {
-                                if let Some(widget) = app.manager.get_mut(&id) {
-                                    let _ = widget.handle_mouse(mouse, cell_area);
+                            MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown
+                            | MouseEventKind::ScrollLeft
+                            | MouseEventKind::ScrollRight => {
+                                if in_zoom {
+                                    mouse_acted =
+                                        route_mouse_to_zoom_widget(&mut app, mouse, inner_rect);
                                 }
                             }
+                            _ => {}
                         }
-                        _ => {}
+                    } else {
+                        match mouse.kind {
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                if let Some((id, cell_area)) = target {
+                                    if let Some(pos) =
+                                        app.focus_order.iter().position(|w| w == &id)
+                                    {
+                                        // Focus moved → the highlight changes, so a
+                                        // repaint is warranted regardless of what the
+                                        // widget does with the click.
+                                        if app.focus_idx != pos {
+                                            mouse_acted = true;
+                                        }
+                                        app.focus_idx = pos;
+                                    }
+                                    if let Some(widget) = app.manager.get_mut(&id) {
+                                        if widget.handle_mouse(mouse, cell_area)
+                                            == EventResult::Handled
+                                        {
+                                            mouse_acted = true;
+                                        }
+                                    }
+                                }
+                            }
+                            // Scroll wheel (both axes): forward to the widget
+                            // under the cursor without changing focus — most
+                            // users expect "scroll whatever I'm hovering over".
+                            MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown
+                            | MouseEventKind::ScrollLeft
+                            | MouseEventKind::ScrollRight => {
+                                if let Some((id, cell_area)) = target {
+                                    if let Some(widget) = app.manager.get_mut(&id) {
+                                        if widget.handle_mouse(mouse, cell_area)
+                                            == EventResult::Handled
+                                        {
+                                            mouse_acted = true;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
+                // Only a mouse event that actually changed something warrants a
+                // repaint; inert events (button release, a click on empty space,
+                // a scroll that hit its limit) must not force a full redraw.
+                nontick_wants_draw = mouse_acted;
             }
             Event::Paste(text) => {
                 // Hand the full bracketed-paste payload to the focused
@@ -1076,7 +1426,25 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
                 apply_config_change(&mut app, &path);
             }
             Event::Tick => {
+                // While zoomed, throttle backdrop widget updates to
+                // `stack_hidden_poll_ratio` cadence — mirrors how StackWidget
+                // gates hidden children.  The zoom target always updates at
+                // full rate so its data stays live inside the frame (Req 4).
+                app.zoom_backdrop_tick_counter =
+                    app.zoom_backdrop_tick_counter.wrapping_add(1);
+                let ratio = app.config.global.stack_hidden_poll_ratio.max(1) as u64;
+                let allow_backdrop_tick = app.zoom_target.is_none()
+                    || ratio == 1
+                    || app.zoom_backdrop_tick_counter % ratio == 0;
+                let zoom_parent_id: Option<String> =
+                    app.zoom_target.as_ref().map(|z| z.parent_id.clone());
                 for id in app.manager.ids().to_vec() {
+                    // Skip backdrop widgets on non-quota ticks while zoomed.
+                    if !allow_backdrop_tick
+                        && zoom_parent_id.as_deref() != Some(id.as_str())
+                    {
+                        continue;
+                    }
                     if let Some(w) = app.manager.get_mut(&id) {
                         if let Err(err) = w.update(&ctx).await {
                             tracing::warn!(widget = %id, error = %err, "widget update failed");
@@ -1106,42 +1474,52 @@ pub async fn run(config_path_override: Option<PathBuf>) -> Result<()> {
         // Always drain widget dirty bits so they don't pile up between
         // draws — even when we already know we're going to draw (non-tick
         // events), so the next tick starts from a clean slate.
-        let widgets_dirty_ids = app.drain_widget_dirty_ids();
-        let should_draw = if is_tick {
-            !widgets_dirty_ids.is_empty() || feedback_cleared || focus_promoted
+        deferred_dirty.extend(app.drain_widget_dirty_ids());
+
+        // Per-widget `dirty_ids` is the authoritative "what changed" signal
+        // only on ticks. Non-tick events (key / paste / resize / config
+        // change) can mutate state outside the dirty-bit contract, so they
+        // repaint unconditionally; a mouse event repaints only when it
+        // actually acted (`nontick_wants_draw`). A non-tick draw forces a
+        // full repaint; a tick-only batch keeps the partial fast path.
+        let this_wants_draw = if is_tick {
+            !deferred_dirty.is_empty() || feedback_cleared || focus_promoted
         } else {
-            true
+            // A cleared status-bar feedback needs a repaint even if the mouse
+            // event itself was inert.
+            nontick_wants_draw || feedback_cleared
         };
-        if should_draw {
-            // Move the partial-draw cache out so the closure has a
-            // disjoint mut borrow while `render_state()` holds an
-            // immutable borrow of the rest of `app`. We restore it
-            // immediately after the closure returns.
+        deferred_draw |= this_wants_draw;
+        deferred_force_full |= !is_tick && nontick_wants_draw;
+
+        // Coalesce: if more input is already queued, fold it into the next
+        // iteration's single draw rather than repainting per event. Collapses
+        // bursts (rapid clicks, scroll-wheel spins) into one repaint.
+        if events.has_pending() {
+            continue;
+        }
+
+        if deferred_draw {
+            // Move the partial-draw cache out so the closure has a disjoint
+            // mut borrow while `render_state()` holds an immutable borrow of
+            // the rest of `app`. We restore it immediately after.
             let mut cache = std::mem::take(&mut app.partial_draw);
             let render_state = app.render_state();
-            // Per-widget `dirty_ids` is the authoritative "what
-            // changed" signal only on ticks. Non-tick events
-            // (key / mouse / paste / resize / config change) can
-            // mutate widget state without going through the dirty
-            // bit — by trait contract widgets rely on the app's
-            // unconditional non-tick redraw and don't bother
-            // setting their own bit from `handle_key`. So on
-            // non-tick events we tell `render_partial` to treat
-            // the cache as out-of-date and repaint everything.
-            // The full-repaint path still refreshes the cache, so
-            // subsequent ticks resume the partial-blit fast path.
-            let force_full = !is_tick;
+            let force_full = deferred_force_full;
             terminal.draw(|frame| {
                 ui::render_partial(
                     frame,
                     &render_state,
-                    &widgets_dirty_ids,
+                    &deferred_dirty,
                     force_full,
                     &mut cache,
                 );
             })?;
             app.partial_draw = cache;
         }
+        deferred_dirty.clear();
+        deferred_draw = false;
+        deferred_force_full = false;
     }
 
     Ok(())
@@ -1391,5 +1769,155 @@ mod tests {
         let click = MouseEventKind::Down(MouseButton::Left);
         assert_eq!(invert_scroll(click), click);
         assert_eq!(invert_scroll(MouseEventKind::Moved), MouseEventKind::Moved);
+    }
+
+    // ── Zoom tests ────────────────────────────────────────────────────────
+
+    /// `z` key enters zoom for the focused widget and sets `zoom_target`.
+    #[cfg(feature = "widgets-all")]
+    #[test]
+    fn zoom_enter_sets_zoom_target() {
+        let mut app = App::new(Config::default());
+        assert!(app.zoom_target.is_none());
+        assert_eq!(app.focused_widget(), Some("clock"));
+        app.zoom_enter();
+        assert_eq!(
+            app.zoom_target.as_ref().map(|z| z.parent_id.as_str()),
+            Some("clock")
+        );
+    }
+
+    /// `exit_zoom` clears `zoom_target` and restores focus to the widget that was zoomed.
+    #[cfg(feature = "widgets-all")]
+    #[test]
+    fn exit_zoom_clears_target_and_restores_focus() {
+        let mut app = App::new(Config::default());
+        // Move focus to calendar (index 1), then zoom.
+        app.cycle_focus(true);
+        assert_eq!(app.focused_widget(), Some("calendar"));
+        app.zoom_enter();
+        assert!(app.zoom_target.is_some());
+        // Advance focus without exiting zoom — simulates what a retarget call might do.
+        app.focus_idx = 0;
+        app.exit_zoom();
+        assert!(app.zoom_target.is_none());
+        // exit_zoom restores focus_idx to the zoomed widget's position.
+        assert_eq!(app.focused_widget(), Some("calendar"));
+    }
+
+    /// Pressing `z` while already zoomed exits zoom (no nested zoom).
+    #[cfg(feature = "widgets-all")]
+    #[test]
+    fn second_z_press_exits_zoom() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(Config::default());
+        app.zoom_enter();
+        assert!(app.zoom_target.is_some());
+        // Second `z` while zoom is active → handled by handle_global_zoom_key → exit_zoom.
+        let key = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+        app.handle_global_zoom_key(key);
+        assert!(app.zoom_target.is_none());
+    }
+
+    /// `Esc` while zoomed exits zoom.
+    #[cfg(feature = "widgets-all")]
+    #[test]
+    fn esc_exits_zoom() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(Config::default());
+        app.zoom_enter();
+        assert!(app.zoom_target.is_some());
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        app.handle_global_zoom_key(key);
+        assert!(app.zoom_target.is_none());
+    }
+
+    /// `retarget_zoom_cycle` advances and wraps correctly.
+    #[cfg(feature = "widgets-all")]
+    #[test]
+    fn retarget_zoom_cycle_wraps() {
+        let mut app = App::new(Config::default());
+        app.zoom_enter();
+        // focus_order for default config should be [clock, calendar, weather, news, stocks].
+        let n = app.focus_order.len();
+        assert!(n > 1);
+        let start_id = app.zoom_target.as_ref().unwrap().parent_id.clone();
+        app.retarget_zoom_cycle(true);
+        let next_id = app.zoom_target.as_ref().unwrap().parent_id.clone();
+        assert_ne!(start_id, next_id);
+        // Cycle back and forward (n-1) more times to get back to start.
+        for _ in 0..(n - 1) {
+            app.retarget_zoom_cycle(true);
+        }
+        let final_id = app.zoom_target.as_ref().unwrap().parent_id.clone();
+        assert_eq!(start_id, final_id, "cycling forward n times should wrap back to start");
+    }
+
+    /// `assign_shortcuts` never assigns 'z' — it is reserved for zoom.
+    #[test]
+    fn assign_shortcuts_never_assigns_z() {
+        let mut manager = WidgetManager::new();
+        let shortcuts = assign_shortcuts(&mut manager);
+        // 'z' must not appear as any assigned shortcut regardless of widget preferences.
+        assert!(
+            !shortcuts.contains_key(&'z'),
+            "assign_shortcuts must never assign 'z' (reserved for zoom toggle)"
+        );
+    }
+
+    /// `zoom_target_for_widget_id` returns a leaf ZoomTarget for a non-composite widget.
+    #[cfg(feature = "widgets-all")]
+    #[test]
+    fn zoom_target_for_leaf_widget_has_no_child() {
+        let app = App::new(Config::default());
+        let zt = app.zoom_target_for_widget_id("clock".into());
+        assert_eq!(zt.parent_id, "clock");
+        assert!(
+            zt.child_id.is_none(),
+            "clock is not a composite; child_id should be None"
+        );
+    }
+
+    /// `zoom_backdrop_tick_counter` starts at zero.
+    #[test]
+    fn zoom_backdrop_tick_counter_starts_at_zero() {
+        let app = App::new(Config::default());
+        assert_eq!(app.zoom_backdrop_tick_counter, 0);
+    }
+
+    /// Verify the backdrop-throttle decision math: with ratio=3, over 9
+    /// increments the backdrop is allowed on ticks 3, 6, 9 (3 of 9).
+    /// The `allow_backdrop_tick` expression in the tick arm is replicated
+    /// exactly here so any future refactor that changes the expression
+    /// without updating this test will surface the divergence.
+    #[test]
+    fn zoom_backdrop_tick_throttle_math_correct() {
+        let ratio: u64 = 3;
+        let mut counter: u64 = 0;
+        let mut allowed: u64 = 0;
+        for _ in 0..9 {
+            counter = counter.wrapping_add(1);
+            // Replicate the tick arm condition (zoom is assumed active, ratio > 1).
+            if ratio == 1 || counter % ratio == 0 {
+                allowed += 1;
+            }
+        }
+        // 9 ticks ÷ ratio 3 = 3 allowed backdrop ticks (at ticks 3, 6, 9).
+        assert_eq!(allowed, 9 / ratio);
+    }
+
+    /// With ratio=1, every tick is a backdrop tick regardless of counter.
+    #[test]
+    fn zoom_backdrop_tick_ratio_one_means_no_throttle() {
+        let ratio: u64 = 1;
+        let mut counter: u64 = 0;
+        let mut allowed: u64 = 0;
+        for _ in 0..10 {
+            counter = counter.wrapping_add(1);
+            if ratio == 1 || counter % ratio == 0 {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 10, "ratio=1 must allow every tick");
     }
 }

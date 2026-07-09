@@ -28,6 +28,7 @@ mod theme;
 mod ui;
 mod widgets;
 mod wizard;
+mod zoom;
 
 /// glint — terminal dashboard for stocks, calendar, news, and beyond.
 #[derive(Parser, Debug)]

@@ -3,10 +3,13 @@
 
 pub mod big_digits;
 pub mod chart;
+pub mod grid;
 pub mod help;
 pub mod modal;
 pub mod status;
 pub mod status_bar;
+
+pub use grid::CardGrid;
 
 use std::{cell::Cell, collections::HashMap, collections::HashSet, sync::Arc};
 
@@ -15,13 +18,14 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{block::Title, Block, BorderType, Borders, Paragraph},
+    widgets::{block::Title, Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
-use crate::config::LayoutConfig;
+use crate::config::{LayoutConfig, ZoomMargin};
 use crate::theme::Theme;
 use crate::widgets::WidgetManager;
+use crate::zoom::ZoomTarget;
 
 /// Severity tag attached to a command-bar feedback message. Determines
 /// which theme role colors the message line.
@@ -69,6 +73,13 @@ pub struct RenderState<'a> {
     /// row goes back to the widget grid. Mirrors `[global]
     /// show_status_bar` in config.toml.
     pub show_status_bar: bool,
+    /// The currently-active zoom target, or `None` when zoom is off.
+    /// `render_zoom_overlay` reads this to decide whether to paint
+    /// the dim + frame pass over the grid.
+    pub zoom_target: Option<&'a ZoomTarget>,
+    /// Per-side margin used to size the zoom overlay, in percent of screen
+    /// width/height per side. Sourced from `[global] zoom_margin` in config.
+    pub zoom_margin: ZoomMargin,
 }
 
 /// Minimum char gap between the title and the right-aligned metadata on
@@ -110,24 +121,6 @@ fn metadata_style_for_emphasis(theme: &Theme, focused: bool, emphasis: MetadataE
         MetadataEmphasis::Default => base,
         MetadataEmphasis::Emphasized => base.add_modifier(Modifier::ITALIC),
     }
-}
-
-/// Tail-truncate `s` to at most `max_chars` user-perceived chars, suffixing
-/// `…` when truncation occurs. `max_chars < 1` collapses to an empty string
-/// (no room for even the ellipsis). Used by the title-row builder when
-/// metadata would otherwise overflow the inner border width.
-fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    let char_count = s.chars().count();
-    if char_count <= max_chars {
-        return s.to_string();
-    }
-    let keep = max_chars - 1; // reserve a cell for `…`
-    let mut out: String = s.chars().take(keep).collect();
-    out.push('…');
-    out
 }
 
 /// Build the title row for a widget's border. The title is the
@@ -188,16 +181,12 @@ pub fn title_row(
         if content_budget == 0 {
             return None;
         }
-        let content = if meta.chars().count() <= content_budget {
-            meta.to_string()
-        } else {
-            // Need at least 1 content char + the ellipsis (2 chars) to
-            // be worth showing — anything less is just `…` in a void.
-            if content_budget < 2 {
-                return None;
-            }
-            truncate_with_ellipsis(meta, content_budget)
-        };
+        // Need at least 1 content char + the ellipsis (2 cells) to be worth
+        // showing when truncation is required — anything less is just `…`.
+        if meta.chars().count() > content_budget && content_budget < 2 {
+            return None;
+        }
+        let content = crate::text::truncate(meta, content_budget);
         Some(build_metadata_line(&content, metadata_style))
     });
 
@@ -585,23 +574,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_with_ellipsis_keeps_shorter_strings_intact() {
-        assert_eq!(truncate_with_ellipsis("Tokyo", 10), "Tokyo");
-        assert_eq!(truncate_with_ellipsis("Tokyo", 5), "Tokyo");
-    }
-
-    #[test]
-    fn truncate_with_ellipsis_tail_truncates_longer_strings() {
-        // Reserves a cell for the ellipsis: 4 chars budget = 3 content + …
-        assert_eq!(truncate_with_ellipsis("Tokyo, Japan", 4), "Tok…");
-    }
-
-    #[test]
-    fn truncate_with_ellipsis_collapses_to_empty_at_zero_budget() {
-        assert_eq!(truncate_with_ellipsis("Anything", 0), "");
-    }
-
-    #[test]
     fn title_row_never_emits_focus_arrows() {
         let theme = Theme::builtin_defaults();
         let (title, _) = title_row(
@@ -694,6 +666,705 @@ mod tests {
         let got = snapshot_chars(&dst, area);
         assert!(got.chars().all(|c| c == '.' || c == '\n'));
     }
+
+    /// Verify that the `Clear` widget in step [5] of `render_zoom_overlay`
+    /// removes the `Modifier::DIM` flag from cells inside the zoom frame rect.
+    /// Cells outside the frame (but inside main_area) retain DIM from step [2].
+    #[test]
+    fn render_zoom_overlay_clears_zoom_rect_area() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::cell::Cell as StdCell;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let theme = std::sync::Arc::new(crate::theme::Theme::builtin_defaults());
+        let manager = crate::widgets::WidgetManager::new();
+        let layout = crate::config::layout::LayoutConfig::default();
+        let help_scroll_max = StdCell::new(0u16);
+
+        let zoom = crate::zoom::ZoomTarget {
+            parent_id: "missing_widget".into(),
+            child_id: None,
+        };
+        let state = RenderState {
+            layout: &layout,
+            manager: &manager,
+            focused: None,
+            show_help: false,
+            command_buffer: None,
+            command_feedback: None,
+            theme: &theme,
+            theme_name: "default",
+            help_scroll: 0,
+            help_scroll_max: &help_scroll_max,
+            show_status_bar: false,
+            zoom_target: Some(&zoom),
+            zoom_margin: ZoomMargin::default(),
+        };
+
+        terminal
+            .draw(|frame| {
+                render(frame, &state);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let area = buf.area;
+        // Compute the zoom rect the same way render_zoom_overlay does.
+        // main_area == full area (no status bar, no chrome).
+        let main_area = area;
+        let zoom_rect = zoom_rect_with_margins(main_area, ZoomMargin::default());
+
+        // Cells inside the zoom rect must NOT have DIM (the Clear in step [5]
+        // resets them to default style).
+        let inside_x = zoom_rect.x + zoom_rect.width / 2;
+        let inside_y = zoom_rect.y + zoom_rect.height / 2;
+        let inside_dim = buf[(inside_x, inside_y)].modifier.contains(Modifier::DIM);
+        assert!(
+            !inside_dim,
+            "cell ({inside_x},{inside_y}) inside zoom_rect should not have DIM after Clear"
+        );
+
+        // Cells outside the zoom rect (in main_area) should have DIM from step [2].
+        // Use a corner cell that is guaranteed to be outside the zoom rect.
+        let outside_x = main_area.x;
+        let outside_y = main_area.y;
+        if outside_x < zoom_rect.x || outside_y < zoom_rect.y {
+            let outside_dim = buf[(outside_x, outside_y)].modifier.contains(Modifier::DIM);
+            assert!(
+                outside_dim,
+                "cell ({outside_x},{outside_y}) outside zoom_rect should have DIM"
+            );
+        }
+    }
+
+    /// Verify that the placeholder text appears in the home cell area
+    /// when zoom is active and the widget id matches a layout cell.
+    /// Uses the default layout (which maps "clock" to the top-left cell)
+    /// and a real widget registered under "clock".
+    #[cfg(feature = "widget-clock")]
+    #[test]
+    fn render_zoom_placeholder_text_at_home_cell() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::cell::Cell as StdCell;
+        use std::sync::Arc;
+
+        let config = crate::config::Config::default();
+        let theme = Arc::new(crate::theme::Theme::builtin_defaults());
+        let cache = crate::cache::Cache::at(std::env::temp_dir().join("glint-ui-zoom-test"));
+        let mut manager = crate::widgets::WidgetManager::new();
+        // Register the clock widget so display_name() is available.
+        let widget = crate::widgets::registry::build_for("clock", "main", |instance| {
+            crate::widgets::WidgetCtx {
+                instance,
+                theme: theme.clone(),
+                llm: None,
+                cache: cache.scoped("clock", "main"),
+            }
+        });
+        if let Some(w) = widget {
+            manager.register_boxed(w);
+        }
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let help_scroll_max = StdCell::new(0u16);
+        let zoom = crate::zoom::ZoomTarget {
+            parent_id: "clock".into(),
+            child_id: None,
+        };
+        let state = RenderState {
+            layout: &config.layout,
+            manager: &manager,
+            focused: None,
+            show_help: false,
+            command_buffer: None,
+            command_feedback: None,
+            theme: &theme,
+            theme_name: "default",
+            help_scroll: 0,
+            help_scroll_max: &help_scroll_max,
+            show_status_bar: false,
+            zoom_target: Some(&zoom),
+            zoom_margin: ZoomMargin::default(),
+        };
+
+        terminal
+            .draw(|frame| {
+                render(frame, &state);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let area = buf.area;
+        // Collect every character in the buffer and verify "zoomed" appears.
+        // The placeholder step [3] writes "{name} — zoomed · Esc to return" into
+        // the clock's home cell BEFORE step [5] clears the zoom_rect. The portion
+        // of the placeholder that falls in the top/left margin (outside the
+        // zoom_rect) survives the Clear. With a 120×40 terminal the top margin
+        // is 2 rows tall and the clock cell's row 0 is in that margin, so the
+        // placeholder text at row 0 is intact in the final buffer.
+        let full_snapshot = snapshot_chars(buf, area);
+        assert!(
+            full_snapshot.contains("zoomed"),
+            "placeholder 'zoomed' should appear somewhere in the buffer (margin strip \
+             of home cell survives the Clear); got:\n{full_snapshot}"
+        );
+    }
+
+    /// Verify the CEO Q1 requirement: when `zoom_target.child_id` is `Some`,
+    /// `render_zoom_overlay` renders the stack child in isolation — no
+    /// tab-strip chrome — by calling `composite_child(child_id).render()`
+    /// directly rather than `stack.render()`.
+    ///
+    /// Regression marker: if step [7] is accidentally changed to call
+    /// `parent.render(frame, inner_rect, true)`, the stack's `render` would
+    /// overlay the tab strip, painting ALL tab labels (including
+    /// "ZoomTabBeta", the inactive child's display name) at the top row of
+    /// `inner_rect`.  The assertion below catches that.
+    ///
+    /// This is the only automated regression net for the CEO Q1
+    /// child-isolated render path (§3 QA Layer 2).
+    #[test]
+    fn render_zoom_overlay_stack_child_has_no_tab_strip() {
+        use async_trait::async_trait;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::cell::Cell as StdCell;
+        use std::sync::Arc;
+
+        // Minimal widget stub: renders nothing, carries a controllable
+        // display_name so we can assert its absence from the tab strip.
+        struct TabChildStub {
+            id: String,
+            name: String,
+        }
+
+        #[async_trait]
+        impl crate::widgets::Widget for TabChildStub {
+            fn id(&self) -> &str {
+                &self.id
+            }
+            fn display_name(&self) -> &str {
+                &self.name
+            }
+            fn kind(&self) -> &str {
+                "stub"
+            }
+            async fn update(
+                &mut self,
+                _ctx: &crate::widgets::AppContext,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn render(&self, _frame: &mut Frame, _area: Rect, _focused: bool) {}
+            fn handle_key(
+                &mut self,
+                _key: crossterm::event::KeyEvent,
+            ) -> crate::widgets::EventResult {
+                crate::widgets::EventResult::Ignored
+            }
+            fn handle_command(
+                &mut self,
+                _cmd: &str,
+                _args: &[&str],
+            ) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            fn config(&self) -> serde_json::Value {
+                serde_json::Value::Null
+            }
+            fn apply_config(
+                &mut self,
+                _v: serde_json::Value,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let theme = Arc::new(crate::theme::Theme::builtin_defaults());
+
+        // Two children: active "alpha_tab" / "ZoomTabAlpha" and inactive
+        // "beta_tab" / "ZoomTabBeta".  The tab strip would paint both names;
+        // the child-isolated path renders neither.
+        let child_alpha = TabChildStub {
+            id: "alpha_tab".to_string(),
+            name: "ZoomTabAlpha".to_string(),
+        };
+        let child_beta = TabChildStub {
+            id: "beta_tab".to_string(),
+            name: "ZoomTabBeta".to_string(),
+        };
+
+        let stack = crate::widgets::stack::StackWidget::new(
+            "stack:alpha_tab+beta_tab".to_string(),
+            vec![Box::new(child_alpha), Box::new(child_beta)],
+            1,
+            theme.clone(),
+        );
+
+        let mut manager = WidgetManager::new();
+        manager.register_boxed(Box::new(stack));
+
+        let layout = LayoutConfig::default();
+        let help_scroll_max = StdCell::new(0u16);
+
+        // CEO Q1 path: child_id is Some — triggers the composite_child
+        // branch in render_zoom_overlay step [7].
+        let zoom = ZoomTarget {
+            parent_id: "stack:alpha_tab+beta_tab".to_string(),
+            child_id: Some("alpha_tab".to_string()),
+        };
+        let state = RenderState {
+            layout: &layout,
+            manager: &manager,
+            focused: None,
+            show_help: false,
+            command_buffer: None,
+            command_feedback: None,
+            theme: &theme,
+            theme_name: "default",
+            help_scroll: 0,
+            help_scroll_max: &help_scroll_max,
+            show_status_bar: false,
+            zoom_target: Some(&zoom),
+            zoom_margin: ZoomMargin::default(),
+        };
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, &state);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let main_area = buf.area;
+
+        // Replicate render_zoom_overlay geometry to locate inner_rect.
+        let zoom_rect = zoom_rect_with_margins(main_area, ZoomMargin::default());
+        let inner_rect = Block::default().borders(Borders::ALL).inner(zoom_rect);
+
+        let inner_snapshot = snapshot_chars(buf, inner_rect);
+
+        // The inactive child's display name must NOT appear inside the zoom
+        // frame.  A broken step [7] that calls stack.render() instead of
+        // composite_child().render() would paint "ZoomTabBeta" in the tab
+        // strip at inner_rect.y, and this assertion would fail.
+        assert!(
+            !inner_snapshot.contains("ZoomTabBeta"),
+            "tab-strip chrome ('ZoomTabBeta') must not appear inside the zoom \
+             frame when rendering a stack child in isolation (CEO Q1); \
+             inner_rect snapshot:\n{inner_snapshot}"
+        );
+
+        // Corroboration: the Clear in step [5] removed DIM from zoom_rect.
+        let center_x = zoom_rect.x + zoom_rect.width / 2;
+        let center_y = zoom_rect.y + zoom_rect.height / 2;
+        assert!(
+            !buf[(center_x, center_y)]
+                .modifier
+                .contains(Modifier::DIM),
+            "cells inside zoom_rect must not carry DIM after the Clear in step [5]"
+        );
+    }
+
+    /// `zoom_rect_with_margins` carves the correct margins off each side.
+    #[test]
+    fn zoom_rect_with_margins_known_area() {
+        use crate::config::ZoomMargin;
+        // 100×40 area, uniform 10% margin.
+        // left=right=10, top=bottom=4
+        let area = Rect::new(0, 0, 100, 40);
+        let m = ZoomMargin { top: 10, right: 10, bottom: 10, left: 10 };
+        let r = zoom_rect_with_margins(area, m);
+        assert_eq!(r.x, 10, "left margin");
+        assert_eq!(r.y, 4, "top margin");
+        assert_eq!(r.width, 80, "width = 100 - 10 - 10");
+        assert_eq!(r.height, 32, "height = 40 - 4 - 4");
+    }
+
+    /// `zoom_rect_with_margins` with asymmetric margins.
+    #[test]
+    fn zoom_rect_with_margins_asymmetric() {
+        use crate::config::ZoomMargin;
+        // 200×100 area: top=5%, right=10%, bottom=15%, left=20%
+        let area = Rect::new(0, 0, 200, 100);
+        let m = ZoomMargin { top: 5, right: 10, bottom: 15, left: 20 };
+        let r = zoom_rect_with_margins(area, m);
+        // left  = 200 * 20 / 100 = 40  →  x = 40
+        // right = 200 * 10 / 100 = 20  →  width = 200 - 40 - 20 = 140
+        // top   = 100 *  5 / 100 =  5  →  y = 5
+        // bot   = 100 * 15 / 100 = 15  →  height = 100 - 5 - 15 = 80
+        assert_eq!(r.x, 40);
+        assert_eq!(r.y, 5);
+        assert_eq!(r.width, 140);
+        assert_eq!(r.height, 80);
+    }
+
+    /// `zoom_rect_with_margins` never returns an empty rect.
+    #[test]
+    fn zoom_rect_with_margins_never_empty() {
+        use crate::config::ZoomMargin;
+        // Tiny terminal; even with large margins the rect must be at least 1×1.
+        let area = Rect::new(0, 0, 4, 3);
+        let m = ZoomMargin { top: 45, right: 45, bottom: 45, left: 45 };
+        let r = zoom_rect_with_margins(area, m);
+        assert!(r.width >= 1, "width must be at least 1");
+        assert!(r.height >= 1, "height must be at least 1");
+    }
+
+    /// Default margin (5% each side) is consistent across the production
+    /// render path and the mouse hit-testing path: both call
+    /// `zoom_rect_with_margins` with the same `ZoomMargin`, so the rects agree.
+    #[test]
+    fn zoom_rect_default_margin_consistent() {
+        use crate::config::ZoomMargin;
+        let area = Rect::new(0, 0, 120, 40);
+        let r1 = zoom_rect_with_margins(area, ZoomMargin::default());
+        let r2 = zoom_rect_with_margins(area, ZoomMargin::default());
+        assert_eq!(r1, r2);
+    }
+
+    /// Regression: while zoomed, a backdrop widget whose dirty bit is set must
+    /// NOT be re-rendered on the partial path — it stays blitted from the
+    /// cached composited buffer.  Simultaneously verifies that the zoom target
+    /// itself renders at inner_rect (not at its home cell rect).
+    ///
+    /// Layout: two side-by-side cells.  "bkdp" is the backdrop; "tgt" is the
+    /// zoom target.  Both widgets render a fixed character ('B' and 'T'
+    /// respectively).  The primed cache contains 'P' everywhere, simulating a
+    /// previous composited zoom frame.  With zoom active and both widgets
+    /// marked dirty:
+    ///
+    ///   - "bkdp" cells that lie outside the inner_rect must show 'P' (blit).
+    ///   - "tgt" home cells outside the inner_rect must also show 'P' (blit).
+    ///   - Cells inside inner_rect must show 'T' (fresh target render).
+    #[test]
+    fn render_partial_zoom_backdrop_frozen_target_at_inner_rect() {
+        use crate::config::{
+            layout::{GridCell, LayoutConfig},
+            ZoomMargin,
+        };
+        use async_trait::async_trait;
+        use ratatui::{backend::TestBackend, Terminal};
+        use std::cell::Cell as StdCell;
+        use std::sync::Arc;
+
+        // Stub that fills its area with a single character.
+        struct FillWidget {
+            id: String,
+            ch: char,
+        }
+
+        #[async_trait]
+        impl crate::widgets::Widget for FillWidget {
+            fn id(&self) -> &str {
+                &self.id
+            }
+            fn display_name(&self) -> &str {
+                &self.id
+            }
+            fn kind(&self) -> &str {
+                "stub"
+            }
+            async fn update(
+                &mut self,
+                _ctx: &crate::widgets::AppContext,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn render(&self, frame: &mut Frame, area: Rect, _focused: bool) {
+                let buf = frame.buffer_mut();
+                for row in area.y..area.y.saturating_add(area.height) {
+                    for col in area.x..area.x.saturating_add(area.width) {
+                        if col < buf.area.right() && row < buf.area.bottom() {
+                            buf[(col, row)].set_char(self.ch);
+                        }
+                    }
+                }
+            }
+            fn handle_key(
+                &mut self,
+                _key: crossterm::event::KeyEvent,
+            ) -> crate::widgets::EventResult {
+                crate::widgets::EventResult::Ignored
+            }
+            fn handle_command(
+                &mut self,
+                _cmd: &str,
+                _args: &[&str],
+            ) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            fn config(&self) -> serde_json::Value {
+                serde_json::Value::Null
+            }
+            fn apply_config(&mut self, _v: serde_json::Value) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        // Two columns 50/50: "bkdp" left, "tgt" right.
+        let layout = LayoutConfig {
+            columns: vec![50, 50],
+            rows: vec![100],
+            cells: vec![
+                GridCell {
+                    widget: Some("bkdp".into()),
+                    widgets: None,
+                    col: 0,
+                    row: 0,
+                    col_span: 1,
+                    row_span: 1,
+                },
+                GridCell {
+                    widget: Some("tgt".into()),
+                    widgets: None,
+                    col: 1,
+                    row: 0,
+                    col_span: 1,
+                    row_span: 1,
+                },
+            ],
+        };
+
+        let theme = Arc::new(crate::theme::Theme::builtin_defaults());
+        let mut manager = crate::widgets::WidgetManager::new();
+        manager.register_boxed(Box::new(FillWidget { id: "bkdp".into(), ch: 'B' }));
+        manager.register_boxed(Box::new(FillWidget { id: "tgt".into(), ch: 'T' }));
+
+        let zoom = ZoomTarget { parent_id: "tgt".into(), child_id: None };
+        let help_scroll_max = StdCell::new(0u16);
+        let state = RenderState {
+            layout: &layout,
+            manager: &manager,
+            focused: None,
+            show_help: false,
+            command_buffer: None,
+            command_feedback: None,
+            theme: &theme,
+            theme_name: "default",
+            help_scroll: 0,
+            help_scroll_max: &help_scroll_max,
+            show_status_bar: false,
+            zoom_target: Some(&zoom),
+            zoom_margin: ZoomMargin::default(),
+        };
+
+        // Build a cache primed with 'P' everywhere, area matching the terminal.
+        // last_zoom_target must equal state.zoom_target to avoid zoom_toggled=true
+        // (which would force a full repaint and bypass the partial path).
+        let area = Rect::new(0, 0, 80, 24);
+        let mut cached_buf = ratatui::buffer::Buffer::empty(area);
+        fill_buffer(&mut cached_buf, 'P');
+
+        // Compute the cell rects the layout would produce so rect_moved stays false.
+        let resolved = layout.resolve(area);
+        let last_cell_rects: HashMap<String, Rect> = resolved
+            .iter()
+            .filter_map(|r| r.cell.render_target_id().map(|id| (id, r.area)))
+            .collect();
+
+        let mut cache = PartialDrawCache {
+            last_drawn: Some(cached_buf),
+            last_cell_rects,
+            last_focused_id: None,
+            last_show_help: false,
+            last_zoom_target: Some(zoom.clone()),
+        };
+
+        // Mark both widgets dirty.
+        let mut dirty_ids = HashSet::new();
+        dirty_ids.insert("bkdp".into());
+        dirty_ids.insert("tgt".into());
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_partial(frame, &state, &dirty_ids, false, &mut cache);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let main_area = buf.area;
+        let zoom_rect = zoom_rect_with_margins(main_area, ZoomMargin::default());
+        let inner_rect = Block::default().borders(Borders::ALL).inner(zoom_rect);
+
+        // Cells strictly outside the zoom_rect (left and right margin strips)
+        // must be 'P' (blitted from cache).  The left margin is x=0..zoom_rect.x.
+        if zoom_rect.x > 0 {
+            let x = 0;
+            let y = zoom_rect.y + zoom_rect.height / 2;
+            assert_eq!(
+                buf[(x, y)].symbol(),
+                "P",
+                "left margin cell ({x},{y}) must be 'P' (blitted); backdrop must not re-render"
+            );
+        }
+
+        // Cells inside inner_rect must be 'T' (zoom target rendered fresh there).
+        let ix = inner_rect.x + inner_rect.width / 2;
+        let iy = inner_rect.y + inner_rect.height / 2;
+        assert_eq!(
+            buf[(ix, iy)].symbol(),
+            "T",
+            "inner_rect cell ({ix},{iy}) must be 'T' (fresh target render at inner_rect)"
+        );
+
+        // The "tgt" home cell is the right half of the terminal.  Pick a corner
+        // outside the zoom_rect (top-right) — must be 'P' (blitted, not re-rendered
+        // at the home cell rect).
+        let tgt_home_x = main_area.x + main_area.width - 1; // rightmost column
+        let tgt_home_y = main_area.y; // top row
+        if tgt_home_x >= zoom_rect.x + zoom_rect.width || tgt_home_y < zoom_rect.y {
+            assert_eq!(
+                buf[(tgt_home_x, tgt_home_y)].symbol(),
+                "P",
+                "tgt home cell corner ({tgt_home_x},{tgt_home_y}) must be 'P' \
+                 (blitted; target must not render at home cell rect)"
+            );
+        }
+    }
+
+    /// While zoomed on a steady-state tick (zoom_toggled=false, not force_full),
+    /// the `zoom_active` flag no longer forces a full repaint.  This verifies
+    /// the partial path is taken: if the cache is valid the terminal diff layer
+    /// should see a partial redraw, not a full one.  Concretely: after the
+    /// partial call, the cache's `last_zoom_target` is updated and no panic /
+    /// assertion fires (i.e. the non-force_full code path runs to completion).
+    #[test]
+    fn render_partial_steady_state_zoom_does_not_force_full() {
+        use crate::config::{
+            layout::{GridCell, LayoutConfig},
+            ZoomMargin,
+        };
+        use async_trait::async_trait;
+        use ratatui::{backend::TestBackend, Terminal};
+        use std::cell::Cell as StdCell;
+        use std::sync::Arc;
+
+        struct NoopWidget {
+            id: String,
+        }
+
+        #[async_trait]
+        impl crate::widgets::Widget for NoopWidget {
+            fn id(&self) -> &str {
+                &self.id
+            }
+            fn display_name(&self) -> &str {
+                &self.id
+            }
+            fn kind(&self) -> &str {
+                "stub"
+            }
+            async fn update(
+                &mut self,
+                _ctx: &crate::widgets::AppContext,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn render(&self, _frame: &mut Frame, _area: Rect, _focused: bool) {}
+            fn handle_key(
+                &mut self,
+                _key: crossterm::event::KeyEvent,
+            ) -> crate::widgets::EventResult {
+                crate::widgets::EventResult::Ignored
+            }
+            fn handle_command(
+                &mut self,
+                _cmd: &str,
+                _args: &[&str],
+            ) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            fn config(&self) -> serde_json::Value {
+                serde_json::Value::Null
+            }
+            fn apply_config(&mut self, _v: serde_json::Value) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let layout = LayoutConfig {
+            columns: vec![100],
+            rows: vec![100],
+            cells: vec![GridCell {
+                widget: Some("w".into()),
+                widgets: None,
+                col: 0,
+                row: 0,
+                col_span: 1,
+                row_span: 1,
+            }],
+        };
+
+        let theme = Arc::new(crate::theme::Theme::builtin_defaults());
+        let mut manager = crate::widgets::WidgetManager::new();
+        manager.register_boxed(Box::new(NoopWidget { id: "w".into() }));
+
+        let zoom = ZoomTarget { parent_id: "w".into(), child_id: None };
+        let help_scroll_max = StdCell::new(0u16);
+        let state = RenderState {
+            layout: &layout,
+            manager: &manager,
+            focused: None,
+            show_help: false,
+            command_buffer: None,
+            command_feedback: None,
+            theme: &theme,
+            theme_name: "default",
+            help_scroll: 0,
+            help_scroll_max: &help_scroll_max,
+            show_status_bar: false,
+            zoom_target: Some(&zoom),
+            zoom_margin: ZoomMargin::default(),
+        };
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut cached_buf = ratatui::buffer::Buffer::empty(area);
+        fill_buffer(&mut cached_buf, 'X');
+
+        let resolved = layout.resolve(area);
+        let last_cell_rects: HashMap<String, Rect> = resolved
+            .iter()
+            .filter_map(|r| r.cell.render_target_id().map(|id| (id, r.area)))
+            .collect();
+
+        let mut cache = PartialDrawCache {
+            last_drawn: Some(cached_buf),
+            last_cell_rects,
+            last_focused_id: None,
+            last_show_help: false,
+            last_zoom_target: Some(zoom.clone()),
+        };
+
+        // No dirty widgets — no data changed, no focus change.
+        let dirty_ids: HashSet<String> = HashSet::new();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        // Must not panic; the partial path must reach its end.
+        terminal
+            .draw(|frame| {
+                render_partial(frame, &state, &dirty_ids, false, &mut cache);
+            })
+            .unwrap();
+
+        // Cache must now reflect the current zoom target (updated at end of partial path).
+        assert_eq!(
+            cache.last_zoom_target.as_ref().map(|z| z.parent_id.as_str()),
+            Some("w"),
+            "cache.last_zoom_target must be updated on the partial path"
+        );
+    }
 }
 
 /// Mutable cache passed by `App` to [`render_partial`]. Owns the
@@ -713,6 +1384,54 @@ pub struct PartialDrawCache {
     pub last_focused_id: Option<String>,
     /// `show_help` value on the previous draw.
     pub last_show_help: bool,
+    /// Zoom target on the previous draw. Drives `zoom_toggled` in
+    /// `render_partial` to force a full repaint on any zoom-state
+    /// change (entry, exit, or retarget).
+    pub last_zoom_target: Option<ZoomTarget>,
+}
+
+/// Compute a centered `Rect` of `width_pct`% × `height_pct`% of `area`.
+///
+/// Shared by all overlay surfaces (help overlay, zoom frame, and any
+/// future floating panel). Extracted from `ui::help` to the platform
+/// layer so overlay-style features can reuse it without depending on
+/// the help module.
+pub(crate) fn center_rect(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height_pct) / 2),
+            Constraint::Percentage(height_pct),
+            Constraint::Percentage((100 - height_pct) / 2),
+        ])
+        .split(area);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width_pct) / 2),
+            Constraint::Percentage(width_pct),
+            Constraint::Percentage((100 - width_pct) / 2),
+        ])
+        .split(rows[1]);
+    cols[1]
+}
+
+/// Carve a [`ZoomMargin`] off each side of `area` and return the remaining
+/// center [`Rect`]. Each margin is `percent * area_dimension / 100` pixels,
+/// using integer (floor) division. The result is clamped to at least 1×1 so
+/// the rect is always valid even with very small terminals or large margins.
+pub(crate) fn zoom_rect_with_margins(area: Rect, m: ZoomMargin) -> Rect {
+    let top = (area.height as u32 * m.top as u32 / 100) as u16;
+    let bottom = (area.height as u32 * m.bottom as u32 / 100) as u16;
+    let left = (area.width as u32 * m.left as u32 / 100) as u16;
+    let right = (area.width as u32 * m.right as u32 / 100) as u16;
+
+    let x = area.x.saturating_add(left);
+    let y = area.y.saturating_add(top);
+    let width = area.width.saturating_sub(left).saturating_sub(right).max(1);
+    let height = area.height.saturating_sub(top).saturating_sub(bottom).max(1);
+
+    Rect::new(x, y, width, height)
 }
 
 /// Render the full frame: grid cells on top, single-line status bar pinned
@@ -736,10 +1455,18 @@ pub fn render(frame: &mut Frame, state: &RenderState) {
     let main_area = chunks[0];
     let chrome_area = chunks[1];
 
+    // When zoom is active, skip the target's home cell: it renders exactly
+    // once at inner_rect in render_zoom_overlay step [7]. Rendering here
+    // would create a second live instance (Req 3) and destabilise the image
+    // cache (two different rects → re-encode every frame).
+    let zoom_parent_id: Option<&str> = state.zoom_target.as_ref().map(|z| z.parent_id.as_str());
     for resolved in state.layout.resolve(main_area) {
         let Some(id) = resolved.cell.render_target_id() else {
             continue;
         };
+        if zoom_parent_id == Some(id.as_str()) {
+            continue;
+        }
         let is_focused = state.focused == Some(id.as_str());
         match state.manager.get(&id) {
             Some(widget) => widget.render(frame, resolved.area, is_focused),
@@ -763,6 +1490,11 @@ pub fn render(frame: &mut Frame, state: &RenderState) {
                 state.theme,
             );
         }
+    }
+
+    // Zoom overlay sits above the widget grid and below the help overlay.
+    if let Some(zoom) = state.zoom_target {
+        render_zoom_overlay(frame, state, main_area, zoom);
     }
 
     if state.show_help {
@@ -825,7 +1557,13 @@ pub fn render_partial(
         .last_drawn
         .as_ref()
         .map_or(true, |b| b.area != area);
-    let force_full = force_full || area_changed || help_toggled || state.show_help;
+    // Zoom: force a full repaint on zoom edges only (entry, exit, retarget).
+    // Steady-state while zoomed uses the partial path — the cached buffer
+    // already carries the composited dim + placeholder + frame from the edge
+    // repaint, so backdrop widgets stay frozen and only the target re-renders
+    // at inner_rect when its data changes.
+    let zoom_toggled = state.zoom_target != cache.last_zoom_target.as_ref().map(|z| z);
+    let force_full = force_full || area_changed || help_toggled || state.show_help || zoom_toggled;
 
     if force_full {
         render(frame, state);
@@ -844,6 +1582,7 @@ pub fn render_partial(
                 last_cell_rects: collect_cell_rects(frame, state),
                 last_focused_id: state.focused.map(str::to_string),
                 last_show_help: false,
+                last_zoom_target: state.zoom_target.cloned(),
             };
         }
         return;
@@ -877,7 +1616,13 @@ pub fn render_partial(
     //   - we don't have a previous rect for it yet (newly added).
     //
     // Everything else blits.
+    //
+    // While zoomed, backdrop widgets are always frozen in the blit cache
+    // regardless of their dirty bits — only the zoom target is eligible to
+    // join to_render. This prevents double-renders of image widgets and
+    // stale iTerm2 escape sequences corrupting the dimmed backdrop.
     let focus_changed = state.focused.map(str::to_string) != cache.last_focused_id;
+    let zoom_parent_id: Option<&str> = state.zoom_target.as_ref().map(|z| z.parent_id.as_str());
     let resolved = state.layout.resolve(main_area);
     let mut to_render: HashSet<String> = HashSet::new();
     let mut new_rects: HashMap<String, Rect> = HashMap::with_capacity(resolved.len());
@@ -886,6 +1631,10 @@ pub fn render_partial(
             continue;
         };
         new_rects.insert(id.clone(), r.area);
+        // Freeze backdrop widgets — only the zoom target can join to_render.
+        if zoom_parent_id.is_some() && zoom_parent_id != Some(id.as_str()) {
+            continue;
+        }
         let rect_moved = cache
             .last_cell_rects
             .get(&id)
@@ -903,11 +1652,17 @@ pub fn render_partial(
     // any newly-rendered widget overwrites stale cached pixels in
     // its rect (defense-in-depth against an edge where rect_moved
     // didn't fire but should have).
+    //
+    // While zoomed: the target's home cell is ALWAYS blitted from cache
+    // (the placeholder lives there in the cached composited buffer) even
+    // when the target is in to_render. The fresh render happens at
+    // inner_rect after the grid loops, not at the home cell.
     for r in &resolved {
         let Some(id) = r.cell.render_target_id() else {
             continue;
         };
-        if !to_render.contains(&id) {
+        let is_zoom_home = zoom_parent_id == Some(id.as_str());
+        if !to_render.contains(&id) || is_zoom_home {
             blit_rect(frame.buffer_mut(), cached_buf, r.area);
         }
     }
@@ -918,10 +1673,48 @@ pub fn render_partial(
         if !to_render.contains(&id) {
             continue;
         }
+        // Skip the zoom target at its home cell — it renders at inner_rect below.
+        if zoom_parent_id == Some(id.as_str()) {
+            continue;
+        }
         let is_focused = state.focused == Some(id.as_str());
         match state.manager.get(&id) {
             Some(widget) => widget.render(frame, r.area, is_focused),
             None => render_unknown(frame, r.area, &id, is_focused, state.theme),
+        }
+    }
+
+    // While zoomed, if the target was dirty, render it at inner_rect.
+    // The dim + frame border are preserved from the blitted cache — we only
+    // repaint the widget's interior so live data stays current (Req 4).
+    // We intentionally do NOT re-apply dim or re-draw the frame border here;
+    // those are stable in the cache and double-dim on re-application.
+    if let Some(zoom) = state.zoom_target {
+        if to_render.contains(zoom.parent_id.as_str()) {
+            let zoom_rect = zoom_rect_with_margins(main_area, state.zoom_margin);
+            let inner_rect = Block::default().borders(Borders::ALL).inner(zoom_rect);
+            // Clear the frame interior before re-rendering the zoomed widget on a
+            // steady-state tick. The backdrop/border stay cached, but the interior
+            // is blitted from the cached buffer — a widget that paints sparsely
+            // (e.g. big-digit clocks: centered glyphs, off-cells left untouched)
+            // would otherwise composite over stale cells and garble as the digits
+            // change width. The border lives on zoom_rect (outside inner_rect), so
+            // clearing here loses nothing.
+            frame.render_widget(Clear, inner_rect);
+            match &zoom.child_id {
+                None => {
+                    if let Some(widget) = state.manager.get(&zoom.parent_id) {
+                        widget.render(frame, inner_rect, true);
+                    }
+                }
+                Some(child_id) => {
+                    if let Some(parent) = state.manager.get(&zoom.parent_id) {
+                        if let Some(child) = parent.composite_child(child_id) {
+                            child.render(frame, inner_rect, true);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -947,6 +1740,7 @@ pub fn render_partial(
     cache.last_cell_rects = new_rects;
     cache.last_focused_id = state.focused.map(str::to_string);
     cache.last_show_help = false;
+    cache.last_zoom_target = state.zoom_target.cloned();
 }
 
 /// Copy a rect's worth of cells from `src` into `dst`. Assumes the
@@ -1049,6 +1843,8 @@ fn build_help_sections(
                 "jump focus to widget (red letter in title)".into(),
             ),
             ("click cell".into(), "focus that widget".into()),
+            ("z / Z".into(), "zoom focused widget".into()),
+            ("z / Z (while zoomed)".into(), "exit zoom".into()),
             (":".into(), "open command bar".into()),
             (
                 "Ctrl+U (in :)".into(),
@@ -1155,6 +1951,108 @@ fn build_help_sections(
     }
 
     sections
+}
+
+/// Render the seven-step zoom overlay on top of the already-rendered grid.
+///
+/// Steps, in order:
+///
+/// 1. (caller) Grid rendered normally — the zoom target's home cell is
+///    **skipped** in the grid loop (`render` guards on `zoom_parent_id`),
+///    so no second live instance exists before step 3 runs.
+/// 2. **Dim pass:** every cell in `main_area` gets `Modifier::DIM` added.
+///    One buffer pass; no widget cooperation required.
+/// 3. **Placeholder:** the zoom target's home cell is overwritten with a
+///    static dim paragraph `"{name} — zoomed · Esc to return"`. This is the
+///    one-live-instance invariant: the home cell is now a static label, not
+///    a second widget render.
+/// 4. `zoom_rect = zoom_rect_with_margins(main_area, state.zoom_margin)` — sized
+///    by `[global] zoom_margin` from config (default: 5% per side).
+/// 5. `Clear` the `zoom_rect`, removing the dim applied in step 2.
+/// 6. Render the focused-border block with the `" z · Esc to exit zoom "`
+///    title annotation.
+/// 7. Resolve and render the widget at `inner_rect`:
+///    - Leaf: `manager.get(parent_id).render(inner_rect, focused=true)`
+///    - Stack child: `composite_child(child_id).render(inner_rect, focused=true)` —
+///      bypasses the stack's `render` and its tab-strip overlay (CEO Q1).
+///    - If either lookup returns `None` (live-reload race), return early;
+///      `apply_config_change`'s guard clears `zoom_target` on the next tick.
+fn render_zoom_overlay(
+    frame: &mut Frame,
+    state: &RenderState,
+    main_area: Rect,
+    zoom: &ZoomTarget,
+) {
+    // [2] Dim every cell in main_area.
+    {
+        let buf = frame.buffer_mut();
+        for row in main_area.y..main_area.y.saturating_add(main_area.height) {
+            for col in main_area.x..main_area.x.saturating_add(main_area.width) {
+                if col < buf.area.right() && row < buf.area.bottom() {
+                    buf[(col, row)].modifier |= Modifier::DIM;
+                }
+            }
+        }
+    }
+
+    // [3] Overwrite the home cell with a static placeholder paragraph.
+    // Find the resolved Rect for this zoom target's parent_id. Skip silently
+    // on a live-reload race (the Clear in step [5] still produces a valid frame).
+    if let Some(home_area) = state
+        .layout
+        .resolve(main_area)
+        .into_iter()
+        .find(|r| r.cell.render_target_id().as_deref() == Some(zoom.parent_id.as_str()))
+        .map(|r| r.area)
+    {
+        let display_name = state
+            .manager
+            .get(&zoom.parent_id)
+            .map(|w| w.display_name().to_string())
+            .unwrap_or_else(|| zoom.parent_id.clone());
+        let placeholder = format!("{display_name} — zoomed · Esc to return");
+        let para = Paragraph::new(placeholder)
+            .alignment(Alignment::Center)
+            .style(state.theme.text_dim);
+        frame.render_widget(para, home_area);
+    }
+
+    // [4] Zoom frame rect sized by the configured per-side margin.
+    let zoom_rect = zoom_rect_with_margins(main_area, state.zoom_margin);
+
+    // [5] Clear the zoom rect, removing the dim applied in step [2].
+    frame.render_widget(Clear, zoom_rect);
+
+    // [6] Focused-border frame block with zoom-exit title annotation.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(state.theme.border_focused)
+        .title(Span::styled(
+            " z · Esc to exit zoom ",
+            state.theme.text_dim,
+        ));
+    let inner_rect = block.inner(zoom_rect);
+    frame.render_widget(block, zoom_rect);
+
+    // [7] Resolve and render the widget at inner_rect.
+    match &zoom.child_id {
+        None => {
+            // Leaf widget: render directly at the inner zoom frame area.
+            if let Some(widget) = state.manager.get(&zoom.parent_id) {
+                widget.render(frame, inner_rect, true);
+            }
+        }
+        Some(child_id) => {
+            // Stack child (CEO Q1): bypass the stack's render method and its
+            // tab-strip overlay by calling composite_child directly.
+            if let Some(parent) = state.manager.get(&zoom.parent_id) {
+                if let Some(child) = parent.composite_child(child_id) {
+                    child.render(frame, inner_rect, true);
+                }
+            }
+        }
+    }
 }
 
 fn render_unknown(frame: &mut Frame, area: Rect, id: &str, focused: bool, theme: &Theme) {

@@ -20,6 +20,7 @@ This document is the living source of truth for **what the platform offers a wid
     - [Credentials storage (`glint::credentials`)](#credentials-storage-glintcredentials)
     - [Transient status (`glint::ui::status`)](#transient-status-glintuistatus)
     - [Confirm modal (`glint::ui::modal`)](#confirm-modal-glintuimodal)
+    - [Responsive views & Focus Zoom (`ViewTier`)](#responsive-views--focus-zoom-viewtier)
 5. [Best practices](#best-practices)
 6. [Where to look in the codebase](#where-to-look)
 7. [Roadmap](#roadmap)
@@ -572,6 +573,117 @@ if self.state.lock().expect("poisoned").confirm_remove.is_some() {
 
 ---
 
+### Responsive views & Focus Zoom (`ViewTier`)
+
+Focus Zoom lets the user press `z` to enlarge the focused widget into a
+large centered frame (and `z`/`Esc` to return). This is a platform
+feature — **you don't implement zoom**; you implement a *richer view for
+a bigger rect*, and zoom (plus a large dedicated layout cell on a wide
+display) is what hands you that rect.
+
+**Zoom is invisible to your widget.** The framed copy is your one live
+instance, re-rendered at the frame's size: `render(frame, area, focused)`
+is called with a larger `area`, exactly as it would be for any large
+layout cell. Your widget has **no signal that zoom is involved and must
+never try to detect it** — only ever ask *"how big is my rect?"*. Because
+`render` is a pure function of state + rect, state preservation (Req 4 of
+the zoom design — selection, scroll, active tab, warm data) is automatic:
+zoom is a *resize, not a reset*. Your `update()` keeps running while
+zoomed, so data that refreshes or errors updates live inside the frame.
+
+**Pick a render path from the rect** with `ViewTier::from_rect(area)`
+([`src/widgets/view_tier.rs`](../src/widgets/view_tier.rs)):
+
+```rust
+use crate::widgets::view_tier::ViewTier;
+
+fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
+    match ViewTier::from_rect(area) {
+        ViewTier::Full => self.render_full(frame, area),        // dashboard-filling
+        _              => self.render_standard(frame, area),    // everything else, unchanged
+    }
+}
+```
+
+The tiers are ordered (`Compact < Standard < Expanded < Full`), so you
+can write `if ViewTier::from_rect(area) >= ViewTier::Expanded`. Width is
+the primary axis; `Full` additionally requires `FULL_MIN_H` rows (a
+wide-but-shallow cell stays `Expanded`).
+
+| Tier | Rough footprint | What fits |
+|---|---|---|
+| `Compact` | ~20 × ~10 | One primary signal; maximum compression. |
+| `Standard` | ~40 × ~18 | Fully functional: chart, scrollable list, multi-day view. |
+| `Expanded` | ~80 × ~24 | Split-pane layouts; extra data columns. |
+| `Full` | ~120 × ~36 | Reading panes, multi-column grids, all context without scrolling. The typical zoom target. |
+
+**The cardinal rule: enrich `Full`, leave the smaller tiers untouched.**
+A responsive view is opt-in per tier. Add your richer rendering under
+`ViewTier::Full` and keep `Compact`/`Standard`/`Expanded` **byte-for-byte
+as they were**, so the unzoomed dashboard is unaffected and zoom is
+purely additive. Lock it in with a render test asserting the smaller
+tiers' output is unchanged (no Full-only content leaks down) — every
+built-in responsive widget has a `non_full_tier_*_unchanged` test.
+
+**Keep render and hit-testing in lockstep.** If your Full-tier view adds
+clickable regions (grid cells, tabs, a calendar day), the hit-test in
+`handle_mouse` must reproduce the *same* geometry the renderer painted.
+Don't copy the math into two places — factor the layout into **one shared
+helper** that both the renderer and the hit-test call, so they can't
+drift apart when you tune spacing later. (See the calendar's
+`month_full_layout` — returns the month columns consumed by both
+`render_month_full` and `month_full_day_at` — and the shared
+`day_full_areas` / `mini_month_spacing` helpers.)
+
+**Handlers don't receive `area` — remember the tier.** `handle_key(key)`
+has no rect at all, and `handle_mouse(mouse, area)` gets the *current*
+rect but sometimes needs to know how the *last frame* was laid out. When
+a key means one thing zoomed and another unzoomed, stash what you need
+from the last render in a cheap field and read it in your handlers:
+
+```rust
+// field: last_full: AtomicBool
+fn render(&self, frame, area, focused) {
+    let full = ViewTier::from_rect(area) == ViewTier::Full;
+    self.last_full.store(full, Ordering::Relaxed);   // set at the top of render
+    // ...
+}
+fn handle_key(&mut self, key) -> EventResult {
+    // e.g. Month view: arrows walk the day at Full tier; page months otherwise
+    if self.last_full.load(Ordering::Relaxed) { /* … */ }
+}
+```
+
+**Shared primitives for Full-tier layouts** (don't reinvent these):
+
+- [`glint::widgets::view_tier`](../src/widgets/view_tier.rs) —
+  `ViewTier::from_rect`, plus `inner_rows` / `inner_cols` (border-aware
+  content dimensions) and `row_split` (give one section up to N rows, the
+  remainder to another — e.g. a sparkline budget above a process list).
+- [`glint::ui::grid::CardGrid`](../src/ui/grid.rs) — responsive
+  card-row / card-grid layout (pinned-home strip, scrollable grid, or
+  fixed-centered), with the render and click hit-test derived from one
+  `layout()` call. Powers the clock and weather Full-tier city grids.
+- [`glint::ui::chart::range_bar`](../src/ui/chart/range_bar.rs) — a
+  labelled min–max range bar (the stocks/forex 52-week bar).
+- [`glint::text::truncate`](../src/text.rs) (Unicode-width aware) and the
+  big-digit / braille chart helpers under `glint::ui`.
+
+**Degrade gracefully.** A `Full` rect can still be relatively short.
+Compute what fits and fall back to a smaller layout rather than clipping
+or panicking (see how the calendar picks a wall-calendar grid, then a
+plain grid, then a compact two-row grid as vertical space shrinks).
+
+**Reference examples:** the calendar
+([`src/widgets/calendar/mod.rs`](../src/widgets/calendar/mod.rs)) is the
+most complete — zoomed Day/Week views with a 3-month reference block, a
+zoomed wall-calendar Month view with per-day event dots, and click
+hit-tests kept in sync with every layout. Weather and clock show
+`CardGrid`-based multi-column Full grids; email and news show split
+reading panes.
+
+---
+
 ## Best practices
 
 These conventions emerged from building 11+ widgets. They aren't enforced — just the patterns that consistently work well.
@@ -592,6 +704,15 @@ These conventions emerged from building 11+ widgets. They aren't enforced — ju
 
 - Capture screen-absolute rects (and per-row hit ranges) into widget state *during render*, then consult them in `handle_mouse`. Avoid re-running layout math on every click. Examples: `feeds`'s `list_rows`, `tab_rects`; `forex`'s `row_hits`.
 - Route scroll wheel by cursor position (inside list → navigate, inside details → scroll content) rather than always doing the same thing.
+- For layouts you *recompute* in the hit-test rather than cache (e.g. a large grid), put the geometry in **one shared helper** the renderer and hit-test both call — never two copies of the maths that can drift. See `calendar`'s `month_full_layout`.
+- Return `Handled` only when the click actually changed something. The app repaints on every *acting* mouse event but skips inert ones (a click on empty space, a scroll at its limit), so an honest `Handled`/`Ignored` keeps the dashboard from doing needless full repaints.
+
+### Responsive & zoomed views
+
+- Branch your render on `ViewTier::from_rect(area)`; put richer rendering under `ViewTier::Full` and leave the smaller tiers **byte-for-byte unchanged**. Prove it with a `non_full_tier_*_unchanged` render test.
+- Never detect "am I zoomed?" — a zoom frame is just a large rect. Ask only how big your rect is.
+- Handlers have no `area` (keys) or only the current one (mouse): stash the last-rendered tier in a field (`last_full`) during render and read it in `handle_key` / `handle_mouse`.
+- Reach for the shared primitives — `CardGrid`, `range_bar`, `row_split` / `inner_rows` — before hand-rolling grid maths. Full section: [Responsive views & Focus Zoom](#responsive-views--focus-zoom-viewtier).
 
 ### Confirm modals
 

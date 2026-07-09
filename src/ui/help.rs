@@ -4,7 +4,7 @@
 use std::cell::Cell;
 
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Rect},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
@@ -35,7 +35,7 @@ pub fn render(
     scroll: u16,
     scroll_max_out: &Cell<u16>,
 ) {
-    let overlay = center_rect(area, 70, 80);
+    let overlay = super::center_rect(area, 70, 80);
 
     // Wipe whatever's underneath so the dashboard doesn't bleed through.
     frame.render_widget(Clear, overlay);
@@ -100,23 +100,3 @@ pub fn render(
     );
 }
 
-/// Center a rect of `width_pct%` × `height_pct%` of `area`.
-fn center_rect(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - height_pct) / 2),
-            Constraint::Percentage(height_pct),
-            Constraint::Percentage((100 - height_pct) / 2),
-        ])
-        .split(area);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - width_pct) / 2),
-            Constraint::Percentage(width_pct),
-            Constraint::Percentage((100 - width_pct) / 2),
-        ])
-        .split(rows[1]);
-    cols[1]
-}
