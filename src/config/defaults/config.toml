@@ -24,6 +24,13 @@ mouse_scroll = "natural"
 # still surfaces the full help overlay either way.
 show_status_bar = true
 
+# Zoom-overlay margin — percent of screen carved off each side when a widget
+# is zoomed. Follows CSS shorthand: a single number sets all four sides; a
+# 2-value list sets [top+bottom, left+right]; 3 values set [top, left+right,
+# bottom]; 4 values set [top, right, bottom, left]. Each side must be 0–45
+# and top+bottom / left+right must each be ≤90. Invalid values fall back to 5.
+zoom_margin = 5
+
 [layout]
 columns = [40, 60]
 rows = [35, 35, 30]

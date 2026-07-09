@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 
 pub use layout::LayoutConfig;
 pub use types::Config;
+pub use types::ZoomMargin;
 
 /// Load a per-widget TOML config from `~/.config/glint/<name>.toml`. Returns
 /// `T::default()` if the file does not exist.

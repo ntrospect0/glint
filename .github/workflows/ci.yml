@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Clippy (warn-only)
+        # The repo carries pre-existing clippy warnings in several widgets
+        # (field-assignment-outside-Default, too-many-arguments, etc.) that
+        # are unrelated to Focus Zoom. Running without -D warnings keeps CI
+        # green on the current codebase while still surfacing any new lints
+        # introduced by a PR.
+        # To harden this step: address the pre-existing debt in a dedicated
+        # cleanup PR, then replace this line with:
+        #   cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features
+      - name: Test
+        run: cargo test --quiet

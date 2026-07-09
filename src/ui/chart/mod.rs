@@ -10,3 +10,5 @@
 pub mod annotations;
 pub mod axes;
 pub mod braille;
+pub(crate) mod range_bar;
+pub(crate) use range_bar::range_bar_line;

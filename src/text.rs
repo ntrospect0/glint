@@ -206,6 +206,26 @@ pub fn sanitize_html(raw: &str) -> String {
     decode_entities(&strip_tags(raw))
 }
 
+/// Wrap `s` in TOML basic-string double-quotes with correct escaping:
+/// `\` → `\\`, `"` → `\"`, and C0 control characters (U+0000–U+001F)
+/// as `\uXXXX` escape sequences. Suitable for writing TOML values that
+/// must survive a round-trip through the parser (timezone names, feed
+/// labels, OAuth fields, etc.).
+pub fn toml_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn strip_tags(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut in_tag = false;
@@ -451,5 +471,47 @@ mod tests {
     fn sanitize_html_collapses_whitespace() {
         let out = sanitize_html("<p>line one</p>\n\n<p>line  two</p>");
         assert_eq!(out, "line one line two");
+    }
+
+    // ── toml_quote ─────────────────────────────────────────────
+
+    #[test]
+    fn toml_quote_plain_string() {
+        assert_eq!(toml_quote("hello"), "\"hello\"");
+    }
+
+    #[test]
+    fn toml_quote_escapes_double_quote() {
+        assert_eq!(toml_quote(r#"say "hi""#), r#""say \"hi\"""#);
+    }
+
+    #[test]
+    fn toml_quote_escapes_backslash() {
+        assert_eq!(toml_quote(r"C:\Users"), r#""C:\\Users""#);
+    }
+
+    #[test]
+    fn toml_quote_escapes_newline_as_unicode() {
+        assert_eq!(toml_quote("line1\nline2"), "\"line1\\u000aline2\"");
+    }
+
+    #[test]
+    fn toml_quote_escapes_tab_as_unicode() {
+        assert_eq!(toml_quote("a\tb"), "\"a\\u0009b\"");
+    }
+
+    #[test]
+    fn toml_quote_escapes_cr_as_unicode() {
+        assert_eq!(toml_quote("a\rb"), "\"a\\u000db\"");
+    }
+
+    #[test]
+    fn toml_quote_empty_string() {
+        assert_eq!(toml_quote(""), "\"\"");
+    }
+
+    #[test]
+    fn toml_quote_unicode_passthrough() {
+        assert_eq!(toml_quote("München"), "\"München\"");
     }
 }
