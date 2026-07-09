@@ -73,7 +73,46 @@ pub fn render_series(points: &[f64], rows: u16, cols: u16, min: f64, max: f64) -
         prev_y = Some(y);
     }
 
-    // Collapse the bitmap into rows of braille chars.
+    collapse(&bitmap, rows, cols, sub_rows, sub_cols)
+}
+
+/// Like [`render_series`] but fills every sub-pixel *below* the trace down to
+/// the baseline, producing a filled-area chart of braille dots (rather than a
+/// thin line). Useful for utilisation graphs where the area reads as "how
+/// full" at a glance.
+#[allow(clippy::needless_range_loop)]
+pub fn render_series_filled(points: &[f64], rows: u16, cols: u16, min: f64, max: f64) -> Vec<String> {
+    let rows = rows as usize;
+    let cols = cols as usize;
+    if rows == 0 || cols == 0 || points.len() < 2 {
+        return vec![String::new(); rows];
+    }
+
+    let sub_rows = rows * SUB_ROWS_PER_CHAR;
+    let sub_cols = cols * SUB_COLS_PER_CHAR;
+    let span = (max - min).max(f64::MIN_POSITIVE);
+    let mut bitmap = vec![vec![false; sub_cols]; sub_rows];
+
+    let n = points.len();
+    for x in 0..sub_cols {
+        let idx = if sub_cols == 1 {
+            0
+        } else {
+            (x * (n - 1)) / (sub_cols - 1)
+        };
+        let frac = ((points[idx] - min) / span).clamp(0.0, 1.0);
+        // y=0 at top; fill from the trace height down to the baseline.
+        let top = ((1.0 - frac) * (sub_rows as f64 - 1.0)).round() as usize;
+        for y in top.min(sub_rows - 1)..sub_rows {
+            bitmap[y][x] = true;
+        }
+    }
+
+    collapse(&bitmap, rows, cols, sub_rows, sub_cols)
+}
+
+/// Collapse a sub-pixel `bitmap` into `rows` strings of `cols` braille chars.
+fn collapse(bitmap: &[Vec<bool>], rows: usize, cols: usize, sub_rows: usize, sub_cols: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(rows);
     for r in 0..rows {
         let mut row = String::with_capacity(cols);
@@ -138,5 +177,27 @@ mod tests {
         let out = render_series(&points, 3, 10, 0.0, 10.0);
         assert!(out[2].chars().any(|c| c != ' '));
         assert!(out[0].chars().all(|c| c == ' '));
+    }
+
+    #[test]
+    fn filled_series_fills_from_baseline_up() {
+        // A flat series at mid-range: every row from the trace down to the
+        // bottom is filled; rows above the trace stay blank.
+        let points = vec![5.0; 30];
+        let out = render_series_filled(&points, 4, 10, 0.0, 10.0);
+        assert_eq!(out.len(), 4);
+        // Bottom rows filled.
+        assert!(out[3].chars().any(|c| c != ' '), "baseline row filled");
+        assert!(out[2].chars().any(|c| c != ' '), "mid rows filled up to the trace");
+        // Top row (above the 50% trace) is blank.
+        assert!(out[0].chars().all(|c| c == ' '), "above the trace stays blank");
+    }
+
+    #[test]
+    fn filled_series_at_max_fills_every_row() {
+        let out = render_series_filled(&vec![10.0; 30], 4, 8, 0.0, 10.0);
+        for row in &out {
+            assert!(row.chars().any(|c| c != ' '), "max value fills the whole column");
+        }
     }
 }

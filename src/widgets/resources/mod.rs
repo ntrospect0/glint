@@ -12,10 +12,12 @@
 //! `Full` (≥ 105 cols AND ≥ 30 rows — e.g., Focus Zoom or a large layout
 //! cell) adds four enhancements, all gated on `ViewTier::Full`:
 //!
-//! 1. **CPU sparkline** — up to 10-row braille chart of the last ≤ 60
-//!    aggregate CPU% readings, drawn above the per-core bars. Row count
-//!    is `row_split(available, SPARKLINE_MAX_ROWS).0`; the process list
-//!    receives the remainder.
+//! 1. **CPU history chart** — a filled braille area of the last ≤ 60
+//!    aggregate CPU% readings, drawn above the per-core bars: a vertical
+//!    green→amber→red gradient keyed to the utilisation level, a `%` y-axis
+//!    with faint gridlines, and a time x-axis. Plot height is
+//!    `row_split(available, SPARKLINE_MAX_ROWS).0`; the process list receives
+//!    the remainder. Rendered as an overlay after the main paragraph.
 //! 2. **Taller process list** — process count inferred from available rows
 //!    (up to 40; respects the hard cap). Always 40 rows are sampled so the
 //!    Full tier can show more without a fresh poll.
@@ -45,7 +47,7 @@ use async_trait::async_trait;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
@@ -55,6 +57,7 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, Refresh
 
 use crate::text::truncate;
 use crate::theme::{ColorScheme, Theme};
+use crate::ui::chart::axes::{draw_reference_line, lay_out_x_axis_labels};
 use crate::ui::chart::braille;
 use crate::ui::{apply_title_row, MetadataEmphasis};
 use crate::widgets::view_tier::row_split;
@@ -135,6 +138,39 @@ impl Default for ResourcesConfig {
 /// At the focused cadence (2 s/sample) this covers the last ~2 minutes;
 /// at the background cadence (5 s/sample) it covers the last ~5 minutes.
 const CPU_HISTORY_CAP: usize = 60;
+
+/// Geometry + data for the Full-tier CPU chart, reserved during the main
+/// render and drawn as an overlay afterwards (see `render_cpu_chart`).
+struct CpuChart {
+    /// Row index within `inner` where the plot begins.
+    start_row: u16,
+    /// Plot height in terminal rows (each row = 4 braille sub-rows).
+    plot_h: u16,
+    /// Left-gutter width holding the `%` y-axis.
+    gutter_w: u16,
+    /// CPU% history, oldest first.
+    history: Vec<f32>,
+}
+
+/// Map a utilisation percentage to an earthy green → ochre → brick-red
+/// gradient: 0% olive-green, 50% ochre, 100% brick-red, interpolated through
+/// muted (rather than neon) anchors so a busy CPU reads warm, not garish.
+fn cpu_gradient(pct: f64) -> Color {
+    // Earthy anchors: olive-drab → ochre → brick.
+    const LOW: (u8, u8, u8) = (107, 142, 35);
+    const MID: (u8, u8, u8) = (194, 152, 66);
+    const HIGH: (u8, u8, u8) = (160, 64, 45);
+    let lerp = |a: u8, b: u8, t: f64| (a as f64 + (b as f64 - a as f64) * t).round() as u8;
+    let blend = |a: (u8, u8, u8), b: (u8, u8, u8), t: f64| {
+        Color::Rgb(lerp(a.0, b.0, t), lerp(a.1, b.1, t), lerp(a.2, b.2, t))
+    };
+    let f = (pct / 100.0).clamp(0.0, 1.0);
+    if f < 0.5 {
+        blend(LOW, MID, f / 0.5)
+    } else {
+        blend(MID, HIGH, (f - 0.5) / 0.5)
+    }
+}
 
 /// Snapshot of one process row used by `render`. Kept owned + plain so
 /// rendering doesn't hold the `System` mutex while painting.
@@ -459,6 +495,87 @@ impl ResourcesWidget {
             .snapshot
             .clone()
     }
+
+    /// Draw the Full-tier CPU-history chart into the region reserved during the
+    /// main render: a filled braille area with a vertical green→amber→red
+    /// gradient keyed to the utilisation level, a `%` y-axis with faint
+    /// gridlines, and a time x-axis. Drawn as an overlay so the per-row colour
+    /// and buffer-painted gridlines land on top of the blank placeholder rows.
+    fn render_cpu_chart(&self, frame: &mut Frame, inner: Rect, chart: CpuChart) {
+        let CpuChart {
+            start_row,
+            plot_h,
+            gutter_w,
+            history,
+        } = chart;
+        let plot_x = inner.x + gutter_w;
+        let plot_y = inner.y + start_row;
+        let plot_w = inner.width.saturating_sub(gutter_w);
+        if plot_w == 0 || plot_h == 0 {
+            return;
+        }
+
+        // y-value → row: row 0 is the top (100%), row plot_h-1 the bottom (0%).
+        let row_value = |i: u16| 100.0 * (1.0 - i as f64 / (plot_h as f64 - 1.0).max(1.0));
+
+        let series: Vec<f64> = history.iter().map(|&v| v as f64).collect();
+        let rows = braille::render_series_filled(&series, plot_h, plot_w, 0.0, 100.0);
+
+        // Filled area, each row coloured by the % level it represents.
+        let plot_lines: Vec<Line<'static>> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                Line::from(Span::styled(
+                    row.clone(),
+                    Style::default().fg(cpu_gradient(row_value(i as u16))),
+                ))
+            })
+            .collect();
+        frame.render_widget(
+            Paragraph::new(plot_lines),
+            Rect { x: plot_x, y: plot_y, width: plot_w, height: plot_h },
+        );
+
+        // Faint horizontal gridlines behind the fill (painted only on cells the
+        // area left blank).
+        for gv in [25.0, 50.0, 75.0] {
+            draw_reference_line(
+                frame, plot_x, plot_y, plot_h, plot_w, 0.0, 100.0, &rows, gv, '┈',
+                self.theme.text_dim,
+            );
+        }
+
+        // y-axis: `│` rule with clean 0/25/50/75/100 `%` labels placed on the
+        // rows nearest those values, so they line up with the gridlines.
+        let mut row_label: Vec<Option<i32>> = vec![None; plot_h as usize];
+        for v in [0i32, 25, 50, 75, 100] {
+            let row = ((1.0 - v as f64 / 100.0) * (plot_h as f64 - 1.0)).round() as usize;
+            if let Some(slot) = row_label.get_mut(row) {
+                *slot = Some(v);
+            }
+        }
+        let gutter_lines: Vec<Line<'static>> = (0..plot_h as usize)
+            .map(|i| {
+                let axis = match row_label[i] {
+                    Some(v) => format!("{v:>3}┤"),
+                    None => "   │".to_string(),
+                };
+                Line::from(Span::styled(axis, self.theme.text_dim))
+            })
+            .collect();
+        frame.render_widget(
+            Paragraph::new(gutter_lines),
+            Rect { x: inner.x, y: plot_y, width: gutter_w, height: plot_h },
+        );
+
+        // x-axis: window span under the plot.
+        let x_line = lay_out_x_axis_labels(&["~2m", "now"], plot_w as usize);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(x_line, self.theme.text_dim))),
+            Rect { x: plot_x, y: plot_y + plot_h, width: plot_w, height: 1 },
+        );
+    }
 }
 
 /// Map `sysinfo::ProcessStatus` to a single display character.
@@ -658,36 +775,44 @@ impl Widget for ResourcesWidget {
         lines.push(Line::from(Span::styled(header, self.theme.text_brilliant)));
         lines.push(Line::from(""));
 
-        // CPU section — per-core bars. Aggregate % goes in the section title.
+        // CPU section — per-core bars. Aggregate % goes in the section title;
+        // at Full the window peak rides alongside it.
+        let mut cpu_chart: Option<CpuChart> = None;
         if !snap.cpu_per_core.is_empty() {
             let avg = snap.cpu_per_core.iter().sum::<f32>() / snap.cpu_per_core.len() as f32;
+            let mut cpu_title = format!("   {avg:>5.1}% avg across {} cores", snap.cpu_per_core.len());
+            if tier == ViewTier::Full {
+                if let Some(peak) = snap.cpu_history.iter().cloned().reduce(f32::max) {
+                    cpu_title.push_str(&format!("  ·  peak {peak:.0}%"));
+                }
+            }
             lines.push(Line::from(vec![
                 Span::styled("CPU", self.theme.text_focused),
-                Span::raw(format!(
-                    "   {avg:>5.1}% avg across {} cores",
-                    snap.cpu_per_core.len()
-                )),
+                Span::raw(cpu_title),
             ]));
 
-            // At Full: braille sparkline of aggregate CPU% history (up to
-            // SPARKLINE_MAX_ROWS rows), inserted between the section header
-            // and the per-core bars. The sparkline claims as many rows as the
-            // available inner height allows up to the cap; the process list
-            // then inherits whatever remains (accounted via `lines.len()` in
-            // the proc_display_count block below). Skipped at all other tiers.
+            // At Full: a decorated, filled braille CPU-history chart — a
+            // green→amber→red gradient area (dots) with a % y-axis, faint
+            // gridlines, and a time x-axis. It's drawn as an overlay *after*
+            // the main Paragraph (so the per-row gradient and buffer-drawn
+            // gridlines survive), so here we only reserve its rows as blanks;
+            // `proc_display_count` accounts for them via `lines.len()`.
             if tier == ViewTier::Full && snap.cpu_history.len() >= 2 {
-                let h_f64: Vec<f64> = snap.cpu_history.iter().map(|&v| v as f64).collect();
-                // Rows consumed so far (including CPU section header just pushed).
-                // `row_split` caps the sparkline at SPARKLINE_MAX_ROWS; the
-                // process list picks up the difference via lines.len() later.
+                const GUTTER_W: u16 = 4; // "100┤"
                 let rows_used_so_far = lines.len() as u16;
                 let available = inner.height.saturating_sub(rows_used_so_far);
-                let (spark_rows, _) = row_split(available, SPARKLINE_MAX_ROWS);
-                let spark_cols = inner.width;
-                let sparklines =
-                    braille::render_series(&h_f64, spark_rows, spark_cols, 0.0, 100.0);
-                for row in sparklines {
-                    lines.push(Line::from(Span::styled(row, self.theme.text_focused)));
+                let (plot_h, _) = row_split(available, SPARKLINE_MAX_ROWS);
+                if plot_h >= 3 && inner.width > GUTTER_W + 4 {
+                    cpu_chart = Some(CpuChart {
+                        start_row: lines.len() as u16,
+                        plot_h,
+                        gutter_w: GUTTER_W,
+                        history: snap.cpu_history.clone(),
+                    });
+                    // Reserve the plot rows + one x-axis row as blanks.
+                    for _ in 0..plot_h + 1 {
+                        lines.push(Line::from(""));
+                    }
                 }
             }
 
@@ -900,6 +1025,11 @@ impl Widget for ResourcesWidget {
         }
 
         frame.render_widget(Paragraph::new(lines), inner);
+
+        // Overlay the decorated CPU chart onto the rows reserved above.
+        if let Some(chart) = cpu_chart {
+            self.render_cpu_chart(frame, inner, chart);
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {

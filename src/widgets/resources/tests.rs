@@ -520,3 +520,22 @@ fn format_thread_count_formats_correctly() {
     assert_eq!(format_thread_count(Some(256)), " 256");
     assert_eq!(format_thread_count(None), "   -");
 }
+
+#[test]
+fn cpu_gradient_maps_load_to_earthy_anchors() {
+    use ratatui::style::Color;
+    // Earthy anchors: olive-green (low) → ochre (mid) → brick-red (high).
+    assert_eq!(cpu_gradient(0.0), Color::Rgb(107, 142, 35));
+    assert_eq!(cpu_gradient(50.0), Color::Rgb(194, 152, 66));
+    assert_eq!(cpu_gradient(100.0), Color::Rgb(160, 64, 45));
+    // Clamped outside 0..=100.
+    assert_eq!(cpu_gradient(-10.0), Color::Rgb(107, 142, 35));
+    assert_eq!(cpu_gradient(150.0), Color::Rgb(160, 64, 45));
+    // A quarter-load colour sits between the low and mid anchors.
+    if let Color::Rgb(r, g, b) = cpu_gradient(25.0) {
+        assert!((107..=194).contains(&r) && (142..=152).contains(&g) && (35..=66).contains(&b));
+    } else {
+        panic!("expected Rgb");
+    }
+}
+
