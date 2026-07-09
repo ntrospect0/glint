@@ -4,6 +4,56 @@ All notable changes to glint are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions track
 the `Cargo.toml` `version` field.
 
+## [0.5.0] — unreleased
+
+**Focus Zoom + responsive widget views.** Press `z` to enlarge the focused
+widget into a framed overlay, and every widget now renders a richer view when
+it's given a large (zoomed) pane — while normal grid rendering is left exactly
+as before.
+
+### Added
+
+- **Focus Zoom** (`z` / `Shift-Z`): enlarge the focused widget to a centered
+  ~90% frame over a dimmed backdrop; the home cell shows a placeholder (never a
+  second live copy); state is fully preserved on enter/exit; layered `Esc`;
+  `Shift-<letter>` / `Tab` / mouse retargeting; configurable `zoom_margin`
+  (CSS-style, with fallback); live-reload safe.
+- **`ViewTier` framework** (`Compact`/`Standard`/`Expanded`/`Full`) plus shared
+  UI helpers (`row_split`, `CardGrid`, `range_bar`) so widgets can adapt to the
+  space they are given. Documented for widget authors in
+  [`docs/widget-sdk.md`](docs/widget-sdk.md) → *Responsive views & Focus Zoom*.
+- **Zoomed (Full-tier) views** — all Full-tier only, unzoomed rendering
+  unchanged:
+  - **Stocks** — fundamentals panel.
+  - **Email** — split list + full-message read pane.
+  - **Forex** — 52-week range bar (highlight-coloured) in the details column.
+  - **Weather** — side-by-side city columns (home pinned, `←/→` scroll,
+    prefetch-all-cities), each with a 24h temperature chart (high/low labelled),
+    rain-probability bar, and a 7-day forecast.
+  - **Clock** — large-digit world-clock grid (bordered cards, day/date +
+    day/night glyph), stopwatch lap table, timer burn-down bar.
+  - **Resources** — CPU-history sparkline, taller process list with selection,
+    extra columns.
+  - **Feeds** — article panel expanded by default when zoomed.
+  - **Calendar** — zoomed Day/Week views place agenda columns above a 3-month
+    reference block (prev · current · next) whose days carry event dots
+    colour-coded by calendar and are click-to-navigate; a zoomed **wall-calendar
+    Month view** with bordered day cells, per-day busyness dots (count scaled to
+    the day's events, split across calendars by colour), a bordered month-title
+    box, the real current month always accented, clickable days, and arrow-key
+    day navigation (`←↑↓→` walk the day, `h`/`l` page months, `j`/`k` scroll the
+    agenda). Event data is fetched across the visible months.
+
+### Fixed
+
+- Gallery images render centered (top-aligned) and are never upscaled.
+- Weather forecast lines no longer garble on wide panes (cell-width-correct
+  layout).
+- Mouse input on the dashboard no longer lags: pointer motion/drag reports are
+  dropped at the source, inert clicks/scrolls don't force a repaint, and bursts
+  of events coalesce into a single redraw — so clicks feel as immediate as
+  keyboard navigation, even on the heavy zoomed calendar.
+
 ## [0.4.0] — unreleased
 
 **Profiles.** `glint --profile <name>` (or `-p <name>`, or
