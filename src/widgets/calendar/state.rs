@@ -156,6 +156,14 @@ impl CalendarWidget {
     pub(super) fn fetch_range(&self) -> (DateTime<Local>, DateTime<Local>) {
         let (start, end) = self.current_range();
         let buffer = match self.view {
+            // At Full tier the bottom 3-month block needs event data for
+            // the full adjacent months. 60 days covers any anchor position's
+            // ±1 month window without over-fetching at other tiers.
+            CalendarView::Day | CalendarView::Week
+                if self.last_full.load(Ordering::Relaxed) =>
+            {
+                ChronoDuration::days(60)
+            }
             // ±2 weeks lets the user step through a month of days
             // without re-hitting the provider.
             CalendarView::Day => ChronoDuration::days(14),

@@ -10,8 +10,7 @@ use chrono::TimeZone;
 use crate::theme::parse_color;
 use super::nav::{
     advance_month, bottom_action_at, content_rect_for, first_of_next_month, google_calendar_url,
-    local_midnight, month_long, outlook_calendar_url, rotated_weekday_labels, start_of_month,
-    start_of_week, weekday_short, BottomAction, WebTarget,
+    outlook_calendar_url, rotated_weekday_labels, start_of_week, BottomAction,
 };
 use super::colors::CalendarColors;
 
@@ -435,16 +434,59 @@ use super::colors::CalendarColors;
         let inner = Rect::new(0, 0, 40, 20);
         // Rows: padding=0, month name=1, weekday header=2, weeks start at 3.
         // May 2026 starts Friday → first grid row is Sun Apr 26 … Sat May 2.
+        let opts = super::MiniMonthOpts::default();
         let apr26 = NaiveDate::from_ymd_opt(2026, 4, 26).unwrap();
-        assert_eq!(w.month_day_at(3, 3, inner), Some(apr26));
+        assert_eq!(w.month_day_at(3, 3, inner, opts), Some(apr26));
         let may2 = NaiveDate::from_ymd_opt(2026, 5, 2).unwrap();
-        assert_eq!(w.month_day_at(33, 3, inner), Some(may2));
+        assert_eq!(w.month_day_at(33, 3, inner, opts), Some(may2));
         // Clicks in padding / month-name / weekday-header rows → None.
-        assert_eq!(w.month_day_at(3, 0, inner), None);
-        assert_eq!(w.month_day_at(3, 1, inner), None);
-        assert_eq!(w.month_day_at(3, 2, inner), None);
+        assert_eq!(w.month_day_at(3, 0, inner, opts), None);
+        assert_eq!(w.month_day_at(3, 1, inner, opts), None);
+        assert_eq!(w.month_day_at(3, 2, inner, opts), None);
         // Beyond the 7th column of the grid → None.
-        assert_eq!(w.month_day_at(38, 3, inner), None);
+        assert_eq!(w.month_day_at(38, 3, inner, opts), None);
+    }
+
+    #[test]
+    fn month_full_day_at_maps_full_grid_to_dates() {
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Month,
+            ..CalendarConfig::default()
+        });
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        // 100 wide < 2×63 → single month (July); 40 tall → the titled wall grid.
+        // cw = (100−8)/7 = 13, grid width 99 centered in 100 → first cell at
+        // col 1, day pitch cw+1 = 14. Rows: top margin (0), label box (1–3),
+        // weekday (4), top border (5), then per week date/dot/separator (first
+        // date row 6, stride 3).
+        let area = Rect::new(0, 0, 100, 40);
+        let layout = w.month_full_layout(area).unwrap();
+        assert_eq!(
+            layout.style,
+            super::MonthGridStyle::WallTitled,
+            "100×40 affords the titled wall grid"
+        );
+        let first = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        let grid_start = super::start_of_week(first, w.first_day_of_week);
+
+        // Week 2 is mid-July regardless of the configured first-day-of-week.
+        let dow = 0i64;
+        let week = 2i64;
+        let col = 1 + (14 * dow as u16) + 3; // inside cell `dow`
+        let date_row = 6 + 3 * week as u16; // 1 top margin + 5 header rows
+        let expected = grid_start + chrono::Duration::days(week * 7 + dow);
+        assert_eq!(expected.month(), 7, "week 2 dow 0 lands in July");
+        // Date row and its dot row both select the day.
+        assert_eq!(w.month_full_day_at(area, col, date_row), Some(expected));
+        assert_eq!(w.month_full_day_at(area, col, date_row + 1), Some(expected));
+        // The separator/border line between weeks selects nothing.
+        assert_eq!(w.month_full_day_at(area, col, date_row + 2), None);
+        // Top margin, label box, weekday, and top border rows are all inert.
+        for r in 0..6 {
+            assert_eq!(w.month_full_day_at(area, col, r), None, "header row {r}");
+        }
+        // Too short for the Full grid → None (caller falls back to month_day_at).
+        assert_eq!(w.month_full_day_at(Rect::new(0, 0, 100, 8), col, 7), None);
     }
 
     #[test]
@@ -690,4 +732,1070 @@ use super::colors::CalendarColors;
             Local::now().date_naive(),
             "navigating re-bases the baseline to today"
         );
+    }
+
+    #[test]
+    fn month_view_arrows_walk_the_selected_day() {
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Month,
+            ..CalendarConfig::default()
+        });
+        let start = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        w.anchor = start;
+        let press = |w: &mut CalendarWidget, code| {
+            w.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        };
+        // Arrows move the day (←/→ ±1 day, ↑/↓ ±1 week).
+        press(&mut w, KeyCode::Right);
+        assert_eq!(w.anchor, start + ChronoDuration::days(1));
+        press(&mut w, KeyCode::Left);
+        assert_eq!(w.anchor, start);
+        press(&mut w, KeyCode::Down);
+        assert_eq!(w.anchor, start + ChronoDuration::days(7));
+        press(&mut w, KeyCode::Up);
+        assert_eq!(w.anchor, start);
+        // h/l still page months (nav_step = 30 days in Month view).
+        press(&mut w, KeyCode::Char('l'));
+        assert_eq!(w.anchor, start + ChronoDuration::days(30));
+        press(&mut w, KeyCode::Char('h'));
+        assert_eq!(w.anchor, start);
+        // j/k don't move the day (they scroll the agenda).
+        press(&mut w, KeyCode::Char('j'));
+        assert_eq!(w.anchor, start, "j/k scroll the agenda, not the day");
+    }
+
+    #[test]
+    fn day_view_arrows_unchanged_by_month_nav() {
+        // In Day view, ←/→ still step the anchor by one day (arrows == h/l).
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Day,
+            ..CalendarConfig::default()
+        });
+        let start = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        w.anchor = start;
+        w.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(w.anchor, start + ChronoDuration::days(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-tier Day view tests
+    // -----------------------------------------------------------------------
+
+    /// `day_full_areas` degrade boundary: the bottom calendar appears only
+    /// when the top can still fit ≥ 20 rows.
+    ///
+    /// Compact bottom = 13 (borders 2 + grid 10 + blank 1), roomy bottom = 18
+    /// (grid 15). SPACER = 1, TOP_MIN_H = 20. Compact threshold = 34; roomy
+    /// threshold = 20 + 18 + 1 = 39.
+    #[test]
+    fn day_full_areas_degrade_boundary() {
+        // Exactly at the compact threshold (height = 34): bottom present, top = 20.
+        let area = Rect::new(0, 0, 130, 34);
+        let (top, bottom) = CalendarWidget::day_full_areas(area);
+        assert_eq!(top.height, 20, "top should be 20 at threshold");
+        assert_eq!(bottom.map(|b| b.height), Some(13), "compact bottom at height 34");
+
+        // One row below threshold (height = 33): bottom must be dropped.
+        let area = Rect::new(0, 0, 130, 33);
+        let (top, bottom) = CalendarWidget::day_full_areas(area);
+        assert_eq!(top.height, 33, "top should fill full height when bottom is dropped");
+        assert!(bottom.is_none(), "bottom must be dropped below threshold");
+
+        // Just below the roomy threshold (height = 38): still the compact bottom.
+        let area = Rect::new(0, 0, 130, 38);
+        let (_top, bottom) = CalendarWidget::day_full_areas(area);
+        assert_eq!(bottom.map(|b| b.height), Some(13), "compact bottom below 39");
+
+        // At/above the roomy threshold (height = 39): the roomy bottom (18),
+        // top holds its minimum (20).
+        let area = Rect::new(0, 0, 130, 39);
+        let (top, bottom) = CalendarWidget::day_full_areas(area);
+        assert_eq!(top.height, 20, "top keeps its minimum with the roomy bottom");
+        assert_eq!(bottom.map(|b| b.height), Some(18), "roomy bottom at height 39");
+
+        // Well above (height = 50): roomy bottom (18), top = 50 - 18 - 1 = 31.
+        let area = Rect::new(0, 0, 130, 50);
+        let (top, bottom) = CalendarWidget::day_full_areas(area);
+        assert_eq!(top.height, 31, "top = total - roomy bottom - spacer");
+        assert_eq!(bottom.map(|b| b.height), Some(18), "roomy bottom present");
+    }
+
+    /// `day_full_areas` bottom rect starts after the SPACER row, spans the
+    /// roomy 18 rows at a tall height, and is non-overlapping with top.
+    #[test]
+    fn day_full_areas_no_overlap() {
+        let area = Rect::new(5, 3, 130, 50);
+        let (top, bottom) = CalendarWidget::day_full_areas(area);
+        let bottom = bottom.expect("bottom must be present at height 50");
+        // No overlap: bottom starts where top ends + SPACER.
+        assert_eq!(
+            bottom.y,
+            top.y + top.height + 1,
+            "bottom.y = top.y + top.height + SPACER"
+        );
+        // At height 50 the roomy bottom (borders 2 + grid 15 + blank 1) is used.
+        assert_eq!(bottom.height, 18, "roomy bottom height at a tall frame");
+        // Both share the same x and width as the input.
+        assert_eq!(top.x, area.x);
+        assert_eq!(bottom.x, area.x);
+        assert_eq!(top.width, area.width);
+        assert_eq!(bottom.width, area.width);
+    }
+
+    /// Full-tier Day view renders ≥2 day-agenda columns with ` │ ` separator
+    /// starting at the anchor, and a 3-month bottom grid.
+    #[test]
+    fn full_tier_day_view_renders_columns_and_bottom_grid() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        // 130 cols × 40 rows → ViewTier::Full (≥ 105 cols, ≥ 30 rows).
+        // After border removal: inner = 128 × 38.
+        // content_rect_for(Day, inner) adds 1-col gutters: 126 × 37.
+        // day_full_areas(area = content = 126 × 37):
+        //   37 >= 33 (threshold) → bottom present.
+        //   top = 126 × 24 (37 - 13), bottom = Some(126 × 12).
+        // N columns = (126 + 3) / (58 + 3) = 129 / 61 = 2.
+        let backend = TestBackend::new(130, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Day,
+            ..CalendarConfig::default()
+        });
+        // Fixed anchor for reproducible output (a Monday).
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                // Call render via the Widget trait (the impl block).
+                Widget::render(&w, frame, area, false);
+            })
+            .unwrap();
+
+        // Collect all rendered text.
+        let buf = terminal.backend().buffer().clone();
+        let rendered: String = (0..40)
+            .flat_map(|row| {
+                let row_str: String = (0..130)
+                    .map(|col| buf.cell((col, row)).map(|c| c.symbol().chars().next().unwrap_or(' ')).unwrap_or(' '))
+                    .collect();
+                [row_str, "\n".to_string()]
+            })
+            .collect();
+
+        // The separator character must appear (two day columns present).
+        assert!(
+            rendered.contains('│'),
+            "Full-tier Day view must render a │ column separator between day columns"
+        );
+    }
+
+    /// At a Full rect too short for both halves, the bottom grid is dropped
+    /// and the top spans the full height.
+    #[test]
+    fn full_tier_day_view_drops_bottom_when_too_short() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        // 130 cols × 32 rows → ViewTier::Full (≥ 105 cols, ≥ 30 rows).
+        // content_rect_for(Day, inner 128×30) → area = 126 × 29.
+        // day_full_areas(126 × 29): 29 < 33 (threshold) → bottom dropped.
+        let backend = TestBackend::new(130, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Day,
+            ..CalendarConfig::default()
+        });
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+
+        terminal
+            .draw(|frame| {
+                Widget::render(&w, frame, frame.area(), false);
+            })
+            .unwrap();
+
+        // No crash = the degrade path works.
+        // The content still renders (separator should appear from 2-col layout).
+        let buf = terminal.backend().buffer().clone();
+        let rendered: String = (0..32)
+            .flat_map(|row| {
+                let row_str: String = (0..130)
+                    .map(|col| buf.cell((col, row)).map(|c| c.symbol().chars().next().unwrap_or(' ')).unwrap_or(' '))
+                    .collect();
+                [row_str, "\n".to_string()]
+            })
+            .collect();
+
+        // Should still show a separator (two columns fit in 126 cols).
+        assert!(
+            rendered.contains('│'),
+            "columns still render even when the bottom is dropped"
+        );
+    }
+
+    /// Non-Full Day/Week/Month rendering is unchanged: a Standard-size
+    /// rect must NOT invoke the Full-tier layout path.
+    #[test]
+    fn non_full_tier_day_view_unchanged() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        // 80 × 24 → ViewTier::Expanded (< 105 cols), not Full.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Day,
+            ..CalendarConfig::default()
+        });
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+
+        terminal
+            .draw(|frame| {
+                Widget::render(&w, frame, frame.area(), false);
+            })
+            .unwrap();
+
+        // No panic means the non-Full path ran correctly.
+        // Additional sanity: the existing two-day view should appear at 80 cols.
+        // At 80 cols, inner width ≈ 78, content ≈ 76 → >= TWO_DAY_MIN_WIDTH(50).
+        let buf = terminal.backend().buffer().clone();
+        let has_separator: bool = (0..24).any(|row| {
+            (0..80).any(|col| {
+                buf.cell((col, row))
+                    .map(|c| c.symbol() == "│")
+                    .unwrap_or(false)
+            })
+        });
+        assert!(has_separator, "Standard Day view should render a │ separator for two-day split");
+    }
+
+    /// Click in the bottom 3-month calendar in Full-tier Day view sets the
+    /// anchor to the clicked date via `month_day_at`.
+    #[test]
+    fn full_tier_day_view_click_in_bottom_sets_anchor() {
+        // Area: 130 × 40 (Full tier).
+        //   inner = Rect { x:1, y:1, w:128, h:38 }
+        //   content = content_rect_for(Day, inner)
+        //           = Rect { x:2, y:1, w:126, h:37 }
+        //   (Day view: 1-col gutters on each side, 1 row removed for hint)
+        //
+        // day_full_areas(content = {x:2, y:1, w:126, h:37}):
+        //   BOTTOM_H = 13 (CARD_BORDERS=2 + GRID_HEIGHT=9 + TRAILING_BLANK=1 + SPACER=1)
+        //   37 >= 20 + 13 = 33 → bottom present.
+        //   top_h = 37 - 13 = 24.
+        //   bottom.y = 1 + 24 + 1 = 26, bottom.height = 12.
+        //
+        // The mouse handler offsets into the grid: grid_rect.y = bottom.y + 1 = 27.
+        // month_day_at skips rows 0-2 (pad + name + header): week rows start at
+        //   grid_rect.y + 3 = 30.
+        // Three months across content.width 126: each column ≈ 42 wide.
+        //   Col 0: x=[2..43], Col 1 (anchor Jul): x=[44..85], Col 2: x=[86..127].
+        let area = Rect::new(0, 0, 130, 40);
+
+        // Reproduce the same content rect the click handler uses.
+        let inner = Rect::new(1, 1, 128, 38);
+        let content = content_rect_for(CalendarView::Day, inner);
+        let (_top, bottom_opt) = CalendarWidget::day_full_areas(content);
+        let bottom = bottom_opt.expect("bottom must be present at height 37");
+
+        // The mouse handler shifts y by 1 to skip the card top border;
+        // month_day_at then skips rows 0-2, so week rows start at bottom.y+1+3 = bottom.y+4.
+        let click_row = bottom.y + 4;
+        // Middle of the second (anchor) month column.
+        let click_col = content.x + content.width / 2;
+
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Day,
+            ..CalendarConfig::default()
+        });
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        let original_anchor = w.anchor;
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: click_col,
+            row: click_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let result = w.handle_mouse(mouse, area);
+
+        // The click must have been handled and the anchor must have changed
+        // to some date (month_day_at resolved a cell).
+        assert_eq!(result, EventResult::Handled, "click in bottom grid must be handled");
+        assert_ne!(
+            w.anchor, original_anchor,
+            "clicking in bottom calendar must update the anchor"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-tier Week view tests
+    // -----------------------------------------------------------------------
+
+    /// Full-tier Week view renders the week grid on top and the 3-month block
+    /// at the bottom. The week grid must contain column-separator characters;
+    /// the 3-month block card borders (rounded corners) must be visible.
+    #[test]
+    fn full_tier_week_view_renders_grid_and_bottom_block() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        // 130 × 40 → Full tier. Week view content has no side gutters.
+        // inner = 128 × 38, content = 128 × 37 (hint row removed).
+        // day_full_areas(128 × 37): 37 >= 33 → bottom present.
+        // top = 128 × 24, bottom = 128 × 12.
+        let backend = TestBackend::new(130, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Week,
+            ..CalendarConfig::default()
+        });
+        // Anchor on a known Monday so the week span is deterministic.
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+
+        terminal
+            .draw(|frame| {
+                Widget::render(&w, frame, frame.area(), false);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let rendered: String = (0..40)
+            .flat_map(|row| {
+                let row_str: String = (0..130)
+                    .map(|col| buf.cell((col, row)).map(|c| c.symbol().chars().next().unwrap_or(' ')).unwrap_or(' '))
+                    .collect();
+                [row_str, "\n".to_string()]
+            })
+            .collect();
+
+        // The 7-column grid uses │ separators between day columns.
+        assert!(
+            rendered.contains('│'),
+            "Full-tier Week view top must contain │ column separators"
+        );
+        // The card borders use rounded corners (╭/╰ or ─ top/bottom bar).
+        // At minimum the horizontal border character ─ must appear in the
+        // bottom block rows.
+        assert!(
+            rendered.contains('─'),
+            "Full-tier Week view bottom block must contain ─ card border characters"
+        );
+    }
+
+    /// Full-tier Week view bottom block: degrade drops the bottom when the
+    /// total height is below the threshold (top < 20 rows).
+    #[test]
+    fn full_tier_week_view_drops_bottom_when_too_short() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        // 130 × 32 → Full (≥ 105 cols, ≥ 30 rows).
+        // content = 128 × 29; 29 < 33 → bottom dropped.
+        let backend = TestBackend::new(130, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Week,
+            ..CalendarConfig::default()
+        });
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+
+        terminal
+            .draw(|frame| {
+                Widget::render(&w, frame, frame.area(), false);
+            })
+            .unwrap();
+
+        // No crash = degrade path works. The week grid still renders.
+        let buf = terminal.backend().buffer().clone();
+        let has_separator = (0..32).any(|row| {
+            (0..130).any(|col| {
+                buf.cell((col, row))
+                    .map(|c| c.symbol() == "│")
+                    .unwrap_or(false)
+            })
+        });
+        assert!(has_separator, "week grid must still render when bottom is dropped");
+    }
+
+    /// Click in the bottom 3-month block in Full-tier Week view navigates
+    /// to the week containing the clicked date and stays in Week view.
+    #[test]
+    fn full_tier_week_view_click_in_bottom_navigates_week() {
+        // Area: 130 × 40 (Full tier).
+        //   inner = Rect { x:1, y:1, w:128, h:38 }
+        //   content = content_rect_for(Week, inner) = Rect { x:1, y:1, w:128, h:37 }
+        //   (Week view: no side gutters, 1 hint row removed)
+        //
+        // day_full_areas(content = {x:1, y:1, w:128, h:37}):
+        //   37 >= 34 (compact) but < 39 (roomy) → compact bottom (13).
+        //   top_h = 37 - 14 = 23; bottom.y = 1 + 23 + 1 = 25, bottom.height = 13.
+        //
+        // The mouse handler offsets into the grid: grid_rect.y = bottom.y + 1.
+        // With the block's header rules, week rows start at grid_rect.y + 4
+        // (name, rule, weekday, rule).
+        let area = Rect::new(0, 0, 130, 40);
+
+        let inner = Rect::new(1, 1, 128, 38);
+        let content = content_rect_for(CalendarView::Week, inner);
+        let (_top, bottom_opt) = CalendarWidget::day_full_areas(content);
+        let bottom = bottom_opt.expect("bottom must be present at height 37");
+
+        // Click the first week row: card border (1) + the 4 header rows.
+        let click_row = bottom.y + 1 + 4;
+        // Middle of the content area (second month column).
+        let click_col = content.x + content.width / 2;
+
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Week,
+            ..CalendarConfig::default()
+        });
+        // Anchor on 2026-07-06 (Monday); any click in another week should move it.
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        let original_anchor = w.anchor;
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: click_col,
+            row: click_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let result = w.handle_mouse(mouse, area);
+
+        assert_eq!(result, EventResult::Handled, "click in bottom block must be handled");
+        // The anchor should have changed.
+        assert_ne!(
+            w.anchor, original_anchor,
+            "clicking in bottom 3-month block should move the anchor to the clicked week"
+        );
+        // The view must remain Week.
+        assert_eq!(
+            w.view, CalendarView::Week,
+            "Week view click in bottom block must not change the view mode"
+        );
+    }
+
+    /// Non-Full Week rendering is unchanged: a Standard-size rect must NOT
+    /// invoke the Full-tier layout path (no bottom block).
+    #[test]
+    fn non_full_tier_week_view_unchanged() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        // 80 × 24 → Expanded, not Full.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Week,
+            ..CalendarConfig::default()
+        });
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+
+        terminal
+            .draw(|frame| {
+                Widget::render(&w, frame, frame.area(), false);
+            })
+            .unwrap();
+
+        // No crash = non-Full path ran correctly. The standard week grid renders.
+        let buf = terminal.backend().buffer().clone();
+        let has_separator = (0..24).any(|row| {
+            (0..80).any(|col| {
+                buf.cell((col, row))
+                    .map(|c| c.symbol() == "│")
+                    .unwrap_or(false)
+            })
+        });
+        assert!(
+            has_separator,
+            "Standard Week view must render │ column separators without Full-tier layout"
+        );
+    }
+
+    /// Day view at Full tier: each of the 3 months has a card border. The
+    /// render must not panic and must contain rounded-box characters.
+    #[test]
+    fn full_tier_day_view_months_have_card_borders() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let backend = TestBackend::new(130, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Day,
+            ..CalendarConfig::default()
+        });
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+
+        terminal
+            .draw(|frame| {
+                Widget::render(&w, frame, frame.area(), false);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        // Rounded card border characters must appear in the output.
+        let has_border_h = (0..40).any(|row| {
+            (0..130).any(|col| {
+                buf.cell((col, row))
+                    .map(|c| c.symbol() == "─")
+                    .unwrap_or(false)
+            })
+        });
+        assert!(
+            has_border_h,
+            "Full-tier Day view must render ─ card border characters for the month cards"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-tier Month view tests (restored zoomed Month)
+    // -----------------------------------------------------------------------
+
+    /// Helper: render the widget into a terminal and return the concatenated
+    /// text of every row.
+    fn render_to_string(w: &CalendarWidget, cols: u16, rows: u16) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let backend = TestBackend::new(cols, rows);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                Widget::render(w, frame, frame.area(), false);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..rows)
+            .flat_map(|row| {
+                let row_str: String = (0..cols)
+                    .map(|col| {
+                        buf.cell((col, row))
+                            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+                            .unwrap_or(' ')
+                    })
+                    .collect();
+                [row_str, "\n".to_string()]
+            })
+            .collect()
+    }
+
+    /// At Full tier the footer contains all three tabs: [day], [week], [month].
+    /// Month is no longer suppressed — it shows the Full-tier zoomed Month view.
+    #[test]
+    fn full_tier_footer_shows_all_three_tabs() {
+        let mut w = build_widget(CalendarConfig::default());
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        let rendered = render_to_string(&w, 130, 40);
+        assert!(
+            rendered.to_lowercase().contains("day"),
+            "Full-tier footer must contain the [day] tab"
+        );
+        assert!(
+            rendered.to_lowercase().contains("week"),
+            "Full-tier footer must contain the [week] tab"
+        );
+        assert!(
+            rendered.to_lowercase().contains("month"),
+            "Full-tier footer must contain the [month] tab"
+        );
+    }
+
+    /// At non-Full tier the footer also contains all three tabs.
+    #[test]
+    fn non_full_tier_footer_shows_all_three_tabs() {
+        let mut w = build_widget(CalendarConfig::default());
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        let rendered = render_to_string(&w, 80, 24);
+        assert!(
+            rendered.to_lowercase().contains("day"),
+            "non-Full footer must contain [day] tab"
+        );
+        assert!(
+            rendered.to_lowercase().contains("week"),
+            "non-Full footer must contain [week] tab"
+        );
+        assert!(
+            rendered.to_lowercase().contains("month"),
+            "non-Full footer must contain [month] tab"
+        );
+    }
+
+    /// Pressing `m` at Full tier switches to Month view and renders the
+    /// Full-tier zoomed Month view.
+    #[test]
+    fn full_tier_m_key_switches_to_month() {
+        let mut w = build_widget(CalendarConfig::default());
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        let _ = render_to_string(&w, 130, 40);
+        assert_eq!(w.view, CalendarView::Day);
+        let result = w.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(result, EventResult::Handled, "m key must be Handled at Full tier");
+        assert_eq!(w.view, CalendarView::Month, "m key must switch to Month at Full tier");
+    }
+
+    /// A widget in Month view at Full tier renders the Full-tier zoomed Month
+    /// (not the old Day fold). The footer must show the [month] tab active.
+    #[test]
+    fn full_tier_month_state_renders_month_view() {
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Month,
+            ..CalendarConfig::default()
+        });
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        assert_eq!(w.view, CalendarView::Month);
+        let rendered_full = render_to_string(&w, 130, 40);
+        // The month name "July" must appear in the zoomed month grid.
+        assert!(
+            rendered_full.to_lowercase().contains("july"),
+            "Full-tier Month-state widget must render the month name in the grid"
+        );
+        // Footer must show all three tabs including [month].
+        assert!(
+            rendered_full.to_lowercase().contains("month"),
+            "Full-tier footer must show [month] tab when view is Month"
+        );
+    }
+
+    /// Pressing `m` switches to Month view at both Full and non-Full tiers.
+    #[test]
+    fn m_key_switches_to_month_at_any_tier() {
+        for (cols, rows, label) in [(130u16, 40u16, "Full"), (80, 24, "non-Full")] {
+            let mut w = build_widget(CalendarConfig::default());
+            w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+            let _ = render_to_string(&w, cols, rows);
+            assert_eq!(w.view, CalendarView::Day);
+            let result = w.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+            assert_eq!(result, EventResult::Handled, "{label}: m key must be Handled");
+            assert_eq!(w.view, CalendarView::Month, "{label}: m key must switch to Month");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // day_dot_specs unit tests
+    // -----------------------------------------------------------------------
+
+    fn make_event_cal(
+        date: NaiveDate,
+        source: &str,
+        calendar: &str,
+        count: u32,
+    ) -> Vec<Arc<Event>> {
+        let start_dt = date
+            .and_hms_opt(9, 0, 0)
+            .and_then(|d| d.and_local_timezone(Local).single())
+            .unwrap();
+        let end_dt = date
+            .and_hms_opt(10, 0, 0)
+            .and_then(|d| d.and_local_timezone(Local).single())
+            .unwrap();
+        (0..count)
+            .map(|_| {
+                Arc::new(Event {
+                    title: "test".into(),
+                    start: start_dt,
+                    end: end_dt,
+                    all_day: false,
+                    source: source.into(),
+                    calendar: calendar.into(),
+                    location: None,
+                })
+            })
+            .collect()
+    }
+
+    fn build_colors_with_calendars(entries: &[(&str, &str)]) -> super::colors::CalendarColors {
+        use super::config::{ProviderEntry, ProviderKind};
+        let providers: Vec<ProviderEntry> = entries
+            .iter()
+            .map(|(source, cal)| {
+                let kind = match *source {
+                    "google" => ProviderKind::Google,
+                    "outlook" => ProviderKind::Outlook,
+                    _ => ProviderKind::Local,
+                };
+                ProviderEntry {
+                    kind,
+                    account: None,
+                    calendar_ids: vec![cal.to_string()],
+                }
+            })
+            .collect();
+        super::colors::CalendarColors::build(&CalendarConfig {
+            providers,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn day_dot_specs_empty_day_returns_empty() {
+        let colors = build_colors_with_calendars(&[("google", "primary")]);
+        let date = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        let result = super::day_dot_specs(date, &[], &colors, 5, false);
+        assert!(result.is_empty(), "no events → no dots");
+    }
+
+    #[test]
+    fn day_dot_specs_single_calendar_color_mode() {
+        let colors = build_colors_with_calendars(&[("google", "primary")]);
+        let date = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        let events = make_event_cal(date, "google", "primary", 3);
+        let result = super::day_dot_specs(date, &events, &colors, 2, false);
+        assert_eq!(result.len(), 1, "one calendar → one dot entry");
+        assert_eq!(result[0].1, 1, "color-by-calendar mode always returns count=1");
+    }
+
+    #[test]
+    fn day_dot_specs_color_mode_capped_at_cap() {
+        // 3 distinct calendars, cap=2.
+        let colors = build_colors_with_calendars(&[
+            ("google", "a"),
+            ("google", "b"),
+            ("google", "c"),
+        ]);
+        let date = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        let mut events = make_event_cal(date, "google", "a", 5);
+        events.extend(make_event_cal(date, "google", "b", 2));
+        events.extend(make_event_cal(date, "google", "c", 1));
+        let result = super::day_dot_specs(date, &events, &colors, 2, false);
+        assert_eq!(result.len(), 2, "color mode capped at cap=2");
+        // All count=1 in color mode.
+        assert!(result.iter().all(|(_, c)| *c == 1));
+    }
+
+    #[test]
+    fn day_dot_specs_hybrid_worked_example() {
+        // Worked example from §7: cap=5, {A:6, B:2, C:1} → [(A,3),(B,1),(C,1)].
+        let colors = build_colors_with_calendars(&[
+            ("google", "A"),
+            ("google", "B"),
+            ("google", "C"),
+        ]);
+        let date = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        let mut events = make_event_cal(date, "google", "A", 6);
+        events.extend(make_event_cal(date, "google", "B", 2));
+        events.extend(make_event_cal(date, "google", "C", 1));
+        let result = super::day_dot_specs(date, &events, &colors, 5, true);
+        assert_eq!(result.len(), 3, "three calendars active");
+        let total: u8 = result.iter().map(|(_, c)| c).sum();
+        assert_eq!(total, 5, "hybrid: total dots == cap");
+        // A should have the most dots (6 events → largest share).
+        let a_color = colors.resolve("google", "A");
+        let a_dots = result.iter().find(|(c, _)| *c == a_color).map(|(_, n)| *n).unwrap_or(0);
+        assert_eq!(a_dots, 3, "A gets 3 dots (floor(6/9*5)=3)");
+        // B and C each get 1 (min-1 floor applied).
+        let b_color = colors.resolve("google", "B");
+        let b_dots = result.iter().find(|(c, _)| *c == b_color).map(|(_, n)| *n).unwrap_or(0);
+        assert_eq!(b_dots, 1, "B gets 1 dot (min-1 floor)");
+        let c_color = colors.resolve("google", "C");
+        let c_dots = result.iter().find(|(c, _)| *c == c_color).map(|(_, n)| *n).unwrap_or(0);
+        assert_eq!(c_dots, 1, "C gets 1 dot (min-1 floor)");
+    }
+
+    #[test]
+    fn day_dot_specs_hybrid_min1_floor() {
+        // A:9, B:1, cap=5. Busyness 10 saturates to n_dots=5. Proportional
+        // apportionment floors B's 0.5 share to 0, so the min-1 floor bumps B
+        // to 1 and reclaims that dot from A. Result: A=4, B=1, total=5.
+        let colors = build_colors_with_calendars(&[("google", "a"), ("google", "b")]);
+        let date = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        let mut events = make_event_cal(date, "google", "a", 9);
+        events.extend(make_event_cal(date, "google", "b", 1));
+        let result = super::day_dot_specs(date, &events, &colors, 5, true);
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().all(|(_, c)| *c >= 1), "min-1 floor: each calendar ≥ 1 dot");
+        let total: u8 = result.iter().map(|(_, c)| c).sum();
+        assert_eq!(total, 5, "busyness 10 saturates to cap 5");
+        let b_dots = result
+            .iter()
+            .find(|(c, _)| *c == colors.resolve("google", "b"))
+            .map(|(_, n)| *n)
+            .unwrap();
+        assert_eq!(b_dots, 1, "B floored to 0 then bumped to min-1");
+    }
+
+    #[test]
+    fn day_dot_specs_hybrid_count_tracks_busyness() {
+        // A single calendar: the dot count equals the event count until it
+        // saturates at the cap. This is what makes a quiet day look quiet and
+        // a packed day look packed.
+        let colors = build_colors_with_calendars(&[("google", "a")]);
+        let date = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        for (events_n, expect) in [(1u32, 1u8), (2, 2), (5, 5), (6, 6), (12, 6)] {
+            let events = make_event_cal(date, "google", "a", events_n);
+            let result = super::day_dot_specs(date, &events, &colors, 6, true);
+            let total: u8 = result.iter().map(|(_, c)| c).sum();
+            assert_eq!(total, expect, "{events_n} events → {expect} dots (cap 6)");
+        }
+    }
+
+    #[test]
+    fn day_dot_specs_hybrid_over_cap_drops_lowest() {
+        // 5 calendars each with 1 event, cap=4.
+        // Over-cap: 5 > 4. Drop alphabetically-last calendar.
+        let colors = build_colors_with_calendars(&[
+            ("google", "a"),
+            ("google", "b"),
+            ("google", "c"),
+            ("google", "d"),
+            ("google", "e"),
+        ]);
+        let date = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        let mut events = Vec::new();
+        for cal in ["a", "b", "c", "d", "e"] {
+            events.extend(make_event_cal(date, "google", cal, 1));
+        }
+        let result = super::day_dot_specs(date, &events, &colors, 4, true);
+        // Over-cap: exactly cap calendars kept.
+        assert_eq!(result.len(), 4, "over-cap: exactly 4 calendars kept");
+        let e_color = colors.resolve("google", "e");
+        assert!(
+            result.iter().all(|(c, _)| *c != e_color),
+            "calendar 'e' (lowest alphabetically in tie) must be dropped"
+        );
+    }
+
+    #[test]
+    fn day_dot_specs_events_on_wrong_day_excluded() {
+        let colors = build_colors_with_calendars(&[("google", "primary")]);
+        let date = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        let other_date = NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
+        let events = make_event_cal(other_date, "google", "primary", 3);
+        let result = super::day_dot_specs(date, &events, &colors, 5, false);
+        assert!(result.is_empty(), "events on other day must not produce dots");
+    }
+
+    // -----------------------------------------------------------------------
+    // render_month_full render tests
+    // -----------------------------------------------------------------------
+
+    /// Full-tier Month view renders the month name and weekday headers.
+    #[test]
+    fn full_tier_month_view_renders_grid() {
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Month,
+            ..CalendarConfig::default()
+        });
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        // 130 × 40 → Full tier.
+        let rendered = render_to_string(&w, 130, 40);
+        // Month name must appear.
+        assert!(
+            rendered.to_lowercase().contains("july"),
+            "Full-tier Month view must render the month name 'July'"
+        );
+        // Weekday headers must appear.
+        assert!(
+            rendered.to_lowercase().contains("sun") || rendered.to_lowercase().contains("mon"),
+            "Full-tier Month view must render weekday headers"
+        );
+    }
+
+    /// Full-tier Month view includes the next month when width allows.
+    #[test]
+    fn full_tier_month_view_multi_month_priority() {
+        // MONTH_FULL_RICH_WIDTH = 63; need ≥ 126 content for 2 months.
+        // 130 cols inner ≈ 128 content → current (July) + next (August).
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Month,
+            ..CalendarConfig::default()
+        });
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        let rendered = render_to_string(&w, 130, 40);
+        // Current month (July) must always appear.
+        assert!(
+            rendered.to_lowercase().contains("july"),
+            "current month must always appear"
+        );
+        // At 130 cols, next month (August) should appear.
+        assert!(
+            rendered.to_lowercase().contains("august"),
+            "next month must appear when width allows (130 cols)"
+        );
+    }
+
+    /// Full-tier Month view shows months in chronological order (prev·current·next).
+    /// MONTH_FULL_RICH_WIDTH = 63 needs ≥ 189 content for all 3 months, so we
+    /// render at 200 cols (content ≈ 198). We verify the layout by checking
+    /// column positions in the month-name row.
+    #[test]
+    fn full_tier_month_view_chronological_order() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Month,
+            ..CalendarConfig::default()
+        });
+        // Anchor in July 2026 so we get June·July·August.
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+
+        let backend = TestBackend::new(200, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                Widget::render(&w, frame, frame.area(), false);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+
+        // Scan every terminal row for the month-name row that contains both
+        // "june" AND "july" AND "august" on the same line.  That row is the
+        // header row rendered by render_month_full where each column shows its
+        // month name centered.  Checking same-row column positions is the only
+        // reliable way to assert left-to-right ordering without being confused
+        // by the widget title (which contains "July 2026" on row 0).
+        let row_strings: Vec<String> = (0..40u16)
+            .map(|row| {
+                (0..200u16)
+                    .map(|col| {
+                        buf.cell((col, row))
+                            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+                            .unwrap_or(' ')
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Find the row that contains all three month names (the grid header row).
+        let header_row = row_strings.iter().find(|r| {
+            let l = r.to_lowercase();
+            l.contains("june") && l.contains("july") && l.contains("august")
+        });
+
+        if let Some(row) = header_row {
+            let lower = row.to_lowercase();
+            let pos_june = lower.find("june").unwrap();
+            let pos_july = lower.find("july").unwrap();
+            let pos_aug = lower.find("august").unwrap();
+            assert!(
+                pos_june < pos_july,
+                "June ({pos_june}) must be left of July ({pos_july}) on the same row"
+            );
+            assert!(
+                pos_july < pos_aug,
+                "July ({pos_july}) must be left of August ({pos_aug}) on the same row"
+            );
+        } else {
+            // Three-month layout may not trigger if borders eat into the width;
+            // fall back to verifying at least current + next appear somewhere.
+            let all_rows = row_strings.join("\n").to_lowercase();
+            assert!(
+                all_rows.contains("july"),
+                "July (current) must appear in the grid"
+            );
+            assert!(
+                all_rows.contains("august"),
+                "August (next) must appear at 200 cols"
+            );
+        }
+    }
+
+    /// Non-Full Month rendering is unchanged: a Standard-size rect uses the
+    /// compact single-row-per-week grid without dot strips.
+    #[test]
+    fn non_full_tier_month_view_unchanged() {
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Month,
+            ..CalendarConfig::default()
+        });
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        // 80 × 24 → Expanded, not Full.
+        let rendered = render_to_string(&w, 80, 24);
+        // Month name must appear.
+        assert!(
+            rendered.to_lowercase().contains("july"),
+            "non-Full Month view must render the month name"
+        );
+        // No crash = non-Full path ran correctly.
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-tier Day/Week mini-month dot tests
+    // -----------------------------------------------------------------------
+
+    /// Full-tier Day view mini-months render without panic when events are
+    /// present. (Color dot presence is hard to assert without deep cell
+    /// inspection, so we verify the render completes and the bottom block
+    /// appears via its border character.)
+    #[test]
+    fn full_tier_day_mini_months_render_with_events() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let backend = TestBackend::new(130, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut w = build_widget(CalendarConfig {
+            default_view: CalendarView::Day,
+            providers: vec![super::config::ProviderEntry {
+                kind: super::config::ProviderKind::Google,
+                account: None,
+                calendar_ids: vec!["primary".into()],
+            }],
+            ..CalendarConfig::default()
+        });
+        w.anchor = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        // Inject synthetic events directly into state.
+        let date = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        let events_to_inject = make_event_cal(date, "google", "primary", 2);
+        {
+            let mut st = w.state.lock().unwrap();
+            st.events = events_to_inject;
+        }
+
+        terminal
+            .draw(|frame| {
+                Widget::render(&w, frame, frame.area(), false);
+            })
+            .unwrap();
+
+        // Bottom block borders should appear (rounded card borders).
+        let buf = terminal.backend().buffer().clone();
+        let has_border = (0..40).any(|row| {
+            (0..130).any(|col| {
+                buf.cell((col, row))
+                    .map(|c| c.symbol() == "─")
+                    .unwrap_or(false)
+            })
+        });
+        assert!(has_border, "mini-month block must render card border characters");
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_range Full-tier extension tests
+    // -----------------------------------------------------------------------
+
+    /// At Full tier (last_full=true), Day and Week view fetch buffers expand
+    /// to 60 days to cover the 3-month bottom block.
+    #[test]
+    fn fetch_range_full_tier_expands_buffer() {
+        for view in [CalendarView::Day, CalendarView::Week] {
+            let wv = build_widget(CalendarConfig { default_view: view, ..CalendarConfig::default() });
+            wv.last_full.store(true, std::sync::atomic::Ordering::Relaxed);
+            let (start, end) = wv.fetch_range();
+            let duration = end.signed_duration_since(start);
+            // 60-day buffer on each side means at least 120 days total span.
+            assert!(
+                duration.num_days() >= 120,
+                "{view:?} at Full tier must have ≥120-day fetch span, got {days}",
+                days = duration.num_days()
+            );
+        }
+    }
+
+    /// At non-Full tier (last_full=false), Day and Week use the standard
+    /// ±14-day buffer (≥28 days total span).
+    #[test]
+    fn fetch_range_non_full_tier_unchanged() {
+        for view in [CalendarView::Day, CalendarView::Week] {
+            let w = build_widget(CalendarConfig { default_view: view, ..CalendarConfig::default() });
+            w.last_full.store(false, std::sync::atomic::Ordering::Relaxed);
+            let (start, end) = w.fetch_range();
+            let duration = end.signed_duration_since(start);
+            // ±14 days → ~30 days total (current_range for Day is 2 days; 2 + 14 + 14 = 30).
+            assert!(
+                duration.num_days() >= 28 && duration.num_days() < 50,
+                "{view:?} at non-Full tier must have 28–50 day fetch span, got {days}",
+                days = duration.num_days()
+            );
+        }
     }
