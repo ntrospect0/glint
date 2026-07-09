@@ -11,6 +11,7 @@
 
 use std::time::{Duration, SystemTime};
 
+use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Alignment, Rect},
@@ -21,6 +22,7 @@ use ratatui::{
 };
 
 use crate::ui::big_digits;
+use crate::widgets::ViewTier;
 
 use super::stopwatch::format_hms;
 use super::{ClockWidget, EventResult};
@@ -268,7 +270,7 @@ pub(super) fn edit_blink_on() -> bool {
 }
 
 impl ClockWidget {
-    pub(super) fn render_timer_body(&self, frame: &mut Frame, inner: Rect) {
+    pub(super) fn render_timer_body(&self, frame: &mut Frame, inner: Rect, tier: ViewTier) {
         let (phase, remaining, edit_snapshot, gradient, duration) = {
             let st = self.state.lock().expect("clock state poisoned");
             (
@@ -311,6 +313,52 @@ impl ClockWidget {
         lines.push(Line::from(""));
         for line in big_lines {
             lines.push(line);
+        }
+
+        // ── Full-tier: burn-down progress bar ──────────────────────────
+        //
+        // At Full, insert a horizontal progress bar + human-readable
+        // detail line below the big digits and above the phase hints.
+        // The bar shows elapsed fraction = (duration − remaining) /
+        // duration, clipped to [0, 1]. Only shown for phases where the
+        // fraction is meaningful (Running, Paused, Fired) and only when
+        // duration > 0 to avoid division by zero.
+        //
+        // The "remaining" text in the detail row is the test-visible
+        // signal that distinguishes Full-tier rendering from Standard:
+        // standard/expanded hints do not include the word "remaining".
+        if tier == ViewTier::Full
+            && duration > Duration::ZERO
+            && !matches!(phase, TimerPhase::Idle | TimerPhase::Editing { .. })
+        {
+            let elapsed_frac = {
+                let elapsed_secs =
+                    duration.as_secs_f64() - remaining.as_secs_f64();
+                (elapsed_secs / duration.as_secs_f64()).clamp(0.0, 1.0)
+            };
+            const BAR_INNER: usize = 40;
+            let filled = (elapsed_frac * BAR_INNER as f64).round() as usize;
+            let empty = BAR_INNER - filled;
+            let bar_str = format!(
+                "[{}{}] {:3.0}%",
+                "█".repeat(filled),
+                "░".repeat(empty),
+                elapsed_frac * 100.0,
+            );
+            let detail_str = format_timer_detail(&phase, remaining);
+            if (lines.len() as u16) + 2 < inner.height {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    bar_str,
+                    self.theme.text_focused,
+                )));
+                if (lines.len() as u16) < inner.height {
+                    lines.push(Line::from(Span::styled(
+                        detail_str,
+                        self.theme.text_dim,
+                    )));
+                }
+            }
         }
 
         // Phase-specific annotation line that lives right under the
@@ -691,5 +739,43 @@ impl ClockWidget {
             }
             _ => EventResult::Ignored,
         }
+    }
+}
+
+/// Build the human-readable remaining-time string for the Full-tier
+/// burn-down bar's detail row. Format varies by phase:
+/// - Running: "Xm Ys remaining · fires at HH:MM"
+/// - Paused:  "Xm Ys remaining (paused)"
+/// - Fired:   "Elapsed"
+/// - Other phases are not reached (caller guards on Running/Paused/Fired).
+fn format_timer_detail(phase: &TimerPhase, remaining: Duration) -> String {
+    let rem = format_remaining_human(remaining);
+    match phase {
+        TimerPhase::Running { end_at } => {
+            let fires_at = DateTime::<Local>::from(*end_at);
+            format!("{rem} remaining · fires at {}", fires_at.format("%H:%M"))
+        }
+        TimerPhase::Paused { .. } => {
+            format!("{rem} remaining (paused)")
+        }
+        TimerPhase::Fired { .. } => "Elapsed".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Format a `Duration` as a compact human-readable string suitable for
+/// the burn-down bar's detail row. Examples: "42s", "5m 23s", "1h 05m".
+fn format_remaining_human(d: Duration) -> String {
+    let total = d.as_secs();
+    if total >= 3600 {
+        let h = total / 3600;
+        let m = (total % 3600) / 60;
+        format!("{h}h {m:02}m")
+    } else if total >= 60 {
+        let m = total / 60;
+        let s = total % 60;
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{total}s")
     }
 }

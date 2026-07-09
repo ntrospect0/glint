@@ -17,11 +17,12 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
 
-use crate::ui::big_digits;
+use crate::ui::{big_digits, CardGrid};
+use crate::widgets::ViewTier;
 
 use super::{ClockWidget, EventResult};
 
@@ -344,6 +345,34 @@ impl ClockWidget {
         }
     }
 
+    /// Returns `(label, "HH:MM", "Wkd Mon DD")` triples for the Full-tier
+    /// big-digit grid.
+    ///
+    /// Only the *secondary* world-clock zones are returned — the primary
+    /// (home) zone is already shown by the big-digit face at the top of the
+    /// widget and must not be repeated as a grid cell. Each triple carries
+    /// the zone's own local day-of-week and date so the user can tell at a
+    /// glance when a secondary is on a different calendar day than home.
+    pub(super) fn world_clock_secondary_grid_entries(
+        &self,
+    ) -> Vec<(String, String, String, &'static str)> {
+        let now = chrono::Utc::now();
+        let mut out: Vec<(String, String, String, &'static str)> =
+            Vec::with_capacity(self.secondaries.len());
+        for (label, tz) in &self.secondaries {
+            let t = now.with_timezone(tz);
+            let hhmm = format!("{:02}:{:02}", t.hour(), t.minute());
+            let day_date = format!(
+                "{} {} {}",
+                weekday_name(t.weekday()),
+                month_name(t.month()),
+                t.day()
+            );
+            out.push((label.clone(), hhmm, day_date, day_night_icon(t.hour())));
+        }
+        out
+    }
+
     /// Returns (label, "HH:MM Wkd Mon DD") pairs for the World Clocks block.
     /// Primary timezone leads, then any configured secondaries. Each entry
     /// carries its own local date so the user can tell when a clock is on a
@@ -401,11 +430,17 @@ impl ClockWidget {
     /// + ticker + date + world clocks layout, factored out of the
     /// top-level `render` so the new tab strip + mode dispatch can
     /// share the chrome (title row, border, mode tabs).
+    ///
+    /// At `ViewTier::Full` the world-clocks block is replaced by a
+    /// multi-column side-by-side grid so all configured zones are
+    /// visible at once without scrolling. At every other tier the
+    /// existing scrollable vertical list renders unchanged.
     pub(super) fn render_clock_body(
         &self,
         frame: &mut Frame,
         inner: Rect,
         transient: Option<&(String, String, Tz)>,
+        tier: ViewTier,
     ) {
         let now = chrono::Utc::now();
         let (time, ampm, date) = self.render_strings(now);
@@ -449,6 +484,42 @@ impl ClockWidget {
             // No blank line above the date — the ticker and the day-date sit
             // together as one block of secondary info beneath the clock.
             lines.push(Line::from(date));
+        }
+
+        // ── Full-tier: large-digit multi-TZ grid ──────────────────────
+        //
+        // At Full, split the body into a top rect (big digits + ticker +
+        // date, rendered as before) and a bottom rect (the PinnedGrid of
+        // per-zone large-digit clocks). The scrollable list path is
+        // completely bypassed; world_clock_max_scroll is set by the grid
+        // itself based on how many zones fit. Scroll keys delegate to
+        // scroll_world_clocks(), which returns Ignored when max_scroll == 0.
+        if tier == ViewTier::Full {
+            let top_h = lines.len() as u16;
+            let top_rect = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: top_h.min(inner.height),
+            };
+            frame.render_widget(
+                Paragraph::new(lines).alignment(Alignment::Center),
+                top_rect,
+            );
+            // One blank row between the primary face's day/date line and the
+            // timezone card grid below.
+            const TOP_GRID_GAP: u16 = 1;
+            if inner.height > top_h + TOP_GRID_GAP {
+                let grid_rect = Rect {
+                    x: inner.x,
+                    y: inner.y + top_h + TOP_GRID_GAP,
+                    width: inner.width,
+                    height: inner.height - top_h - TOP_GRID_GAP,
+                };
+                let entries = self.world_clock_secondary_grid_entries();
+                self.render_full_world_clock_grid(frame, grid_rect, &entries);
+            }
+            return;
         }
 
         // World clocks block — show as many entries as fit, scroll the rest
@@ -569,7 +640,7 @@ impl ClockWidget {
                         Style::default()
                     };
                     let prefix = if selected == Some(idx) { "▸ " } else { "  " };
-                    let display_label = truncate_with_ellipsis(label, max_label);
+                    let display_label = crate::text::truncate(label, max_label);
                     let line = format!(
                         "{}{:<width$}  {}",
                         prefix,
@@ -625,25 +696,162 @@ impl ClockWidget {
             frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), hint_area);
         }
     }
+
+    /// Render secondary world-clock zones as a capped-width large-digit grid at Full tier.
+    ///
+    /// The home/primary zone is intentionally excluded — it is already displayed
+    /// by the big-digit face at the top of the widget. Only the configured
+    /// secondary zones appear here.
+    ///
+    /// Each cell is rendered as a bordered card (all four sides). Inside the card:
+    /// - Row 0: top padding
+    /// - Rows 1–5: big-digit "HH:MM" (5 glyph rows via `big_digits::render_styled`)
+    /// - Row 6: city label (dim)
+    /// - Row 7: day-of-week + date (e.g. "Tue Jul 8", dim)
+    ///
+    /// Card geometry:
+    /// - max card width: `CARD_MAX_W` (40 cols) — never stretched beyond this.
+    /// - min card width: `CELL_MIN_STRIDE` (29 cols) — keeps big-digit block intact.
+    /// - height: 8 content rows + 2 border rows = 10 total
+    /// - 1-col gap between adjacent cards; group is horizontally centered.
+    ///
+    /// Layout is delegated to [`crate::ui::CardGrid`] (unpinned, multi-row).
+    /// A partial last row is centered to its own card count.
+    fn render_full_world_clock_grid(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        entries: &[(String, String, String, &'static str)],
+    ) {
+        if area.height == 0 || entries.is_empty() {
+            let mut st = self.state.lock().expect("clock state poisoned");
+            st.world_clock_max_scroll = 0;
+            st.world_clock_scroll = 0;
+            return;
+        }
+
+        // "HH:MM" glyph width: 5 chars × 3 cols + 4 single-space separators = 19.
+        const GLYPH_COLS: u16 = 19;
+        // Preferred inner padding on each side of the glyph block.
+        const PAD: u16 = 4;
+        // Card border consumes 2 cols (left + right) and 2 rows (top + bottom).
+        const BORDER: u16 = 2;
+        // Minimum card width: inner glyph+pad space + border cols.
+        const CELL_MIN_STRIDE: u16 = GLYPH_COLS + PAD * 2 + BORDER;
+        // Maximum card width — cards never stretch beyond this.
+        const CARD_MAX_W: u16 = 40;
+        // 1-col gap between adjacent card borders.
+        const INTER_CARD_GAP: u16 = 1;
+        // Cell height: 2 border rows + 1 top-pad + 5 glyph rows + 1 blank
+        // spacer + 1 label + 1 date.
+        const CELL_ROWS: u16 = BORDER + 1 + big_digits::GLYPH_HEIGHT as u16 + 1 + 2;
+
+        // Read the current scroll offset from state.
+        let scroll_offset = {
+            let st = self.state.lock().expect("clock state poisoned");
+            st.world_clock_scroll
+        };
+
+        // Compute card positions via the shared CardGrid primitive.
+        // pin_home = false: all entries scroll together (the home/primary zone
+        // is already shown by the big-digit face above — only secondaries here).
+        let grid_layout = CardGrid {
+            area,
+            card_max_w: CARD_MAX_W,
+            card_min_w: CELL_MIN_STRIDE,
+            cell_h: CELL_ROWS,
+            gap: INTER_CARD_GAP,
+            item_count: entries.len(),
+            scroll_offset,
+            pin_home: false,
+        }
+        .layout();
+
+        // Persist max_scroll and clamped offset back to state.
+        {
+            let mut st = self.state.lock().expect("clock state poisoned");
+            st.world_clock_max_scroll = grid_layout.max_scroll;
+            let clamped = scroll_offset.min(grid_layout.max_scroll);
+            st.world_clock_scroll = clamped;
+        }
+
+        if grid_layout.cells.is_empty() {
+            return;
+        }
+
+        let gradient = self.state.lock().expect("clock state poisoned").gradient;
+        let cell_style = self.theme.text_plain;
+
+        for &(item_idx, cell_rect) in &grid_layout.cells {
+            let entry = &entries[item_idx];
+            if cell_rect.width == 0 || cell_rect.height == 0 {
+                continue;
+            }
+
+            let (label, hhmm, day_date, glyph) = entry;
+
+            // Draw the card border and obtain the inner content rect.
+            let card = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(self.theme.border_style(false));
+            let inner = card.inner(cell_rect);
+            frame.render_widget(card, cell_rect);
+
+            if inner.width == 0 || inner.height == 0 {
+                continue;
+            }
+
+            // Row 0 (inner): top padding — empty line so glyphs breathe from the border.
+            // Rows 1–5: big-digit time, centered.
+            let digit_lines = big_digits::render_styled(hhmm, gradient, cell_style);
+            for (row_offset, dline) in digit_lines.into_iter().enumerate() {
+                let y = inner.y + 1 + row_offset as u16;
+                if y >= inner.bottom() {
+                    break;
+                }
+                frame.render_widget(
+                    Paragraph::new(dline).alignment(Alignment::Center),
+                    Rect::new(inner.x, y, inner.width, 1),
+                );
+            }
+
+            // One blank spacer row between the digits and the label, then the
+            // city label (centered, dim).
+            let label_y = inner.y + 1 + big_digits::GLYPH_HEIGHT as u16 + 1;
+            if label_y < inner.bottom() {
+                // City name with the zone's day/night glyph to its right.
+                // Reserve 2 cols (" ☀") so the glyph survives truncation.
+                let city = crate::text::truncate(
+                    label,
+                    (inner.width as usize).saturating_sub(2),
+                );
+                let label_span = Span::styled(
+                    format!("{city} {glyph}"),
+                    self.theme.text_dim,
+                );
+                frame.render_widget(
+                    Paragraph::new(Line::from(label_span)).alignment(Alignment::Center),
+                    Rect::new(inner.x, label_y, inner.width, 1),
+                );
+            }
+
+            // Row 7 (inner): day + date, centered and dim.
+            let date_y = label_y + 1;
+            if date_y < inner.bottom() {
+                let date_span = Span::styled(
+                    crate::text::truncate(day_date, inner.width as usize),
+                    self.theme.text_dim,
+                );
+                frame.render_widget(
+                    Paragraph::new(Line::from(date_span)).alignment(Alignment::Center),
+                    Rect::new(inner.x, date_y, inner.width, 1),
+                );
+            }
+        }
+    }
 }
 
-/// Trim `s` to at most `max_width` characters, appending an ellipsis
-/// to mark the truncation. `max_width <= 1` collapses to a bare "…"
-/// — callers should guarantee at least a minimal label budget before
-/// calling. Counts unicode `char`s rather than bytes so multibyte
-/// city names (e.g. "São Paulo") trim correctly.
-fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
-    let count = s.chars().count();
-    if count <= max_width {
-        return s.to_string();
-    }
-    if max_width <= 1 {
-        return "…".to_string();
-    }
-    let mut out: String = s.chars().take(max_width - 1).collect();
-    out.push('…');
-    out
-}
 
 fn format_clock_entry<T: TimeZone>(t: &DateTime<T>) -> String
 where

@@ -340,10 +340,16 @@ impl Widget for ClockWidget {
             (inner, None)
         };
 
+        // ViewTier deviation: clock uses ViewTier::from_rect for gating
+        // the Full-tier rich views, but keeps its own inline geometry
+        // constants for the big-digit layout (which drives the per-mode
+        // thresholds). The tier is derived from the outer area (borders
+        // included), consistent with the convention in every other widget.
+        let tier = crate::widgets::ViewTier::from_rect(area);
         match mode {
-            Mode::Clock => self.render_clock_body(frame, body, transient.as_ref()),
-            Mode::Stopwatch => self.render_stopwatch_body(frame, body),
-            Mode::Timer => self.render_timer_body(frame, body),
+            Mode::Clock => self.render_clock_body(frame, body, transient.as_ref(), tier),
+            Mode::Stopwatch => self.render_stopwatch_body(frame, body, tier),
+            Mode::Timer => self.render_timer_body(frame, body, tier),
         }
 
         if let Some(tabs) = tabs_area {

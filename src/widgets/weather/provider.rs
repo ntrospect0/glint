@@ -43,6 +43,19 @@ impl Units {
     }
 }
 
+/// One hour of forecast data returned by the Open-Meteo hourly endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HourlyPoint {
+    /// Wall-clock hour in the location's local timezone (`timezone=auto`).
+    /// Stored as `NaiveDateTime` because Open-Meteo returns times without an
+    /// offset suffix; callers compare against `Local::now().naive_local()`.
+    pub time: chrono::NaiveDateTime,
+    /// Air temperature at 2 m in the configured unit.
+    pub temperature: f64,
+    /// Precipitation probability 0–100.
+    pub precipitation_probability: f64,
+}
+
 /// Snapshot of current conditions as we parse them out of the Open-Meteo response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WeatherData {
@@ -50,12 +63,20 @@ pub struct WeatherData {
     pub apparent_temperature: f64,
     pub humidity: f64,
     pub wind_speed: f64,
+    /// Wind direction in degrees (0–360, clockwise from north). Absent from
+    /// older cached snapshots; `None` degrades gracefully.
+    #[serde(default)]
+    pub wind_direction: Option<f64>,
     pub weather_code: u32,
     pub units: Units,
     pub fetched_at: chrono::DateTime<chrono::Local>,
     /// Daily forecast for the next few days, starting with today. Includes
     /// each day's sunrise/sunset so the renderer can swap day/night sprites.
     pub daily: Vec<DailyForecast>,
+    /// Hourly temperature + precipitation for the next ~48 h.
+    /// Empty in older cached snapshots; degrades gracefully.
+    #[serde(default)]
+    pub hourly: Vec<HourlyPoint>,
 }
 
 impl WeatherData {
@@ -85,6 +106,13 @@ pub struct DailyForecast {
     /// caller should fall back to a heuristic.
     pub sunrise: Option<chrono::DateTime<chrono::Local>>,
     pub sunset: Option<chrono::DateTime<chrono::Local>>,
+    /// Maximum precipitation probability for the day (0–100). Absent from
+    /// older cached snapshots; `None` degrades gracefully.
+    #[serde(default)]
+    pub precipitation_probability_max: Option<f64>,
+    /// Maximum UV index for the day. Absent from older cached snapshots.
+    #[serde(default)]
+    pub uv_index_max: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -106,13 +134,17 @@ impl OpenMeteoProvider {
             longitude,
             units,
             base_url: "https://api.open-meteo.com/v1/forecast".into(),
-            forecast_days: 4, // today + next 3
+            forecast_days: 8, // today + next 7
         }
     }
 
     fn build_url(&self) -> String {
         format!(
-            "{base}?latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset&forecast_days={days}&temperature_unit={temp}&wind_speed_unit={wind}&timezone=auto",
+            "{base}?latitude={lat}&longitude={lon}\
+            &current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m\
+            &daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,precipitation_probability_max,uv_index_max\
+            &hourly=temperature_2m,precipitation_probability\
+            &forecast_days={days}&temperature_unit={temp}&wind_speed_unit={wind}&timezone=auto",
             base = self.base_url,
             lat = self.latitude,
             lon = self.longitude,
@@ -128,6 +160,8 @@ struct OpenMeteoResponse {
     current: OpenMeteoCurrent,
     #[serde(default)]
     daily: Option<OpenMeteoDaily>,
+    #[serde(default)]
+    hourly: Option<OpenMeteoHourly>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,6 +171,8 @@ struct OpenMeteoCurrent {
     apparent_temperature: f64,
     weather_code: u32,
     wind_speed_10m: f64,
+    #[serde(default)]
+    wind_direction_10m: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +189,19 @@ struct OpenMeteoDaily {
     sunrise: Vec<Option<String>>,
     #[serde(default)]
     sunset: Vec<Option<String>>,
+    #[serde(default)]
+    precipitation_probability_max: Vec<Option<f64>>,
+    #[serde(default)]
+    uv_index_max: Vec<Option<f64>>,
+}
+
+/// Hourly arrays from Open-Meteo (`hourly=temperature_2m,precipitation_probability`).
+#[derive(Debug, Deserialize)]
+struct OpenMeteoHourly {
+    time: Vec<String>,
+    temperature_2m: Vec<f64>,
+    #[serde(default)]
+    precipitation_probability: Vec<Option<f64>>,
 }
 
 impl OpenMeteoProvider {
@@ -170,15 +219,18 @@ impl OpenMeteoProvider {
             .await
             .context("failed to deserialize open-meteo response")?;
         let daily = resp.daily.map(parse_daily).unwrap_or_default();
+        let hourly = resp.hourly.map(parse_hourly).unwrap_or_default();
         Ok(WeatherData {
             temperature: resp.current.temperature_2m,
             apparent_temperature: resp.current.apparent_temperature,
             humidity: resp.current.relative_humidity_2m,
             wind_speed: resp.current.wind_speed_10m,
+            wind_direction: resp.current.wind_direction_10m,
             weather_code: resp.current.weather_code,
             units: self.units,
             fetched_at: chrono::Local::now(),
             daily,
+            hourly,
         })
     }
 }
@@ -208,6 +260,34 @@ fn parse_daily(daily: OpenMeteoDaily) -> Vec<DailyForecast> {
                     .get(i)
                     .and_then(|s| s.as_deref())
                     .and_then(parse_local_dt),
+                precipitation_probability_max: daily
+                    .precipitation_probability_max
+                    .get(i)
+                    .and_then(|x| *x),
+                uv_index_max: daily.uv_index_max.get(i).and_then(|x| *x),
+            });
+        }
+    }
+    out
+}
+
+/// Parse Open-Meteo hourly arrays into `HourlyPoint` values. Times are
+/// in the same `%Y-%m-%dT%H:%M` local-wall-clock format as `parse_local_dt`.
+fn parse_hourly(h: OpenMeteoHourly) -> Vec<HourlyPoint> {
+    let n = h.time.len().min(h.temperature_2m.len());
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if let Ok(time) =
+            chrono::NaiveDateTime::parse_from_str(&h.time[i], "%Y-%m-%dT%H:%M")
+        {
+            out.push(HourlyPoint {
+                time,
+                temperature: h.temperature_2m[i],
+                precipitation_probability: h
+                    .precipitation_probability
+                    .get(i)
+                    .and_then(|x| *x)
+                    .unwrap_or(0.0),
             });
         }
     }
@@ -372,6 +452,8 @@ mod tests {
             temperature_2m_min: vec![12.0, 11.0, 10.0],
             sunrise: vec![Some("2026-05-20T05:30".into()), None, None],
             sunset: vec![Some("2026-05-20T20:15".into()), None, None],
+            precipitation_probability_max: vec![Some(30.0), None, Some(80.0)],
+            uv_index_max: vec![Some(5.0), None, None],
         };
         let out = parse_daily(raw);
         assert_eq!(out.len(), 3);
@@ -380,6 +462,10 @@ mod tests {
         assert_eq!(out[2].temperature_low, 10.0);
         assert!(out[0].sunrise.is_some());
         assert!(out[1].sunrise.is_none());
+        assert_eq!(out[0].precipitation_probability_max, Some(30.0));
+        assert_eq!(out[1].precipitation_probability_max, None);
+        assert_eq!(out[0].uv_index_max, Some(5.0));
+        assert_eq!(out[2].uv_index_max, None);
     }
 
     #[test]
@@ -391,8 +477,40 @@ mod tests {
             temperature_2m_min: vec![12.0, 11.0],
             sunrise: vec![],
             sunset: vec![],
+            precipitation_probability_max: vec![],
+            uv_index_max: vec![],
         };
         assert_eq!(parse_daily(raw).len(), 1);
+    }
+
+    #[test]
+    fn parse_hourly_zips_time_and_values() {
+        let raw = OpenMeteoHourly {
+            time: vec![
+                "2026-05-20T12:00".into(),
+                "2026-05-20T13:00".into(),
+                "2026-05-20T14:00".into(),
+            ],
+            temperature_2m: vec![18.0, 19.5, 21.0],
+            precipitation_probability: vec![Some(10.0), None, Some(60.0)],
+        };
+        let out = parse_hourly(raw);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].temperature, 18.0);
+        assert_eq!(out[1].precipitation_probability, 0.0); // None → 0
+        assert_eq!(out[2].precipitation_probability, 60.0);
+    }
+
+    #[test]
+    fn parse_hourly_missing_precip_field_defaults_to_zero() {
+        let raw = OpenMeteoHourly {
+            time: vec!["2026-05-20T12:00".into()],
+            temperature_2m: vec![20.0],
+            precipitation_probability: vec![], // empty → defaults
+        };
+        let out = parse_hourly(raw);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].precipitation_probability, 0.0);
     }
 
     #[test]
@@ -455,6 +573,7 @@ mod tests {
             apparent_temperature: 0.0,
             humidity: 0.0,
             wind_speed: 0.0,
+            wind_direction: None,
             weather_code: 0,
             units: Units::Metric,
             fetched_at: chrono::Local::now(),
@@ -465,7 +584,10 @@ mod tests {
                 weather_code: 0,
                 sunrise: Some(sunrise),
                 sunset: Some(sunset),
+                precipitation_probability_max: None,
+                uv_index_max: None,
             }],
+            hourly: vec![],
         };
         let noon = chrono::Local
             .from_local_datetime(&today.and_hms_opt(12, 0, 0).unwrap())

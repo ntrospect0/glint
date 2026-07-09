@@ -17,12 +17,14 @@ use std::time::{Duration, SystemTime};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Alignment, Rect},
+    style::Style,
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
 };
 
 use crate::ui::big_digits;
+use crate::widgets::ViewTier;
 
 use super::{ClockWidget, EventResult};
 
@@ -133,7 +135,7 @@ pub(super) fn format_hms_ms(d: Duration) -> String {
 }
 
 impl ClockWidget {
-    pub(super) fn render_stopwatch_body(&self, frame: &mut Frame, inner: Rect) {
+    pub(super) fn render_stopwatch_body(&self, frame: &mut Frame, inner: Rect, tier: ViewTier) {
         let (running, elapsed, gradient, laps, laps_scroll) = {
             let st = self.state.lock().expect("clock state poisoned");
             (
@@ -207,8 +209,15 @@ impl ClockWidget {
         //   - 1 blank row at the bottom of `inner` (above the mode
         //     tab strip, which lives outside `inner`)
         // and use everything in between for the scrollable list.
+        //
+        // At Full tier, the compact scrollable list is replaced by a
+        // structured table with a header row and fastest/slowest
+        // styling. The scroll offset is not used in the table (it
+        // auto-shows the most recent laps), so last_laps_max_scroll
+        // is set to 0 — j/k return Ignored at Full tier, which is
+        // correct since the table is not user-scrollable.
         let (laps_max_scroll, applied_scroll) =
-            if laps.is_empty() || inner.height <= top_h + 2 {
+            if inner.height <= top_h + 2 {
                 (0usize, 0usize)
             } else {
                 let laps_rect = Rect {
@@ -217,28 +226,159 @@ impl ClockWidget {
                     width: inner.width,
                     height: inner.height - top_h - 2,
                 };
-                // Pre-compute the maximum scroll for this pane so we
-                // can clamp `laps_scroll` BEFORE rendering — handles
-                // the after-restart "scroll to end" sentinel and any
-                // pane-shrink event that would otherwise leave the
-                // user scrolled past the end with a blank list. Max
-                // scroll = however far we can advance while keeping
-                // one lap row visible (the bottom one) plus the
-                // `↑ N more` cue.
-                let pane_h = laps_rect.height as usize;
-                let total = laps.len();
-                let max_scroll = if total > pane_h {
-                    total - (pane_h - 1)
+                if tier == ViewTier::Full {
+                    // Full-tier: structured table regardless of lap count
+                    // (shows header + "no laps recorded" when empty).
+                    self.render_stopwatch_lap_table(frame, laps_rect, &laps);
+                    (0usize, 0usize)
+                } else if laps.is_empty() {
+                    (0usize, 0usize)
                 } else {
-                    0
-                };
-                let clamped = laps_scroll.min(max_scroll);
-                self.render_stopwatch_laps(frame, laps_rect, &laps, clamped);
-                (max_scroll, clamped)
+                    // Pre-compute the maximum scroll for this pane so we
+                    // can clamp `laps_scroll` BEFORE rendering — handles
+                    // the after-restart "scroll to end" sentinel and any
+                    // pane-shrink event that would otherwise leave the
+                    // user scrolled past the end with a blank list. Max
+                    // scroll = however far we can advance while keeping
+                    // one lap row visible (the bottom one) plus the
+                    // `↑ N more` cue.
+                    let pane_h = laps_rect.height as usize;
+                    let total = laps.len();
+                    let max_scroll = if total > pane_h {
+                        total - (pane_h - 1)
+                    } else {
+                        0
+                    };
+                    let clamped = laps_scroll.min(max_scroll);
+                    self.render_stopwatch_laps(frame, laps_rect, &laps, clamped);
+                    (max_scroll, clamped)
+                }
             };
         let mut st = self.state.lock().expect("clock state poisoned");
         st.last_laps_max_scroll = laps_max_scroll;
         st.laps_scroll = applied_scroll;
+    }
+
+    /// Render the Full-tier structured lap table inside `area`.
+    ///
+    /// Shows a column header row ("Lap  Split  Total") followed by lap
+    /// rows formatted as `" NN  HH:MM:SS.mmm  HH:MM:SS.mmm"`. The
+    /// fastest lap (minimum split) is painted in `text_focused` (bright);
+    /// the slowest (maximum split, only meaningful with ≥ 2 laps) is
+    /// painted in `text_dim`. All other laps render at default style.
+    ///
+    /// When there are more laps than vertical rows, the most recent laps
+    /// are shown (the table auto-tails), with a "↑ N earlier laps" cue
+    /// in the first row. This matches the behavior a developer expects
+    /// from a live timing tool — the freshest split is always visible.
+    fn render_stopwatch_lap_table(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        laps: &[Duration],
+    ) {
+        if area.height == 0 {
+            return;
+        }
+        let pane_h = area.height as usize;
+
+        // Compute per-lap splits (gap from the previous lap, or from zero
+        // for the first lap) and find fastest/slowest indices.
+        let splits: Vec<Duration> = (0..laps.len())
+            .map(|i| {
+                let prev = if i == 0 { Duration::ZERO } else { laps[i - 1] };
+                laps[i].checked_sub(prev).unwrap_or(Duration::ZERO)
+            })
+            .collect();
+        let fastest_idx = splits
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, d)| d.as_nanos())
+            .map(|(i, _)| i);
+        // Slowest is only meaningful when there are ≥ 2 laps; with a
+        // single lap fastest == slowest and marking it both ways is noisy.
+        let slowest_idx = if splits.len() >= 2 {
+            splits
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, d)| d.as_nanos())
+                .map(|(i, _)| i)
+        } else {
+            None
+        };
+
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(pane_h);
+
+        // Header row — always rendered regardless of lap count so the
+        // user sees the column structure even before the first lap.
+        lines.push(Line::from(Span::styled(
+            " Lap  Split            Total".to_string(),
+            self.theme.text_dim,
+        )));
+
+        if laps.is_empty() {
+            if pane_h > 1 {
+                lines.push(Line::from(Span::styled(
+                    " no laps recorded".to_string(),
+                    self.theme.text_dim,
+                )));
+            }
+        } else {
+            // Rows available after the header. If more laps than fit,
+            // show the most recent (tail) with a "↑ N earlier" cue.
+            let avail = pane_h.saturating_sub(1);
+            let total = laps.len();
+            let (start, show_above_cue) = if total <= avail {
+                (0, false)
+            } else {
+                // Reserve one row for the "↑ N earlier" cue.
+                let start = total - avail.saturating_sub(1);
+                (start, true)
+            };
+
+            if show_above_cue {
+                lines.push(Line::from(Span::styled(
+                    format!("  ↑ {} earlier laps", start),
+                    self.theme.text_dim,
+                )));
+            }
+
+            for i in start..total {
+                if lines.len() >= pane_h {
+                    break;
+                }
+                let num = i + 1;
+                let split = splits[i];
+                let total_elapsed = laps[i];
+                let row_text = format!(
+                    " {:>2}   {}   {}",
+                    num,
+                    format_hms_ms(split),
+                    format_hms_ms(total_elapsed),
+                );
+                let style = if fastest_idx == Some(i) {
+                    self.theme.text_focused
+                } else if slowest_idx == Some(i) {
+                    self.theme.text_dim
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(row_text, style)));
+            }
+        }
+
+        // Center the table as a block under the (centered) stopwatch time:
+        // find the widest line and place the whole column set in a centered
+        // sub-rect, left-aligned inside it so the columns stay aligned.
+        let block_width = lines
+            .iter()
+            .map(|l| l.width() as u16)
+            .max()
+            .unwrap_or(0)
+            .min(area.width);
+        let x = area.x + area.width.saturating_sub(block_width) / 2;
+        let centered = Rect { x, y: area.y, width: block_width, height: area.height };
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Left), centered);
     }
 
     /// Render the scrollable lap list inside `area`. The caller is
