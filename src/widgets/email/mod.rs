@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Local, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
-    layout::{Alignment, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::Style,
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
@@ -40,13 +40,19 @@ use crate::llm::{LlmMessage, LlmProvider, LlmRequest, Role};
 use crate::theme::{ColorScheme, Theme};
 use crate::ui::{apply_title_row, MetadataEmphasis};
 
-use super::{AppContext, EventResult, Widget};
+use super::{AppContext, EventResult, ViewTier, Widget};
 
 use provider::{EmailMessage, EmailProvider};
 use seen_store::SeenStore;
 
 const MAX_SUMMARY_LINES: usize = 5;
 const MAX_PER_FOLDER: usize = 100;
+/// Minimum list-area content width before the list splits into list + read pane.
+/// Intentionally very wide: the read pane is only shown when the widget is
+/// genuinely large (zoomed pane or a wide dedicated cell). At 175 cols and
+/// below the list fills the full width; the read pane only fires at ≥ 176.
+/// (Per-widget deviation — see the ViewTier convention-sweep note.)
+const READ_PANE_MIN_WIDTH: u16 = 176;
 
 const SUMMARY_SYSTEM_PROMPT: &str = "You are a concise email summarizer. \
 Given a sender, subject, and the message body, return a neutral summary in at \
@@ -168,6 +174,11 @@ struct EmailState {
     /// Last-rendered list_area Rect — used together with `row_layout` to
     /// translate raw mouse coordinates into a clicked message index.
     last_list_area: Option<Rect>,
+    /// True when the last render painted a read pane (list_area.width ≥
+    /// READ_PANE_MIN_WIDTH at an Expanded/Full tier). Written by the render
+    /// path; read by handle_key to suppress the inline `e`/Enter expand
+    /// while the full body is already visible in the read pane.
+    read_pane_active: bool,
     /// Display-state dirty bit drained by `take_dirty`. Set true by
     /// every async-task / tick-time mutation site so the main loop's
     /// dirty-flag gate triggers a redraw.
@@ -1007,7 +1018,30 @@ impl Widget for EmailWidget {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        let tier = ViewTier::from_rect(area);
+
         let (tab_area, list_area, footer_area) = self.split_inner(inner);
+
+        // At Expanded/Full tiers with enough width, split the list area into:
+        //   left (50%) | 3-col gutter | right (remaining)
+        // The gutter renders a centered `│` with one blank column on each side.
+        // Below READ_PANE_MIN_WIDTH the list column is too narrow, so
+        // Compact/Standard (and cramped Expanded) leave the read pane off (None).
+        let (list_area, gutter_area, read_area) = if tier >= ViewTier::Expanded
+            && list_area.width >= READ_PANE_MIN_WIDTH
+        {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(50),
+                    Constraint::Length(3),
+                    Constraint::Min(0),
+                ])
+                .split(list_area);
+            (chunks[0], Some(chunks[1]), Some(chunks[2]))
+        } else {
+            (list_area, None, None)
+        };
 
         // Placeholder when no provider is configured (no token, etc.).
         if !self.provider_ready {
@@ -1090,7 +1124,7 @@ impl Widget for EmailWidget {
         // the expansion clips (the standard "long content" failure
         // mode; the user can collapse or use the LLM summary to
         // shorten).
-        if expanded {
+        if expanded && read_area.is_none() {
             if let Some(msg) = filtered.get(selected) {
                 let body_max_width = (list_area.width as usize).saturating_sub(3);
                 let subject_lines = wrap_text(&msg.subject, body_max_width, 2).len();
@@ -1159,7 +1193,7 @@ impl Widget for EmailWidget {
         for (i, msg) in filtered.iter().enumerate().skip(scroll) {
             let row_start = rows_emitted;
             let is_selected = i == selected;
-            let expand_this = is_selected && expanded;
+            let expand_this = is_selected && expanded && read_area.is_none();
 
             let row_style = if is_selected {
                 self.theme.text_selected
@@ -1243,12 +1277,102 @@ impl Widget for EmailWidget {
         }
         frame.render_widget(Paragraph::new(lines), list_area);
 
+        // Expanded/Full tier: render the selected message's full body in the
+        // right-hand read pane. `read_area` is None at Compact/Standard tier
+        // so this block is a no-op there.
+        if let Some(rp) = read_area {
+            let mut rp_lines: Vec<Line<'_>> = Vec::new();
+            match filtered.get(selected) {
+                None => {
+                    // Empty selection (e.g. folder just switched, selected
+                    // index not yet clamped). Show a dim placeholder.
+                    rp_lines.push(Line::from(""));
+                    rp_lines.push(Line::from(Span::styled(
+                        "Select a message",
+                        self.theme.text_dim,
+                    )));
+                }
+                Some(msg) => {
+                    // Header row 1: sender (left-aligned) + date (right-aligned).
+                    let date_str = format_received(now_local, msg.received);
+                    let sender_budget =
+                        (rp.width as usize).saturating_sub(date_str.len() + 2).max(1);
+                    let sender_display =
+                        normalize_sender(&msg.from_name, &msg.from_address, sender_budget);
+                    let sender_padded = pad_or_truncate(&sender_display, sender_budget);
+                    rp_lines.push(Line::from(vec![
+                        Span::styled(sender_padded, self.theme.text_focused),
+                        Span::raw("  "),
+                        Span::styled(date_str, self.theme.text_dim),
+                    ]));
+                    // Header row 2: full subject, truncated to pane width.
+                    let subject_display = if msg.subject.is_empty() {
+                        "(no subject)".to_string()
+                    } else {
+                        msg.subject.clone()
+                    };
+                    rp_lines.push(Line::from(Span::styled(
+                        truncate(&subject_display, rp.width as usize),
+                        self.theme.text_brilliant,
+                    )));
+                    // Blank separator between header and body.
+                    rp_lines.push(Line::from(""));
+                    // Body: full plain_body with no MAX_SUMMARY_LINES cap,
+                    // wrapped to pane width. Clip to available rows with a
+                    // trailing dim "…" when the body overflows the pane.
+                    const HEADER_ROWS: usize = 3; // sender, subject, blank
+                    let body_rows_avail = (rp.height as usize).saturating_sub(HEADER_ROWS);
+                    if body_rows_avail > 0 {
+                        let body_w = (rp.width as usize).saturating_sub(1).max(1);
+                        let all_body = wrap_text(&msg.plain_body, body_w, usize::MAX);
+                        let clipped = all_body.len() > body_rows_avail;
+                        let take = if clipped {
+                            body_rows_avail.saturating_sub(1)
+                        } else {
+                            body_rows_avail
+                        };
+                        for bline in all_body.iter().take(take) {
+                            rp_lines.push(Line::from(Span::raw(bline.clone())));
+                        }
+                        if clipped {
+                            rp_lines.push(Line::from(Span::styled("…", self.theme.text_dim)));
+                        }
+                    }
+                }
+            }
+            frame.render_widget(Paragraph::new(rp_lines), rp);
+        }
+
+        // Vertical divider between the list pane and the read pane. The gutter
+        // is 3 cols wide (from the Layout above); `│` sits in the center column
+        // with one blank on each side. Styled dim to match other widget borders.
+        if let Some(gutter) = gutter_area {
+            let divider_lines: Vec<Line<'_>> = (0..gutter.height)
+                .map(|_| {
+                    Line::from(vec![
+                        Span::raw(" "),
+                        Span::styled("│", self.theme.text_dim),
+                        Span::raw(" "),
+                    ])
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(divider_lines), gutter);
+        }
+
         // Hide the `s summarize` hint when summarisation isn't usable —
         // either the user disabled it in email.toml or there's no LLM
         // key configured. Surfacing an unbindable key in the footer is
         // confusing ("I pressed s and nothing happened…").
         let summarize_usable = self.summarize_with_llm && self.llm.is_some();
-        let footer_text = if summarize_usable {
+        // When the read pane is active the `e`/Enter key is a no-op, so drop
+        // that hint to avoid implying a binding that does nothing in this mode.
+        let footer_text = if read_area.is_some() {
+            if summarize_usable {
+                "↑/↓ select · ←/→ folder · o open · s summarize · r refresh"
+            } else {
+                "↑/↓ select · ←/→ folder · o open · r refresh"
+            }
+        } else if summarize_usable {
             "↑/↓ select · ←/→ folder · e/⏎/click expand · o open · s summarize · r refresh"
         } else {
             "↑/↓ select · ←/→ folder · e/⏎/click expand · o open · r refresh"
@@ -1263,6 +1387,7 @@ impl Widget for EmailWidget {
         st.scroll = scroll;
         st.row_layout = row_layout;
         st.last_list_area = Some(list_area);
+        st.read_pane_active = read_area.is_some();
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
@@ -1303,7 +1428,13 @@ impl Widget for EmailWidget {
                 EventResult::Handled
             }
             KeyCode::Char('e') | KeyCode::Enter => {
-                self.toggle_expand();
+                let read_pane_active = {
+                    let st = self.state.lock().expect("email state poisoned");
+                    st.read_pane_active
+                };
+                if !read_pane_active {
+                    self.toggle_expand();
+                }
                 EventResult::Handled
             }
             KeyCode::Char('o') => {

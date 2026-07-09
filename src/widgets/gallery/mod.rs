@@ -456,23 +456,24 @@ impl GalleryWidget {
     }
 }
 
-/// Carve a horizontally-centered sub-rect inside `area` that matches
-/// the image's aspect ratio in *terminal cells*. Vertical alignment
-/// stays anchored to the top of `area` (matching ratatui-image's
-/// default placement); only the x position shifts.
+/// Compute where the current image is drawn inside `area`.
 ///
-/// `image_px` is the source image's natural size in pixels;
-/// `font_size_px` is the terminal's cell size in pixels (width,
-/// height) — both reported by `ratatui-image::picker::Picker`. We
-/// convert image px → cell-equivalent units, then ask: in this pane's
-/// aspect ratio (in cells), is the image bound by the width or the
-/// height of the area?
+/// The image is shown at its **natural size** when it fits within
+/// `area`, and scaled down (preserving aspect ratio) only when it
+/// exceeds the pane in either dimension — it is **never upscaled**.
+/// The draw rect is **horizontally centered** and **top-aligned**
+/// within `area`. Top alignment matches ratatui-image's placement and
+/// is consistent across the grid and zoomed views; it's simply not
+/// noticeable in the grid, where the image is almost always scaled
+/// down to fill the small cell.
 ///
-///   - Width-bound: image stretches across the full pane width; no
-///     horizontal offset needed.
-///   - Height-bound: image fills vertically and leaves space on
-///     either side; we split that space evenly to center the column.
-fn centered_horizontal_area(area: Rect, image_px: (u32, u32), font_size_px: (u16, u16)) -> Rect {
+/// `image_px` is the source image's natural pixel size; `font_size_px`
+/// is the terminal's cell size in pixels (width, height) — both
+/// reported by `ratatui-image::picker::Picker`. Converting image px →
+/// cell units lets us size the draw rect in the terminal's own units,
+/// so `Resize::Fit` into the returned rect fills it exactly without
+/// upscaling.
+fn centered_image_rect(area: Rect, image_px: (u32, u32), font_size_px: (u16, u16)) -> Rect {
     if area.width == 0 || area.height == 0 {
         return area;
     }
@@ -481,40 +482,33 @@ fn centered_horizontal_area(area: Rect, image_px: (u32, u32), font_size_px: (u16
     if img_w <= 0.0 || img_h <= 0.0 || cell_w <= 0.0 || cell_h <= 0.0 {
         return area;
     }
-    // Image dimensions expressed in cell units (not yet rounded). The
-    // pane's aspect ratio in the same units is just area.width /
-    // area.height — both are already in cells.
-    let img_cells_w = img_w / cell_w;
-    let img_cells_h = img_h / cell_h;
-    let area_w = area.width as f32;
-    let area_h = area.height as f32;
-    let img_aspect = img_cells_w / img_cells_h;
-    let area_aspect = area_w / area_h;
-    if img_aspect >= area_aspect {
-        // Width-bound: full pane width, no horizontal offset.
-        return area;
+    // Natural image size expressed in terminal cells.
+    let nat_w = (img_w / cell_w).round().max(1.0);
+    let nat_h = (img_h / cell_h).round().max(1.0);
+
+    // Fit factor: capped at 1.0 so a small image keeps its natural size
+    // (never upscaled); otherwise the largest factor that keeps both
+    // axes inside the pane.
+    let scale = (area.width as f32 / nat_w)
+        .min(area.height as f32 / nat_h)
+        .min(1.0);
+    let disp_h = ((nat_h * scale).round() as u16).clamp(1, area.height);
+    let mut disp_w = ((nat_w * scale).round() as u16).clamp(1, area.width);
+
+    // Horizontal centering. Integer division of an odd gap biases the
+    // image one cell left of centre; shrink the width by one cell so the
+    // gap is even and the image sits dead-centre. Shrinking (vs.
+    // growing) avoids any horizontal stretch of the source aspect ratio.
+    if disp_w >= 2 && (area.width - disp_w) % 2 != 0 {
+        disp_w -= 1;
     }
-    // Height-bound: scale so img height = area height, then derive width.
-    let scale = area_h / img_cells_h;
-    let target_w = (img_cells_w * scale).round() as u16;
-    let mut target_w = target_w.min(area.width).max(1);
-    // Centering correction: integer division `(area.width - target_w) /
-    // 2` rounds the offset toward zero, so any odd gap (e.g. area=50,
-    // target=47 → gap=3) systematically biases the image one cell to
-    // the left of pane center. We'd rather lose a single cell of
-    // width than render every height-bound image off-centre, so when
-    // the natural target_w produces an odd gap we shrink it by 1.
-    // Shrinking (vs. growing) avoids any horizontal stretching of the
-    // source image's aspect ratio.
-    if target_w >= 2 && (area.width - target_w) % 2 != 0 {
-        target_w -= 1;
-    }
-    let x_offset = (area.width - target_w) / 2;
+    let x_offset = (area.width - disp_w) / 2;
+
     Rect {
         x: area.x + x_offset,
-        y: area.y,
-        width: target_w,
-        height: area.height,
+        y: area.y, // top-aligned
+        width: disp_w,
+        height: disp_h,
     }
 }
 
@@ -706,7 +700,7 @@ impl Widget for GalleryWidget {
                     // Re-lock just to render the protocol's stateful
                     // widget, then release.
                     let centered = pixel_size
-                        .map(|sz| centered_horizontal_area(image_area, sz, self.font_size))
+                        .map(|sz| centered_image_rect(image_area, sz, self.font_size))
                         .unwrap_or(image_area);
                     let mut guard = self.slides.lock().expect("gallery slides poisoned");
                     if let Some(slide) = guard.get_mut(idx) {

@@ -26,7 +26,7 @@ use serde::Deserialize;
 use crate::cache::ScopedCache;
 use crate::format::relative_time_label;
 use crate::llm::{LlmMessage, LlmProvider, LlmRequest, Role};
-use crate::text::{truncate, wrap};
+use crate::text::{toml_quote, truncate, wrap};
 use crate::theme::{ColorScheme, Theme};
 use crate::ui::{apply_title_row, MetadataEmphasis};
 
@@ -2389,21 +2389,6 @@ fn render_news_toml(
         }
     }
     out.push_str(feed_blocks.trim_start_matches('\n'));
-    out
-}
-
-fn toml_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
     out
 }
 

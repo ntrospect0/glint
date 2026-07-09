@@ -541,6 +541,57 @@ fn paste_in_normal_mode_is_ignored() {
     assert_eq!(w.state.lock().unwrap().notes[0].body, "");
 }
 
+/// Zoom-contract requirement: normal-mode Esc must propagate to the app-level
+/// zoom handler (EventResult::Ignored), not claim the key unconditionally.
+/// Without this, pressing Esc while a Notes widget is zoomed would be swallowed
+/// by Notes and zoom would never exit. This test is non-negotiable: any Notes
+/// refactor that changes this behavior breaks the zoom-exit contract.
+#[test]
+fn normal_mode_esc_returns_ignored() {
+    let mut w = make_widget();
+    // Default state is Normal mode.
+    assert_eq!(w.state.lock().unwrap().mode, Mode::Normal);
+    let result = w.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(
+        result,
+        EventResult::Ignored,
+        "normal-mode Esc must return Ignored so zoom can exit"
+    );
+}
+
+#[test]
+fn is_capturing_text_false_in_normal_mode() {
+    use crate::widgets::Widget;
+    let w = make_widget();
+    assert_eq!(w.state.lock().unwrap().mode, Mode::Normal);
+    assert!(
+        !w.is_capturing_text(),
+        "is_capturing_text should be false in Normal mode"
+    );
+}
+
+#[test]
+fn is_capturing_text_true_in_insert_mode() {
+    use crate::widgets::Widget;
+    let _g = TempHome::set();
+    let mut w = make_widget();
+    // Enter insert mode by creating a note ('+' in normal mode calls create_note,
+    // which leaves the widget in Insert mode).
+    w.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+    assert_eq!(w.state.lock().unwrap().mode, Mode::Insert);
+    assert!(
+        w.is_capturing_text(),
+        "is_capturing_text should be true in Insert mode"
+    );
+    // Exit insert mode via Esc (insert-mode Esc → Normal, returns Handled).
+    let _ = w.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(w.state.lock().unwrap().mode, Mode::Normal);
+    assert!(
+        !w.is_capturing_text(),
+        "is_capturing_text should be false after returning to Normal mode"
+    );
+}
+
 /// Single shared TempHome guard for tests that touch ~/.config/glint/notes.
 /// Sets XDG_CONFIG_HOME to a per-test directory and removes it on drop.
 struct TempHome(std::path::PathBuf);

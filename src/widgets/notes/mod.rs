@@ -1265,6 +1265,14 @@ impl Widget for NotesWidget {
         self.shortcut
     }
 
+    fn is_capturing_text(&self) -> bool {
+        self.state
+            .lock()
+            .expect("notes state poisoned")
+            .mode
+            == Mode::Insert
+    }
+
     fn title_metadata(&self) -> Option<String> {
         let st = self.state.lock().expect("notes state poisoned");
         self.derive_title_metadata(&st)
@@ -1976,7 +1984,10 @@ impl NotesWidget {
                 }
                 EventResult::Handled
             }
-            KeyCode::Esc => EventResult::Handled,
+            // Normal mode has no pending state to clear, so Esc propagates to
+            // the app-level zoom handler (zoom-contract requirement: every widget
+            // must let Esc exit zoom when nothing internal is pending).
+            KeyCode::Esc => EventResult::Ignored,
             _ => EventResult::Ignored,
         }
     }

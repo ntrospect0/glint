@@ -5,6 +5,45 @@
 
 use super::*;
 
+/// RAII guard that points `XDG_CONFIG_HOME` at an empty per-thread temp
+/// directory for the lifetime of the guard. Ensures `runtime_state::load()`
+/// finds no persisted period/selection and returns defaults, so widget
+/// construction is deterministic regardless of what the user has saved on
+/// disk. Mirrors the `TempHome` pattern used in `notes/tests.rs`.
+struct TempConfigDir(std::path::PathBuf);
+impl TempConfigDir {
+    fn set() -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "glint-stocks-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        TempConfigDir(dir)
+    }
+}
+impl Drop for TempConfigDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Build a stocks widget with an empty runtime-state environment so
+/// persisted selection/period from the user's real config can't leak
+/// into tests. The `_guard` must be held for the duration of the test.
+fn build_widget_isolated(cfg: StocksConfig) -> (StocksWidget, TempConfigDir) {
+    let guard = TempConfigDir::set();
+    let widget = StocksWidget::with_config(
+        "main".to_string(),
+        cfg,
+        Arc::new(Theme::builtin_defaults()),
+        ScopedCache::ephemeral(),
+    );
+    (widget, guard)
+}
+
 fn build_widget(cfg: StocksConfig) -> StocksWidget {
     StocksWidget::with_config(
         "main".to_string(),
@@ -201,7 +240,9 @@ fn cycle_period_wraps_at_both_ends() {
 
 #[test]
 fn move_selection_clamps() {
-    let mut w = build_widget(StocksConfig::default());
+    // Isolate from persisted state: without isolation a persisted selection
+    // of e.g. AMZN (index 6) makes move_selection(-5) land at 1, not 0.
+    let (mut w, _guard) = build_widget_isolated(StocksConfig::default());
     w.move_selection(-5);
     assert_eq!(w.state.lock().unwrap().selected, 0);
     w.move_selection(100);
@@ -898,5 +939,114 @@ fn rolling_year_labels_handle_year_boundaries() {
     assert_eq!(
         labels,
         vec!["Jan", "Mar", "May", "Jul", "Sep", "Nov", "Jan"]
+    );
+}
+
+// --- Responsive fundamentals strip (ViewTier integration) ---
+
+/// Build a quote with fundamentals fields populated so the render tests can
+/// assert that the Expanded-tier strip appears.
+fn quote_with_fundamentals(symbol: &str) -> StockQuote {
+    let mut q = quote(symbol, 185.50, 183.00);
+    q.pe_ratio = Some(28.41);
+    q.eps = Some(6.12);
+    q.beta = Some(1.21);
+    q.fifty_two_week_high = Some(260.10);
+    q.fifty_two_week_low = Some(164.08);
+    q.market_cap = Some(2_940_000_000_000u64);
+    q.dividend_yield = Some(0.0052);
+    q
+}
+
+/// Inject a pre-built quote into a widget's Day-period bucket and snap
+/// the selection to that symbol. Returns the symbol's index in `all_symbols`.
+fn inject_quote(widget: &StocksWidget, symbol: &str, q: StockQuote) -> usize {
+    let idx = widget
+        .all_symbols()
+        .iter()
+        .position(|s| s == symbol)
+        .expect("symbol must be in widget's symbol list");
+    let mut st = widget.state.lock().unwrap();
+    st.selected = idx;
+    st.quotes_mut(Period::Day)
+        .insert(symbol.to_string(), QuoteState::Ready(Arc::new(q)));
+    idx
+}
+
+use crate::widgets::test_support::buffer_text;
+
+/// At Standard size (50×20), the widget is in portrait layout and
+/// `ViewTier::from_rect` returns `Standard`. The fundamentals strip
+/// must NOT appear — no "P/E" or "Beta" anywhere in the buffer.
+#[test]
+fn standard_size_hides_fundamentals_strip() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    // Standard tier: area.width = 50 (< EXPANDED_MIN_W = 65).
+    let (w, h) = (50u16, 20u16);
+    assert_eq!(
+        crate::widgets::ViewTier::from_rect(ratatui::layout::Rect::new(0, 0, w, h)),
+        crate::widgets::ViewTier::Standard,
+        "precondition: 50×20 must be Standard tier"
+    );
+
+    let widget = build_widget(StocksConfig::default());
+    inject_quote(&widget, "^DJI", quote_with_fundamentals("^DJI"));
+
+    let backend = TestBackend::new(w, h);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            widget.render(frame, frame.area(), false);
+        })
+        .unwrap();
+
+    let text = buffer_text(terminal.backend().buffer());
+    assert!(
+        !text.contains("P/E"),
+        "fundamentals strip must be absent at Standard size; buffer snippet: {:?}",
+        &text[..text.len().min(200)]
+    );
+    assert!(!text.contains("Beta"), "Beta label must be absent at Standard size");
+}
+
+/// At Expanded size (75×25), the widget is in wide layout but without a
+/// stats column. `ViewTier::from_rect` returns `Expanded`. The fundamentals
+/// strip MUST appear — "P/E" and "Beta" should be visible in the buffer.
+#[test]
+fn expanded_size_shows_fundamentals_strip() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    // Expanded tier: area.width = 75 (65 ≤ 75 < 105).
+    // body.width = 73, with_stats threshold = 86 → stats column absent.
+    let (w, h) = (75u16, 25u16);
+    assert_eq!(
+        crate::widgets::ViewTier::from_rect(ratatui::layout::Rect::new(0, 0, w, h)),
+        crate::widgets::ViewTier::Expanded,
+        "precondition: 75×25 must be Expanded tier"
+    );
+
+    let widget = build_widget(StocksConfig::default());
+    inject_quote(&widget, "^DJI", quote_with_fundamentals("^DJI"));
+
+    let backend = TestBackend::new(w, h);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            widget.render(frame, frame.area(), false);
+        })
+        .unwrap();
+
+    let text = buffer_text(terminal.backend().buffer());
+    assert!(
+        text.contains("P/E"),
+        "fundamentals strip must show 'P/E' at Expanded size; buffer snippet: {:?}",
+        &text[..text.len().min(400)]
+    );
+    assert!(
+        text.contains("Beta"),
+        "fundamentals strip must show 'Beta' at Expanded size"
     );
 }

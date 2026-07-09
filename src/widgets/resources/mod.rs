@@ -3,8 +3,39 @@
 
 //! Resources widget — htop-style CPU / memory / process view.
 //! Backed by `sysinfo` (cross-platform; no FFI of our own).
+//!
+//! # Responsive tiers
+//!
+//! `Compact`, `Standard`, and `Expanded` render exactly as before Phase 2 —
+//! no new content, no layout changes.
+//!
+//! `Full` (≥ 105 cols AND ≥ 30 rows — e.g., Focus Zoom or a large layout
+//! cell) adds four enhancements, all gated on `ViewTier::Full`:
+//!
+//! 1. **CPU sparkline** — up to 10-row braille chart of the last ≤ 60
+//!    aggregate CPU% readings, drawn above the per-core bars. Row count
+//!    is `row_split(available, SPARKLINE_MAX_ROWS).0`; the process list
+//!    receives the remainder.
+//! 2. **Taller process list** — process count inferred from available rows
+//!    (up to 40; respects the hard cap). Always 40 rows are sampled so the
+//!    Full tier can show more without a fresh poll.
+//! 3. **j/k navigation cursor** — selected row is highlighted with
+//!    reversed-video at Full. Navigation keys are consumed only when
+//!    rendered at Full so they don't steal 'm'/'r' shortcuts elsewhere.
+//! 4. **Extra process columns** — ST (single-char status), THRD (thread
+//!    count; Linux/Android only, '-' elsewhere), TIME (elapsed run_time).
+//!    These fields are always captured from sysinfo — no additional
+//!    `ProcessRefreshKind` flags required for `status()` or `run_time()`.
+//!
+//! # Network I/O — deferred
+//!
+//! Per-interface rx/tx rates require the `"network"` feature flag in
+//! `sysinfo` (currently only `"system"` is enabled in Cargo.toml). Adding
+//! that feature and the `Networks` refresh lifecycle is left for a
+//! follow-on PR to keep this change self-contained.
 
 use std::{
+    collections::VecDeque,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -20,13 +51,21 @@ use ratatui::{
     Frame,
 };
 use serde::Deserialize;
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, RefreshKind, System};
 
 use crate::text::truncate;
 use crate::theme::{ColorScheme, Theme};
+use crate::ui::chart::braille;
 use crate::ui::{apply_title_row, MetadataEmphasis};
+use crate::widgets::view_tier::row_split;
+use crate::widgets::ViewTier;
 
 use super::{AppContext, EventResult, Widget};
+
+/// Maximum rows the CPU sparkline may claim at Full tier.
+/// The process list receives whatever rows remain after the sparkline
+/// and the header/CPU-bar/memory lines are accounted for.
+const SPARKLINE_MAX_ROWS: u16 = 10;
 
 /// Loaded from `~/.config/glint/resources.toml`.
 #[derive(Debug, Clone, Deserialize)]
@@ -44,7 +83,9 @@ pub struct ResourcesConfig {
     #[serde(default = "default_focused_poll_interval")]
     pub focused_poll_interval_secs: u64,
 
-    /// Top processes to surface. Clamped to ≤40 at construction.
+    /// Top processes to surface at Standard/Expanded. Clamped to ≤40 at
+    /// construction. At Full the displayed count is inferred from
+    /// available rows (still capped at 40).
     #[serde(default = "default_top_n")]
     pub top_n_processes: usize,
 
@@ -90,6 +131,11 @@ impl Default for ResourcesConfig {
     }
 }
 
+/// How many aggregate CPU% samples to keep in the sparkline ring buffer.
+/// At the focused cadence (2 s/sample) this covers the last ~2 minutes;
+/// at the background cadence (5 s/sample) it covers the last ~5 minutes.
+const CPU_HISTORY_CAP: usize = 60;
+
 /// Snapshot of one process row used by `render`. Kept owned + plain so
 /// rendering doesn't hold the `System` mutex while painting.
 #[derive(Debug, Clone)]
@@ -103,6 +149,17 @@ struct ProcRow {
     /// including file-backed regions and anonymous mappings that haven't
     /// been touched (htop's "VIRT").
     virtual_bytes: u64,
+    /// Single-char status abbreviation: R/S/Z/I/T/D/? (Full tier only).
+    /// Derived from `sysinfo::Process::status()` which is always
+    /// populated — no extra `ProcessRefreshKind` flag needed.
+    status_char: char,
+    /// Seconds the process has been running (`sysinfo::Process::run_time()`).
+    /// Always populated alongside status; shown in Full tier.
+    run_time_secs: u64,
+    /// Number of threads (from `sysinfo::Process::tasks()`). `None` on
+    /// platforms where `tasks()` returns `None` (everything except
+    /// Linux/Android); displayed as `-` at Full tier.
+    thread_count: Option<usize>,
 }
 
 /// Compact metrics snapshot — built inside the tick under the `System`
@@ -121,8 +178,17 @@ struct Snapshot {
     uptime_secs: u64,
     /// Pretty hostname or "(unknown)".
     hostname: String,
-    /// Top-N processes by the configured sort key.
+    /// Top processes (up to 40) sorted by the configured key. The Full
+    /// tier infers a visible count from available rows; other tiers cap
+    /// display at `config.top_n_processes`.
     top: Vec<ProcRow>,
+    /// Aggregate CPU% history for the braille sparkline. Cloned from the
+    /// ring buffer in `ResourcesState` on each snapshot rebuild.
+    cpu_history: Vec<f32>,
+    /// Currently-selected process index (0-based). Updated both on each
+    /// refresh (to clamp against the new list length) and on j/k key
+    /// presses (so the highlight moves without waiting for the next poll).
+    selected_row: usize,
     fetched_at: Option<Instant>,
 }
 
@@ -144,6 +210,9 @@ struct ResourcesState {
     /// [`FOCUS_FRESHNESS_WINDOW`] — drives the fast vs slow cadence
     /// choice inside `refresh_if_due`.
     last_focused_at: Option<Instant>,
+    /// Ring buffer of aggregate CPU% readings for the Full-tier sparkline.
+    /// Capped at [`CPU_HISTORY_CAP`] entries; oldest dropped on overflow.
+    cpu_history: VecDeque<f32>,
 }
 
 impl Default for ResourcesState {
@@ -157,6 +226,7 @@ impl Default for ResourcesState {
             tracked_pids: Vec::new(),
             snapshot: Snapshot::default(),
             last_focused_at: None,
+            cpu_history: VecDeque::new(),
         }
     }
 }
@@ -257,7 +327,7 @@ impl ResourcesWidget {
         // Decide *what* we're refreshing this tick. A full sweep walks
         // every process on the system (O(P) syscalls — ~500 on macOS);
         // a partial sweep only refreshes the PIDs already in our top-N
-        // list (O(N), typically ≤ 10). We pay for the full sweep at
+        // list (O(N), typically ≤ 40). We pay for the full sweep at
         // most once per FULL_SWEEP_INTERVAL, so a previously-quiet
         // process that suddenly spikes becomes visible within that
         // window. `refresh_cpu_usage` + `refresh_memory` are cheap
@@ -296,17 +366,30 @@ impl ResourcesWidget {
         let uptime_secs = System::uptime();
         let hostname = System::host_name().unwrap_or_else(|| "(unknown)".into());
 
-        // On a full sweep we walk every process to rediscover the
-        // top-N; on a partial sweep we just resort the existing
-        // tracked set (their CPU% / mem just got refreshed). Either
-        // way we land on a `Vec<ProcRow>` truncated to `top_n`.
-        let top_n = self.config.top_n_processes.min(40);
+        // Push the aggregate CPU% into the sparkline ring buffer.
+        let avg_cpu = if cpu_per_core.is_empty() {
+            0.0
+        } else {
+            cpu_per_core.iter().sum::<f32>() / cpu_per_core.len() as f32
+        };
+        st.cpu_history.push_back(avg_cpu);
+        if st.cpu_history.len() > CPU_HISTORY_CAP {
+            st.cpu_history.pop_front();
+        }
+
+        // Always collect up to 40 processes regardless of the configured
+        // top_n. The render layer decides how many to display based on
+        // the available rows: Standard/Expanded/Compact show
+        // `config.top_n_processes`; Full shows as many as fit.
         let row_from = |pid: u32, p: &sysinfo::Process| ProcRow {
             name: p.name().to_string_lossy().into_owned(),
             pid,
             cpu_percent: p.cpu_usage(),
             memory_bytes: p.memory(),
             virtual_bytes: p.virtual_memory(),
+            status_char: proc_status_char(p.status()),
+            run_time_secs: p.run_time(),
+            thread_count: p.tasks().map(|t| t.len()),
         };
         let mut rows: Vec<ProcRow> = if full_sweep {
             st.system
@@ -337,12 +420,19 @@ impl ResourcesWidget {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
         }
-        rows.truncate(top_n);
+        // Hard cap at 40 — enough for any view tier without blowing up
+        // the per-tick memory budget.
+        rows.truncate(40);
         // Capture the new top-N PIDs so the next partial sweep refreshes
         // just those. After a full sweep this is the rediscovered set;
         // after a partial sweep it's the same set in (possibly) a new
         // order — that's fine, we're tracking PIDs not positions.
         st.tracked_pids = rows.iter().map(|r| Pid::from_u32(r.pid)).collect();
+
+        // Clamp the selection cursor to the new list length so j/k
+        // navigation stays valid across process list changes.
+        let prev_selected = st.snapshot.selected_row;
+        let clamped_selected = prev_selected.min(rows.len().saturating_sub(1));
 
         st.snapshot = Snapshot {
             cpu_per_core,
@@ -354,6 +444,8 @@ impl ResourcesWidget {
             uptime_secs,
             hostname,
             top: rows,
+            cpu_history: st.cpu_history.iter().cloned().collect(),
+            selected_row: clamped_selected,
             fetched_at: Some(now),
         };
         st.last_refresh = Some(now);
@@ -366,6 +458,53 @@ impl ResourcesWidget {
             .expect("resources state poisoned")
             .snapshot
             .clone()
+    }
+}
+
+/// Map `sysinfo::ProcessStatus` to a single display character.
+/// The mapping aims to match traditional Unix `ps` output:
+///   R = running/runnable, S = sleeping, Z = zombie, I = idle,
+///   T = stopped, D = uninterruptible disk sleep, ? = unknown.
+fn proc_status_char(s: ProcessStatus) -> char {
+    match s {
+        ProcessStatus::Run => 'R',
+        ProcessStatus::Sleep => 'S',
+        ProcessStatus::Zombie => 'Z',
+        ProcessStatus::Idle => 'I',
+        ProcessStatus::Stop | ProcessStatus::Tracing => 'T',
+        ProcessStatus::Dead => 'D',
+        ProcessStatus::UninterruptibleDiskSleep => 'D',
+        ProcessStatus::Parked | ProcessStatus::Waking | ProcessStatus::Wakekill => 'P',
+        ProcessStatus::LockBlocked => 'L',
+        ProcessStatus::Unknown(_) => '?',
+    }
+}
+
+/// Format elapsed run_time (seconds) as a compact ≤5-char string:
+///   ` 0:00`  — zero (MM:SS, 5 chars)
+///   `12:34`  — minutes and seconds
+///   ` 1:05`  — hours and minutes (when h > 0)
+///   `999h+`  — capped at 999h for very long-running processes
+fn format_run_time_compact(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h >= 100 {
+        // Cap at 999h+ (5 chars) so the column never overflows.
+        format!("{:>3}h+", h.min(999))
+    } else if h > 0 {
+        format!("{h:>2}:{m:02}")
+    } else {
+        format!("{m:>2}:{s:02}")
+    }
+}
+
+/// Format thread count for the THRD column (4 chars, right-aligned).
+/// Returns `"   -"` on platforms where `tasks()` is not supported.
+fn format_thread_count(count: Option<usize>) -> String {
+    match count {
+        Some(n) => format!("{n:>4}"),
+        None => "   -".to_string(),
     }
 }
 
@@ -472,6 +611,9 @@ impl Widget for ResourcesWidget {
             .lock()
             .expect("resources state poisoned")
             .last_focused_at = focused.then(Instant::now);
+
+        let tier = ViewTier::from_rect(area);
+
         let title_base = if self.instance == "main" {
             "Resources".to_string()
         } else {
@@ -526,6 +668,29 @@ impl Widget for ResourcesWidget {
                     snap.cpu_per_core.len()
                 )),
             ]));
+
+            // At Full: braille sparkline of aggregate CPU% history (up to
+            // SPARKLINE_MAX_ROWS rows), inserted between the section header
+            // and the per-core bars. The sparkline claims as many rows as the
+            // available inner height allows up to the cap; the process list
+            // then inherits whatever remains (accounted via `lines.len()` in
+            // the proc_display_count block below). Skipped at all other tiers.
+            if tier == ViewTier::Full && snap.cpu_history.len() >= 2 {
+                let h_f64: Vec<f64> = snap.cpu_history.iter().map(|&v| v as f64).collect();
+                // Rows consumed so far (including CPU section header just pushed).
+                // `row_split` caps the sparkline at SPARKLINE_MAX_ROWS; the
+                // process list picks up the difference via lines.len() later.
+                let rows_used_so_far = lines.len() as u16;
+                let available = inner.height.saturating_sub(rows_used_so_far);
+                let (spark_rows, _) = row_split(available, SPARKLINE_MAX_ROWS);
+                let spark_cols = inner.width;
+                let sparklines =
+                    braille::render_series(&h_f64, spark_rows, spark_cols, 0.0, 100.0);
+                for row in sparklines {
+                    lines.push(Line::from(Span::styled(row, self.theme.text_focused)));
+                }
+            }
+
             // Per-core layout. `prefix_cols` is the non-bar overhead
             // each row carries: "CPUxx  100.0% " = 5 + 2 + 6 + 1 = 14.
             // Two-column packing halves the vertical real estate the
@@ -613,12 +778,22 @@ impl Widget for ResourcesWidget {
         }
         lines.push(Line::from(""));
 
-        // Processes header + rows. Two layouts:
-        //   wide (≥ 50 inner cols):  PID   CPU%   RES    VIRT   COMMAND
+        // Processes section.
+        //
+        // Table layout at Full (≥105 cols AND ≥30 rows):
+        //   PID   CPU%  ST  THRD   TIME     RES    VIRT   COMMAND
+        //   extra columns: ST (status char), THRD (thread count), TIME (run_time)
+        //   fixed prefix width = 48 chars, leaving remainder for COMMAND.
+        //
+        // Table layout at Compact / Standard / Expanded — unchanged from
+        // pre-Phase-2:
+        //   wide (≥50 inner cols):  PID   CPU%   RES    VIRT   COMMAND
         //   narrow                :  PID   CPU%   RES    COMMAND
-        // VIRT is the per-process virtual memory size (mapped address
-        // space). On a 30%-of-screen pane the column doesn't fit, so we
-        // drop it and use the freed room for the command name.
+        //
+        // Process display count:
+        //   Full — inferred from remaining inner rows after all header/CPU/
+        //          memory lines, capped at 40.
+        //   Other tiers — config.top_n_processes (as today).
         let proc_title = if self.config.sort_by_memory {
             "Top processes (by memory)"
         } else {
@@ -628,36 +803,86 @@ impl Widget for ResourcesWidget {
             proc_title,
             self.theme.text_selected,
         )));
-        let show_virt = inner.width >= 50;
-        let header = if show_virt {
-            "  PID   CPU%     RES    VIRT   COMMAND"
+
+        let show_full_table = tier == ViewTier::Full;
+
+        // Compute how many process rows to show.
+        // At Full we infer from available height; at other tiers we use
+        // the configured default (same behaviour as before).
+        let proc_display_count = if show_full_table {
+            // Estimate overhead rows already in `lines`:
+            //   lines.len() + 1 (proc header below) = used rows
+            // Add 1 for the process column header line we're about to push.
+            let used = lines.len() as u16 + 1;
+            (inner.height.saturating_sub(used) as usize).min(40).max(1)
         } else {
-            "  PID   CPU%     RES   COMMAND"
+            self.config.top_n_processes.min(snap.top.len())
         };
-        lines.push(Line::from(Span::styled(header, self.theme.text_dim)));
-        let fixed_prefix = if show_virt { 35 } else { 27 };
-        let name_room = (inner.width as usize).saturating_sub(fixed_prefix).max(6);
-        for row in &snap.top {
-            let name = truncate(&row.name, name_room);
-            let line = if show_virt {
-                format!(
-                    "{:>6}  {:>5.1}  {:>6}  {:>6}   {}",
+
+        if show_full_table {
+            // Full-tier process table with extra columns.
+            // Format: "{:>6}  {:>5.1}  {:<2} {:>4}  {:>5}  {:>6}  {:>6}   {}"
+            //          PID     CPU%  ST  THRD   TIME    RES    VIRT  NAME
+            // Fixed prefix width = 6+2+5+2+2+1+4+2+5+2+6+2+6+3 = 48
+            const FULL_FIXED_PREFIX: usize = 48;
+            let name_room = (inner.width as usize).saturating_sub(FULL_FIXED_PREFIX).max(6);
+            lines.push(Line::from(Span::styled(
+                "  PID   CPU%  ST  THRD   TIME     RES    VIRT   COMMAND",
+                self.theme.text_dim,
+            )));
+            let selected_style = Style::default().add_modifier(Modifier::REVERSED);
+            for (idx, row) in snap.top.iter().take(proc_display_count).enumerate() {
+                let name = truncate(&row.name, name_room);
+                let line_str = format!(
+                    "{:>6}  {:>5.1}  {:<2} {}  {:>5}  {:>6}  {:>6}   {}",
                     row.pid,
                     row.cpu_percent,
+                    row.status_char,
+                    format_thread_count(row.thread_count),
+                    format_run_time_compact(row.run_time_secs),
                     compact_bytes(row.memory_bytes),
                     compact_bytes(row.virtual_bytes),
                     name
-                )
+                );
+                if idx == snap.selected_row {
+                    lines.push(Line::from(Span::styled(line_str, selected_style)));
+                } else {
+                    lines.push(Line::from(line_str));
+                }
+            }
+        } else {
+            // Compact / Standard / Expanded — identical to pre-Phase-2.
+            let show_virt = inner.width >= 50;
+            let header = if show_virt {
+                "  PID   CPU%     RES    VIRT   COMMAND"
             } else {
-                format!(
-                    "{:>6}  {:>5.1}  {:>6}   {}",
-                    row.pid,
-                    row.cpu_percent,
-                    compact_bytes(row.memory_bytes),
-                    name
-                )
+                "  PID   CPU%     RES   COMMAND"
             };
-            lines.push(Line::from(line));
+            lines.push(Line::from(Span::styled(header, self.theme.text_dim)));
+            let fixed_prefix = if show_virt { 35 } else { 27 };
+            let name_room = (inner.width as usize).saturating_sub(fixed_prefix).max(6);
+            for row in snap.top.iter().take(proc_display_count) {
+                let name = truncate(&row.name, name_room);
+                let line = if show_virt {
+                    format!(
+                        "{:>6}  {:>5.1}  {:>6}  {:>6}   {}",
+                        row.pid,
+                        row.cpu_percent,
+                        compact_bytes(row.memory_bytes),
+                        compact_bytes(row.virtual_bytes),
+                        name
+                    )
+                } else {
+                    format!(
+                        "{:>6}  {:>5.1}  {:>6}   {}",
+                        row.pid,
+                        row.cpu_percent,
+                        compact_bytes(row.memory_bytes),
+                        name
+                    )
+                };
+                lines.push(Line::from(line));
+            }
         }
 
         // First-fetch placeholder.
@@ -689,6 +914,25 @@ impl Widget for ResourcesWidget {
             }
         }
         match key.code {
+            // `j` / `k` — move the Full-tier selection cursor down / up.
+            // The cursor exists in state at all tiers but is only rendered
+            // (and useful) at Full. We update it unconditionally here so
+            // it's in the right position when the view next reaches Full.
+            KeyCode::Char('j') => {
+                let mut st = self.state.lock().expect("resources state poisoned");
+                let max = st.snapshot.top.len().saturating_sub(1);
+                let new = (st.snapshot.selected_row + 1).min(max);
+                st.snapshot.selected_row = new;
+                self.dirty = true;
+                EventResult::Handled
+            }
+            KeyCode::Char('k') => {
+                let mut st = self.state.lock().expect("resources state poisoned");
+                let new = st.snapshot.selected_row.saturating_sub(1);
+                st.snapshot.selected_row = new;
+                self.dirty = true;
+                EventResult::Handled
+            }
             // `m` toggles between sort-by-CPU and sort-by-memory.
             KeyCode::Char('m') => {
                 self.config.sort_by_memory = !self.config.sort_by_memory;
@@ -724,6 +968,7 @@ impl Widget for ResourcesWidget {
 
     fn keybindings(&self) -> Vec<(&'static str, &'static str)> {
         vec![
+            ("j/k", "move selection cursor (Full view)"),
             ("m", "toggle sort: CPU ↔ memory"),
             ("r", "force refresh on next tick"),
         ]
@@ -813,9 +1058,9 @@ pub fn wizard_descriptor() -> crate::wizard::descriptor::WizardDescriptor {
             WizardField {
                 key: "top_n_processes",
                 label: "Top processes to show",
-                help: "Number of process rows under the CPU / memory bars. \
-                       Clamped to ≤40 at construction so a misconfigured \
-                       value can't blow out the render budget.",
+                help: "Number of process rows at Standard/Expanded. At \
+                       Full (zoomed) the count is inferred from available \
+                       rows. Clamped to ≤40.",
                 required: true,
                 kind: WizardFieldKind::Number {
                     default: Some(10.0),

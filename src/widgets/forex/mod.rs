@@ -3036,6 +3036,26 @@ fn render_stats_panel(
         &q.fetched_at.format("%H:%M:%S").to_string(),
         theme,
     ));
+    // 52-week range bar flows directly after the stats text with exactly two
+    // blank lines of spacing. Cross pairs (no 52wk window) show "52w —".
+    lines.push(Line::from(""));
+    lines.push(Line::from(""));
+    match (q.fifty_two_week_low, q.fifty_two_week_high) {
+        (Some(low), Some(high)) => {
+            lines.push(crate::ui::chart::range_bar_line(
+                area.width as usize,
+                low * primary_unit,
+                high * primary_unit,
+                q.price * primary_unit,
+                theme.text_dim,   // "52w " label → gray/dim
+                theme.text_plain, // low/high numbers → white/plain
+                theme.text_focused, // ├──●──┤ bar → highlight/accent
+            ));
+        }
+        _ => {
+            lines.push(Line::from(Span::styled("52w —".to_string(), theme.text_dim)));
+        }
+    }
 
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -3046,6 +3066,7 @@ fn stat_line(label: &str, value: &str, theme: &Theme) -> Line<'static> {
         Span::styled(value.to_string(), theme.text_plain),
     ])
 }
+
 
 /// Period change %: 1D uses prev-close convention; longer windows
 /// compare to the first sample of the series.

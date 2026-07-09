@@ -321,6 +321,11 @@ struct FeedsState {
     /// True when the user has expanded the selected article. Shows
     /// the hero image + summary panel.
     expanded: bool,
+    /// True once the user has explicitly toggled expand on or off
+    /// (via key or click). When false the render path uses
+    /// ViewTier::Full as the auto-on signal so a zoomed pane opens
+    /// the article panel without requiring a manual keypress.
+    expand_user_set: bool,
     /// First-visible row of the expanded panel's content. PgUp/PgDn
     /// adjust this so long summaries can be read fully without
     /// resizing the widget. Reset to 0 on every article change.
@@ -685,6 +690,7 @@ impl FeedsWidget {
         st.selected = 0;
         st.list_scroll = 0;
         st.expanded = false;
+        st.expand_user_set = false;
         st.expanded_scroll = 0;
         st.dirty = true;
     }
@@ -698,6 +704,7 @@ impl FeedsWidget {
             st.selected = 0;
             st.list_scroll = 0;
             st.expanded = false;
+            st.expand_user_set = false;
             st.expanded_scroll = 0;
             st.dirty = true;
         }
@@ -858,6 +865,7 @@ impl FeedsWidget {
 
     fn toggle_expanded(&self) {
         let mut st = self.state.lock().expect("feeds state poisoned");
+        st.expand_user_set = true;
         st.expanded = !st.expanded;
     }
 
@@ -1538,7 +1546,18 @@ impl Widget for FeedsWidget {
         self.render_tabs(frame, body_rows[0]);
         // body_rows[1] is intentionally left blank.
 
-        let expanded = self.state.lock().expect("feeds state poisoned").expanded;
+        let tier = crate::widgets::ViewTier::from_rect(area);
+        let (expanded_stored, expand_user_set) = {
+            let st = self.state.lock().expect("feeds state poisoned");
+            (st.expanded, st.expand_user_set)
+        };
+        // Effective expanded: honour an explicit user toggle, otherwise
+        // auto-on at Full tier (zoomed / dashboard-filling pane).
+        let expanded = if expand_user_set {
+            expanded_stored
+        } else {
+            tier == crate::widgets::ViewTier::Full
+        };
         // Layout switch: when the widget cell is narrow (width <
         // NARROW_VS_WIDE_THRESHOLD), the horizontal list|details
         // split crowds both columns, so we vertically stack
@@ -1696,7 +1715,9 @@ impl Widget for FeedsWidget {
             KeyCode::Char('s') => {
                 self.request_summary();
                 // Auto-expand so the user can see the summary land.
-                self.state.lock().expect("feeds state poisoned").expanded = true;
+                let mut st = self.state.lock().expect("feeds state poisoned");
+                st.expanded = true;
+                st.expand_user_set = true;
                 EventResult::Handled
             }
             KeyCode::Char('r') => {
@@ -1718,7 +1739,7 @@ impl Widget for FeedsWidget {
             // the home row.
             KeyCode::PageDown | KeyCode::Char(']') => {
                 let mut st = self.state.lock().expect("feeds state poisoned");
-                if st.expanded {
+                if st.expanded_rect.is_some() {
                     let step = 5u16;
                     let max = st.expanded_content_height.saturating_sub(1);
                     st.expanded_scroll = (st.expanded_scroll.saturating_add(step)).min(max);
@@ -1727,7 +1748,7 @@ impl Widget for FeedsWidget {
             }
             KeyCode::PageUp | KeyCode::Char('[') => {
                 let mut st = self.state.lock().expect("feeds state poisoned");
-                if st.expanded {
+                if st.expanded_rect.is_some() {
                     st.expanded_scroll = st.expanded_scroll.saturating_sub(5);
                 }
                 EventResult::Handled
@@ -1824,6 +1845,7 @@ impl Widget for FeedsWidget {
                         // / Enter / Space key behavior so a pointer-
                         // only user can collapse / expand without
                         // reaching for the keyboard.
+                        st.expand_user_set = true;
                         st.expanded = !st.expanded;
                     } else {
                         st.selected = new_idx;

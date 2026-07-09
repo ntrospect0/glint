@@ -34,6 +34,7 @@ use ratatui::{
 
 use super::PageAction;
 use crate::auth::registry::{CredentialsSpec, SetupSchema};
+use crate::text::toml_quote;
 use crate::wizard::{app::WizardApp, style};
 
 /// Resolve a provider's credentials spec via the auth registry. Returns
@@ -194,21 +195,6 @@ fn save_and_authorize(
         "wizard wrote OAuth client credentials"
     );
     Ok(())
-}
-
-fn toml_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 pub fn render(frame: &mut Frame, area: Rect, app: &WizardApp, provider: &str) {

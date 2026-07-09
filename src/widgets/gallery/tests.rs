@@ -260,67 +260,70 @@ fn load_thumb_round_trips_through_cache() {
 }
 
 #[test]
-fn centered_area_unchanged_when_image_is_wider_than_pane() {
-    // Image aspect (in cells) wider than pane → width-bound, no
-    // horizontal offset. Use generous cell sizes so we control the
-    // math without relying on a probe.
-    let area = Rect::new(0, 0, 30, 20);
-    // 1600×800 image at 10×10 cells = 160×80 cell-equivalents; pane
-    // is 30×20 → 3:2 aspect; image is 2:1 (wider).
-    let out = centered_horizontal_area(area, (1600, 800), (10, 10));
-    assert_eq!(out, area);
-}
-
-#[test]
-fn centered_area_shrinks_and_offsets_for_portrait_image() {
-    // 800×1600 image at 10×10 cells: cell-equivalent 80×160 → 1:2
-    // aspect. Pane 30×20 → 3:2 (much wider). Image is height-bound;
-    // its width-after-fit in cells = 20 * (80/160) = 10. Offset:
-    // (30 - 10) / 2 = 10.
-    let area = Rect::new(0, 0, 30, 20);
-    let out = centered_horizontal_area(area, (800, 1600), (10, 10));
-    assert_eq!(out.width, 10);
-    assert_eq!(out.x, 10);
-    assert_eq!(out.height, 20);
-    assert_eq!(out.y, 0);
-}
-
-#[test]
-fn centered_area_handles_zero_area_gracefully() {
-    let zero = Rect::new(5, 7, 0, 0);
-    assert_eq!(centered_horizontal_area(zero, (100, 100), (10, 10)), zero);
-}
-
-#[test]
-fn centered_area_yields_even_gap_for_perfect_centering() {
-    // Construct a height-bound image whose natural target_w would
-    // be an odd number of cells against an even pane width — the
-    // classic case that pre-fix biased one cell left of centre.
-    // 700×1000 at 10×10 cells = 70×100 cell-equivalents → aspect
-    // 0.7. Pane 50×20 → height-bound. width-after-fit =
-    // 20 * (70/100) = 14 (even, no shrink). gap = 36, x = 18.
-    let area = Rect::new(0, 0, 50, 20);
-    let out = centered_horizontal_area(area, (700, 1000), (10, 10));
+fn image_smaller_than_pane_keeps_natural_size_and_centers() {
+    // 50×50 px image at 10×10 cells = 5×5 cells, in a big 100×40 pane.
+    // Must NOT upscale: draw rect stays 5×5, horizontally centered,
+    // top-aligned. gap = 100 - 5 = 95 (odd) → shrink to 4, gap 96, x=48.
+    let area = Rect::new(0, 0, 100, 40);
+    let out = centered_image_rect(area, (50, 50), (10, 10));
+    assert_eq!(out.height, 5, "natural height preserved (no upscale)");
+    assert!(out.width <= 5, "natural width preserved (no upscale)");
+    assert_eq!(out.y, 0, "top-aligned");
     let left = out.x - area.x;
     let right = area.width - out.width - left;
-    assert_eq!(
-        left, right,
-        "even-gap case must be symmetrically centred: {out:?} in {area:?}"
-    );
+    assert_eq!(left, right, "horizontally centered: {out:?} in {area:?}");
 }
 
 #[test]
-fn centered_area_shrinks_one_cell_when_natural_gap_is_odd() {
-    // 750×1000 at 10×10 = 75×100 cell-equivalents → aspect 0.75.
-    // Pane 50×20 height-bound, raw target_w = 20 * 0.75 = 15
-    // (odd) → gap 35 (odd) → would left-bias by 1 cell. We
-    // shrink target_w to 14 so gap = 36 (even) → perfect centering.
+fn image_exactly_fitting_is_centered_top_aligned() {
+    // 300×200 px at 10×10 cells = 30×20 cells; pane 30×20 → fits exactly.
+    let area = Rect::new(0, 0, 30, 20);
+    let out = centered_image_rect(area, (300, 200), (10, 10));
+    assert_eq!(out, Rect::new(0, 0, 30, 20));
+}
+
+#[test]
+fn portrait_image_exceeding_height_scales_down_and_centers() {
+    // 800×1600 px at 10×10 cells = 80×160 cells; pane 30×20.
+    // scale = min(30/80, 20/160, 1) = 0.125 → 10×20. Centered: x=10.
+    let area = Rect::new(0, 0, 30, 20);
+    let out = centered_image_rect(area, (800, 1600), (10, 10));
+    assert_eq!(out.width, 10);
+    assert_eq!(out.height, 20);
+    assert_eq!(out.x, 10, "horizontally centered");
+    assert_eq!(out.y, 0, "top-aligned");
+}
+
+#[test]
+fn wide_image_exceeding_width_fills_width_and_top_aligns() {
+    // 1600×800 px at 10×10 cells = 160×80 cells; pane 30×20.
+    // scale = min(30/160, 20/80, 1) = 0.1875 → 30×15. Fills width, top.
+    let area = Rect::new(0, 0, 30, 20);
+    let out = centered_image_rect(area, (1600, 800), (10, 10));
+    assert_eq!(out.width, 30, "scaled to full pane width");
+    assert_eq!(out.height, 15);
+    assert_eq!(out.x, 0);
+    assert_eq!(out.y, 0, "top-aligned, does not fill height");
+}
+
+#[test]
+fn centered_image_handles_zero_area_gracefully() {
+    let zero = Rect::new(5, 7, 0, 0);
+    assert_eq!(centered_image_rect(zero, (100, 100), (10, 10)), zero);
+}
+
+#[test]
+fn odd_gap_shrinks_one_cell_for_symmetry() {
+    // 150×100 px at 10×10 cells = 15×10 cells; fits in 50×20 pane at
+    // natural size. gap = 50 - 15 = 35 (odd) → shrink width to 14 so
+    // gap = 36 (even) → symmetric centering.
     let area = Rect::new(0, 0, 50, 20);
-    let out = centered_horizontal_area(area, (750, 1000), (10, 10));
+    let out = centered_image_rect(area, (150, 100), (10, 10));
     let left = out.x - area.x;
     let right = area.width - out.width - left;
     assert_eq!(left, right, "odd-gap shrink must restore symmetry");
     assert_eq!(out.width, 14, "should have shrunk by 1 cell");
+    assert_eq!(out.height, 10, "natural height preserved");
 }
 
 #[test]

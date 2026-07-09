@@ -39,7 +39,7 @@ use crate::ui::chart::braille;
 use crate::ui::status::{live_value, TimedFeedback};
 use crate::ui::{apply_title_row, MetadataEmphasis};
 
-use super::{AppContext, EventResult, Widget};
+use super::{AppContext, EventResult, ViewTier, Widget};
 
 use provider::{StockQuote, YahooFinanceProvider};
 
@@ -1329,6 +1329,9 @@ impl Widget for StocksWidget {
             height: inner.height - footer_h,
         };
 
+        // Size-driven tier — used to gate the Expanded fundamentals strip.
+        let tier = ViewTier::from_rect(area);
+
         // Adaptive layout: in landscape mode (wide), list | stats | graph
         // run horizontally — list + stats get their full width first, graph
         // fills whatever's left. In portrait mode (narrow), they stack
@@ -1344,6 +1347,34 @@ impl Widget for StocksWidget {
         const MIN_GRAPH_W: u16 = 24;
         let is_wide = body.width >= WIDE_LIST_W + MIN_GRAPH_W;
         let with_stats = is_wide && body.width >= WIDE_LIST_W + WIDE_STATS_W + MIN_GRAPH_W;
+
+        // At Expanded/Full tier in wide-but-no-stats-column mode, carve 2
+        // rows off the bottom of the layout body for a compact fundamentals
+        // summary strip. The existing stats panel (which fires when
+        // `with_stats` is true) already renders fundamentals for wider cells.
+        const FUND_STRIP_H: u16 = 2;
+        let show_fund_strip = tier >= ViewTier::Expanded
+            && is_wide
+            && !with_stats
+            && body.height > FUND_STRIP_H + 4;
+        let fund_strip_area = if show_fund_strip {
+            Some(Rect {
+                y: body.y + body.height - FUND_STRIP_H,
+                height: FUND_STRIP_H,
+                ..body
+            })
+        } else {
+            None
+        };
+        // Shadow body so the main layout doesn't clobber the fundamentals rows.
+        let body = if show_fund_strip {
+            Rect {
+                height: body.height - FUND_STRIP_H,
+                ..body
+            }
+        } else {
+            body
+        };
 
         // 1-col gaps between panels so they don't visually run together.
         if is_wide {
@@ -1438,6 +1469,18 @@ impl Widget for StocksWidget {
                 self.period,
                 self.config.graph_high_low_lines,
                 self.config.pad_intraday_to_full_day,
+                &self.theme,
+            );
+        }
+
+        // Compact fundamentals summary for Expanded tier when the full stats
+        // column doesn't fit. Uses the rows carved out of the layout body.
+        if let Some(fund_area) = fund_strip_area {
+            render_fundamentals_strip(
+                frame,
+                fund_area,
+                selected_sym.as_deref(),
+                &quotes,
                 &self.theme,
             );
         }
@@ -2821,6 +2864,78 @@ fn render_stats_panel(
     lines.push(Line::from(Span::styled(status.message, style)));
 
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Render a compact horizontal fundamentals summary for the Expanded tier.
+///
+/// Fires when the pane is wide enough for the landscape list+graph split but
+/// not wide enough for the full stats column. Shows whichever of the
+/// `quoteSummary`-fetched fields are `Some` on two rows of `label value`
+/// pairs. The existing `render_stats_panel` (which fires at wider sizes)
+/// already renders these fields; this function covers the 65–87-col gap
+/// where no stats column fits.
+fn render_fundamentals_strip(
+    frame: &mut Frame,
+    area: Rect,
+    selected: Option<&str>,
+    quotes: &HashMap<String, QuoteState>,
+    theme: &Theme,
+) {
+    let q = match selected.and_then(|s| quotes.get(s)) {
+        Some(QuoteState::Ready(q)) => q.as_ref(),
+        _ => return,
+    };
+
+    // Collect whichever fundamentals fields are available. Order matches the
+    // priority a stock-watcher would want to see at a glance.
+    let mut pairs: Vec<(&'static str, String)> = Vec::new();
+    if let Some(pe) = q.pe_ratio {
+        pairs.push(("P/E", format!("{pe:.2}")));
+    }
+    if let Some(eps) = q.eps {
+        pairs.push(("EPS", format!("{eps:.2}")));
+    }
+    if let Some(b) = q.beta {
+        pairs.push(("Beta", format!("{b:.2}")));
+    }
+    if let (Some(lo), Some(hi)) = (q.fifty_two_week_low, q.fifty_two_week_high) {
+        pairs.push(("52w", format!("{lo:.0}–{hi:.0}")));
+    }
+    if let Some(cap) = q.market_cap {
+        pairs.push(("Cap", humanize_big(cap as f64)));
+    }
+    if let Some(y) = q.dividend_yield {
+        if y > 0.0 {
+            pairs.push(("Div", format!("{:.2}%", y * 100.0)));
+        }
+    }
+
+    if pairs.is_empty() {
+        return;
+    }
+
+    // Split into (at most) two rows: first half on row 0, remainder on row 1.
+    let mid = (pairs.len() + 1) / 2;
+    let rows = [&pairs[..mid], &pairs[mid..]];
+    for (row_idx, chunk) in rows.iter().enumerate() {
+        if row_idx as u16 >= area.height || chunk.is_empty() {
+            break;
+        }
+        let mut spans: Vec<Span<'_>> = Vec::new();
+        for (i, (label, value)) in chunk.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(format!("{label} "), theme.text_dim));
+            spans.push(Span::styled(value.clone(), theme.text_plain));
+        }
+        let row_rect = Rect {
+            y: area.y + row_idx as u16,
+            height: 1,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(Line::from(spans)), row_rect);
+    }
 }
 
 /// Snapshot of US equity-market hours: whether the regular session is

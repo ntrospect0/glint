@@ -160,3 +160,141 @@ fn article_prefix_width_matches_marker_plus_topic_tag() {
     assert_eq!(article_prefix_width("Tech"), 2 + 1 + 4 + 1 + 1);
     assert_eq!(article_prefix_width("Politics"), 2 + 1 + 8 + 1 + 1);
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// expand_user_set / auto-expand render tests
+// ─────────────────────────────────────────────────────────────────────
+
+fn build_widget_for_expand_tests() -> FeedsWidget {
+    use std::sync::Arc;
+
+    let cfg = FeedsConfig {
+        feeds: vec![FeedSpec {
+            topic: "Test".to_string(),
+            url: "https://example.com/feed".to_string(),
+        }],
+        ..FeedsConfig::default()
+    };
+    let widget = FeedsWidget::with_config(
+        "main".to_string(),
+        cfg,
+        Arc::new(crate::theme::Theme::builtin_defaults()),
+        crate::cache::ScopedCache::ephemeral(),
+        None,
+    );
+    // Seed one article so selected_article() returns Some.
+    {
+        use chrono::Utc;
+        let article = Arc::new(provider::FeedArticle {
+            title: "Test Expand Article Title".to_string(),
+            url: "https://example.com/article/1".to_string(),
+            topic: "Test".to_string(),
+            source: "example.com".to_string(),
+            published: Utc::now(),
+            summary: Some("Test article body.".to_string()),
+            hero_image_url: None,
+            authors: vec![],
+        });
+        widget
+            .state
+            .lock()
+            .unwrap()
+            .articles
+            .push(article);
+    }
+    widget
+}
+
+/// At Full size (105 × 30), with no manual toggle, the article panel
+/// auto-expands (expand_user_set = false, tier = Full → effective = true).
+/// expanded_rect is Some after render.
+#[test]
+fn full_tier_auto_expands_when_no_manual_toggle() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let (w, h) = (
+        crate::widgets::view_tier::FULL_MIN_W,
+        crate::widgets::view_tier::FULL_MIN_H,
+    );
+    assert_eq!(
+        crate::widgets::ViewTier::from_rect(ratatui::layout::Rect::new(0, 0, w, h)),
+        crate::widgets::ViewTier::Full,
+        "precondition: must resolve to Full"
+    );
+
+    let widget = build_widget_for_expand_tests();
+    // No manual toggle — expand_user_set stays false.
+    assert!(!widget.state.lock().unwrap().expand_user_set);
+
+    let backend = TestBackend::new(w, h);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| widget.render(frame, frame.area(), false))
+        .unwrap();
+
+    assert!(
+        widget.state.lock().unwrap().expanded_rect.is_some(),
+        "expanded panel must be shown automatically at Full tier"
+    );
+}
+
+/// At Standard size (50 × 20), the tier is not Full so auto-expand does
+/// not fire. expanded_rect remains None.
+#[test]
+fn non_full_tier_does_not_auto_expand() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let (w, h) = (50u16, 20u16);
+    assert_eq!(
+        crate::widgets::ViewTier::from_rect(ratatui::layout::Rect::new(0, 0, w, h)),
+        crate::widgets::ViewTier::Standard,
+        "precondition: must resolve to Standard"
+    );
+
+    let widget = build_widget_for_expand_tests();
+
+    let backend = TestBackend::new(w, h);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| widget.render(frame, frame.area(), false))
+        .unwrap();
+
+    assert!(
+        widget.state.lock().unwrap().expanded_rect.is_none(),
+        "expanded panel must not show at Standard tier without a manual toggle"
+    );
+}
+
+/// At Full size, a manual toggle-off (expand_user_set = true, expanded = false)
+/// overrides auto-expand — the panel stays collapsed.
+#[test]
+fn manual_toggle_off_overrides_auto_expand_at_full() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let (w, h) = (
+        crate::widgets::view_tier::FULL_MIN_W,
+        crate::widgets::view_tier::FULL_MIN_H,
+    );
+
+    let widget = build_widget_for_expand_tests();
+    // Simulate the user explicitly pressing `e` to collapse.
+    {
+        let mut st = widget.state.lock().unwrap();
+        st.expand_user_set = true;
+        st.expanded = false;
+    }
+
+    let backend = TestBackend::new(w, h);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| widget.render(frame, frame.area(), false))
+        .unwrap();
+
+    assert!(
+        widget.state.lock().unwrap().expanded_rect.is_none(),
+        "manual toggle-off must keep the panel collapsed even at Full tier"
+    );
+}
