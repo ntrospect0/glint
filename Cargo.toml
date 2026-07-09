@@ -42,7 +42,7 @@ widget-stocks = []
 # Forex reuses Stocks' Yahoo `Period` mapping verbatim, so enabling
 # widget-forex implicitly pulls in widget-stocks.
 widget-forex = ["widget-stocks"]
-widget-email = ["dep:imap", "dep:native-tls", "dep:mail-parser"]
+widget-email = ["dep:imap", "dep:native-tls", "dep:mail-parser", "dep:html2text"]
 widget-resources = ["dep:sysinfo"]
 widget-gallery = ["dep:image", "dep:ratatui-image"]
 widget-notes = []
@@ -158,6 +158,14 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 imap = { version = "2", optional = true }
 native-tls = { version = "0.2", optional = true }
 mail-parser = { version = "0.9", optional = true }
+# Robust HTML → text rendering for email bodies (widget-email). Pure,
+# in-process (no network): parses the message's HTML part with the
+# html5ever tree builder and renders terminal-friendly text — dropping
+# comments/script/style, decoding the full entity set, and formatting
+# lists, links, blockquotes, and headings. Replaces the hand-rolled
+# `html_strip` fallback that leaked MSO-conditional comments and
+# undecoded entities.
+html2text = { version = "0.12", optional = true }
 
 [dev-dependencies]
 wiremock = "0.6"

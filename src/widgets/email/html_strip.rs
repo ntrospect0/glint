@@ -1,209 +1,63 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 ntrospect0
 
-//! Minimal HTML → plain text converter for email bodies. Hand-rolled rather
-//! than pulling in `scraper` / `html2text` because real-world emails are wildly
-//! malformed (Outlook ships angle brackets unescaped, marketing emails
-//! cram inline styles, etc.) and a tolerant state-machine is faster + more
-//! predictable than a full parser.
+//! HTML → plain text for email bodies, backed by the `html2text` renderer
+//! (the html5ever tree builder). Runs entirely in-process — no network.
 //!
-//! Coverage:
-//!   - tags stripped (in-tag vs out-of-tag state)
-//!   - <br>, <br/>, <p>, </p>, <div>, </div> become \n
-//!   - <script> and <style> blocks (including their contents) get dropped
-//!   - common entities decoded: &amp; &lt; &gt; &quot; &apos; &#39; &nbsp; &copy; …
-//!   - numeric entities (decimal &#N; and hex &#xNN;) decoded
-//!   - runs of whitespace collapsed to a single space; multiple blank lines
-//!     collapsed to at most one
+//! html2text tolerates the wildly malformed HTML real emails ship (unescaped
+//! angle brackets, unclosed tags, MSO conditional comments, inline styles) and
+//! handles what the previous hand-rolled stripper missed:
+//!   - comments (`<!-- … -->`, incl. `<!--[if mso]> … <![endif]-->`) dropped
+//!     wholesale, so their embedded tables / CSS can't leak into the body
+//!   - `<script>` / `<style>` blocks dropped
+//!   - the full HTML entity set decoded (not just a hand-picked dozen)
+//!   - lists, links, blockquotes, and headings given readable structure
+//!
+//! We render at a wide width so paragraphs stay on one logical line; the read
+//! pane re-wraps them to its own width. A post-pass strips zero-width / control
+//! junk (invisible preheader spacers) and caps runs of blank lines.
+
+/// Render width handed to html2text. Deliberately wide so it keeps each
+/// paragraph on a single logical line (the read pane wraps to its own width);
+/// bounded so pathological input can't blow up column math.
+const RENDER_WIDTH: usize = 10_000;
 
 /// Convert an HTML string into plain text suitable for terminal display.
-/// Best-effort: malformed input doesn't error, it just produces a best
-/// approximation.
+/// Best-effort: malformed input doesn't error — on the rare render failure we
+/// fall back to the raw string so the user still sees *something*.
 pub fn html_to_text(html: &str) -> String {
-    // Drop <script>…</script> and <style>…</style> bodies wholesale
-    // (case-insensitive) so they can't leak into the output.
-    let stripped_scripts = strip_block(html, "script");
-    let stripped = strip_block(&stripped_scripts, "style");
-
-    // Walk the remaining bytes, tracking tag vs body. Line-break-worthy
-    // tags push `\n`; everything else outside a tag goes through with
-    // entity decoding. Whitespace is collapsed at the end so
-    // quoted-printable wraps don't survive.
-    let bytes = stripped.as_bytes();
-    let mut out = String::with_capacity(bytes.len());
-    let mut i = 0usize;
-    let mut in_tag = false;
-    let mut tag_buf = String::new();
-    while i < bytes.len() {
-        let b = bytes[i];
-        if !in_tag {
-            if b == b'<' {
-                in_tag = true;
-                tag_buf.clear();
-                i += 1;
-                continue;
-            }
-            if b == b'&' {
-                // Find the next ';' within a short window; longer than 8 and
-                // it's not really an entity. Pass through as-is on no match.
-                let end = stripped[i + 1..]
-                    .find([';', ' ', '<', '&'])
-                    .map(|n| i + 1 + n);
-                if let Some(end_idx) = end {
-                    if bytes.get(end_idx) == Some(&b';') {
-                        let entity = &stripped[i + 1..end_idx];
-                        out.push_str(&decode_entity(entity));
-                        i = end_idx + 1;
-                        continue;
-                    }
-                }
-                out.push('&');
-                i += 1;
-                continue;
-            }
-            // HTML treats source newlines and tabs as inline whitespace, so
-            // collapse them to a space here. The only \n's that survive into
-            // `out` are the ones the tag handler injects below.
-            if b == b'\n' || b == b'\r' || b == b'\t' {
-                out.push(' ');
-            } else {
-                out.push(b as char);
-            }
-            i += 1;
-        } else {
-            if b == b'>' {
-                in_tag = false;
-                let lname = tag_name(&tag_buf);
-                if matches!(
-                    lname.as_str(),
-                    "br" | "/p" | "/div" | "p" | "div" | "tr" | "/tr" | "li" | "/li"
-                ) {
-                    out.push('\n');
-                }
-                tag_buf.clear();
-                i += 1;
-                continue;
-            }
-            // Track tag content so we can recognize the name + slash.
-            tag_buf.push(b as char);
-            i += 1;
-        }
-    }
-
-    collapse_whitespace(&out)
+    let rendered = html2text::config::plain()
+        .no_table_borders() // layout tables shouldn't draw ASCII borders
+        .string_from_read(html.as_bytes(), RENDER_WIDTH)
+        .unwrap_or_else(|_| html.to_string());
+    normalize(&rendered)
 }
 
-/// Lowercased tag name (e.g. " BR / " → "br"; "/P" → "/p"). Strips the
-/// trailing self-closing slash so `<br/>` and `<br>` are equivalent.
-fn tag_name(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let head = trimmed.split_whitespace().next().unwrap_or("");
-    let head = head.trim_end_matches('/');
-    head.to_ascii_lowercase()
-}
-
-/// Drop every occurrence of `<name>…</name>` (case-insensitive) including the
-/// surrounding tags. Used to nuke `<script>` and `<style>` blocks before
-/// the main tag-strip walk so their contents don't leak into the output.
-fn strip_block(html: &str, name: &str) -> String {
-    let lower = html.to_ascii_lowercase();
-    let open = format!("<{name}");
-    let close = format!("</{name}");
-    let mut out = String::with_capacity(html.len());
-    let mut cursor = 0usize;
-    while cursor < html.len() {
-        match lower[cursor..].find(&open) {
-            None => {
-                out.push_str(&html[cursor..]);
-                break;
-            }
-            Some(rel) => {
-                let abs_open = cursor + rel;
-                out.push_str(&html[cursor..abs_open]);
-                // Find the closing `>` of the opening tag, then the matching
-                // `</name…>`. If either is missing, bail and emit verbatim.
-                let after_open = match html[abs_open..].find('>') {
-                    Some(p) => abs_open + p + 1,
-                    None => {
-                        out.push_str(&html[abs_open..]);
-                        break;
-                    }
-                };
-                match lower[after_open..].find(&close) {
-                    None => {
-                        // Unclosed — drop the rest entirely to avoid leaking
-                        // raw <script> content.
-                        break;
-                    }
-                    Some(c) => {
-                        let close_open = after_open + c;
-                        match html[close_open..].find('>') {
-                            Some(p) => {
-                                cursor = close_open + p + 1;
-                            }
-                            None => break,
-                        }
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-fn decode_entity(name: &str) -> String {
-    // Numeric: &#N; (decimal) or &#xNN; (hex).
-    if let Some(rest) = name.strip_prefix('#') {
-        let (radix, digits) =
-            if let Some(hex) = rest.strip_prefix('x').or_else(|| rest.strip_prefix('X')) {
-                (16, hex)
-            } else {
-                (10, rest)
-            };
-        if let Ok(code) = u32::from_str_radix(digits, radix) {
-            if let Some(c) = char::from_u32(code) {
-                return c.to_string();
-            }
-        }
-        return String::new();
-    }
-    match name {
-        "amp" => "&".into(),
-        "lt" => "<".into(),
-        "gt" => ">".into(),
-        "quot" => "\"".into(),
-        "apos" => "'".into(),
-        "nbsp" => " ".into(),
-        "copy" => "©".into(),
-        "reg" => "®".into(),
-        "trade" => "™".into(),
-        "hellip" => "…".into(),
-        "mdash" => "—".into(),
-        "ndash" => "–".into(),
-        "rsquo" | "lsquo" => "'".into(),
-        "rdquo" | "ldquo" => "\"".into(),
-        _ => format!("&{name};"),
-    }
-}
-
-/// Collapse runs of inline whitespace to a single space, and runs of blank
-/// lines to at most one blank line. Preserves explicit \n's because the
-/// tag-strip pass emits them at paragraph boundaries.
-fn collapse_whitespace(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
+/// Strip invisible junk (zero-width spaces, soft hyphens, BOMs, stray control
+/// chars) that newsletters stuff into preheaders, and collapse runs of blank
+/// lines to at most one.
+fn normalize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
     let mut blank_run = 0u32;
-    for line in input.lines() {
-        let trimmed = line.split_whitespace().collect::<Vec<_>>().join(" ");
-        if trimmed.is_empty() {
+    for line in s.lines() {
+        let cleaned: String = line
+            .chars()
+            .filter(|c| {
+                !matches!(
+                    *c,
+                    '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{00AD}'
+                ) && (*c == '\t' || !c.is_control())
+            })
+            .collect();
+        let trimmed = cleaned.trim_end();
+        if trimmed.trim().is_empty() {
             blank_run += 1;
             if blank_run <= 1 {
                 out.push('\n');
             }
         } else {
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str(&trimmed);
+            out.push_str(trimmed);
+            out.push('\n');
             blank_run = 0;
         }
     }
@@ -215,71 +69,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strips_simple_tags() {
-        let html = "<p>hello <b>world</b></p>";
-        let plain = html_to_text(html);
-        assert_eq!(plain, "hello world");
+    fn strips_tags_to_visible_text() {
+        assert_eq!(html_to_text("<p>hello <b>world</b></p>"), "hello world");
     }
 
     #[test]
-    fn decodes_named_entities() {
-        let html = "Tom &amp; Jerry &lt;3 &quot;quoted&quot; &nbsp;space";
-        let plain = html_to_text(html);
-        assert_eq!(plain, "Tom & Jerry <3 \"quoted\" space");
-    }
-
-    #[test]
-    fn decodes_numeric_entities() {
-        // &#39; = apostrophe, &#xA9; = ©, &#8212; = em-dash
-        let html = "it&#39;s &#xA9; 2026 &#8212; ok";
-        let plain = html_to_text(html);
-        assert_eq!(plain, "it's © 2026 — ok");
-    }
-
-    #[test]
-    fn br_and_p_become_newlines() {
-        let html = "line one<br>line two<br/>line three</p>line four";
-        let plain = html_to_text(html);
-        // <br> and <br/> both insert newlines; </p> too.
-        let lines: Vec<&str> = plain.lines().collect();
-        assert_eq!(
-            lines,
-            vec!["line one", "line two", "line three", "line four"]
+    fn decodes_the_full_entity_set() {
+        let plain = html_to_text(
+            "Tom &amp; Jerry &lt;3 it&#39;s &#xA9; 2026 &#8212; 5&deg; &bull; &euro;10 &rarr; &frac12;",
         );
+        assert!(plain.contains("Tom & Jerry"));
+        assert!(plain.contains("<3") && plain.contains("it's"));
+        // Entities the old hand-picked table rendered literally as `&deg;` etc.
+        for want in ['©', '—', '°', '•', '€', '→', '½'] {
+            assert!(plain.contains(want), "missing {want:?} in {plain:?}");
+        }
     }
 
     #[test]
     fn drops_script_and_style_blocks() {
-        let html = "before<script>alert('x');</script>after<style>body{color:red}</style>tail";
+        let plain = html_to_text(
+            "before<script>alert('x');</script>after<style>body{color:red}</style>tail",
+        );
+        assert_eq!(plain, "beforeaftertail");
+    }
+
+    #[test]
+    fn drops_comments_including_mso_conditionals() {
+        // The old stripper bailed at the first `>` inside the comment and leaked
+        // the embedded table + CSS; html2text drops the whole comment.
+        let html = "start<!--[if gte mso 9]><table><tr><td>OUTLOOKJUNK</td></tr></table>\
+                    <style>.x{color:red}</style><![endif]-->end";
         let plain = html_to_text(html);
-        // Critical: the alert() text + CSS body must not leak through.
-        assert!(!plain.contains("alert"));
+        assert!(!plain.contains("OUTLOOKJUNK"), "MSO comment leaked: {plain:?}");
         assert!(!plain.contains("color:red"));
-        assert!(plain.contains("before"));
-        assert!(plain.contains("after"));
-        assert!(plain.contains("tail"));
+        assert!(plain.contains("start") && plain.contains("end"));
     }
 
     #[test]
-    fn collapses_excessive_whitespace() {
-        let html = "<p>hello   \n\n  world</p>\n\n\n<p>next</p>";
-        let plain = html_to_text(html);
-        assert_eq!(plain, "hello world\nnext");
+    fn br_and_block_tags_break_lines() {
+        let plain = html_to_text("line one<br>line two<br/>line three</p><p>line four");
+        let lines: Vec<&str> = plain.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines, vec!["line one", "line two", "line three", "line four"]);
     }
 
     #[test]
-    fn handles_unclosed_tags_gracefully() {
-        // Malformed input shouldn't panic — just produce best-effort output.
-        let html = "<p>unfinished";
-        let plain = html_to_text(html);
-        assert_eq!(plain, "unfinished");
+    fn formats_lists_and_links() {
+        let plain = html_to_text(
+            "<ul><li>first</li><li>second</li></ul><a href=\"https://example.com\">a link</a>",
+        );
+        assert!(plain.contains("first") && plain.contains("second"));
+        assert!(plain.contains("a link"));
+        // The link's target is surfaced (footnote-style) rather than dropped.
+        assert!(plain.contains("https://example.com"));
     }
 
     #[test]
-    fn passes_through_loose_ampersand() {
-        // No semicolon → not an entity; render verbatim.
-        let html = "A & B (a & b)";
-        let plain = html_to_text(html);
-        assert_eq!(plain, "A & B (a & b)");
+    fn strips_zero_width_preheader_junk() {
+        let plain = html_to_text("Real text\u{200B}\u{200C}\u{FEFF}\u{00AD} here");
+        assert_eq!(plain, "Real text here");
+        assert!(!plain
+            .chars()
+            .any(|c| matches!(c, '\u{200B}' | '\u{200C}' | '\u{FEFF}' | '\u{00AD}')));
+    }
+
+    #[test]
+    fn malformed_input_does_not_panic() {
+        assert_eq!(html_to_text("<p>unfinished"), "unfinished");
+        // Garbage must not panic.
+        let _ = html_to_text("<<<>&&;<table><tr><td>&#xZZ;");
     }
 }

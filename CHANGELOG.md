@@ -25,15 +25,19 @@ as before.
 - **Zoomed (Full-tier) views** — all Full-tier only, unzoomed rendering
   unchanged:
   - **Stocks** — fundamentals panel.
-  - **Email** — split list + full-message read pane.
+  - **Email** — split list + full-message read pane, with robust HTML→text
+    body rendering (via `html2text`): comments (incl. Outlook MSO conditionals),
+    `<script>`/`<style>`, and zero-width preheader junk are dropped, the full
+    entity set is decoded, and lists/links/blockquotes get readable structure.
   - **Forex** — 52-week range bar (highlight-coloured) in the details column.
   - **Weather** — side-by-side city columns (home pinned, `←/→` scroll,
     prefetch-all-cities), each with a 24h temperature chart (high/low labelled),
     rain-probability bar, and a 7-day forecast.
   - **Clock** — large-digit world-clock grid (bordered cards, day/date +
     day/night glyph), stopwatch lap table, timer burn-down bar.
-  - **Resources** — CPU-history sparkline, taller process list with selection,
-    extra columns.
+  - **Resources** — a decorated CPU-history chart (filled braille area with a
+    green→amber→red utilisation gradient, a `%` y-axis with gridlines, and a
+    time x-axis), taller process list with selection, extra columns.
   - **Feeds** — article panel expanded by default when zoomed.
   - **Calendar** — zoomed Day/Week views place agenda columns above a 3-month
     reference block (prev · current · next) whose days carry event dots
