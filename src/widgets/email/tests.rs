@@ -300,6 +300,127 @@ fn expanded_size_read_pane_shows_full_body() {
     );
 }
 
+/// `expanded_body_lines` is the shared body/summary renderer used by both the
+/// list/expanded panes (capped at `MAX_SUMMARY_LINES`) and the wide read pane
+/// (uncapped via `usize::MAX`). It must (a) leave the raw body uncapped when
+/// asked, (b) still cap when asked, and (c) render an already-generated summary
+/// — reused from state, no LLM call — when the per-message summary toggle is on.
+#[test]
+fn expanded_body_lines_honors_summary_toggle_and_body_cap() {
+    let msg = make_message(20);
+    let widget = make_widget_with_messages(vec![msg.clone()]);
+
+    // Read-pane call shape (usize::MAX): the body is uncapped.
+    let uncapped = expanded_body_lines(&msg, &widget.state, 80, true, usize::MAX);
+    assert!(
+        uncapped.iter().any(|l| l.contains("Body line 19.")),
+        "read-pane body (usize::MAX) must be uncapped; got {uncapped:?}"
+    );
+
+    // List/expanded call shape: the body is capped at MAX_SUMMARY_LINES.
+    let capped = expanded_body_lines(&msg, &widget.state, 80, true, MAX_SUMMARY_LINES);
+    assert_eq!(
+        capped.len(),
+        MAX_SUMMARY_LINES,
+        "list/expanded body must cap at MAX_SUMMARY_LINES; got {capped:?}"
+    );
+
+    // Seed an already-generated summary and toggle the message into summary
+    // view — exactly the state that pressing `s` leaves behind. The renderer
+    // must surface the cached summary instead of the raw body, with no LLM.
+    {
+        let mut st = widget.state.lock().unwrap();
+        st.summaries
+            .insert(msg.id.clone(), SummaryState::Ready("A crisp summary.".into()));
+        st.summary_view.insert(msg.id.clone(), true);
+    }
+    let summarized = expanded_body_lines(&msg, &widget.state, 80, true, usize::MAX);
+    assert!(
+        summarized.iter().any(|l| l.contains("A crisp summary.")),
+        "summary view must render the cached summary; got {summarized:?}"
+    );
+    assert!(
+        !summarized.iter().any(|l| l.contains("Body line 0.")),
+        "summary view must replace the raw body; got {summarized:?}"
+    );
+}
+
+/// Regression: a left-click landing in the read pane must be a no-op. Before the
+/// fix, `handle_mouse` hit-tested against the full-width list area (which spans
+/// the read pane too), so a read-pane click jumped selection to whatever row sat
+/// at that vertical offset. Now it hit-tests the narrowed left list column, so a
+/// read-pane click is ignored while the same row in the list column still hits.
+#[test]
+fn wide_rect_read_pane_click_is_noop() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let (w, h) = (260u16, 30u16);
+    // Six single-line messages so distinct rows map to distinct indices.
+    let msgs: Vec<_> = (0..6)
+        .map(|i| {
+            let mut m = make_message(1);
+            m.id = format!("m{i}");
+            m.subject = format!("Subject {i}");
+            m
+        })
+        .collect();
+    let mut widget = make_widget_with_messages(msgs);
+    let area = ratatui::layout::Rect::new(0, 0, w, h);
+
+    // Render once so the read-pane split runs and `last_list_area` is stored.
+    let backend = TestBackend::new(w, h);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            widget.render(frame, area, true);
+        })
+        .unwrap();
+
+    let la = widget
+        .state
+        .lock()
+        .unwrap()
+        .last_list_area
+        .expect("read pane render must store last_list_area");
+    // A row that maps to a non-selected message (offset 3 → message index 3).
+    let row = la.y + 3;
+    let list_col = la.x + 1; // inside the narrowed left list column
+    let read_col = la.x + la.width + 2; // past the list column, into the read pane
+
+    let click = |col, row| MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    // Click in the read pane: ignored, selection unchanged.
+    let selected_before = widget.state.lock().unwrap().selected;
+    let r = widget.handle_mouse(click(read_col, row), area);
+    assert_eq!(r, EventResult::Ignored, "read-pane click must be a no-op");
+    assert_eq!(
+        widget.state.lock().unwrap().selected,
+        selected_before,
+        "read-pane click must not change selection"
+    );
+
+    // Same row in the list column: handled, and it selects that live row —
+    // proving the read-pane click above would have jumped selection pre-fix.
+    let r = widget.handle_mouse(click(list_col, row), area);
+    assert_eq!(
+        r,
+        EventResult::Handled,
+        "list-column click on the same row must hit a message"
+    );
+    assert_ne!(
+        widget.state.lock().unwrap().selected,
+        selected_before,
+        "list-column click must select the message under the cursor"
+    );
+}
+
 /// At Expanded size (100 × 30) the widget is above the Expanded tier threshold
 /// but `list_area.width` (98) is well below `READ_PANE_MIN_WIDTH` (250), so the
 /// split must NOT activate. Body lines beyond MAX_SUMMARY_LINES must be absent.

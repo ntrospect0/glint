@@ -1133,6 +1133,7 @@ impl Widget for EmailWidget {
                     &self.state,
                     body_max_width,
                     self.summarize_with_llm && self.llm.is_some(),
+                    MAX_SUMMARY_LINES,
                 )
                 .len();
                 let expansion_height = subject_lines + body_lines;
@@ -1246,6 +1247,7 @@ impl Widget for EmailWidget {
                     &self.state,
                     inner_width.saturating_sub(3),
                     self.summarize_with_llm && self.llm.is_some(),
+                    MAX_SUMMARY_LINES,
                 );
                 // First the full subject on its own row(s) (up to 2).
                 for sline in wrap_text(&msg.subject, inner_width.saturating_sub(3), 2) {
@@ -1317,14 +1319,24 @@ impl Widget for EmailWidget {
                     )));
                     // Blank separator between header and body.
                     rp_lines.push(Line::from(""));
-                    // Body: full plain_body with no MAX_SUMMARY_LINES cap,
-                    // wrapped to pane width. Clip to available rows with a
-                    // trailing dim "…" when the body overflows the pane.
+                    // Body: full message with no MAX_SUMMARY_LINES cap,
+                    // wrapped to pane width. Honors the per-message summary
+                    // toggle (`s`) — when the user has switched into summary
+                    // view this renders the already-generated summary (reused
+                    // from the in-memory/disk cache, no fresh LLM call)
+                    // instead of the raw body. Clip to available rows with a
+                    // trailing dim "…" when the content overflows the pane.
                     const HEADER_ROWS: usize = 3; // sender, subject, blank
                     let body_rows_avail = (rp.height as usize).saturating_sub(HEADER_ROWS);
                     if body_rows_avail > 0 {
                         let body_w = (rp.width as usize).saturating_sub(1).max(1);
-                        let all_body = wrap_text(&msg.plain_body, body_w, usize::MAX);
+                        let all_body = expanded_body_lines(
+                            msg,
+                            &self.state,
+                            body_w,
+                            self.summarize_with_llm && self.llm.is_some(),
+                            usize::MAX,
+                        );
                         let clipped = all_body.len() > body_rows_avail;
                         let take = if clipped {
                             body_rows_avail.saturating_sub(1)
@@ -1478,7 +1490,7 @@ impl Widget for EmailWidget {
             return EventResult::Ignored;
         }
         let inner = Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2);
-        let (tab_area, list_area, _footer_area) = self.split_inner(inner);
+        let (tab_area, _list_area, _footer_area) = self.split_inner(inner);
         if tab_area.height > 0
             && mouse.row == tab_area.y
             && mouse.column >= tab_area.x
@@ -1496,14 +1508,24 @@ impl Widget for EmailWidget {
             }
         }
         // Click inside the message list — find the row that owns this
-        // mouse position and toggle expand on that message (selecting
-        // it first if it wasn't already the active row).
-        if list_area.height > 0
-            && mouse.column >= list_area.x
-            && mouse.column < list_area.x + list_area.width
-            && mouse.row >= list_area.y
-            && mouse.row < list_area.y + list_area.height
-        {
+        // mouse position and toggle expand on that message (selecting it
+        // first if it wasn't already the active row). Hit-test against the
+        // last-rendered list area, which is the narrowed left column when a
+        // read pane is present, so a click landing in the read pane is a
+        // no-op rather than jumping to whatever row sits at that vertical
+        // offset.
+        let list_area = {
+            let st = self.state.lock().expect("email state poisoned");
+            st.last_list_area
+        };
+        let in_list = list_area.is_some_and(|la| {
+            la.height > 0
+                && mouse.column >= la.x
+                && mouse.column < la.x + la.width
+                && mouse.row >= la.y
+                && mouse.row < la.y + la.height
+        });
+        if let (true, Some(list_area)) = (in_list, list_area) {
             let click_offset = mouse.row - list_area.y;
             let hit_and_state = {
                 let st = self.state.lock().expect("email state poisoned");
@@ -1677,11 +1699,20 @@ fn truncate_body_in_place(body: &mut String, max_chars: usize) {
     body.push_str("…");
 }
 
+/// Body/summary lines for a message, honoring the per-message summary
+/// preference (`summary_view`) and any already-generated summary
+/// (`summaries`, populated from the in-memory map or the disk cache —
+/// never a fresh LLM call). `body_max_lines` caps the *raw body* view:
+/// the compact list/expanded panes pass `MAX_SUMMARY_LINES` to keep
+/// long emails from crowding the list, while the wide read pane passes
+/// `usize::MAX` and does its own row-clipping. LLM summaries are always
+/// uncapped (already bounded by the system prompt).
 fn expanded_body_lines(
     msg: &EmailMessage,
     state: &Arc<Mutex<EmailState>>,
     max_width: usize,
     llm_enabled: bool,
+    body_max_lines: usize,
 ) -> Vec<String> {
     let (summary_state, prefer_summary) = {
         let st = state.lock().expect("email state poisoned");
@@ -1712,7 +1743,7 @@ fn expanded_body_lines(
                         out.extend(wrap_text(
                             &msg.plain_body,
                             max_width,
-                            MAX_SUMMARY_LINES.saturating_sub(1),
+                            body_max_lines.saturating_sub(1),
                         ));
                     }
                     return out;
@@ -1723,13 +1754,14 @@ fn expanded_body_lines(
             }
         }
     }
-    // Body view: cap at MAX_SUMMARY_LINES (5). Long raw emails would
-    // otherwise push every other message off-screen and require
-    // multi-pane scrolling. The LLM summary remains uncapped (it's
-    // already bounded by the system prompt's ~4 sentences); users who
-    // want the full body open the message in their mail client via
-    // `o` instead.
-    wrap_text(&msg.plain_body, max_width, MAX_SUMMARY_LINES)
+    // Body view: cap at `body_max_lines`. In the list/expanded panes
+    // this is MAX_SUMMARY_LINES (5) — long raw emails would otherwise
+    // push every other message off-screen and require multi-pane
+    // scrolling. The read pane passes usize::MAX and clips to its own
+    // available rows. The LLM summary above stays uncapped (already
+    // bounded by the system prompt's ~4 sentences); users who want the
+    // full body open the message in their mail client via `o` instead.
+    wrap_text(&msg.plain_body, max_width, body_max_lines)
 }
 
 /// Thin wrapper preserving the call sites' `wrap_text` name. The
